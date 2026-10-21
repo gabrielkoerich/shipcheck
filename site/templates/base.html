@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ config.title }}{% endblock title %}</title>
+  <meta name="description" content="{% block description %}{{ config.description }}{% endblock description %}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+  <link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+</head>
+<body>
+  <header class="site-header">
+    <a class="wordmark" href="{{ get_url(path='@/_index.md') }}">shipcheck</a>
+    <nav aria-label="Site">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <a href="{{ get_url(path='@/docs/quickstart.md') }}">Quickstart</a>
+      <a href="https://github.com/gabrielkoerich/shipcheck">Source</a>
+    </nav>
+  </header>
+  {% block content %}{% endblock content %}
+  <footer class="site-footer">
+    <p>shipcheck is MIT licensed. It runs your workflows with <a href="https://github.com/nektos/act">act</a> and clones checkouts with <a href="https://crates.io/crates/git-cow">git-cow</a>.</p>
+  </footer>
+</body>
+</html>

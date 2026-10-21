@@ -1,0 +1,2289 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
+use yaml_rust2::Yaml;
+use yaml_rust2::yaml::Hash;
+
+use super::{Outcome, RunRequest, Runner};
+use crate::cache;
+use crate::config;
+use crate::workflow::{self, key, step};
+
+/// Where per-job tool homes live in the job container, a path in `cache_paths` by default
+pub const JOB_HOMES: &str = "/root/.shipcheck";
+
+/// Runs workflows with nektos/act, each job in a Docker container
+#[derive(Default)]
+pub struct Act {
+    config: config::Act,
+    network: config::Network,
+}
+
+impl Act {
+    pub fn new(config: config::Act) -> Self {
+        Act {
+            config,
+            network: config::Network::None,
+        }
+    }
+
+    pub fn with_network(self, network: config::Network) -> Self {
+        Act { network, ..self }
+    }
+}
+
+/// The label a job gets when `[act.jobs]` gives it an image of its own
+pub fn job_label(job: &str) -> String {
+    format!("shipcheck-{job}")
+}
+
+impl Runner for Act {
+    fn preflight(&self) -> Result<(), String> {
+        let out = Command::new("docker")
+            .args([
+                "version",
+                "--format",
+                "{{.Server.Platform.Name}}|{{range .Server.Components}}{{.Name}}={{.Version}};{{end}}",
+            ])
+            .output()
+            .map_err(|e| format!("docker: {e}"))?;
+
+        if !out.status.success() {
+            return Err(format!(
+                "docker version failed, is a Docker engine running? {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        if let Some(problem) = engine_problem(String::from_utf8_lossy(&out.stdout).trim()) {
+            return Err(problem);
+        }
+
+        // act before 0.2.86 served its cache on every interface and honoured ::set-env (CVE-2026-34041, -34042)
+        let act = self.identity()?;
+
+        match act.rsplit(' ').next().and_then(version) {
+            Some(v) if v < (0, 2, 86) => Err(format!(
+                "{act} has known holes (CVE-2026-34041, CVE-2026-34042). Update act to 0.2.86 or later"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn identity(&self) -> Result<String, String> {
+        // From `/`, so the .actrc of whatever repo the caller stands in cannot break it
+        let out = Command::new("act")
+            .arg("--version")
+            .current_dir("/")
+            .output()
+            .map_err(|e| format!("act: {e}"))?;
+        let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        if !out.status.success() || version.is_empty() {
+            return Err(format!(
+                "act --version failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        Ok(version)
+    }
+
+    /// Adds the `workflow_dispatch` trigger act runs by, expands matrices, gives jobs named in
+    /// `[act.jobs]` their own `runs-on` label, and gives each job its own tool homes
+    fn prepare(&self, source: &str, file: &str) -> Result<String, String> {
+        let mut root = workflow::load(source)?;
+
+        let dispatch = key("workflow_dispatch");
+        let Some(on) = root.get_mut(&key("on")) else {
+            return Err("workflow has no `on` triggers".into());
+        };
+        *on = match std::mem::replace(on, Yaml::Null) {
+            Yaml::String(event) => Yaml::Hash(Hash::from_iter([
+                (key(&event), Yaml::Null),
+                (dispatch, Yaml::Null),
+            ])),
+            Yaml::Array(mut events) => {
+                if !events.contains(&dispatch) {
+                    events.push(dispatch);
+                }
+
+                Yaml::Array(events)
+            }
+            Yaml::Hash(mut events) => {
+                events.entry(dispatch).or_insert(Yaml::Null);
+                Yaml::Hash(events)
+            }
+            other => {
+                return Err(format!("workflow `on` is not a trigger list: {other:?}"));
+            }
+        };
+
+        let jobs = workflow::jobs_mut(&mut root)?;
+        *jobs = expand_matrices(std::mem::take(jobs));
+        // After expansion, so `container: ${{ matrix.c }}` is checked as the value it becomes
+        refuse_escapes(jobs, self.network)?;
+        let own_image = self.config.job_images(file);
+
+        for (id, job) in jobs.iter_mut() {
+            let base = id.as_str().map(|s| s.split("__").next().unwrap_or(s));
+
+            if let (Some(base), Yaml::Hash(job)) = (base, job)
+                && own_image.contains_key(base)
+            {
+                job.insert(key("runs-on"), key(&job_label(base)));
+            }
+        }
+
+        let homes = &self.config.job_homes;
+        let path_lines: String = homes
+            .iter()
+            .filter_map(|(var, home)| {
+                let dir = format!("${var}/{}", home.path()?);
+                Some(format!(
+                    "mkdir -p \"{dir}\"\necho \"{dir}\" >> \"$GITHUB_PATH\"\n"
+                ))
+            })
+            .collect();
+
+        for (id, job) in jobs.iter_mut() {
+            let (Some(id), Yaml::Hash(job)) = (id.as_str(), job) else {
+                continue;
+            };
+
+            if !matches!(job.get(&key("steps")), Some(Yaml::Array(_))) {
+                continue;
+            }
+
+            let env = job
+                .entry(key("env"))
+                .or_insert_with(|| Yaml::Hash(Hash::new()));
+
+            if let Yaml::Hash(env) = env
+                && !env.contains_key(&key("GIT_CONFIG_COUNT"))
+            {
+                // The mounted repository is owned by another user than the job's, which git refuses
+                for (k, v) in [
+                    ("GIT_CONFIG_COUNT", "1"),
+                    ("GIT_CONFIG_KEY_0", "safe.directory"),
+                    ("GIT_CONFIG_VALUE_0", "*"),
+                ] {
+                    env.insert(key(k), key(v));
+                }
+            }
+
+            // Each job gets its own tool homes in the shared cache volume, so parallel jobs never
+            // install into one toolchain or race on one lock
+            if let Yaml::Hash(env) = env {
+                for (var, home) in homes {
+                    env.entry(key(var))
+                        .or_insert_with(|| key(&format!("{JOB_HOMES}/{id}/{}", home.dir())));
+                }
+            }
+
+            if let (false, Some(Yaml::Array(steps))) =
+                (path_lines.is_empty(), job.get_mut(&key("steps")))
+            {
+                steps.insert(0, step("shipcheck homes", None, path_lines.clone()));
+            }
+        }
+
+        for job in jobs.values_mut() {
+            if let Some(step) = job.as_hash().and_then(outputs_step)
+                && let Some(Yaml::Array(steps)) =
+                    job.as_mut_hash().and_then(|j| j.get_mut(&key("steps")))
+            {
+                steps.push(step);
+            }
+        }
+
+        workflow::emit(root)
+    }
+
+    fn run(&self, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+        let run_dir = request.run_dir;
+
+        // act reads these from the checkout, so a commit could change how its own run behaves
+        for dotfile in [".actrc", ".env", ".secrets", ".vars", ".input"] {
+            let _ = fs::remove_file(run_dir.join(dotfile));
+        }
+
+        let wf_path = request.workflow;
+        let prepared = fs::read_to_string(wf_path).map_err(|e| e.to_string())?;
+        let tag = cache::hex(&Sha256::digest(run_dir.to_string_lossy().as_bytes())[..4]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let nonce = cache::hex(
+            &Sha256::digest(format!(
+                "{}{}{}",
+                run_dir.display(),
+                now.as_nanos(),
+                std::process::id()
+            ))[..16],
+        );
+        fs::write(run_dir.join(".git").join(NONCE_FILE), &nonce).map_err(|e| e.to_string())?;
+        fs::write(
+            wf_path,
+            isolate(
+                &prepared,
+                request.file,
+                request.job,
+                request.needs,
+                &tag,
+                &nonce,
+            )?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
+        let mut cmd = Command::new("act");
+        let port = free_port()?;
+        let volumes: Vec<String> = self
+            .config
+            .cache_paths
+            .iter()
+            .map(|p| format!("-v {}:{p}", volume_name(request.repo_id, p)))
+            .collect();
+
+        cmd.arg("workflow_dispatch")
+            .arg("-W")
+            .arg(wf_path)
+            .arg("-j")
+            .arg(request.job)
+            .arg("--bind")
+            .arg("--pull=false")
+            // act leaves the container of a failed job running without it
+            .arg("--rm")
+            // Jobs pass build output to each other through upload-artifact, which act serves only
+            // from a directory it is given, one per workflow run
+            .arg("--artifact-server-path")
+            .arg(request.artifacts)
+            // act's fixed default port would let two concurrent runs share one server
+            .arg("--artifact-server-port")
+            .arg(port.to_string())
+            // act binds the LAN address by default, which anyone on the network could use
+            .arg("--artifact-server-addr")
+            .arg("127.0.0.1")
+            .current_dir(run_dir)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log);
+
+        if !volumes.is_empty() {
+            cmd.arg("--container-options").arg(volumes.join(" "));
+        }
+
+        let mut platforms: BTreeMap<&str, &str> = DEFAULT_PLATFORMS.into_iter().collect();
+        platforms.extend(
+            self.config
+                .platforms
+                .iter()
+                .map(|(l, i)| (l.as_str(), i.as_str())),
+        );
+
+        for (label, image) in platforms {
+            cmd.arg("-P").arg(format!("{label}={image}"));
+        }
+
+        for (job, image) in self.config.job_images(request.file) {
+            cmd.arg("-P").arg(format!("{}={image}", job_label(&job)));
+        }
+
+        let secrets = crate::run::secrets_file(request.repo_id);
+        let secrets = if secrets.exists() {
+            secrets
+        } else {
+            PathBuf::from("/dev/null")
+        };
+        cmd.arg("--secret-file").arg(secrets);
+        // Parallel act processes cloning one action into one cache corrupt it, so each job has its own
+        cmd.arg("--action-cache-path").arg(
+            actions_dir(Some(request.repo_id))
+                .join(request.file)
+                .join(request.job),
+        );
+        // act's default is the host's network, which reaches every service on the machine and the LAN
+        if self.network == config::Network::None {
+            cmd.arg("--network").arg("none");
+        }
+
+        // Job code would get the host through the Docker socket: every file, the App key, other runs
+        cmd.arg("--container-daemon-socket").arg("-");
+        // act's cache server listens on the LAN with no auth and is shared by every branch, so a
+        // stranger or another commit could plant what a later run restores. Warm checkouts replace it
+        cmd.arg("--no-cache-server");
+        // act fills an unset GITHUB_TOKEN secret from the host's token, so it is set, empty
+        cmd.arg("-s").arg("GITHUB_TOKEN=");
+        // act also passes a host GITHUB_TOKEN to jobs, so act sees only what it needs
+        cmd.env_clear().envs(std::env::vars().filter(|(k, _)| {
+            [
+                "PATH",
+                "HOME",
+                "USER",
+                "TMPDIR",
+                "LANG",
+                "LC_ALL",
+                "XDG_CACHE_HOME",
+            ]
+            .contains(&k.as_str())
+                || k.starts_with("DOCKER_")
+        }));
+
+        // On a Mac, Docker runs in a VM whose 127.0.0.1 is not the Mac's, and act takes the URL it
+        // gives jobs from this variable, so jobs reach the loopback artifact server through Docker's route
+        if cfg!(target_os = "macos") {
+            cmd.env(
+                "ACTIONS_RUNTIME_URL",
+                format!("http://host.docker.internal:{port}/"),
+            );
+        }
+
+        for flag in ["--env-file", "--var-file", "--input-file"] {
+            cmd.arg(flag).arg("/dev/null");
+        }
+
+        let mut child = cmd.spawn().map_err(|e| format!("act: {e}"))?;
+        let deadline = Instant::now() + request.timeout;
+
+        let exit = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status.code();
+            }
+
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        hand_back(run_dir);
+        let log = fs::read(log_path).map_err(|e| e.to_string())?;
+        let log = String::from_utf8_lossy(&log);
+        Ok(Outcome {
+            exit,
+            unsupported_jobs: unsupported_jobs(&log),
+            outputs: read_outputs(&log),
+        })
+    }
+
+    /// A dead run's containers still mount its slot's directory, and holding the slot's lock proves
+    /// the run is dead. Docker matches the exact mount path, never a parent
+    fn reclaim(&self, run_dir: &Path) {
+        let mut paths = vec![run_dir.to_path_buf()];
+
+        // act mounts the path its working directory resolves to, /private/var for /var on macOS
+        if let (Some(parent), Some(name)) = (run_dir.parent(), run_dir.file_name())
+            && let Ok(real) = parent.canonicalize()
+        {
+            paths.push(real.join(name));
+        }
+
+        for path in paths {
+            // Both filters must match, so only act's own job containers can ever be removed
+            let Ok(out) = Command::new("docker")
+                .args(["ps", "-aq", "--filter", "name=^act-", "--filter"])
+                .arg(format!("volume={}", path.display()))
+                .output()
+            else {
+                continue;
+            };
+
+            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let _ = Command::new("docker").args(["rm", "-f", id]).output();
+            }
+        }
+
+        hand_back(run_dir);
+    }
+
+    fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
+        let mut done = Vec::new();
+
+        for dir in [cache_dir(repo_id), actions_dir(repo_id)] {
+            if dir.exists() && fs::remove_dir_all(&dir).is_ok() {
+                done.push(format!("removed {}", dir.display()));
+            }
+        }
+
+        let prefix = repo_id.map(volume_prefix).unwrap_or_else(home_prefix);
+        let Ok(listed) = Command::new("docker")
+            .args(["volume", "ls", "-q", "--filter"])
+            .arg(format!("name={prefix}"))
+            .output()
+        else {
+            return done;
+        };
+
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        let removed = listed
+            .split_whitespace()
+            .filter(|v| v.starts_with(&prefix))
+            .filter(|v| {
+                Command::new("docker")
+                    .args(["volume", "rm", v])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            })
+            .map(|v| format!("removed volume {v}"));
+        done.extend(removed);
+        done
+    }
+}
+
+/// Images for the common Ubuntu labels, pinned, unless `[act] platforms` maps the label. Without
+/// them act stops to ask for a default image, and 0.2.89 has none for `ubuntu-24.04`
+const DEFAULT_PLATFORMS: [(&str, &str); 3] = [
+    (
+        "ubuntu-latest",
+        "catthehacker/ubuntu@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43",
+    ),
+    (
+        "ubuntu-24.04",
+        "catthehacker/ubuntu@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43",
+    ),
+    (
+        "ubuntu-22.04",
+        "catthehacker/ubuntu@sha256:3488f78aa97770c8d5d835f2913c1a782d3121ad3f2aafb17054fb1d554ea4e1",
+    ),
+];
+
+/// busybox 1.37, pinned, for handing a checkout back to the user on Linux
+const BUSYBOX: &str =
+    "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
+
+/**
+ * On Linux a job runs as root right on the host's kernel, so every file it writes into its bind
+ * mounted checkout belongs to root, and shipcheck, running as the user, can neither empty, warm nor
+ * clean it. A throwaway container gives the files back. Docker Desktop on a Mac maps them already
+ **/
+fn hand_back(dir: &Path) {
+    if !cfg!(target_os = "linux") || !dir.exists() {
+        return;
+    }
+
+    let id = |flag: &str| {
+        Command::new("id")
+            .arg(flag)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (Some(uid), Some(gid)) = (id("-u"), id("-g")) else {
+        return;
+    };
+
+    let _ = Command::new("docker")
+        .args(["run", "--rm", "--network", "none", "-v"])
+        .arg(format!("{}:/w", dir.display()))
+        .args([BUSYBOX, "chown", "-R", &format!("{uid}:{gid}"), "/w"])
+        .output();
+}
+
+/// Where act keeps the actions it fetched, per job below this, for one repository or every one
+fn actions_dir(repo_id: Option<&str>) -> PathBuf {
+    let dir = crate::run::home().join("actions");
+    repo_id.map_or(dir.clone(), |id| dir.join(id))
+}
+
+/// Where older versions kept act's `actions/cache` entries, which `shipcheck clean` still removes
+fn cache_dir(repo_id: Option<&str>) -> PathBuf {
+    let dir = crate::run::home().join("actcache");
+    repo_id.map_or(dir.clone(), |id| dir.join(id))
+}
+
+fn version(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.trim_start_matches('v').split(['.', '-', ' ']);
+    let mut next = || parts.next()?.parse().ok();
+    Some((next()?, next()?, next().unwrap_or(0)))
+}
+
+/**
+ * A known way out of the container on this engine, from `docker version` printed as
+ * `<platform>|<component>=<version>;...`. Docker Desktop before 4.44.3 served its Engine API to
+ * every container (CVE-2025-9074), runc before 1.2.8 and 1.3.3 had escapes (Leaky Vessels and the
+ * November 2025 CVEs). A version that cannot be read is not a known problem
+ **/
+fn engine_problem(report: &str) -> Option<String> {
+    let (platform, components) = report.split_once('|').unwrap_or((report, ""));
+
+    if let Some(desktop) = platform.strip_prefix("Docker Desktop ").and_then(version)
+        && desktop < (4, 44, 3)
+    {
+        return Some(format!(
+            "{platform} lets any container reach the Docker engine (CVE-2025-9074). Update Docker Desktop to 4.44.3 or later"
+        ));
+    }
+
+    let runc = components
+        .split(';')
+        .find_map(|c| c.strip_prefix("runc="))?;
+    let (major, minor, patch) = version(runc)?;
+    let rc = runc
+        .split("-rc.")
+        .nth(1)
+        .and_then(|n| n.parse::<u32>().ok());
+    let escapes = (major, minor) < (1, 2)
+        || (major, minor) == (1, 2) && patch < 8
+        || (major, minor) == (1, 3) && patch < 3
+        || (major, minor, patch) == (1, 4, 0) && rc.is_some_and(|n| n < 3);
+
+    escapes.then(|| {
+        format!("runc {runc} has known container escapes. Update the Docker engine to one with runc 1.2.8, 1.3.3 or later")
+    })
+}
+
+/// The first `${{ }}` anywhere in a value, which act may expand into options shipcheck never saw
+fn expression_in(value: &Yaml, path: &str) -> Option<String> {
+    match value {
+        Yaml::String(s) if s.contains("${{") => Some(path.to_string()),
+        Yaml::Hash(h) => h.iter().find_map(|(k, v)| {
+            expression_in(v, &format!("{path}.{}", k.as_str().unwrap_or_default()))
+        }),
+        Yaml::Array(items) => items.iter().find_map(|v| expression_in(v, path)),
+        _ => None,
+    }
+}
+
+/// The first `${{ }}` in one container's or service's settings, where only its own `image` and
+/// `env` may hold one, since those never become Docker options
+fn settings_expression(settings: &Yaml, path: &str) -> Option<String> {
+    let Yaml::Hash(h) = settings else {
+        return expression_in(settings, path);
+    };
+
+    h.iter().find_map(|(k, v)| {
+        let k = k.as_str().unwrap_or_default();
+        (k != "image" && k != "env")
+            .then(|| expression_in(v, &format!("{path}.{k}")))
+            .flatten()
+    })
+}
+
+/// Options may hold only these characters, so no escape or quoting trick reads differently to
+/// act's shell-style splitter than to shipcheck's
+fn plain_options(text: &str) -> bool {
+    let quotes_closed =
+        text.matches('"').count().is_multiple_of(2) && text.matches('\'').count().is_multiple_of(2);
+    quotes_closed
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " _=.,:/@+%-\"'".contains(c))
+}
+
+/// The only Docker options a workflow may give a container: limits, environment, health checks
+/// and process settings. Anything else could reach the host's files, network, devices or kernel
+const ALLOWED_OPTIONS: [&str; 22] = [
+    "--cpus",
+    "--memory",
+    "-m",
+    "--memory-swap",
+    "--shm-size",
+    "--env",
+    "-e",
+    "--health-cmd",
+    "--health-interval",
+    "--health-timeout",
+    "--health-retries",
+    "--health-start-period",
+    "--no-healthcheck",
+    "--user",
+    "-u",
+    "--workdir",
+    "-w",
+    "--entrypoint",
+    "--hostname",
+    "-h",
+    "--ulimit",
+    "--init",
+];
+
+/// Splits options like a shell does, so a quoted value such as `--health-cmd "pg_isready -U x"`
+/// is one word and its `-U` is not taken for a flag
+fn shell_words(text: &str) -> Vec<String> {
+    let (mut words, mut word, mut quote) = (Vec::new(), String::new(), None);
+
+    for c in text.chars() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, c) if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(c),
+        }
+    }
+
+    if !word.is_empty() {
+        words.push(word);
+    }
+
+    words
+}
+
+/**
+ * A job's `container.options` and its services' `options` go to Docker as they are, past every
+ * flag shipcheck sets, so one `-v /:/host` or `--network host` undoes the isolation. Workflows come
+ * from the base, yet shipcheck still refuses them, and services when the job has no network
+ **/
+fn refuse_escapes(jobs: &Hash, network: config::Network) -> Result<(), String> {
+    for (id, job) in jobs {
+        let id = id.as_str().unwrap_or_default();
+
+        // act runs a called workflow's jobs, container options included, without this check, and
+        // reads a local one from the branch or clones a remote one on the host
+        if !job["uses"].is_badvalue() {
+            return Err(format!(
+                "job {id} calls a reusable workflow, which shipcheck cannot check before it runs. Leave this workflow out of `workflows`"
+            ));
+        }
+
+        let mut options = vec![("container", &job["container"]["options"])];
+
+        // act evaluates expressions after this check, so `options: ${{ matrix.o }}` would pass it.
+        // A matrix reference in `container` is already resolved, any expression left can be a mapping
+        let container = match &job["container"] {
+            Yaml::String(s) if s.contains("${{") => {
+                return Err(format!(
+                    "job {id} sets its container with an expression, which shipcheck cannot check before it runs"
+                ));
+            }
+            Yaml::String(_) => &Yaml::Null,
+            other => other,
+        };
+        let services = match &job["services"] {
+            Yaml::Hash(s) => s.iter().find_map(|(name, service)| {
+                let name = name.as_str().unwrap_or_default();
+                settings_expression(service, &format!("services.{name}"))
+            }),
+            other => expression_in(other, "services"),
+        };
+
+        if let Some(path) = settings_expression(container, "container").or(services) {
+            return Err(format!(
+                "job {id} sets {path} with an expression, which shipcheck cannot check before it runs"
+            ));
+        }
+
+        if !matches!(job["services"], Yaml::Hash(_) | Yaml::BadValue | Yaml::Null) {
+            return Err(format!("job {id} has services that are not a mapping"));
+        }
+
+        // `volumes` bind host paths, which no job may have
+        let containers = std::iter::once(&job["container"]).chain(
+            job["services"]
+                .as_hash()
+                .into_iter()
+                .flat_map(|s| s.values()),
+        );
+
+        for container in containers {
+            if !matches!(container["volumes"], Yaml::BadValue | Yaml::Null) {
+                return Err(format!(
+                    "job {id} sets volumes on a container, which would reach the host. shipcheck refuses it"
+                ));
+            }
+        }
+
+        if let Yaml::Hash(services) = &job["services"] {
+            if network == config::Network::None {
+                return Err(format!(
+                    "job {id} has services, which need a network. Set network = \"internet\" in shipcheck.toml"
+                ));
+            }
+
+            options.extend(services.values().map(|s| ("service", &s["options"])));
+        }
+
+        for (what, value) in options {
+            let text = match value {
+                Yaml::String(text) => text,
+                Yaml::BadValue | Yaml::Null => continue,
+                _ => {
+                    return Err(format!("job {id} has {what} options that are not a string"));
+                }
+            };
+
+            if !plain_options(text) {
+                return Err(format!(
+                    "job {id} has {what} options with characters other than letters, digits, spaces, closed quotes and _=.,:/@+%-"
+                ));
+            }
+
+            for word in shell_words(text).iter().filter(|w| w.starts_with('-')) {
+                let flag = word.split('=').next().unwrap_or(word);
+
+                if !ALLOWED_OPTIONS.contains(&flag) {
+                    return Err(format!(
+                        "job {id} sets {flag} in its {what} options, which could reach the host. shipcheck allows only {}",
+                        ALLOWED_OPTIONS.join(" ")
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_id(s: &str) -> bool {
+    !s.is_empty() && ident_len(s) == s.len()
+}
+
+fn ident_len(s: &str) -> usize {
+    s.bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        .count()
+}
+
+/// A last step that prints the job's `outputs`, hex-encoded so any value survives the log
+fn outputs_step(job: &Hash) -> Option<Yaml> {
+    let Some(Yaml::Hash(outputs)) = job.get(&key("outputs")) else {
+        return None;
+    };
+    let mut env = Hash::new();
+    let mut script = String::new();
+
+    for (i, (name, value)) in outputs.iter().enumerate() {
+        let value = match value {
+            Yaml::String(s) | Yaml::Real(s) => s.clone(),
+            Yaml::Integer(n) => n.to_string(),
+            Yaml::Boolean(b) => b.to_string(),
+            _ => continue,
+        };
+        let Some(name) = name.as_str().filter(|n| is_id(n)) else {
+            continue;
+        };
+        let var = format!("SHIPCHECK_OUTPUT_{i}");
+        env.insert(key(&var), key(&value));
+        script.push_str(&format!(
+            "printf 'shipcheck-output %s %s\\n' '{name}' \"$(printf %s \"${var}\" | od -An -v -tx1 | tr -d ' \\n')\"\n"
+        ));
+    }
+
+    if script.is_empty() {
+        return None;
+    }
+
+    let mut step = step("shipcheck outputs", None, script);
+
+    if let Yaml::Hash(h) = &mut step {
+        h.insert(key("env"), Yaml::Hash(env));
+    }
+
+    Some(step)
+}
+
+/// The outputs a job printed with its outputs step, the last value of each name
+fn read_outputs(log: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+
+    for line in log.lines() {
+        let Some((_, rest)) = line.split_once("shipcheck-output ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(name) = words.next().filter(|n| is_id(n)) else {
+            continue;
+        };
+        let hex = words.next().unwrap_or("");
+
+        if words.next().is_some() || hex.len() % 2 != 0 {
+            continue;
+        }
+
+        let bytes: Option<Vec<u8>> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+            .collect();
+
+        if let Some(bytes) = bytes {
+            out.insert(
+                name.to_string(),
+                String::from_utf8_lossy(&bytes).into_owned(),
+            );
+        }
+    }
+
+    out
+}
+
+/**
+ * A value as an expression that holds none of its quotes, braces or `$`. act finds `${{` and `}}`
+ * even inside a quoted string in some places, such as a bare `if`, so a quoted value could close
+ * the expression and open one of its own. Every character but letters, digits and spaces is a JSON
+ * `\u` escape
+ **/
+fn literal(value: &str) -> String {
+    let mut json = String::new();
+
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() || c == ' ' {
+            json.push(c);
+        } else {
+            let mut units = [0; 2];
+
+            for unit in c.encode_utf16(&mut units) {
+                json.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+
+    format!("fromJSON('\"{json}\"')")
+}
+
+/// Replaces `needs.<job>.outputs.<name>` and `needs.<job>.result` with literals
+fn replace_needs(s: &str, needs: &BTreeMap<String, BTreeMap<String, String>>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+
+    while let Some(i) = rest.find("needs.") {
+        let boundary = rest[..i]
+            .bytes()
+            .last()
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || b"_-.".contains(&b)));
+        out.push_str(&rest[..i]);
+        let after = &rest[i + "needs.".len()..];
+        let (name, tail) = after.split_at(ident_len(after));
+
+        if let (true, Some(outputs)) = (boundary, needs.get(name)) {
+            if let Some(k) = tail.strip_prefix(".outputs.")
+                && ident_len(k) > 0
+            {
+                let (k, t) = k.split_at(ident_len(k));
+                out.push_str(&literal(outputs.get(k).map_or("", String::as_str)));
+                rest = t;
+                continue;
+            }
+
+            if let Some(t) = tail.strip_prefix(".result")
+                && ident_len(t) == 0
+            {
+                out.push_str("'success'");
+                rest = t;
+                continue;
+            }
+        }
+
+        out.push_str("needs.");
+        rest = after;
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// Replaces needs only inside `${{ }}` and in a bare `if`, the places GitHub reads them. Elsewhere a
+/// value would be plain text where act still expands any `${{ }}` the value holds
+fn substitute(y: &mut Yaml, needs: &BTreeMap<String, BTreeMap<String, String>>, is_if: bool) {
+    match y {
+        Yaml::String(s) if is_if && !s.contains("${{") => *s = replace_needs(s, needs),
+        Yaml::String(s) => {
+            let mut out = String::new();
+            let mut rest = s.as_str();
+
+            while let Some(i) = rest.find("${{") {
+                out.push_str(&rest[..i]);
+                let expr = &rest[i..];
+                let end = expr.find("}}").map_or(expr.len(), |e| e + 2);
+                out.push_str(&replace_needs(&expr[..end], needs));
+                rest = &expr[end..];
+            }
+
+            out.push_str(rest);
+            *s = out;
+        }
+        Yaml::Array(items) => items.iter_mut().for_each(|i| substitute(i, needs, false)),
+        Yaml::Hash(h) => h
+            .iter_mut()
+            .for_each(|(k, v)| substitute(v, needs, k.as_str() == Some("if"))),
+        _ => {}
+    }
+}
+
+/// An expression that still reads the `needs` context, such as `toJSON(needs)`
+fn reads_needs(y: &Yaml, is_if: bool) -> Option<String> {
+    let mentions = |expr: &str| {
+        expr.match_indices("needs").any(|(i, _)| {
+            let before = expr[..i].bytes().last();
+            let after = expr[i + 5..].bytes().next();
+            before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b"_-.".contains(&b)))
+                && after.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        })
+    };
+
+    match y {
+        Yaml::String(s) => {
+            if is_if && !s.contains("${{") && mentions(s) {
+                return Some(s.clone());
+            }
+
+            s.split("${{")
+                .skip(1)
+                .map(|part| part.split("}}").next().unwrap_or(part))
+                .find(|expr| mentions(expr))
+                .map(|expr| expr.trim().to_string())
+        }
+        Yaml::Array(items) => items.iter().find_map(|i| reads_needs(i, false)),
+        Yaml::Hash(h) => h
+            .iter()
+            .find_map(|(k, v)| reads_needs(v, k.as_str() == Some("if"))),
+        _ => None,
+    }
+}
+
+/**
+ * act runs a job's `needs` along with it, so each job's copy holds only that job, without `needs`,
+ * and the outputs and results of its needs become literals. The workflow name gets the checkout's
+ * tag, since act names containers after workflow and job and removes an older one of that name
+ **/
+const NONCE_FILE: &str = "shipcheck-nonce";
+
+/**
+ * The first step of every job. OrbStack has shown a job the files a previous run left at the same
+ * bind mount path, and colima shows an empty directory for a path it does not share. Either would
+ * let a job pass on a tree it never tested, so a job that does not see this run's nonce fails
+ **/
+fn nonce_step(nonce: &str) -> Yaml {
+    let mut step = step(
+        "shipcheck checkout",
+        None,
+        format!(
+            "test \"$(cat \"$GITHUB_WORKSPACE/.git/{NONCE_FILE}\" 2>/dev/null)\" = {nonce} || {{ echo '::error::this job does not see the checkout shipcheck made for it, the Docker engine shows stale or missing files'; exit 1; }}"
+        ),
+    );
+
+    if let Yaml::Hash(h) = &mut step {
+        h.insert(key("shell"), key("sh"));
+    }
+
+    step
+}
+
+fn isolate(
+    source: &str,
+    file: &str,
+    job: &str,
+    needs: &BTreeMap<String, BTreeMap<String, String>>,
+    tag: &str,
+    nonce: &str,
+) -> Result<String, String> {
+    let mut root = workflow::load(source)?;
+    let jobs = workflow::jobs_mut(&mut root)?;
+    let mut this = jobs
+        .remove(&key(job))
+        .ok_or_else(|| format!("workflow has no job {job}"))?;
+
+    if let Yaml::Hash(h) = &mut this {
+        h.remove(&key("needs"));
+    }
+
+    // A job that needed a matrix job reads it by its own name, which now stands for its legs
+    let mut known = needs.clone();
+
+    for (id, outputs) in needs {
+        if let Some((base, _)) = id.split_once("__") {
+            known
+                .entry(base.to_string())
+                .or_default()
+                .extend(outputs.clone());
+        }
+    }
+
+    let before = this["env"].clone();
+    substitute(&mut this, &known, false);
+    // act evaluates a job's `env` again in each step, which would read a `${{ }}` inside a value as
+    // an expression. So the values from needs go to each step's `env`, which act evaluates once
+    let refuse = || {
+        format!(
+            "job {job} passes needs through an env that is not a mapping, which act would evaluate twice"
+        )
+    };
+    let moved: Hash = match (&this["env"], &before) {
+        (Yaml::Hash(after), Yaml::Hash(before)) => after
+            .iter()
+            .filter(|(k, v)| before.get(k) != Some(v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        (after, before) if after == before => Hash::new(),
+        _ => return Err(refuse()),
+    };
+
+    if !moved.is_empty() {
+        let Some(Yaml::Array(steps)) = this.as_mut_hash().and_then(|h| h.get_mut(&key("steps")))
+        else {
+            return Err(refuse());
+        };
+
+        for step in steps.iter_mut() {
+            let Yaml::Hash(step) = step else {
+                return Err(refuse());
+            };
+            let env = step.entry(key("env")).or_insert(Yaml::Null);
+
+            if env.is_null() {
+                *env = Yaml::Hash(Hash::new());
+            }
+
+            let Yaml::Hash(env) = env else {
+                return Err(refuse());
+            };
+
+            for (k, v) in &moved {
+                env.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+
+        if let Some(Yaml::Hash(env)) = this.as_mut_hash().and_then(|h| h.get_mut(&key("env"))) {
+            env.retain(|k, _| !moved.contains_key(k));
+        }
+    }
+
+    if let Some(expr) = reads_needs(&this, false) {
+        return Err(format!(
+            "job {job} reads `needs` in `{expr}`, shipcheck passes only needs.<job>.outputs and needs.<job>.result between jobs"
+        ));
+    }
+
+    // The tag goes on the job's name, since steps read the workflow's name as `github.workflow`
+    if let Yaml::Hash(h) = &mut this {
+        let name = match h.get(&key("name")) {
+            Some(Yaml::String(n)) => n.clone(),
+            _ => job.to_string(),
+        };
+        h.insert(key("name"), key(&format!("{name} {tag}")));
+
+        if let Some(Yaml::Array(steps)) = h.get_mut(&key("steps")) {
+            steps.insert(0, nonce_step(nonce));
+        }
+    }
+
+    *jobs = Hash::from_iter([(key(job), this)]);
+    // act would name an unnamed workflow after the path it runs, which is outside the checkout
+    root.entry(key("name"))
+        .or_insert_with(|| key(&format!("{}/{file}", crate::run::WORKFLOWS)));
+    workflow::emit(root)
+}
+
+fn matches(combo: &Hash, filter: &Hash) -> bool {
+    filter.iter().all(|(k, v)| combo.get(k) == Some(v))
+}
+
+/// The combinations of a static matrix by GitHub's rules, or None when part of it is an expression
+fn legs(matrix: &Hash) -> Option<Vec<Hash>> {
+    let (include, exclude) = (key("include"), key("exclude"));
+    let mut combos = vec![Hash::new()];
+    let mut axes = 0;
+
+    for (k, v) in matrix
+        .iter()
+        .filter(|(k, _)| **k != include && **k != exclude)
+    {
+        let Yaml::Array(values) = v else {
+            return None;
+        };
+        axes += 1;
+        combos = combos
+            .into_iter()
+            .flat_map(|c| {
+                values.iter().map(move |val| {
+                    let mut c = c.clone();
+                    c.insert(k.clone(), val.clone());
+                    c
+                })
+            })
+            .collect();
+    }
+
+    if axes == 0 {
+        combos.clear();
+    }
+
+    match matrix.get(&exclude) {
+        Some(Yaml::Array(filters)) => {
+            let filters: Option<Vec<&Hash>> = filters.iter().map(|f| f.as_hash()).collect();
+            combos.retain(|c| {
+                !filters
+                    .as_ref()
+                    .is_some_and(|fs| fs.iter().any(|f| matches(c, f)))
+            });
+        }
+        Some(_) => {
+            return None;
+        }
+        None => {}
+    }
+
+    let originals = combos.clone();
+
+    match matrix.get(&include) {
+        Some(Yaml::Array(entries)) => {
+            for entry in entries {
+                let entry = entry.as_hash()?;
+                let mut added = false;
+
+                // An entry extends every original combination whose own values it does not overwrite
+                for (combo, original) in combos.iter_mut().zip(&originals) {
+                    if entry
+                        .iter()
+                        .all(|(k, v)| original.get(k).is_none_or(|o| o == v))
+                    {
+                        combo.extend(entry.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        added = true;
+                    }
+                }
+
+                if !added {
+                    combos.push(entry.clone());
+                }
+            }
+        }
+        Some(_) => {
+            return None;
+        }
+        None => {}
+    }
+
+    Some(combos)
+}
+
+/**
+ * The value of a `continue-on-error` condition for one matrix leg, for the few forms real workflows
+ * use: `endsWith`, `startsWith` or `contains` of a matrix value and a quoted string, `==` or `!=`
+ * between them, or `true` and `false`. Anything else is None, and the job's failure stays a failure
+ **/
+fn matrix_condition(value: &str, leg: &Hash) -> Option<bool> {
+    let expr = value.trim().strip_prefix("${{")?.strip_suffix("}}")?.trim();
+    let operand = |text: &str| -> Option<String> {
+        let text = text.trim();
+
+        if let Some(quoted) = text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+            return Some(quoted.replace("''", "'"));
+        }
+
+        match leg.get(&key(text.strip_prefix("matrix.")?))? {
+            Yaml::String(s) => Some(s.clone()),
+            Yaml::Integer(n) => Some(n.to_string()),
+            Yaml::Real(r) => Some(r.clone()),
+            Yaml::Boolean(b) => Some(b.to_string()),
+            _ => None,
+        }
+    };
+
+    match expr {
+        "true" => return Some(true),
+        "false" => return Some(false),
+        _ => {}
+    }
+
+    for (name, test) in [
+        (
+            "endsWith",
+            (|a: &str, b: &str| a.ends_with(b)) as fn(&str, &str) -> bool,
+        ),
+        ("startsWith", |a, b| a.starts_with(b)),
+        ("contains", |a, b| a.contains(b)),
+    ] {
+        if let Some(args) = expr
+            .strip_prefix(name)
+            .and_then(|r| r.trim().strip_prefix('('))
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            let (a, b) = args.split_once(',')?;
+            return Some(test(&operand(a)?, &operand(b)?));
+        }
+    }
+
+    if let Some((a, b)) = expr.split_once("!=") {
+        return Some(operand(a)? != operand(b)?);
+    }
+
+    let (a, b) = expr.split_once("==")?;
+    Some(operand(a)? == operand(b)?)
+}
+
+/// The leg's value for a field that is exactly `${{ matrix.<name> }}`
+fn resolve_matrix(value: &Yaml, leg: &Hash) -> Option<Yaml> {
+    let inner = value
+        .as_str()?
+        .trim()
+        .strip_prefix("${{")?
+        .strip_suffix("}}")?
+        .trim();
+    leg.get(&key(inner.strip_prefix("matrix.")?)).cloned()
+}
+
+/**
+ * act evaluates `runs-on: ${{ matrix.os }}` at random across the legs of a matrix (act 0.2.89):
+ * the same workflow skips, runs or misplaces legs from one run to the next. Each leg becomes its own
+ * job with a one-entry matrix and a literal `runs-on`, which act runs the same way every time.
+ * `needs` on the original job is rewritten to all of its legs
+ **/
+fn expand_matrices(jobs: Hash) -> Hash {
+    let mut out = Hash::new();
+    let mut renamed: BTreeMap<String, Vec<Yaml>> = BTreeMap::new();
+
+    for (id, job) in jobs {
+        let legs = job["strategy"]["matrix"]
+            .as_hash()
+            .and_then(legs)
+            .filter(|l| !l.is_empty());
+        let (Some(legs), Some(name)) = (legs, id.as_str().map(str::to_string)) else {
+            out.insert(id, job);
+            continue;
+        };
+
+        for (n, leg) in legs.into_iter().enumerate() {
+            let mut leg_job = job.clone();
+            let Yaml::Hash(h) = &mut leg_job else {
+                continue;
+            };
+
+            // shipcheck reads `continue-on-error` itself to judge the workflow, so it must be literal too
+            for field in ["runs-on", "continue-on-error", "container"] {
+                if let Some(resolved) = h.get(&key(field)).and_then(|r| resolve_matrix(r, &leg)) {
+                    h.insert(key(field), resolved);
+                }
+            }
+
+            if let Some(allowed) = h
+                .get(&key("continue-on-error"))
+                .and_then(|v| v.as_str())
+                .and_then(|v| matrix_condition(v, &leg))
+            {
+                h.insert(key("continue-on-error"), Yaml::Boolean(allowed));
+            }
+
+            if let Some(Yaml::Hash(strategy)) = h.get_mut(&key("strategy")) {
+                strategy.insert(
+                    key("matrix"),
+                    Yaml::Hash(Hash::from_iter([(
+                        key("include"),
+                        Yaml::Array(vec![Yaml::Hash(leg)]),
+                    )])),
+                );
+            }
+
+            let leg_id = key(&format!("{name}__{}", n + 1));
+            renamed
+                .entry(name.clone())
+                .or_default()
+                .push(leg_id.clone());
+            out.insert(leg_id, leg_job);
+        }
+    }
+
+    for job in out.values_mut() {
+        let Yaml::Hash(job) = job else {
+            continue;
+        };
+        let rename = |n: &Yaml| match n.as_str().and_then(|s| renamed.get(s)) {
+            Some(ids) => ids.clone(),
+            None => vec![n.clone()],
+        };
+        let needs = match job.get(&key("needs")) {
+            Some(Yaml::Array(list)) => Some(Yaml::Array(list.iter().flat_map(rename).collect())),
+            Some(single @ Yaml::String(_)) => Some(Yaml::Array(rename(single))),
+            _ => None,
+        };
+
+        if let Some(needs) = needs {
+            job.insert(key("needs"), needs);
+        }
+    }
+
+    out
+}
+
+/// Jobs act skipped because no platform maps their `runs-on`, named as act prints them
+fn unsupported_jobs(log: &str) -> Vec<String> {
+    log.lines()
+        .filter(|l| l.contains("Skipping unsupported platform"))
+        .filter_map(|l| {
+            let label = l.split_once('[')?.1.split_once(']')?.0;
+            Some(label.rsplit('/').next().unwrap_or(label).trim().to_string())
+        })
+        .collect()
+}
+
+// ponytail: another process can take the port between this check and act binding it, retry the run if so
+fn free_port() -> Result<u16, String> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .map_err(|e| format!("no free port for the artifact server: {e}"))
+}
+
+fn docker_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// The start of every volume name of one repo. The hash keeps `a/b` and `a/b-c` apart, whose
+/// readable parts both turn into `a-b`
+fn volume_prefix(repo_id: &str) -> String {
+    let hash = cache::hex(&Sha256::digest(repo_id.as_bytes())[..4]);
+    format!("{}{}-{hash}-", home_prefix(), docker_safe(repo_id))
+}
+
+/// The start of every volume name under this `SHIPCHECK_HOME`, so `clean --all` of one home leaves
+/// the volumes of another, such as a test's, alone
+fn home_prefix() -> String {
+    let home = crate::run::home();
+    let hash = cache::hex(&Sha256::digest(home.to_string_lossy().as_bytes())[..3]);
+    format!("shipcheck-{hash}-")
+}
+
+fn volume_name(repo_id: &str, path: &str) -> String {
+    format!(
+        "{}{}",
+        volume_prefix(repo_id),
+        docker_safe(path.trim_start_matches('/'))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yaml_rust2::YamlLoader;
+
+    fn load(s: &str) -> Yaml {
+        YamlLoader::load_from_str(s).unwrap().remove(0)
+    }
+
+    fn inject_with(src: &str, nonce: &str, act: config::Act) -> Result<String, String> {
+        workflow::add_markers(&Act::new(act).prepare(src, "ci.yml")?, nonce)
+    }
+
+    fn inject(src: &str, nonce: &str) -> Result<String, String> {
+        inject_with(src, nonce, config::Act::default())
+    }
+
+    const CI: &str = "\
+name: CI
+on:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          cargo build
+          cargo test
+";
+
+    #[test]
+    fn adds_dispatch_to_every_trigger_form() {
+        for on in [
+            "on: push",
+            "on: [push, pull_request]",
+            "on:\n  push:\n    branches: [main]",
+        ] {
+            let out = load(&inject(&format!("{on}\njobs: {{}}\n"), "n").unwrap());
+            let on = &out["on"];
+            let has = match on {
+                Yaml::Hash(h) => h.contains_key(&key("workflow_dispatch")),
+                Yaml::Array(a) => a.contains(&key("workflow_dispatch")),
+                _ => false,
+            };
+            assert!(has, "no workflow_dispatch in {on:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_existing_triggers() {
+        let out = load(&inject(CI, "n").unwrap());
+        assert_eq!(out["on"]["push"]["branches"][0].as_str(), Some("main"));
+    }
+
+    #[test]
+    fn puts_homes_between_the_markers() {
+        let out = load(&inject(CI, "abc").unwrap());
+        let steps = out["jobs"]["test"]["steps"].as_vec().unwrap();
+        assert_eq!(steps.len(), 5);
+        assert_eq!(
+            steps[0]["run"].as_str(),
+            Some("echo \"shipcheck-start abc ${{ github.job }}\"")
+        );
+        assert_eq!(
+            steps[1]["run"].as_str(),
+            Some("mkdir -p \"$CARGO_HOME/bin\"\necho \"$CARGO_HOME/bin\" >> \"$GITHUB_PATH\"\n")
+        );
+        assert_eq!(steps[2]["uses"].as_str(), Some("actions/checkout@v4"));
+        assert_eq!(steps[3]["run"].as_str(), Some("cargo build\ncargo test\n"));
+        assert_eq!(steps[4]["if"].as_str(), Some("always()"));
+    }
+
+    #[test]
+    fn gives_each_job_its_own_tool_homes() {
+        let wf = "\
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo build
+  b:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_HOME: /custom
+    steps:
+      - run: cargo test
+";
+        let out = load(&inject(wf, "n").unwrap());
+        assert_eq!(
+            out["jobs"]["a"]["env"]["RUSTUP_HOME"].as_str(),
+            Some("/root/.shipcheck/a/rustup")
+        );
+        assert_eq!(
+            out["jobs"]["a"]["env"]["CARGO_HOME"].as_str(),
+            Some("/root/.shipcheck/a/cargo")
+        );
+        // A job that sets its own home keeps it
+        assert_eq!(
+            out["jobs"]["b"]["env"]["CARGO_HOME"].as_str(),
+            Some("/custom")
+        );
+        assert_eq!(
+            out["jobs"]["b"]["env"]["RUSTUP_HOME"].as_str(),
+            Some("/root/.shipcheck/b/rustup")
+        );
+    }
+
+    #[test]
+    fn takes_tool_homes_from_the_table() {
+        let act = config::Act {
+            job_homes: BTreeMap::from([(
+                "GOMODCACHE".to_string(),
+                config::Home::Dir("gomod".into()),
+            )]),
+            ..Default::default()
+        };
+        let out = load(&inject_with(CI, "n", act).unwrap());
+        let env = &out["jobs"]["test"]["env"];
+        assert_eq!(
+            env["GOMODCACHE"].as_str(),
+            Some("/root/.shipcheck/test/gomod")
+        );
+        assert!(env["CARGO_HOME"].is_badvalue());
+        // No home has a `path`, so no homes step
+        let steps = out["jobs"]["test"]["steps"].as_vec().unwrap();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[1]["uses"].as_str(), Some("actions/checkout@v4"));
+    }
+
+    #[test]
+    fn an_empty_homes_table_adds_nothing() {
+        let act = config::Act {
+            job_homes: BTreeMap::new(),
+            ..Default::default()
+        };
+        let out = load(&inject_with(CI, "n", act).unwrap());
+        let env = out["jobs"]["test"]["env"].as_hash().unwrap();
+        assert!(
+            env.keys()
+                .all(|k| k.as_str().unwrap().starts_with("GIT_CONFIG_"))
+        );
+        assert_eq!(out["jobs"]["test"]["steps"].as_vec().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn trusts_the_mounted_repository_unless_the_job_configures_git() {
+        let out = load(&inject(CI, "n").unwrap());
+        assert_eq!(
+            out["jobs"]["test"]["env"]["GIT_CONFIG_KEY_0"].as_str(),
+            Some("safe.directory")
+        );
+        let own = CI.replace("    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4", "    runs-on: ubuntu-latest\n    env: {GIT_CONFIG_COUNT: '0'}\n    steps:\n      - uses: actions/checkout@v4");
+        let out = load(&inject(&own, "n").unwrap());
+        assert_eq!(
+            out["jobs"]["test"]["env"]["GIT_CONFIG_COUNT"].as_str(),
+            Some("0")
+        );
+        assert!(out["jobs"]["test"]["env"]["GIT_CONFIG_KEY_0"].is_badvalue());
+    }
+
+    #[test]
+    fn finds_unsupported_platform_skips() {
+        let log = "[ci/test__1] 🚧  Skipping unsupported platform -- Try running with `-P macos-latest=...`\n\
+                   [ci/test__2] ⭐ Run Set up job\n";
+        assert_eq!(unsupported_jobs(log), ["test__1"]);
+    }
+
+    fn combos(matrix: &str) -> Vec<String> {
+        let m = load(matrix);
+        legs(m.as_hash().unwrap())
+            .unwrap()
+            .iter()
+            .map(|c| {
+                c.iter()
+                    .map(|(k, v)| format!("{}={}", k.as_str().unwrap(), v.as_str().unwrap()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matrix_axes_exclude_and_include_follow_github() {
+        assert_eq!(
+            combos("os: [a, b]\nv: ['1', '2']"),
+            ["os=a,v=1", "os=a,v=2", "os=b,v=1", "os=b,v=2"]
+        );
+        assert_eq!(
+            combos("os: [a, b]\nv: ['1', '2']\nexclude: [{os: b, v: '2'}]"),
+            ["os=a,v=1", "os=a,v=2", "os=b,v=1"]
+        );
+        // extends the combinations it does not overwrite, else becomes a new one
+        assert_eq!(
+            combos("os: [a, b]\ninclude: [{os: a, x: y}, {os: c}, {extra: z}]"),
+            ["os=a,x=y,extra=z", "os=b,extra=z", "os=c"]
+        );
+        assert_eq!(
+            combos("include: [{os: a, fs: f1}, {os: b, fs: f2}]"),
+            ["os=a,fs=f1", "os=b,fs=f2"]
+        );
+    }
+
+    #[test]
+    fn expression_matrices_are_left_to_act() {
+        assert!(legs(load("os: ${{ fromJSON(inputs.list) }}").as_hash().unwrap()).is_none());
+    }
+
+    #[test]
+    fn expands_matrix_jobs_and_rewrites_needs() {
+        let wf = "\
+on: push
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, fs: apfs}
+          - {os: ubuntu-latest, fs: ext4}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo ${{ matrix.fs }}
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo release
+";
+        let out = load(&inject(wf, "n").unwrap());
+        let jobs = out["jobs"].as_hash().unwrap();
+        let ids: Vec<&str> = jobs.keys().map(|k| k.as_str().unwrap()).collect();
+        assert_eq!(ids, ["test__1", "test__2", "release"]);
+        assert_eq!(
+            out["jobs"]["test__1"]["runs-on"].as_str(),
+            Some("macos-latest")
+        );
+        assert_eq!(
+            out["jobs"]["test__2"]["runs-on"].as_str(),
+            Some("ubuntu-latest")
+        );
+        assert_eq!(
+            out["jobs"]["test__2"]["strategy"]["matrix"]["include"][0]["fs"].as_str(),
+            Some("ext4")
+        );
+        assert_eq!(
+            out["jobs"]["test__2"]["strategy"]["fail-fast"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(out["jobs"]["release"]["needs"][1].as_str(), Some("test__2"));
+        assert_eq!(out["jobs"]["test__1"]["steps"].as_vec().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn resolves_continue_on_error_per_leg() {
+        let wf = "\
+on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      matrix:
+        php: ['8.3']
+        experimental: [false]
+        include: [{php: nightly, experimental: true}]
+    steps: [{run: echo}]
+";
+        let out = inject(wf, "n").unwrap();
+        let parsed = load(&out);
+        assert_eq!(
+            parsed["jobs"]["t__1"]["continue-on-error"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["jobs"]["t__2"]["continue-on-error"].as_bool(),
+            Some(true)
+        );
+        let allowed = workflow::allowed_failures(&out).unwrap();
+        assert_eq!(allowed.into_iter().collect::<Vec<_>>(), ["t__2"]);
+    }
+
+    #[test]
+    fn gives_listed_jobs_their_own_label() {
+        let wf = "\
+on: push
+jobs:
+  checks:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - run: echo checks
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      matrix:
+        part: [a, b]
+    steps:
+      - run: echo build
+";
+        let act = config::Act {
+            jobs: BTreeMap::from([("ci.yml/build".to_string(), "img@sha256:amd64".to_string())]),
+            ..Default::default()
+        };
+        let out = load(&inject_with(wf, "n", act).unwrap());
+        assert_eq!(
+            out["jobs"]["checks"]["runs-on"].as_str(),
+            Some("blacksmith-4vcpu-ubuntu-2404")
+        );
+        assert_eq!(
+            out["jobs"]["build__1"]["runs-on"].as_str(),
+            Some("shipcheck-build")
+        );
+        assert_eq!(
+            out["jobs"]["build__2"]["runs-on"].as_str(),
+            Some("shipcheck-build")
+        );
+    }
+
+    #[test]
+    fn resolves_anchors_and_flow_style() {
+        let wf = "\
+on: [push]
+x-steps: &steps
+  - run: echo shared
+jobs: {a: {runs-on: ubuntu-latest, steps: *steps}, b: {runs-on: ubuntu-latest, steps: *steps}}
+";
+        let out = load(&inject(wf, "n").unwrap());
+        assert!(
+            out["on"]
+                .as_vec()
+                .unwrap()
+                .contains(&key("workflow_dispatch"))
+        );
+
+        for job in ["a", "b"] {
+            let steps = out["jobs"][job]["steps"].as_vec().unwrap();
+            assert_eq!(steps.len(), 4, "{job}");
+            assert_eq!(steps[2]["run"].as_str(), Some("echo shared"));
+        }
+    }
+
+    #[test]
+    fn keeps_dispatch_once_and_its_inputs() {
+        let wf = "\
+on:
+  workflow_dispatch:
+    inputs:
+      level: {default: low}
+jobs: {}
+";
+        let out = load(&inject(wf, "n").unwrap());
+        assert_eq!(
+            out["on"]["workflow_dispatch"]["inputs"]["level"]["default"].as_str(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn marks_empty_steps_and_leaves_array_runs_on() {
+        let wf = "\
+on: push
+jobs:
+  empty:
+    runs-on: [self-hosted, linux]
+    steps: []
+";
+        let out = load(&inject(wf, "n").unwrap());
+        assert_eq!(out["jobs"]["empty"]["steps"].as_vec().unwrap().len(), 3);
+        assert_eq!(
+            out["jobs"]["empty"]["runs-on"][0].as_str(),
+            Some("self-hosted")
+        );
+    }
+
+    #[test]
+    fn rewrites_needs_through_chains_of_matrices() {
+        let wf = "\
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    strategy: {matrix: {node: [18, 20]}}
+    steps: [{run: echo a}]
+  b:
+    runs-on: ubuntu-latest
+    needs: a
+    steps: [{run: echo b}]
+  c:
+    runs-on: ubuntu-latest
+    needs: [b, a]
+    steps: [{run: echo c}]
+";
+        let out = load(&inject(wf, "n").unwrap());
+        let needs = |job: &str| -> Vec<String> {
+            out["jobs"][job]["needs"]
+                .as_vec()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(needs("b"), ["a__1", "a__2"]);
+        assert_eq!(needs("c"), ["b", "a__1", "a__2"]);
+        assert_eq!(
+            out["jobs"]["a__2"]["strategy"]["matrix"]["include"][0]["node"].as_i64(),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn matrix_of_numbers_and_booleans() {
+        assert_eq!(
+            legs(
+                load("node: [18, 20]\nexperimental: [true, false]")
+                    .as_hash()
+                    .unwrap()
+            )
+            .unwrap()
+            .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn exclude_that_removes_everything_leaves_the_job_to_act() {
+        let wf = "\
+on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    strategy: {matrix: {os: [a], exclude: [{os: a}]}}
+    steps: [{run: echo}]
+";
+        let out = load(&inject(wf, "n").unwrap());
+        assert!(out["jobs"]["t"]["steps"].as_vec().is_some());
+        assert!(out["jobs"]["t__1"].is_badvalue());
+    }
+
+    #[test]
+    fn refuses_reusable_workflow_calls() {
+        let act = Act::new(config::Act::default());
+
+        for uses in [
+            "./.github/workflows/other.yml",
+            "acme/ci/.github/workflows/build.yml@v1",
+        ] {
+            let wf = format!("on: push\njobs:\n  call:\n    uses: {uses}\n");
+            let err = act.prepare(&wf, "ci.yml").unwrap_err();
+            assert!(err.contains("reusable workflow"), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuses_docker_options_that_reach_the_host() {
+        let with = |job: &str| {
+            format!("on: push\njobs:\n  t:\n    runs-on: x\n{job}    steps: [{{run: echo}}]\n")
+        };
+        let internet = Act::new(config::Act::default()).with_network(config::Network::Internet);
+
+        for options in [
+            "-v /:/host",
+            "--volume=/x:/y",
+            "-v/etc:/e",
+            "--network host",
+            "--privileged",
+            "--cap-add SYS_ADMIN",
+            "--sysctl net.ipv4.ip_forward=1",
+            "--gpus all",
+            "--cpus 2 --runtime runc",
+        ] {
+            let wf = with(&format!(
+                "    container: {{image: node, options: '{options}'}}\n"
+            ));
+            let err = internet.prepare(&wf, "ci.yml").unwrap_err();
+            assert!(err.contains("could reach the host"), "{options}: {err}");
+        }
+
+        let service = with("    services: {db: {image: postgres, options: '--network host'}}\n");
+        assert!(
+            internet
+                .prepare(&service, "ci.yml")
+                .unwrap_err()
+                .contains("service options")
+        );
+        let quiet = with(
+            "    services: {db: {image: postgres, options: '--health-cmd \"pg_isready -U postgres\" --health-interval 10s'}}\n",
+        );
+        assert!(internet.prepare(&quiet, "ci.yml").is_ok());
+        let offline = Act::new(config::Act::default());
+        assert!(
+            offline
+                .prepare(&quiet, "ci.yml")
+                .unwrap_err()
+                .contains("need a network")
+        );
+        let bind = with("    container: {image: node, volumes: ['/:/host']}\n");
+        let err = internet.prepare(&bind, "ci.yml").unwrap_err();
+        assert!(err.contains("sets volumes"), "{err}");
+        for job in [
+            "    container: {image: node, options: '${{ matrix.o }}'}\n",
+            "    services: {db: {image: postgres, options: '${{ matrix.o }}'}}\n",
+            "    services: ${{ fromJSON(inputs.s) }}\n",
+            // The image exemption holds only at a container's own top level
+            "    services: {db: {image: p, ports: [{image: '${{ matrix.o }}'}]}}\n",
+            "    container: ${{ fromJSON(inputs.c) }}\n",
+            "    container: {image: node, options: '--cpus 2 \\\\ --privileged'}\n",
+            "    container: {image: node, options: '--cpus \"2'}\n",
+            "    container: {image: node, options: ['--privileged']}\n",
+        ] {
+            assert!(internet.prepare(&with(job), "ci.yml").is_err(), "{job}");
+        }
+
+        for job in [
+            "    strategy: {matrix: {image: [node, 'python:3']}}\n    container: ${{ matrix.image }}\n",
+            "    container: {image: '${{ matrix.image }}', env: {A: '${{ matrix.a }}'}}\n",
+        ] {
+            assert!(internet.prepare(&with(job), "ci.yml").is_ok(), "{job}");
+        }
+
+        // A matrix value can be a whole container mapping with its own options
+        let smuggled = "    strategy: {matrix: {c: [{image: node, options: '--privileged'}]}}\n    container: ${{ matrix.c }}\n";
+        let err = internet.prepare(&with(smuggled), "ci.yml").unwrap_err();
+        assert!(err.contains("--privileged"), "{err}");
+        let unresolved = "    container: ${{ matrix.image }}\n";
+        assert!(internet.prepare(&with(unresolved), "ci.yml").is_err());
+
+        let service_bind = with("    services: {db: {image: postgres, volumes: ['/etc:/e']}}\n");
+        let err = internet.prepare(&service_bind, "ci.yml").unwrap_err();
+        assert!(err.contains("sets volumes"), "{err}");
+        assert!(
+            offline
+                .prepare(
+                    &with("    container: {image: node, options: '--cpus 2'}\n"),
+                    "ci.yml"
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn allows_only_the_listed_docker_options_in_every_form() {
+        let internet = Act::new(config::Act::default()).with_network(config::Network::Internet);
+        let check = |options: &str| {
+            // Debug quoting is also a valid YAML double-quoted string
+            let wf = format!(
+                "on: push\njobs:\n  t:\n    runs-on: x\n    container: {{image: node, options: {options:?}}}\n    services: {{db: {{image: pg, options: {options:?}}}}}\n    steps: [{{run: echo}}]\n"
+            );
+            internet.prepare(&wf, "ci.yml")
+        };
+
+        for refused in [
+            "--privileged",
+            "--privileged=true",
+            "--cap-add ALL",
+            "--cap-add=SYS_PTRACE",
+            "--cap-drop ALL",
+            "--pid host",
+            "--pid=host",
+            "--ipc host",
+            "--uts host",
+            "--userns host",
+            "--cgroupns host",
+            "--cgroup-parent x",
+            "--network host",
+            "--network=container:x",
+            "--net host",
+            "--add-host h:10.0.0.1",
+            "--dns 1.1.1.1",
+            "-p 80:80",
+            "--publish-all",
+            "--device /dev/kvm",
+            "--device-cgroup-rule a",
+            "--gpus all",
+            "--security-opt seccomp=unconfined",
+            "--security-opt apparmor=unconfined",
+            "--mount type=bind,src=/,dst=/host",
+            "-v /:/host",
+            "--volume /:/host",
+            "--volumes-from x",
+            "--tmpfs /x",
+            "--env-file /etc/passwd",
+            "--label-file /etc/passwd",
+            "--runtime runc",
+            "--sysctl a=b",
+            "--group-add 0",
+            "--link x",
+            "--log-driver none",
+            "--name x",
+            "-it",
+            "-eA=1",
+            "--cpus 2 -v/:/host",
+            // Quotes hide no flag, since act's splitter strips them too
+            "\"--privileged\"",
+            "'--privileged'",
+            "--cpus=2 '--priv'ileged",
+            "--health-cmd \"--privileged\"",
+            // Characters act's splitter reads differently, and expressions act would expand later
+            "--cpus 2 \\ --privileged",
+            "--cpus 2\n--privileged",
+            "--cpus 2\t--privileged",
+            "--cpus 2; --privileged",
+            "--cpus $(x)",
+            "--cpus ${{ matrix.c }}",
+            "--cpus `x`",
+            "--cpus \"2",
+        ] {
+            let err = check(refused).expect_err(refused);
+            assert!(err.contains("options"), "{refused:?}: {err}");
+        }
+
+        for allowed in [
+            "--cpus 2",
+            "--memory=4g -m 4g --memory-swap 8g --shm-size 2g",
+            "--env A=1 -e B=2",
+            "--env \"A=a b --privileged\"",
+            "--health-cmd \"pg_isready -U postgres\" --health-interval 10s --health-timeout 5s --health-retries 5 --health-start-period 1s",
+            "--no-healthcheck",
+            "--user 1000:1000 -u 0 --workdir /w -w /w --entrypoint sh",
+            "--hostname h -h h --ulimit nofile=1024:2048 --init",
+        ] {
+            assert!(check(allowed).is_ok(), "{allowed:?}: {:?}", check(allowed));
+        }
+
+        // A matrix leg that becomes a whole container is checked as the value it becomes
+        let wf = "on: push\njobs:\n  t:\n    runs-on: x\n    strategy: {matrix: {c: [{image: a, options: '--cpus 1'}, {image: b, volumes: ['/:/h']}]}}\n    container: ${{ matrix.c }}\n    steps: [{run: echo}]\n";
+        let err = internet.prepare(wf, "ci.yml").unwrap_err();
+        assert!(err.contains("sets volumes"), "{err}");
+    }
+
+    #[test]
+    fn evaluates_simple_continue_on_error_conditions_per_leg() {
+        let leg = load("ruby: 3.4-head\nos: ubuntu\nn: 3")
+            .as_hash()
+            .unwrap()
+            .clone();
+        let cases = [
+            ("${{ endsWith(matrix.ruby, 'head') }}", Some(true)),
+            ("${{ startsWith(matrix.ruby, '3.3') }}", Some(false)),
+            ("${{ contains(matrix.ruby, '4-h') }}", Some(true)),
+            ("${{ matrix.os == 'ubuntu' }}", Some(true)),
+            ("${{ matrix.os != 'ubuntu' }}", Some(false)),
+            ("${{ matrix.n == '3' }}", Some(true)),
+            ("${{ true }}", Some(true)),
+            // Anything else stays unknown, so the failure counts
+            ("${{ matrix.missing == 'x' }}", None),
+            ("${{ github.ref == 'refs/heads/main' }}", None),
+            ("${{ fromJSON(inputs.allow) }}", None),
+            ("plain", None),
+        ];
+
+        for (expr, want) in cases {
+            assert_eq!(matrix_condition(expr, &leg), want, "{expr}");
+        }
+
+        let wf = "\
+on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ endsWith(matrix.ruby, 'head') }}
+    strategy: {matrix: {ruby: ['3.4', head]}}
+    steps: [{run: echo}]
+";
+        let out = inject(wf, "n").unwrap();
+        let allowed = workflow::allowed_failures(&out).unwrap();
+        assert_eq!(allowed.into_iter().collect::<Vec<_>>(), ["t__2"]);
+    }
+
+    #[test]
+    fn refuses_engines_with_known_escapes() {
+        let ok = "Docker Desktop 4.90.0 (238679)|Engine=29.7.2;containerd=v2.3.3;runc=1.4.3;";
+        assert_eq!(engine_problem(ok), None);
+        assert!(
+            engine_problem("Docker Desktop 4.44.2 (1)|runc=1.4.3;")
+                .unwrap()
+                .contains("CVE-2025-9074")
+        );
+        assert_eq!(
+            engine_problem("Docker Desktop 4.44.3 (1)|runc=1.3.3;"),
+            None
+        );
+
+        for runc in ["1.1.12", "1.2.7", "1.3.2", "v1.0.0", "1.4.0-rc.2"] {
+            let report = format!("Docker Engine - Community|runc={runc};");
+            assert!(engine_problem(&report).is_some(), "{runc}");
+        }
+
+        for runc in ["1.2.8", "1.3.3", "1.4.0-rc.3", "1.4.0", "v1.5.1"] {
+            let report = format!("Docker Engine - Community|runc={runc};");
+            assert_eq!(engine_problem(&report), None, "{runc}");
+        }
+
+        // An engine without runc, such as one on crun, is not a known problem
+        assert_eq!(engine_problem("Podman Engine|Podman Engine=5.0.0;"), None);
+    }
+
+    #[test]
+    fn rejects_non_workflows() {
+        assert!(inject("- a\n- b\n", "n").is_err());
+        assert!(inject("jobs: {}\n", "n").is_err());
+        assert!(inject("on: push\n", "n").is_err());
+    }
+
+    #[test]
+    fn prints_job_outputs_in_a_last_step() {
+        let wf = "\
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      bad name: x
+    steps:
+      - id: v
+        run: echo version=1 >> $GITHUB_OUTPUT
+";
+        let out = load(&inject(wf, "n").unwrap());
+        let steps = out["jobs"]["a"]["steps"].as_vec().unwrap();
+        let printed = &steps[steps.len() - 2];
+        assert_eq!(
+            printed["env"]["SHIPCHECK_OUTPUT_0"].as_str(),
+            Some("${{ steps.v.outputs.version }}")
+        );
+        assert!(printed["env"]["SHIPCHECK_OUTPUT_1"].is_badvalue());
+        assert!(printed["run"].as_str().unwrap().contains("'version'"));
+    }
+
+    #[test]
+    fn reads_outputs_from_the_log() {
+        // Lines as the outputs step prints them, plus act echoing the command first
+        let log = "[CI/a] | printf 'shipcheck-output %s %s\\n' 'v' \"$(...)\"\n\
+                   [CI/a]   | shipcheck-output v 6120620a27712720247820c3a9\n\
+                   [CI/a]   | shipcheck-output e \n\
+                   [CI/a]   | shipcheck-output odd 612\n";
+        let out = read_outputs(log);
+        assert_eq!(out["v"], "a b\n'q' $x é");
+        assert_eq!(out["e"], "");
+        assert!(!out.contains_key("odd"));
+        assert_eq!(out.len(), 2);
+    }
+
+    fn outputs(entries: &[(&str, &[(&str, &str)])]) -> BTreeMap<String, BTreeMap<String, String>> {
+        entries
+            .iter()
+            .map(|(job, kv)| {
+                let kv = kv.iter().map(|(k, v)| (k.to_string(), v.to_string()));
+                (job.to_string(), kv.collect())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn isolates_one_job_with_its_needs_as_literals() {
+        let wf = "\
+name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps: [{run: echo test}]
+  build:
+    runs-on: ubuntu-latest
+    steps: [{run: echo build}]
+  deploy:
+    needs: [test__1, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ needs.build.outputs.tag }} ${{ needs.test.outputs.os }} ${{ needs.build.outputs.none }}
+";
+        let needs = outputs(&[("test__1", &[("os", "it's")]), ("build", &[("tag", "v1")])]);
+        let out = load(&isolate(wf, "ci.yml", "deploy", &needs, "abcd", "5eed").unwrap());
+        assert_eq!(out["name"].as_str(), Some("CI"), "github.workflow stays");
+        assert_eq!(out["jobs"]["deploy"]["name"].as_str(), Some("deploy abcd"));
+        let jobs = out["jobs"].as_hash().unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = &out["jobs"]["deploy"];
+        assert!(job["needs"].is_badvalue());
+        assert_eq!(job["if"].as_str(), Some("'success' == 'success'"));
+        let guard = job["steps"][0]["run"].as_str().unwrap();
+        assert!(guard.contains("/.git/shipcheck-nonce") && guard.contains("= 5eed ||"));
+        assert_eq!(job["steps"][0]["shell"].as_str(), Some("sh"));
+        assert_eq!(
+            job["steps"][1]["run"].as_str(),
+            Some(
+                "echo ${{ fromJSON('\"v1\"') }} ${{ fromJSON('\"it\\u0027s\"') }} ${{ fromJSON('\"\"') }}"
+            )
+        );
+    }
+
+    #[test]
+    fn outputs_reach_the_next_job_as_literal_strings() {
+        let wf = "\
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps: [{run: echo a}]
+  b:
+    needs: a
+    if: needs.a.outputs.v != ''
+    runs-on: ubuntu-latest
+    env:
+      E: ${{ needs.a.outputs.v }}
+    steps:
+      - run: echo needs.a.outputs.v
+      - run: echo \"${{ needs.a.outputs.v }}\"
+";
+        let value = "x' }} ${{ secrets.S }} ${{ '\n- run: evil\nkey: [a, {b: \"c\n#";
+        let needs = outputs(&[("a", &[("v", value)])]);
+        let out = load(&isolate(wf, "ci.yml", "b", &needs, "t", "n").unwrap());
+        let literal = literal(value);
+        // Nothing of the value can end the expression or start one, wherever act scans for them
+        let inner = &literal["fromJSON('".len()..literal.len() - "')".len()];
+        assert!(!inner.contains(['\'', '{', '}', '$', '\n']), "{literal}");
+        assert_eq!(serde_json::from_str::<String>(inner).unwrap(), value);
+        let job = &out["jobs"]["b"];
+        assert_eq!(out["jobs"].as_hash().unwrap().len(), 1);
+        assert_eq!(
+            job["steps"].as_vec().unwrap().len(),
+            3,
+            "the checkout step and the two steps"
+        );
+        assert_eq!(job["if"].as_str().unwrap(), format!("{literal} != ''"));
+        // act evaluates a job's env twice, so the value moves to each step's env
+        assert!(job["env"]["E"].is_badvalue());
+
+        for step in &job["steps"].as_vec().unwrap()[1..] {
+            assert_eq!(
+                step["env"]["E"].as_str().unwrap(),
+                format!("${{{{ {literal} }}}}")
+            );
+        }
+        assert_eq!(
+            job["steps"][2]["run"].as_str().unwrap(),
+            format!("echo \"${{{{ {literal} }}}}\"")
+        );
+        // Outside an expression GitHub reads it as plain text, and so must shipcheck, or the value
+        // would land where act expands `${{ }}`
+        assert_eq!(
+            job["steps"][1]["run"].as_str(),
+            Some("echo needs.a.outputs.v")
+        );
+    }
+
+    #[test]
+    fn refuses_needs_in_an_env_it_cannot_move() {
+        let needs = outputs(&[("a", &[("v", "${{ secrets.S }}")])]);
+        let with = |job_env: &str, step: &str| {
+            format!(
+                "on: push\njobs:\n  a: {{runs-on: x, steps: [{{run: echo}}]}}\n  b:\n    needs: a\n    runs-on: x\n{job_env}    steps:\n      - {step}\n"
+            )
+        };
+
+        for wf in [
+            with("    env: ${{ needs.a.outputs.v }}\n", "run: echo"),
+            with(
+                "    env: {E: '${{ needs.a.outputs.v }}'}\n",
+                "{run: echo, env: '${{ fromJSON(x) }}'}",
+            ),
+            with(
+                "    env: {E: '${{ needs.a.outputs.v }}'}\n",
+                "{run: echo, env: [x]}",
+            ),
+        ] {
+            let err = isolate(&wf, "ci.yml", "b", &needs, "t", "n").unwrap_err();
+            assert!(err.contains("not a mapping"), "{wf}: {err}");
+        }
+
+        // An env with nothing from needs is left as it is
+        let plain = with("    env: ${{ fromJSON(x) }}\n", "{run: echo, env: [x]}");
+        assert!(isolate(&plain, "ci.yml", "b", &needs, "t", "n").is_ok());
+        let empty = with(
+            "    env: {E: '${{ needs.a.outputs.v }}'}\n",
+            "{run: echo, env: }",
+        );
+        let out = load(&isolate(&empty, "ci.yml", "b", &needs, "t", "n").unwrap());
+        assert!(out["jobs"]["b"]["steps"][1]["env"]["E"].as_str().is_some());
+    }
+
+    #[test]
+    fn refuses_needs_it_cannot_pass() {
+        let wf = "\
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps: [{run: echo a}]
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo '${{ toJSON(needs) }}'
+";
+        let needs = outputs(&[("a", &[])]);
+        let err = isolate(wf, "ci.yml", "b", &needs, "t", "n").unwrap_err();
+        assert!(err.contains("toJSON(needs)"), "{err}");
+        // Words that only contain `needs`, and `needs` in a script, are fine
+        let ok = wf.replace(
+            "toJSON(needs)",
+            "steps.needs_x.outputs.y }} needs.a.result ${{ inputs.needs",
+        );
+        assert!(isolate(&ok, "ci.yml", "b", &needs, "t", "n").is_ok());
+        assert!(isolate(wf, "ci.yml", "missing", &needs, "t", "n").is_err());
+    }
+
+    #[test]
+    fn volume_names_are_docker_safe() {
+        let name = volume_name("Acme/App.rs", "/root/.rustup");
+        assert!(name.starts_with(&home_prefix()) && name.contains("-acme-app-rs-"));
+        assert!(name.ends_with("-root--rustup"));
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        );
+    }
+
+    #[test]
+    fn volume_prefixes_never_overlap_between_repos() {
+        let (ab, abc) = (volume_prefix("a/b"), volume_prefix("a/b-c"));
+        assert!(!volume_name("a/b-c", "/x").starts_with(&ab));
+        assert!(!volume_name("a/b", "/x").starts_with(&abc));
+        assert!(volume_name("a/b", "/x").starts_with(&ab));
+    }
+}

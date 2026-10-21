@@ -1,0 +1,27 @@
+[package]
+name = "shipcheck"
+version = "0.1.0"
+edition = "2024"
+description = "Run GitHub Actions locally with act, cache the result by git tree, and post it as the PR's required check"
+license = "MIT"
+repository = "https://github.com/gabrielkoerich/shipcheck"
+homepage = "https://shipcheck.run"
+readme = "README.md"
+keywords = ["ci", "github-actions", "act", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+# Only the code goes in the crate, not the site or the docs
+include = ["/src/**", "/LICENSE", "/README.md"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10"
+toml = "0.9"
+yaml-rust2 = "0.13"
+git-cow = "0.2.1"
+ureq = { version = "3", features = ["json"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+globset = "0.4.20"
+
+[dev-dependencies]
+tempfile = "3.27.0"

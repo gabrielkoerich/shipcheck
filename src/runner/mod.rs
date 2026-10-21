@@ -1,0 +1,61 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::Duration;
+
+use crate::config::{RepoConfig, RunnerKind};
+
+pub mod act;
+
+/// What executes a workflow. The cache, checkouts, markers, hooks and checks are shared
+pub trait Runner: Sync {
+    /// Name and version, part of the cache key
+    fn identity(&self) -> Result<String, String>;
+
+    /// Refuses to run on a host whose isolation is known to be broken. Called once per run
+    fn preflight(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Rewrites one workflow copy into what this runner can run. Pure, its output goes into the key
+    fn prepare(&self, workflow: &str, file: &str) -> Result<String, String>;
+
+    /// Runs one job of a prepared workflow in its own checkout, writes its log, and waits within the
+    /// timeout. Jobs it needs have already passed, their outputs are in the request
+    fn run(&self, request: &RunRequest, log: &Path) -> Result<Outcome, String>;
+
+    /// Removes what a dead run left in this job's checkout. Called with the slot's lock held
+    fn reclaim(&self, run_dir: &Path);
+
+    /// Removes this runner's caches for one repository, or for all of them
+    fn clean(&self, repo_id: Option<&str>) -> Vec<String>;
+}
+
+pub struct RunRequest<'a> {
+    /// The job's own checkout
+    pub run_dir: &'a Path,
+    pub file: &'a str,
+    /// The prepared workflow, outside the checkout, so the checkout's own files stay as the base has them
+    pub workflow: &'a Path,
+    pub job: &'a str,
+    /// Outputs of each job in `needs`, by job id
+    pub needs: &'a BTreeMap<String, BTreeMap<String, String>>,
+    /// Shared by the jobs of one workflow run, so artifacts pass between them
+    pub artifacts: &'a Path,
+    pub repo_id: &'a str,
+    pub timeout: Duration,
+}
+
+pub struct Outcome {
+    /// None when the run timed out
+    pub exit: Option<i32>,
+    /// Jobs this host cannot run, which fail the workflow
+    pub unsupported_jobs: Vec<String>,
+    /// The job's `outputs`, for the jobs that need it
+    pub outputs: BTreeMap<String, String>,
+}
+
+pub fn from_config(config: &RepoConfig) -> Box<dyn Runner> {
+    match config.runner {
+        RunnerKind::Act => Box::new(act::Act::new(config.act.clone()).with_network(config.network)),
+    }
+}

@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+
+{% block content %}
+<main class="home">
+  <section class="hero">
+    <svg class="mascot" viewBox="0 0 120 104" role="img" aria-label="The shipcheck crate">
+      <rect x="10" y="22" width="100" height="74" rx="14" fill="#F5C518"/>
+      <rect x="10" y="22" width="100" height="74" rx="14" fill="none" stroke="#16181D" stroke-width="4"/>
+      <path d="M30 22v74M90 22v74" stroke="#16181D" stroke-width="3" opacity=".25"/>
+      <circle cx="46" cy="52" r="6" fill="#16181D"/>
+      <circle cx="74" cy="52" r="6" fill="#16181D"/>
+      <path d="M44 70l10 9 20-18" fill="none" stroke="#1F9D55" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M38 22l8-14h28l8 14" fill="#F5C518" stroke="#16181D" stroke-width="4" stroke-linejoin="round"/>
+    </svg>
+    <h1>Your agent already ran the tests. Let that run be the check.</h1>
+    <p class="lede">shipcheck runs your GitHub Actions workflows on your machine, keeps the result for that exact git tree, and posts the required check. A PR whose tree was already tested gets its check in under a second.</p>
+
+    <div class="install" data-tabs>
+      <div class="tabs" role="tablist" aria-label="Install with">
+        <button role="tab" aria-selected="true" aria-controls="i-brew" id="t-brew">Homebrew</button>
+        <button role="tab" aria-selected="false" aria-controls="i-script" id="t-script" tabindex="-1">Install script</button>
+        <button role="tab" aria-selected="false" aria-controls="i-cargo" id="t-cargo" tabindex="-1">Cargo</button>
+        <button role="tab" aria-selected="false" aria-controls="i-source" id="t-source" tabindex="-1">From source</button>
+      </div>
+      <div class="command" role="tabpanel" id="i-brew" aria-labelledby="t-brew"><code><span class="prompt">$</span> brew install gabrielkoerich/tap/shipcheck</code><button class="copy" type="button">Copy</button></div>
+      <div class="command" role="tabpanel" id="i-script" aria-labelledby="t-script" hidden><code><span class="prompt">$</span> curl -fsSL https://shipcheck.run/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
+      <div class="command" role="tabpanel" id="i-cargo" aria-labelledby="t-cargo" hidden><code><span class="prompt">$</span> cargo install shipcheck</code><button class="copy" type="button">Copy</button></div>
+      <div class="command" role="tabpanel" id="i-source" aria-labelledby="t-source" hidden><code><span class="prompt">$</span> cargo install --git https://github.com/gabrielkoerich/shipcheck shipcheck</code><button class="copy" type="button">Copy</button></div>
+      <p class="install-note">Then run <code>shipcheck init</code> in your repository. <a href="{{ get_url(path='@/docs/quickstart.md') }}">Quickstart</a></p>
+    </div>
+
+    <figure class="pr" aria-label="A pull request whose shipcheck check passed from a cached result">
+      <div class="pr-title"><strong>Fix parser on empty input</strong> <span>#482, fix-parser into main</span></div>
+      <ul class="checks">
+        <li><span class="dot ok" aria-hidden="true"></span><strong>shipcheck</strong><span>Passed, tree already tested</span></li>
+        <li><span class="dot ok" aria-hidden="true"></span><strong>ci.yml / test</strong><span>success, 1 attempt</span></li>
+      </ul>
+      <div class="pr-merge"><span class="merge-button">Squash and merge</span><span>All checks have passed</span></div>
+    </figure>
+  </section>
+
+  <section class="timing" aria-labelledby="timing-title">
+    <h2 id="timing-title">Time until the check is there</h2>
+    <!-- TBD: fill from docs/BENCHMARKS.md, no other number goes here -->
+    <table>
+      <thead>
+        <tr><th></th><th>After a push</th><th>After a commit, with the hooks</th><th>Tree already tested, after a rebase or squash</th></tr>
+      </thead>
+      <tbody>
+        <tr><th>shipcheck</th><td>TBD</td><td>TBD</td><td>TBD</td></tr>
+        <tr><th>GitHub Actions</th><td>TBD</td><td>TBD</td><td>TBD</td></tr>
+      </tbody>
+    </table>
+    <p class="note">The CI of bean, a private Python repository of the author's, on the same commit. shipcheck ran on an Apple silicon Mac with Docker Desktop, GitHub on its hosted runners. <a href="https://github.com/gabrielkoerich/shipcheck/blob/main/docs/BENCHMARKS.md">How it was measured</a>. A single run can take longer than on GitHub. The gain is no runner queue, no Actions minutes on PR pushes, and no new run for a tree already tested.</p>
+  </section>
+
+  <section id="how" class="how">
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li><strong>The agent commits and pushes.</strong> A git hook starts <code>shipcheck</code> in the background for that commit. Nothing waits, and a newer commit stops the older run.</li>
+      <li><strong>shipcheck reads what to run from main.</strong> <code>shipcheck.toml</code> and the workflows come from <code>origin/main</code>, never from the branch, so a PR cannot change what checks it.</li>
+      <li><strong>It runs the workflows in a warm, clean checkout.</strong> A copy-on-write clone of the commit keeps the build caches, act runs the jobs in Docker, and markers added to shipcheck's own copy of each workflow report every job.</li>
+      <li><strong>It keeps the result for the tree.</strong> The key is the git tree plus the config and runner versions, so a rebase or a squash with the same tree needs no new run.</li>
+      <li><strong>The PR gets its check.</strong> shipcheck posts the result as the required <code>shipcheck</code> check. GitHub still runs your workflows on main after the merge.</li>
+    </ol>
+  </section>
+
+  <section class="setup">
+    <h2>What the repository owner sets up</h2>
+    <div class="split">
+      <div>
+        <p>One file says which workflows a PR must pass. Your workflows stay as they are.</p>
+<pre><code># shipcheck.toml
+workflows = ["ci.yml"]
+on = ["push", "commit"]
+paths = ["src/**"]</code></pre>
+      </div>
+      <ul>
+        <li><code>shipcheck init</code> writes the file and installs the hook.</li>
+        <li>A GitHub App posts the check. Today you register your own, a one-click shipcheck App is coming. <a href="{{ get_url(path='@/docs/install.md') }}#what-works-without-the-github-app">What works without it</a></li>
+        <li>A ruleset <a href="{{ get_url(path='@/docs/branch-protection.md') }}">requires the check on main</a>, so a PR merges only after it passes.</li>
+        <li>Each teammate runs <code>shipcheck install</code> once per clone.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="guarantees">
+    <h2>What it stops, and what it does not</h2>
+    <div class="split">
+      <div>
+        <h3>It stops</h3>
+        <ul>
+          <li>An agent that reports a pass it never ran. Only shipcheck posts the check, from runs it started.</li>
+          <li>A PR that edits its workflows or <code>shipcheck.toml</code> to skip work.</li>
+          <li>A pass from before main's config changed.</li>
+          <li>A pass from files that were never committed.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>It does not stop</h3>
+        <ul>
+          <li>An agent that deletes or weakens a test. Tests are part of the PR, so review them.</li>
+          <li>Differences between act and GitHub's runners. The hosted run on main catches them.</li>
+          <li>Jobs act cannot run, such as macOS jobs without a Mac, or a job that mounts a loop device.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="status">
+    <h2>Status</h2>
+    <p>Early. Local runs, the cache, the background hooks and posting the check with your own GitHub App work today. A one-click hosted GitHub App is coming.</p>
+  </section>
+</main>
+<script>
+  for (const box of document.querySelectorAll("[data-tabs]")) {
+    const tabs = [...box.querySelectorAll('[role="tab"]')];
+    const show = (tab) => {
+      for (const t of tabs) {
+        const on = t === tab;
+        t.setAttribute("aria-selected", on);
+        t.tabIndex = on ? 0 : -1;
+        document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+      }
+    };
+    tabs.forEach((tab, i) => {
+      tab.addEventListener("click", () => show(tab));
+      tab.addEventListener("keydown", (e) => {
+        const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+        if (step) {
+          const next = tabs[(i + step + tabs.length) % tabs.length];
+          show(next);
+          next.focus();
+        }
+      });
+    });
+  }
+
+  for (const button of document.querySelectorAll(".copy")) {
+    button.addEventListener("click", async () => {
+      const text = button.previousElementSibling.textContent.replace(/^\$\s*/, "");
+      try {
+        await navigator.clipboard.writeText(text);
+        button.textContent = "Copied";
+      } catch {
+        button.textContent = "Copy failed";
+      }
+      setTimeout(() => (button.textContent = "Copy"), 1600);
+    });
+  }
+</script>
+{% endblock content %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}{{ section.title }} | {{ config.title }}{% endblock title %}
+
+{% block content %}
+<main class="docs">
+  <nav class="doc-nav" aria-label="Docs">
+    <a href="{{ section.permalink }}" aria-current="page">Docs</a>
+    <ol>
+      {% for p in section.pages %}
+      <li><a href="{{ p.permalink }}">{{ p.title }}</a></li>
+      {% endfor %}
+    </ol>
+  </nav>
+  <article class="doc">
+    <h1>{{ section.title }}</h1>
+    {{ section.content | safe }}
+    <ul class="doc-list">
+      {% for page in section.pages %}
+      <li>
+        <a href="{{ page.permalink }}">{{ page.title }}</a>
+        <p>{{ page.description }}</p>
+      </li>
+      {% endfor %}
+    </ul>
+  </article>
+</main>
+{% endblock content %}

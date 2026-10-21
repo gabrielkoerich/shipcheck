@@ -1,0 +1,537 @@
+:root {
+  --paper: #ffffff;
+  --ink: #16181d;
+  --muted: #5d6470;
+  --rule: #e6e8ec;
+  --well: #f4f5f7;
+  --pass: #1f9d55;
+  --crate: #f5c518;
+  --measure: 40rem;
+  --page: 70rem;
+  --gutter: clamp(1rem, 4vw, 3rem);
+  --sans: "Bricolage Grotesque", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 1.0625rem;
+  font-variation-settings: "opsz" 14;
+  line-height: 1.6;
+}
+
+a {
+  color: inherit;
+  text-decoration-color: var(--crate);
+  text-decoration-thickness: 0.14em;
+  text-underline-offset: 0.18em;
+}
+
+a:hover {
+  text-decoration-color: currentColor;
+}
+
+:focus-visible {
+  outline: 3px solid var(--crate);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+code,
+pre {
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+:not(pre) > code {
+  background: var(--well);
+  padding: 0.08em 0.35em;
+  border-radius: 4px;
+}
+
+pre {
+  margin: 1.25rem 0;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  background: var(--well);
+  border-radius: 8px;
+  line-height: 1.55;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--sans);
+  font-variation-settings: "opsz" 64;
+  font-weight: 700;
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+h2 {
+  font-size: clamp(1.75rem, 3.2vw, 2.4rem);
+}
+
+h3 {
+  font-size: 1.3rem;
+}
+
+/* Header and footer */
+
+.site-header,
+.site-footer {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 1.25rem var(--gutter);
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.wordmark {
+  font-variation-settings: "opsz" 64;
+  font-weight: 750;
+  font-size: 1.3rem;
+  letter-spacing: -0.02em;
+  text-decoration: none;
+}
+
+.site-header nav {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.site-header nav a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.site-header nav a:hover {
+  color: var(--ink);
+}
+
+.site-footer {
+  margin-top: 6rem;
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+/* Home */
+
+.home {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+.home section {
+  padding: clamp(4rem, 8vw, 6.5rem) 0 0;
+}
+
+.home section > h2 {
+  max-width: var(--measure);
+  margin-bottom: 1.5rem;
+}
+
+.home p,
+.home li {
+  max-width: var(--measure);
+}
+
+.hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.home .hero {
+  padding-top: clamp(2rem, 6vw, 4.5rem);
+}
+
+.mascot {
+  width: 5.5rem;
+  height: auto;
+}
+
+.hero h1 {
+  font-size: clamp(2.4rem, 5.6vw, 4.4rem);
+  max-width: 17ch;
+  margin-top: 1.25rem;
+}
+
+.lede {
+  font-size: 1.2rem;
+  color: var(--muted);
+  margin: 1.5rem auto 0;
+}
+
+/* Install box */
+
+.install {
+  width: min(100%, 42rem);
+  margin-top: 2.25rem;
+}
+
+.tabs {
+  display: flex;
+  justify-content: center;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+}
+
+.tabs button {
+  font: inherit;
+  font-size: 0.92rem;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  padding: 0.35rem 0.85rem;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.tabs button[aria-selected="true"] {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.command {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  background: var(--well);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 0.85rem 0.85rem 0.85rem 1.1rem;
+  text-align: left;
+}
+
+.command[hidden] {
+  display: none;
+}
+
+.command code {
+  flex: 1;
+  overflow-x: auto;
+  white-space: nowrap;
+  background: none;
+  padding: 0;
+  font-size: 0.95rem;
+}
+
+.command .prompt {
+  color: var(--muted);
+  user-select: none;
+}
+
+.copy {
+  font: inherit;
+  font-size: 0.85rem;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+
+.install-note {
+  margin: 0.85rem auto 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+/* The PR checks panel */
+
+.pr {
+  width: min(100%, 44rem);
+  margin: 3rem 0 0;
+  text-align: left;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(22, 24, 29, 0.04), 0 12px 32px -12px rgba(22, 24, 29, 0.12);
+  overflow: hidden;
+}
+
+.pr-title {
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.pr-title span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.checks {
+  list-style: none;
+  margin: 0;
+  padding: 0.5rem 1.25rem;
+}
+
+.home .checks li {
+  max-width: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+  padding: 0.45rem 0;
+  font-size: 0.95rem;
+}
+
+.checks li span:last-child {
+  color: var(--muted);
+}
+
+.dot {
+  flex: none;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  align-self: center;
+}
+
+.dot.ok {
+  background: var(--pass);
+}
+
+.pr-merge {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 1rem 1.25rem;
+  background: var(--well);
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.merge-button {
+  background: var(--pass);
+  color: #fff;
+  font-weight: 600;
+  padding: 0.45rem 0.9rem;
+  border-radius: 6px;
+}
+
+/* The numbers table */
+
+.note {
+  margin-top: 1.5rem;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+/* How it works, a real sequence */
+
+.steps {
+  list-style: none;
+  counter-reset: step;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 1.5rem;
+}
+
+.steps li {
+  counter-increment: step;
+  position: relative;
+  padding-left: 3.5rem;
+}
+
+.steps li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 2.2rem;
+  height: 2.2rem;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--crate);
+  font-weight: 700;
+}
+
+.steps strong {
+  display: block;
+}
+
+/* Two columns that fall to one */
+
+.split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: 1.5rem 3rem;
+  align-items: start;
+}
+
+.split ul {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.split li + li {
+  margin-top: 0.5rem;
+}
+
+.guarantees h3 {
+  margin-bottom: 0.75rem;
+}
+
+.status p {
+  font-size: 1.15rem;
+}
+
+/* Docs */
+
+.docs {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 1rem var(--gutter) 0;
+  display: grid;
+  grid-template-columns: 13rem minmax(0, var(--measure));
+  gap: 3.5rem;
+}
+
+.doc-nav {
+  position: sticky;
+  top: 1.5rem;
+  align-self: start;
+  font-size: 0.95rem;
+}
+
+.doc-nav > a {
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.doc-nav ol {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  border-left: 1px solid var(--rule);
+}
+
+.doc-nav li a {
+  display: block;
+  padding: 0.3rem 0 0.3rem 0.9rem;
+  margin-left: -1px;
+  border-left: 3px solid transparent;
+  text-decoration: none;
+  color: var(--muted);
+}
+
+.doc-nav li a:hover {
+  color: var(--ink);
+}
+
+.doc-nav li a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 600;
+  border-left-color: var(--crate);
+}
+
+.doc {
+  min-width: 0;
+}
+
+.doc h1 {
+  font-size: clamp(2.2rem, 4.5vw, 3rem);
+  margin: 0.5rem 0 1.5rem;
+}
+
+.doc h2 {
+  font-size: 1.6rem;
+  margin: 2.75rem 0 0.75rem;
+}
+
+.doc table,
+.timing table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25rem 0;
+  font-size: 0.95rem;
+  display: block;
+  overflow-x: auto;
+}
+
+.doc th,
+.doc td,
+.timing th,
+.timing td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.55rem 0.9rem 0.55rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.doc th,
+.timing th {
+  font-weight: 650;
+}
+
+.doc li + li {
+  margin-top: 0.35rem;
+}
+
+.doc-list {
+  list-style: none;
+  padding: 0;
+  margin: 2rem 0 0;
+}
+
+.doc-list li {
+  padding: 1rem 0;
+  border-top: 1px solid var(--rule);
+}
+
+.doc-list a {
+  font-weight: 650;
+  font-size: 1.15rem;
+}
+
+.doc-list p {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+}
+
+.doc-pager {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 3.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--rule);
+}
+
+@media (max-width: 52rem) {
+  .docs {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.5rem;
+  }
+
+  .doc-nav {
+    position: static;
+  }
+}
