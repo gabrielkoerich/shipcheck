@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["Formula/**", "**.md"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Host mode runs checks in bubblewrap, which Ubuntu's AppArmor blocks from making user namespaces.
+      # These are the commands the install docs give, so CI proves them. Turning the restriction off
+      # with sysctl would also do on a throwaway runner, never on a user's machine
+      - timeout-minutes: 5
+        run: |
+          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          sudo apt-get $apt update -q && sudo apt-get $apt install -y bubblewrap apparmor-profiles
+          sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true
+      - run: cargo test
+
