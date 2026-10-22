@@ -51,7 +51,7 @@ jobs:
 
 #[test]
 #[ignore = "needs act and Docker"]
-fn runs_caches_and_ignores_the_working_copy() {
+fn runs_caches_and_tests_the_working_copy() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary that reads or writes the environment
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
@@ -99,13 +99,14 @@ fn runs_caches_and_ignores_the_working_copy() {
     assert_eq!(entry.workflows[0].jobs["check"], "success");
     assert!(run::cached(&plan.key).unwrap().passed);
 
+    // A named commit is tested as it is, its working copy does not count
     git(&work, &["checkout", "-q", "main"]);
     fs::write(work.join("marker.txt"), "uncommitted").unwrap();
     let plan = run::plan(&work, "main", "origin/main").unwrap();
     let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
     assert!(
         !entry.passed,
-        "the uncommitted marker must not count: {entry:?}"
+        "an uncommitted marker must not count for a named commit: {entry:?}"
     );
     assert_eq!(
         entry.workflows[0].jobs["check"],
@@ -384,6 +385,110 @@ fn runs_caches_and_ignores_the_working_copy() {
         "a cancelled run must not leave its job container behind"
     );
 
+    // The agent's run before a commit is the check: committing that tree runs nothing again
+    git(&work, &["checkout", "-q", "-b", "wip", "main"]);
+    // `shipcheck commit` runs plain `git commit`, which needs an identity on a CI runner
+    git(&work, &["config", "user.name", "t"]);
+    git(&work, &["config", "user.email", "t@t"]);
+    git(&work, &["config", "commit.gpgsign", "false"]);
+    fs::write(work.join("marker.txt"), "tested before the commit").unwrap();
+    let shipcheck = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args(args)
+            .env("PATH", &path)
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text)
+    };
+    let worktree = || git(&work, &["status", "--porcelain", "--ignored"]);
+    let before = worktree();
+    let (code, out) = shipcheck(&["run", "--no-fetch"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("tested the working copy, tree "), "{out}");
+    assert!(
+        out.contains("1 untracked file is part of this run: marker.txt"),
+        "{out}"
+    );
+    assert_eq!(
+        worktree(),
+        before,
+        "the run must not write into the agent's worktree"
+    );
+
+    fs::write(work.join("late.txt"), "after the run").unwrap();
+    let (code, out) = shipcheck(&["commit", "-m", "late"]);
+    assert_ne!(code, Some(0), "{out}");
+    assert!(out.contains("files changed since the run"), "{out}");
+    fs::remove_file(work.join("late.txt")).unwrap();
+
+    let (code, out) = shipcheck(&["commit", "-m", "wip"]);
+    assert_eq!(code, Some(0), "{out}");
+    let wip = git(&work, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        code_of(&wip),
+        Some(0),
+        "the commit must find the run's result at once"
+    );
+    let record = |branch: &str| {
+        tmp.path()
+            .join("home/background")
+            .join(run::repo_id(&work).unwrap())
+            .join(format!("{branch}.pid"))
+    };
+    assert!(!record("wip").exists(), "the commit hook must start no run");
+
+    // With --staged, the index is what ran, and a plain `git commit` of it reuses the result
+    git(&work, &["checkout", "-q", "-b", "staged", "main"]);
+    fs::write(work.join("marker.txt"), "staged").unwrap();
+    git(&work, &["add", "marker.txt"]);
+    fs::write(work.join("not-staged.txt"), "left out").unwrap();
+    let (code, out) = shipcheck(&["run", "--no-fetch", "--staged"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("tested the index, tree "), "{out}");
+    let ok = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(["commit", "-q", "-m", "staged"])
+        .env("PATH", &path)
+        .current_dir(&work)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    assert_eq!(
+        code_of("HEAD"),
+        Some(0),
+        "the index's commit must hit the cache"
+    );
+    assert!(!record("staged").exists());
+
+    // Another tree, the file left out of the index, has no result
+    git(&work, &["add", "not-staged.txt"]);
+    git(
+        &work,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            "more",
+        ],
+    );
+    assert_eq!(code_of("HEAD"), Some(2), "a different tree must run again");
+
     // With paths set on main, a change outside them passes without running
     git(&work, &["checkout", "-q", "main"]);
     fs::write(
@@ -654,8 +759,16 @@ fn runs_caches_and_ignores_the_working_copy() {
     );
     assert!(!host.join("ran-timeout").exists());
 
-    // With the network on, jobs pass artifacts through act's server, which listens on loopback only
-    fs::write(work.join(".github/workflows/artifacts.yml"), ARTIFACTS).unwrap();
+    // With the network on, jobs pass artifacts through act's server, and reach the internet but not
+    // the host's loopback
+    fs::write(
+        work.join(".github/workflows/artifacts.yml"),
+        ARTIFACTS.replace(
+            "HOST_PORT",
+            &listener.local_addr().unwrap().port().to_string(),
+        ),
+    )
+    .unwrap();
     fs::write(
         work.join("shipcheck.toml"),
         "workflows = [\"artifacts.yml\"]\nnetwork = \"internet\"\n[act]\ncache_paths = []\n",
@@ -666,14 +779,87 @@ fn runs_caches_and_ignores_the_working_copy() {
     git(&work, &["push", "-q", "--no-verify", "origin", "main"]);
     git(&work, &["fetch", "-q", "origin"]);
     let plan = run::plan(&work, "main", "origin/main").unwrap();
-    let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (entry, modes) = std::thread::scope(|s| {
+        // act removes job containers when they end, so their network mode is read while they run
+        let modes = s.spawn(|| {
+            let mut modes = std::collections::BTreeSet::new();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let ids = Command::new("docker")
+                    .args(["ps", "-q", "--filter", "name=workflows-artifacts-yml-"])
+                    .output()
+                    .unwrap();
+                for id in String::from_utf8_lossy(&ids.stdout).split_whitespace() {
+                    let out = Command::new("docker")
+                        .args(["inspect", "-f", "{{.HostConfig.NetworkMode}}", id])
+                        .output()
+                        .unwrap();
+                    let mode = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+                    if !mode.is_empty() {
+                        modes.insert(mode);
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+
+            modes
+        });
+        let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        (entry, modes.join().unwrap())
+    });
     let log =
         fs::read_to_string(run::log_dir(&plan.key).join("artifacts.yml.log")).unwrap_or_default();
-    assert!(entry.passed, "artifacts did not pass between jobs: {log}");
     assert!(
-        log.contains("Start server on http://127.0.0.1:"),
-        "the artifact server must listen on loopback only"
+        entry.passed,
+        "artifacts or the internet probe failed: {log}"
     );
+    assert!(!modes.is_empty(), "saw no job container");
+    assert!(
+        modes
+            .iter()
+            .all(|m| m.starts_with("shipcheck-") && m.contains("-net-")),
+        "an internet job ran outside its own network: {modes:?}"
+    );
+    let networks = || {
+        let out = Command::new("docker")
+            .args(["network", "ls", "--format", "{{.Name}}"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let listed = networks();
+    assert!(
+        modes.iter().all(|m| !listed.lines().any(|l| l == m)),
+        "a run left its network: {modes:?}"
+    );
+    // What a crashed run would leave, which clean removes below
+    let leftover = modes.first().unwrap().clone();
+    assert!(
+        Command::new("docker")
+            .args(["network", "create", "--label", "shipcheck", &leftover])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // On Linux the server listens on the run network's gateway, on a Mac on loopback behind
+    // host.docker.internal. Never on every interface or the LAN address
+    let server = log
+        .lines()
+        .find_map(|l| l.split_once("Start server on http://"))
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .and_then(|(addr, _)| addr.parse::<std::net::Ipv4Addr>().ok())
+        .expect("no artifact server address in the log");
+    if cfg!(target_os = "macos") {
+        assert!(server.is_loopback(), "{server}");
+    } else {
+        assert!(
+            server.is_private() && !server.is_loopback() && server.octets()[3] == 1,
+            "the artifact server must listen on the run network's gateway: {server}"
+        );
+    }
 
     // With no shipcheck.toml on main, an agent can still run: the workflows that run for branches run, and
     // the result is never posted as the check
@@ -723,7 +909,11 @@ fn runs_caches_and_ignores_the_working_copy() {
         !ran_out.contains("deploy.yml"),
         "a deploy on main does not run: {ran_out}"
     );
+    // The test's SHIPCHECK_HOME is not the default, so post refuses without --home-ok
     let post = cli(&["post"]);
+    assert_eq!(post.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&post.stderr).contains("--home-ok"));
+    let post = cli(&["post", "--home-ok"]);
     assert_eq!(post.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&post.stderr).contains("is not a check"));
 
@@ -746,6 +936,10 @@ fn runs_caches_and_ignores_the_working_copy() {
         );
     };
     clean(&[]);
+    assert!(
+        !networks().lines().any(|l| l == leftover),
+        "clean must remove a network a crashed run left"
+    );
     // Templates sit at templates/<owner>/<repo>. Nothing of this repository, `origin`, may be left,
     // and the other repository of this test keeps its own
     let left: Vec<_> = fs::read_dir(&templates)
@@ -833,21 +1027,23 @@ jobs:
       - run: |
           test "$(printf %s '${{ secrets.OWN_SECRET }}' | sha256sum | cut -c1-16)" = OWN_HASH
           echo "secret is ${{ secrets.OWN_SECRET }}"
-      # No route anywhere: not the host's gateways, Docker's API ports, its proxy or this test's listener
+      # No route anywhere: not the host's gateways, Docker's API ports, its proxy or this test's listener.
+      # bash succeeds once it connects, so a listener that never answers still counts as reached
       - run: |
           test -z "$(awk '$2 == "00000000"' /proc/net/route)"
           for target in 127.0.0.1 host.docker.internal gateway.docker.internal 172.17.0.1 192.168.65.1 192.168.65.7 192.168.65.254; do
             for port in HOST_PORT 80 2375 2376 3128; do
-              if curl -s -m 3 -o /dev/null "http://$target:$port/"; then echo "reached $target:$port"; exit 1; fi
+              if timeout 3 bash -c "echo > /dev/tcp/$target/$port" 2>/dev/null; then echo "reached $target:$port"; exit 1; fi
             done
           done
       - run: "! getent hosts example.com && ! getent hosts host.docker.internal"
       - run: "! curl -s -m 5 -o /dev/null https://example.com"
       # A step container of its own gets no more than the job
-      - uses: docker://busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+      # The job's own image, since busybox has no connect-only probe
+      - uses: docker://catthehacker/ubuntu@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43
         with:
-          entrypoint: /bin/sh
-          args: -c "test ! -e /var/run/docker.sock && ! wget -q -T 3 -O /dev/null http://172.17.0.1:HOST_PORT/ && ! wget -q -T 3 -O /dev/null http://host.docker.internal:HOST_PORT/"
+          entrypoint: /bin/bash
+          args: -c "test ! -e /var/run/docker.sock && ! timeout 3 bash -c 'echo > /dev/tcp/172.17.0.1/HOST_PORT' && ! timeout 3 bash -c 'echo > /dev/tcp/host.docker.internal/HOST_PORT'"
       - run: printf '\033]0;from-job\007\033[2J\n'
       - run: git rev-parse HEAD && git ls-files | grep -q isolation.yml
       - run: "! grep -rq host-secret .git"
@@ -969,6 +1165,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with: {name: out, path: got}
       - run: grep -q built got/file.txt
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      # bash succeeds once it connects, so a listener that never answers still counts as reached
+      - run: timeout 10 bash -c 'echo > /dev/tcp/example.com/443'
+      - run: \"! timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/HOST_PORT'\"
+      - run: sleep 3
 ";
 
 const SLOW_CI: &str = "\
@@ -982,3 +1185,77 @@ jobs:
       - run: test -f marker.txt
       - run: if [ -f slow ]; then sleep 30; fi
 ";
+
+#[test]
+#[ignore = "needs act"]
+fn status_names_the_result_for_the_working_copy_and_the_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    git(
+        tmp.path(),
+        &["clone", "-q", &origin.to_string_lossy(), "work"],
+    );
+    let work = tmp.path().join("work");
+    git(&work, &["checkout", "-q", "-b", "main"]);
+    fs::create_dir_all(work.join(".github/workflows")).unwrap();
+    fs::write(work.join(".github/workflows/ci.yml"), CI).unwrap();
+    fs::write(work.join("shipcheck.toml"), "workflows = [\"ci.yml\"]\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "main"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+
+    fs::write(work.join("marker.txt"), "staged").unwrap();
+    git(&work, &["add", "marker.txt"]);
+    fs::write(work.join("untracked.txt"), "left out").unwrap();
+
+    // A passing result for the index's tree, as a `run --staged` leaves it
+    let staged = run::snapshot(&work, true).unwrap().unwrap();
+    let plan = run::plan(&work, &staged, "origin/main").unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join("cache")).unwrap();
+    let entry = run::Entry {
+        key: plan.key.clone(),
+        sha: plan.sha.clone(),
+        tree: plan.tree.clone(),
+        base: plan.base.clone(),
+        passed: true,
+        workflows: Vec::new(),
+        finished_unix: 0,
+        skipped: None,
+        ci_changes: Vec::new(),
+    };
+    fs::write(
+        home.join("cache").join(format!("{}.json", plan.key)),
+        serde_json::to_string(&entry).unwrap(),
+    )
+    .unwrap();
+
+    let status = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+            .arg("status")
+            .args(args)
+            .env("SHIPCHECK_HOME", &home)
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+
+    let (code, out) = status(&[]);
+    assert_eq!(code, Some(2), "the working copy has no result: {out}");
+    assert!(out.contains("working copy, tree "), "{out}");
+    assert!(
+        out.contains(&format!("index, tree {}: passed", &plan.tree[..12])),
+        "{out}"
+    );
+    assert_eq!(status(&["--staged"]).0, Some(0));
+
+    // Committing the index as it is gives that tree, so its commit has the result
+    git(&work, &["commit", "-q", "-m", "staged"]);
+    assert_eq!(status(&["HEAD"]).0, Some(0));
+}

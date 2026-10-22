@@ -12,12 +12,21 @@ In a clone of the repository, on `main`:
 shipcheck init
 ```
 
-It writes `shipcheck.toml` with every workflow in `workflows`, and installs the hooks for this clone. Open the file, remove the workflows that must not run on a laptop, such as deploys, and say when runs should start:
+It writes `shipcheck.toml` and installs the hooks for this clone. When the root has a `package.json` with a `test` or `lint` script, a `Cargo.toml`, a `pyproject.toml` or a `go.mod`, the file runs those checks natively in a sandbox. Open it, keep the checks CI needs, and say when runs should start:
 
 ```toml
-workflows = ["ci.yml"]
+runner = "host"
 on = ["push", "commit"]
+
+[host]
+versions = ["node --version", "npm --version"]
+
+[host.checks]
+test = "npm test"
+lint = "npm run lint"
 ```
+
+Otherwise it writes `runner = "act"` with every workflow in `workflows`, run in containers. Remove the workflows that must not run on a laptop, such as deploys. [Modes](@/docs/config.md#modes) compares the two.
 
 Commit it and merge it to `main`. shipcheck reads this file and the workflows only from `main`, so a PR cannot change what it must pass. [Every setting](@/docs/config.md).
 

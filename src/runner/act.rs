@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use yaml_rust2::Yaml;
 use yaml_rust2::yaml::Hash;
 
-use super::{Outcome, RunRequest, Runner};
+use super::{Outcome, RunRequest, Runner, shard};
 use crate::cache;
 use crate::config;
 use crate::workflow::{self, key, step};
@@ -21,6 +21,7 @@ pub const JOB_HOMES: &str = "/root/.shipcheck";
 pub struct Act {
     config: config::Act,
     network: config::Network,
+    shards: config::ShardTests,
 }
 
 impl Act {
@@ -28,11 +29,16 @@ impl Act {
         Act {
             config,
             network: config::Network::None,
+            shards: config::ShardTests::default(),
         }
     }
 
     pub fn with_network(self, network: config::Network) -> Self {
         Act { network, ..self }
+    }
+
+    pub fn with_shards(self, shards: config::ShardTests) -> Self {
+        Act { shards, ..self }
     }
 }
 
@@ -123,8 +129,14 @@ impl Runner for Act {
             }
         };
 
+        let root_shell = shard::default_shell(&root);
         let jobs = workflow::jobs_mut(&mut root)?;
         *jobs = expand_matrices(std::mem::take(jobs));
+
+        if self.shards.enabled() {
+            shard::shard_steps(jobs, root_shell.as_deref(), self.shards);
+        }
+
         // After expansion, so `container: ${{ matrix.c }}` is checked as the value it becomes
         refuse_escapes(jobs, self.network)?;
         let own_image = self.config.job_images(file);
@@ -214,7 +226,7 @@ impl Runner for Act {
 
         let wf_path = request.workflow;
         let prepared = fs::read_to_string(wf_path).map_err(|e| e.to_string())?;
-        let tag = cache::hex(&Sha256::digest(run_dir.to_string_lossy().as_bytes())[..4]);
+        let tag = run_tag(run_dir);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -226,29 +238,32 @@ impl Runner for Act {
                 std::process::id()
             ))[..16],
         );
-        fs::write(run_dir.join(".git").join(NONCE_FILE), &nonce).map_err(|e| e.to_string())?;
-        fs::write(
-            wf_path,
-            isolate(
-                &prepared,
-                request.file,
-                request.job,
-                request.needs,
-                &tag,
-                &nonce,
-            )?,
-        )
-        .map_err(|e| e.to_string())?;
+        write_nonces(run_dir, &nonce).map_err(|e| e.to_string())?;
+        let isolated = isolate(
+            &prepared,
+            request.file,
+            request.job,
+            request.needs,
+            &tag,
+            &nonce,
+        )?;
+        let shards = (request.shard && isolated.contains(shard::MARK))
+            .then(|| shard::count(self.shards, engine_resources()));
+
+        if let Some(n) = shards {
+            shard::write_plugin(run_dir, n)?;
+        }
+
+        fs::write(wf_path, keep_caches(run_dir, &isolated)?).map_err(|e| e.to_string())?;
 
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
+        let network = match self.network {
+            config::Network::None => None,
+            config::Network::Internet => Some(create_network(run_dir)?),
+        };
         let mut cmd = Command::new("act");
         let port = free_port()?;
-        let volumes: Vec<String> = self
-            .config
-            .cache_paths
-            .iter()
-            .map(|p| format!("-v {}:{p}", volume_name(request.repo_id, p)))
-            .collect();
+        let volumes = mounts(&self.config, request.repo_id, &tag, run_dir)?;
 
         cmd.arg("workflow_dispatch")
             .arg("-W")
@@ -268,7 +283,7 @@ impl Runner for Act {
             .arg(port.to_string())
             // act binds the LAN address by default, which anyone on the network could use
             .arg("--artifact-server-addr")
-            .arg("127.0.0.1")
+            .arg(artifact_addr(network.as_ref()))
             .current_dir(run_dir)
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| e.to_string())?)
@@ -308,9 +323,8 @@ impl Runner for Act {
                 .join(request.job),
         );
         // act's default is the host's network, which reaches every service on the machine and the LAN
-        if self.network == config::Network::None {
-            cmd.arg("--network").arg("none");
-        }
+        cmd.arg("--network")
+            .arg(network.as_ref().map_or("none", |n| n.name.as_str()));
 
         // Job code would get the host through the Docker socket: every file, the App key, other runs
         cmd.arg("--container-daemon-socket").arg("-");
@@ -371,6 +385,7 @@ impl Runner for Act {
             exit,
             unsupported_jobs: unsupported_jobs(&log),
             outputs: read_outputs(&log),
+            shards,
         })
     }
 
@@ -397,10 +412,15 @@ impl Runner for Act {
             };
 
             for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-                let _ = Command::new("docker").args(["rm", "-f", id]).output();
+                // `-v` takes the anonymous `.venv` volume along, named cache volumes stay
+                let _ = Command::new("docker").args(["rm", "-f", "-v", id]).output();
             }
         }
 
+        // Only after its containers, since Docker keeps a network that one still uses
+        let _ = Command::new("docker")
+            .args(["network", "rm", &network_name(run_dir)])
+            .output();
         hand_back(run_dir);
     }
 
@@ -433,6 +453,28 @@ impl Runner for Act {
                     .is_ok_and(|o| o.status.success())
             })
             .map(|v| format!("removed volume {v}"));
+        done.extend(removed);
+        // Networks are per slot, not per repository, and Docker refuses to remove one in use
+        let prefix = format!("{}net-", home_prefix());
+        let Ok(listed) = Command::new("docker")
+            .args(["network", "ls", "--format", "{{.Name}}", "--filter"])
+            .arg(format!("name={prefix}"))
+            .output()
+        else {
+            return done;
+        };
+
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        let removed = listed
+            .split_whitespace()
+            .filter(|n| n.starts_with(&prefix))
+            .filter(|n| {
+                Command::new("docker")
+                    .args(["network", "rm", n])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            })
+            .map(|n| format!("removed network {n}"));
         done.extend(removed);
         done
     }
@@ -486,6 +528,17 @@ fn hand_back(dir: &Path) {
         .arg(format!("{}:/w", dir.display()))
         .args([BUSYBOX, "chown", "-R", &format!("{uid}:{gid}"), "/w"])
         .output();
+}
+
+/// The CPUs and bytes of memory the Docker engine has, which on a Mac are the VM's, not the host's
+pub fn engine_resources() -> Option<(u32, u64)> {
+    let out = Command::new("docker")
+        .args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (cpus, memory) = text.trim().split_once(' ')?;
+    Some((cpus.parse().ok()?, memory.parse().ok()?))
 }
 
 /// Where act keeps the actions it fetched, per job below this, for one repository or every one
@@ -948,18 +1001,56 @@ fn reads_needs(y: &Yaml, is_if: bool) -> Option<String> {
  * tag, since act names containers after workflow and job and removes an older one of that name
  **/
 const NONCE_FILE: &str = "shipcheck-nonce";
+/// The same nonce at the checkout's root, a second path the engine has to show fresh
+const ROOT_NONCE: &str = ".shipcheck-nonce";
+
+/// Writes the nonce into `.git` and the root, kept out of `git status` by `.git/info/exclude`
+fn write_nonces(run_dir: &Path, nonce: &str) -> std::io::Result<()> {
+    let git = run_dir.join(".git");
+    fs::write(git.join(NONCE_FILE), nonce)?;
+    fs::create_dir_all(git.join("info"))?;
+    let mut exclude = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(git.join("info/exclude"))?;
+    std::io::Write::write_all(&mut exclude, format!("\n/{ROOT_NONCE}\n").as_bytes())?;
+    // The tree can hold this name, even as a link to a host file, so it goes first
+    let root = run_dir.join(ROOT_NONCE);
+
+    if fs::symlink_metadata(&root).is_ok() {
+        fs::remove_file(&root)?;
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root)?;
+    std::io::Write::write_all(&mut file, nonce.as_bytes())
+}
 
 /**
  * The first step of every job. OrbStack has shown a job the files a previous run left at the same
  * bind mount path, and colima shows an empty directory for a path it does not share. Either would
- * let a job pass on a tree it never tested, so a job that does not see this run's nonce fails
+ * let a job pass on a tree it never tested, so a job that does not see this attempt's nonce, in
+ * `.git` and at the root, fails
  **/
 fn nonce_step(nonce: &str) -> Yaml {
     let mut step = step(
         "shipcheck checkout",
         None,
         format!(
-            "test \"$(cat \"$GITHUB_WORKSPACE/.git/{NONCE_FILE}\" 2>/dev/null)\" = {nonce} || {{ echo '::error::this job does not see the checkout shipcheck made for it, the Docker engine shows stale or missing files'; exit 1; }}"
+            r#"f="$GITHUB_WORKSPACE/.git/{NONCE_FILE}"
+r="$GITHUB_WORKSPACE/{ROOT_NONCE}"
+if [ "$(cat "$f" 2>/dev/null)" != {nonce} ] || [ "$(cat "$r" 2>/dev/null)" != {nonce} ]; then
+  if [ -e "$f" ] || [ -e "$r" ]; then
+    seen="an older checkout"
+  else
+    seen="no checkout"
+  fi
+  echo "::error::this job does not see the checkout shipcheck made for it, it sees $seen. The Docker engine shows stale or missing files"
+  exit 1
+fi
+"#
         ),
     );
 
@@ -1316,6 +1407,78 @@ fn unsupported_jobs(log: &str) -> Vec<String> {
         .collect()
 }
 
+/// What separates a run's act process from another's: its containers, apt volume and network
+fn run_tag(run_dir: &Path) -> String {
+    cache::hex(&Sha256::digest(run_dir.to_string_lossy().as_bytes())[..4])
+}
+
+fn network_name(run_dir: &Path) -> String {
+    format!("{}net-{}", home_prefix(), run_tag(run_dir))
+}
+
+/// A Docker network of the run's own, which `reclaim` removes
+struct Network {
+    name: String,
+    gateway: std::net::Ipv4Addr,
+}
+
+/**
+ * An internet job gets a bridge of its own rather than act's default, the host's network, which
+ * reaches every port on the host's loopback. A crashed run can leave the name taken, so it is
+ * removed first. Jobs with services still get the network act creates for them
+ **/
+fn create_network(run_dir: &Path) -> Result<Network, String> {
+    let name = network_name(run_dir);
+    let _ = Command::new("docker")
+        .args(["network", "rm", &name])
+        .output();
+    let out = Command::new("docker")
+        .args([
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--label",
+            "shipcheck",
+            &name,
+        ])
+        .output()
+        .map_err(|e| format!("docker network create: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "docker network create {name}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let out = Command::new("docker")
+        .args(["network", "inspect", &name, "-f"])
+        .arg("{{range .IPAM.Config}}{{.Gateway}} {{end}}")
+        .output()
+        .map_err(|e| format!("docker network inspect: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let gateway = gateway(&text)
+        .ok_or_else(|| format!("network {name} has no private IPv4 gateway: {text}"))?;
+    Ok(Network { name, gateway })
+}
+
+fn gateway(inspect: &str) -> Option<std::net::Ipv4Addr> {
+    inspect
+        .split_whitespace()
+        .find_map(|a| a.parse::<std::net::Ipv4Addr>().ok())
+        .filter(|a| a.is_private())
+}
+
+/// A bridge container on Linux reaches the host only at its network's gateway, never the host's
+/// loopback. act gives jobs this address too, unless ACTIONS_RUNTIME_URL is set as on a Mac
+fn artifact_addr(network: Option<&Network>) -> String {
+    match network {
+        Some(n) if !cfg!(target_os = "macos") => n.gateway.to_string(),
+        _ => "127.0.0.1".into(),
+    }
+}
+
 // ponytail: another process can take the port between this check and act binding it, retry the run if so
 fn free_port() -> Result<u16, String> {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -1349,6 +1512,263 @@ fn home_prefix() -> String {
     let home = crate::run::home();
     let hash = cache::hex(&Sha256::digest(home.to_string_lossy().as_bytes())[..3]);
     format!("shipcheck-{hash}-")
+}
+
+/**
+ * Setup actions that prune their cache when the `actions/cache` restore missed, or on every run,
+ * lose it each time here, since every restore misses without act's cache server. So their steps in
+ * the job and in the local composite actions it uses are rewritten, in this checkout only. Git, and
+ * so the tree and the key, never see the change. An action reached through a symlink, or one with
+ * YAML aliases, keeps its prune
+ **/
+fn keep_caches(run_dir: &Path, workflow: &str) -> Result<String, String> {
+    let mut root = workflow::load(workflow)?;
+    let before = root.clone();
+    let mut actions = Vec::new();
+
+    for job in workflow::jobs_mut(&mut root)?.values_mut() {
+        if let Some(Yaml::Array(steps)) = job.as_mut_hash().and_then(|j| j.get_mut(&key("steps"))) {
+            actions.extend(no_prune(steps));
+        }
+    }
+
+    let changed = root != before;
+
+    let mut seen = BTreeSet::new();
+
+    while let Some(action) = actions.pop() {
+        let Some(path) = local_action(run_dir, &action) else {
+            continue;
+        };
+
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+
+        let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+
+        // The branch wrote this file, and an alias bomb would expand on the host before any timeout
+        if !workflow::safe_to_load(&source) {
+            continue;
+        }
+
+        let mut action = workflow::load(&source)?;
+        let Some(Yaml::Array(steps)) = action
+            .get_mut(&key("runs"))
+            .and_then(|r| r.as_mut_hash())
+            .and_then(|r| r.get_mut(&key("steps")))
+        else {
+            continue;
+        };
+        let before = steps.clone();
+        actions.extend(no_prune(steps));
+
+        if *steps != before {
+            fs::write(&path, workflow::emit(action)?).map_err(|e| e.to_string())?;
+        }
+    }
+
+    if changed {
+        workflow::emit(root)
+    } else {
+        Ok(workflow.to_string())
+    }
+}
+
+/**
+ * Sets `prune-cache: false` on setup-uv steps. pnpm/action-setup has no such input and runs
+ * `pnpm store prune` after any `run_install`, which empties a store that `node_modules` copies from,
+ * so its installs move to steps of their own. Returns the local actions the steps use
+ **/
+fn no_prune(steps: &mut Vec<Yaml>) -> Vec<String> {
+    let mut local = Vec::new();
+    let mut i = 0;
+
+    while i < steps.len() {
+        let Some(step) = steps[i].as_mut_hash() else {
+            i += 1;
+            continue;
+        };
+        let uses = step
+            .get(&key("uses"))
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut installs = Vec::new();
+
+        if uses.starts_with("./") {
+            local.push(uses);
+        } else if uses.starts_with("astral-sh/setup-uv@") {
+            let with = step
+                .entry(key("with"))
+                .or_insert_with(|| Yaml::Hash(Hash::new()));
+
+            if let Yaml::Hash(with) = with {
+                with.insert(key("prune-cache"), key("false"));
+            }
+        } else if uses.starts_with("pnpm/action-setup@")
+            && let Some(Yaml::Hash(with)) = step.get_mut(&key("with"))
+            && let Some(runs) = with.get(&key("run_install")).and_then(pnpm_installs)
+        {
+            with.remove(&key("run_install"));
+            installs = runs
+                .into_iter()
+                .map(|(run, cwd)| install_step(step, run, cwd))
+                .collect();
+        }
+
+        i += 1;
+
+        for install in installs {
+            steps.insert(i, install);
+            i += 1;
+        }
+    }
+
+    local
+}
+
+/// The commands pnpm/action-setup runs for `run_install`, with their `cwd`. None leaves the step
+/// alone: no install, an expression, or a value the action itself would refuse
+fn pnpm_installs(input: &Yaml) -> Option<Vec<(String, Option<String>)>> {
+    let text = match input {
+        Yaml::Boolean(b) => b.to_string(),
+        Yaml::String(s) if !s.contains("${{") => s.clone(),
+        _ => return None,
+    };
+
+    if !workflow::safe_to_load(&text) {
+        return None;
+    }
+
+    let entries = match yaml_rust2::YamlLoader::load_from_str(&text).ok()?.pop()? {
+        Yaml::Boolean(true) => vec![Yaml::Hash(Hash::from_iter([(
+            key("recursive"),
+            Yaml::Boolean(true),
+        )]))],
+        Yaml::Hash(h) => vec![Yaml::Hash(h)],
+        Yaml::Array(a) if !a.is_empty() => a,
+        _ => return None,
+    };
+    let mut runs = Vec::new();
+
+    for entry in entries {
+        let (mut recursive, mut cwd, mut args) = (false, None, Vec::new());
+
+        for (k, v) in entry.into_hash()? {
+            match (k.as_str()?, v) {
+                ("recursive", Yaml::Boolean(b)) => recursive = b,
+                ("cwd", Yaml::String(dir)) => cwd = Some(dir),
+                ("args", Yaml::Array(a)) => {
+                    args = a
+                        .iter()
+                        .map(|a| a.as_str().map(String::from))
+                        .collect::<Option<_>>()?
+                }
+                _ => return None,
+            }
+        }
+
+        let cmd = [
+            "pnpm",
+            if recursive {
+                "recursive install"
+            } else {
+                "install"
+            },
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain(args);
+        runs.push((cmd.collect::<Vec<_>>().join(" "), cwd));
+    }
+
+    Some(runs)
+}
+
+/// A step that runs one of the setup step's installs, under the setup step's condition and env
+fn install_step(setup: &Hash, run: String, cwd: Option<String>) -> Yaml {
+    let mut h = Hash::new();
+    h.insert(key("name"), key(&run));
+
+    for field in ["if", "env", "continue-on-error"] {
+        if let Some(v) = setup.get(&key(field)) {
+            h.insert(key(field), v.clone());
+        }
+    }
+
+    h.insert(key("run"), key(&run));
+    // Composite actions need a shell on every run step
+    h.insert(key("shell"), key("bash"));
+
+    if let Some(dir) = cwd {
+        h.insert(key("working-directory"), key(&dir));
+    }
+
+    Yaml::Hash(h)
+}
+
+/// The `action.yml` of a `uses: ./dir` action inside the checkout, if no part of its path is a link
+fn local_action(run_dir: &Path, uses: &str) -> Option<PathBuf> {
+    let rel = Path::new(uses.strip_prefix("./")?);
+
+    if !rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+
+    let mut path = run_dir.to_path_buf();
+
+    for part in rel.components() {
+        path.push(part);
+
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            return None;
+        }
+    }
+
+    ["action.yml", "action.yaml"]
+        .map(|f| path.join(f))
+        .into_iter()
+        .find(|f| fs::symlink_metadata(f).is_ok_and(|m| m.is_file()))
+}
+
+/// A new anonymous volume at the checkout's `.venv`, so a Python venv lives off the macOS bind mount
+/// and starts empty each run. act splits its container options as a shell would, hence the quotes
+fn venv_mount(run_dir: &Path) -> Result<String, String> {
+    let dir = run_dir.join(".venv");
+    let dir = dir
+        .to_str()
+        .filter(|d| !d.contains(['\'', ',']))
+        .ok_or_else(|| {
+            format!(
+                "{}: a run directory needs a path without quotes or commas",
+                run_dir.display()
+            )
+        })?;
+    Ok(format!("--mount 'type=volume,dst={dir}'"))
+}
+
+/// `cache_paths` share a volume per repository, `slot_paths` get one per slot and job, as `tag` names
+fn mounts(
+    config: &config::Act,
+    repo_id: &str,
+    tag: &str,
+    run_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let shared = config
+        .cache_paths
+        .iter()
+        .map(|p| (volume_name(repo_id, p), p));
+    let slot = (config.slot_paths.iter()).map(|p| (volume_name(repo_id, &format!("{tag}{p}")), p));
+    let mut mounts: Vec<String> = shared
+        .chain(slot)
+        .map(|(v, p)| format!("-v {v}:{p}"))
+        .collect();
+    mounts.push(venv_mount(run_dir)?);
+    Ok(mounts)
 }
 
 fn volume_name(repo_id: &str, path: &str) -> String {
@@ -1410,9 +1830,187 @@ jobs:
     }
 
     #[test]
+    fn the_checkout_step_needs_both_nonces() {
+        let script = nonce_step("abc")["run"].as_str().unwrap().to_string();
+        let run = |dir: &Path| {
+            let out = Command::new("sh")
+                .args(["-e", "-c", &script])
+                .env("GITHUB_WORKSPACE", dir)
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(&git).unwrap();
+
+        let (ok, out) = run(dir.path());
+        assert!(!ok && out.contains("it sees no checkout"), "{out}");
+
+        fs::write(git.join(NONCE_FILE), "old").unwrap();
+        let (ok, out) = run(dir.path());
+        assert!(!ok && out.contains("it sees an older checkout"), "{out}");
+
+        fs::write(git.join(NONCE_FILE), "abc").unwrap();
+        let (ok, out) = run(dir.path());
+        assert!(
+            !ok && out.contains("an older checkout"),
+            "no root nonce: {out}"
+        );
+
+        write_nonces(dir.path(), "abc").unwrap();
+        assert_eq!(run(dir.path()), (true, String::new()));
+    }
+
+    #[test]
+    fn the_root_nonce_replaces_a_planted_link_and_stays_out_of_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(outside.path().join("zshrc"), "mine").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("zshrc"), dir.path().join(ROOT_NONCE))
+            .unwrap();
+        write_nonces(dir.path(), "abc").unwrap();
+        assert_eq!(
+            fs::read_to_string(outside.path().join("zshrc")).unwrap(),
+            "mine"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(ROOT_NONCE)).unwrap(),
+            "abc"
+        );
+        let exclude = fs::read_to_string(dir.path().join(".git/info/exclude")).unwrap();
+        assert!(exclude.contains("/.shipcheck-nonce\n"));
+    }
+
+    #[test]
+    fn shards_pytest_only_when_the_config_asks() {
+        let wf = "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: uv run pytest\n";
+        let off = Act::default().prepare(wf, "ci.yml").unwrap();
+        assert!(
+            !off.contains(shard::MARK),
+            "a config without shard_tests must keep its key"
+        );
+        let on = Act::default()
+            .with_shards(config::ShardTests::Fixed(3))
+            .prepare(wf, "ci.yml")
+            .unwrap();
+        let step = &load(&on)["jobs"]["t"]["steps"][1];
+        assert_eq!(
+            step["name"].as_str(),
+            Some("Run uv run pytest (shipcheck: 3 shards)")
+        );
+        assert!(
+            !on.contains("nproc"),
+            "the shard count must stay out of the key"
+        );
+    }
+
+    #[test]
     fn keeps_existing_triggers() {
         let out = load(&inject(CI, "n").unwrap());
         assert_eq!(out["on"]["push"]["branches"][0].as_str(), Some("main"));
+    }
+
+    #[test]
+    fn setup_uv_keeps_its_cache_in_the_checkout_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let setup = dir.path().join(".github/actions/setup");
+        fs::create_dir_all(&setup).unwrap();
+        let composite = "runs:\n  using: composite\n  steps:\n    - uses: astral-sh/setup-uv@v7\n      with:\n        enable-cache: true\n";
+        fs::write(setup.join("action.yml"), composite).unwrap();
+        fs::write(outside.path().join("action.yml"), composite).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".github/actions/linked"))
+            .unwrap();
+        let wf = "on: push\njobs:\n  t:\n    steps:\n      - uses: astral-sh/setup-uv@v6\n      - uses: ./.github/actions/setup\n      - uses: ./.github/actions/linked\n      - uses: ./../escape\n";
+
+        let out = load(&keep_caches(dir.path(), wf).unwrap());
+        assert_eq!(
+            out["jobs"]["t"]["steps"][0]["with"]["prune-cache"].as_str(),
+            Some("false")
+        );
+        let action = load(&fs::read_to_string(setup.join("action.yml")).unwrap());
+        let with = &action["runs"]["steps"][0]["with"];
+        assert_eq!(with["prune-cache"].as_str(), Some("false"));
+        assert_eq!(with["enable-cache"].as_bool(), Some(true));
+        assert_eq!(
+            fs::read_to_string(outside.path().join("action.yml")).unwrap(),
+            composite
+        );
+
+        let plain = "on: push\njobs:\n  t:\n    steps:\n      - run: true\n";
+        assert_eq!(keep_caches(dir.path(), plain).unwrap(), plain);
+
+        // An action.yml with aliases is left as the branch wrote it, never expanded
+        let bomb = "a: &a [x, x]\nb: &b [*a, *a]\nruns:\n  using: composite\n  steps:\n    - uses: astral-sh/setup-uv@v7\n";
+        fs::write(setup.join("action.yml"), bomb).unwrap();
+        keep_caches(dir.path(), wf).unwrap();
+        assert_eq!(fs::read_to_string(setup.join("action.yml")).unwrap(), bomb);
+    }
+
+    #[test]
+    fn pnpm_installs_move_out_of_the_setup_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let setup = dir.path().join("setup");
+        fs::create_dir_all(&setup).unwrap();
+        let composite = "runs:\n  using: composite\n  steps:\n    - uses: pnpm/action-setup@v4\n      with:\n        run_install: true\n";
+        fs::write(setup.join("action.yml"), composite).unwrap();
+        let bomb = dir.path().join("bomb");
+        fs::create_dir_all(&bomb).unwrap();
+        let aliased = "a: &a [x]\nruns:\n  using: composite\n  steps:\n    - uses: pnpm/action-setup@v4\n      with: {run_install: true, b: *a}\n";
+        fs::write(bomb.join("action.yml"), aliased).unwrap();
+        let wf = r#"on: push
+jobs:
+  t:
+    steps:
+      - uses: pnpm/action-setup@v4
+        if: always()
+        env: {CI: "1"}
+        with:
+          version: 10
+          run_install: |
+            - args: [--frozen-lockfile]
+              recursive: true
+            - cwd: web
+      - uses: pnpm/action-setup@v4
+        with: {run_install: "${{ matrix.install }}"}
+      - uses: pnpm/action-setup@v4
+        with: {run_install: false}
+      - uses: ./setup
+      - uses: ./bomb
+"#;
+        let out = load(&keep_caches(dir.path(), wf).unwrap());
+        let steps = out["jobs"]["t"]["steps"].as_vec().unwrap();
+        assert_eq!(steps.len(), 7);
+        assert!(steps[0]["with"]["run_install"].is_badvalue());
+        assert_eq!(steps[0]["with"]["version"].as_i64(), Some(10));
+        assert_eq!(
+            steps[1]["run"].as_str(),
+            Some("pnpm recursive install --frozen-lockfile")
+        );
+        assert_eq!(steps[1]["if"].as_str(), Some("always()"));
+        assert_eq!(steps[1]["env"]["CI"].as_str(), Some("1"));
+        assert_eq!(steps[2]["run"].as_str(), Some("pnpm install"));
+        assert_eq!(steps[2]["working-directory"].as_str(), Some("web"));
+        assert_eq!(
+            steps[3]["with"]["run_install"].as_str(),
+            Some("${{ matrix.install }}")
+        );
+        assert_eq!(steps[4]["with"]["run_install"].as_bool(), Some(false));
+
+        let action = load(&fs::read_to_string(setup.join("action.yml")).unwrap());
+        let inner = action["runs"]["steps"].as_vec().unwrap();
+        assert!(inner[0]["with"]["run_install"].is_badvalue());
+        assert_eq!(inner[1]["run"].as_str(), Some("pnpm recursive install"));
+        assert_eq!(inner[1]["shell"].as_str(), Some("bash"));
+        assert_eq!(
+            fs::read_to_string(bomb.join("action.yml")).unwrap(),
+            aliased
+        );
     }
 
     #[test]
@@ -1814,6 +2412,26 @@ jobs:
     }
 
     #[test]
+    fn the_artifact_server_listens_on_the_run_network_gateway_or_loopback() {
+        assert_eq!(gateway("172.18.0.1 "), Some([172, 18, 0, 1].into()));
+        assert_eq!(gateway("fd00::1 10.1.0.1"), Some([10, 1, 0, 1].into()));
+        assert_eq!(gateway("8.8.8.8"), None);
+        assert_eq!(gateway(""), None);
+        assert_eq!(artifact_addr(None), "127.0.0.1");
+        let net = Network {
+            name: network_name(Path::new("/x")),
+            gateway: [172, 18, 0, 1].into(),
+        };
+        let want = if cfg!(target_os = "macos") {
+            "127.0.0.1"
+        } else {
+            "172.18.0.1"
+        };
+        assert_eq!(artifact_addr(Some(&net)), want);
+        assert!(net.name.starts_with(&format!("{}net-", home_prefix())));
+    }
+
+    #[test]
     fn refuses_docker_options_that_reach_the_host() {
         let with = |job: &str| {
             format!("on: push\njobs:\n  t:\n    runs-on: x\n{job}    steps: [{{run: echo}}]\n")
@@ -2142,7 +2760,7 @@ jobs:
         assert!(job["needs"].is_badvalue());
         assert_eq!(job["if"].as_str(), Some("'success' == 'success'"));
         let guard = job["steps"][0]["run"].as_str().unwrap();
-        assert!(guard.contains("/.git/shipcheck-nonce") && guard.contains("= 5eed ||"));
+        assert!(guard.contains("/.git/shipcheck-nonce") && guard.contains("!= 5eed ]"));
         assert_eq!(job["steps"][0]["shell"].as_str(), Some("sh"));
         assert_eq!(
             job["steps"][1]["run"].as_str(),
@@ -2280,9 +2898,32 @@ jobs:
     }
 
     #[test]
+    fn slot_paths_get_a_volume_per_slot_and_job() {
+        let act = config::Act::default();
+        let run = Path::new("/r");
+        let a = mounts(&act, "o/r", "aaaa", run).unwrap();
+        let b = mounts(&act, "o/r", "bbbb", run).unwrap();
+        let apt = |m: &[String]| {
+            m.iter()
+                .find(|m| m.ends_with(":/var/lib/apt/lists"))
+                .cloned()
+        };
+        assert_ne!(apt(&a), apt(&b));
+        assert!(apt(&a).unwrap().contains("-aaaa-var-lib-apt-lists:"));
+        let npm = |m: &[String]| m.iter().find(|m| m.ends_with(":/root/.npm")).cloned();
+        assert_eq!(npm(&a), npm(&b));
+        assert_eq!(a.last().unwrap(), "--mount 'type=volume,dst=/r/.venv'");
+    }
+
+    #[test]
     fn volume_prefixes_never_overlap_between_repos() {
         let (ab, abc) = (volume_prefix("a/b"), volume_prefix("a/b-c"));
         assert!(!volume_name("a/b-c", "/x").starts_with(&ab));
+        assert_eq!(
+            venv_mount(Path::new("/Users/a/Application Support/r")).unwrap(),
+            "--mount 'type=volume,dst=/Users/a/Application Support/r/.venv'"
+        );
+        assert!(venv_mount(Path::new("/a'b")).is_err());
         assert!(!volume_name("a/b", "/x").starts_with(&abc));
         assert!(volume_name("a/b", "/x").starts_with(&ab));
     }

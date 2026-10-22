@@ -4,9 +4,11 @@ description = "What shipcheck needs on the machine, and how to install it."
 weight = 10
 +++
 
+A repository in host mode needs no Docker: on a Mac, only shipcheck, and on Linux, shipcheck and bubblewrap. Docker is for act mode ([modes](@/docs/config.md#modes)).
+
 ## Set up a Mac
 
-Tested on macOS with Docker Desktop on Apple silicon.
+Tested on macOS with Docker Desktop on Apple silicon. Host mode uses macOS's own `sandbox-exec`.
 
 1. Install shipcheck with [Homebrew](https://brew.sh). It also installs act, git and the Docker client:
 
@@ -39,6 +41,16 @@ macOS disks use APFS, so each job's checkout is a copy-on-write clone and costs 
 ## Set up Linux
 
 Tested on Debian 13 with Docker Engine 29 on x86_64.
+
+For host mode, install bubblewrap, which runs each check in a sandbox: `sudo apt install bubblewrap` or `sudo dnf install bubblewrap`. Ubuntu 23.10 and later let only programs with an AppArmor profile create user namespaces, which bubblewrap needs. Allow bwrap alone with the profile apparmor ships, and leave the restriction on for everything else:
+
+```sh
+sudo apt install apparmor-profiles
+sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+`shipcheck doctor` runs bwrap once. When it fails and `/proc/sys/kernel/apparmor_restrict_unprivileged_userns` is 1, it prints these commands, or only the last one when the profile is in `/etc/apparmor.d` but not loaded. Without a working bubblewrap, host mode refuses to run.
 
 1. Install [Docker Engine](https://docs.docker.com/engine/install/) from Docker's own package repository, which brings a current runc. shipcheck refuses runc before 1.2.8 or 1.3.3, which have known container escapes.
 

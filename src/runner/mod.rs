@@ -5,6 +5,8 @@ use std::time::Duration;
 use crate::config::{RepoConfig, RunnerKind};
 
 pub mod act;
+pub mod host;
+pub mod shard;
 
 /// What executes a workflow. The cache, checkouts, markers, hooks and checks are shared
 pub trait Runner: Sync {
@@ -43,6 +45,10 @@ pub struct RunRequest<'a> {
     pub artifacts: &'a Path,
     pub repo_id: &'a str,
     pub timeout: Duration,
+    /// Run the job's pytest step in shards, if the prepared workflow has one
+    pub shard: bool,
+    /// The tree is the base's, so what the job leaves in shared caches may reach runs of the base
+    pub on_base: bool,
 }
 
 pub struct Outcome {
@@ -52,10 +58,18 @@ pub struct Outcome {
     pub unsupported_jobs: Vec<String>,
     /// The job's `outputs`, for the jobs that need it
     pub outputs: BTreeMap<String, String>,
+    /// How many shards the job's pytest step ran in, when it ran sharded
+    pub shards: Option<u32>,
 }
 
-pub fn from_config(config: &RepoConfig) -> Box<dyn Runner> {
+/// `repo` is the checkout the run reads git from, where host mode runs its `versions`
+pub fn from_config(config: &RepoConfig, repo: &Path) -> Box<dyn Runner> {
     match config.runner {
-        RunnerKind::Act => Box::new(act::Act::new(config.act.clone()).with_network(config.network)),
+        RunnerKind::Host => Box::new(host::Host::new(config.host.clone(), repo)),
+        RunnerKind::Act => Box::new(
+            act::Act::new(config.act.clone())
+                .with_network(config.network)
+                .with_shards(config.shard_tests),
+        ),
     }
 }

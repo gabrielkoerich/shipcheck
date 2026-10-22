@@ -1194,6 +1194,7 @@ dependencies = [
  "git-cow",
  "globset",
  "jsonwebtoken",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

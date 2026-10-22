@@ -3,9 +3,9 @@ use std::process::{Command, ExitCode};
 
 use shipcheck::config::Trigger;
 use shipcheck::service::{self, Poster};
-use shipcheck::{check, config, github, run, setup};
+use shipcheck::{agents, check, config, github, run, setup};
 
-const USAGE: &str = "usage: shipcheck run [--sha <rev>] [--no-fetch] [--base <ref>] | status [<rev>] | logs [<rev>] | post [<rev>] [--with-logs] | login | logout | clean [--all] | init | install | doctor";
+const USAGE: &str = "usage: shipcheck run [--sha <rev> | --staged] [--no-fetch] [--base <ref>] | status [<rev> | --staged] | logs [<rev>] | commit -m <message> [--allow-failed] | post [<rev>] [--with-logs] [--home-ok] | login | logout | clean [--all] | init | install | doctor | hook <agent> <event> | daemon [--home-ok]";
 
 fn main() -> ExitCode {
     let existing = std::env::var("GIT_CONFIG_COUNT")
@@ -27,24 +27,72 @@ fn main() -> ExitCode {
     }
 }
 
+const COMMANDS: &[&str] = &[
+    "run",
+    "status",
+    "logs",
+    "commit",
+    "post",
+    "login",
+    "logout",
+    "clean",
+    "init",
+    "install",
+    "doctor",
+    "daemon",
+    "on-commit",
+    "on-push",
+    "hook",
+];
+
 fn cli(args: Vec<String>) -> Result<ExitCode, String> {
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    // Help for an unknown command is an error, so a tool can test which commands this version has
+    let known = COMMANDS.contains(&args.first().map(String::as_str).unwrap_or_default());
+
+    if args.iter().any(|a| a == "-h" || a == "--help")
+        && (known || matches!(args.first().map(String::as_str), Some("-h" | "--help")))
+    {
         println!("{USAGE}\n\nDocs: https://shipcheck.run/docs/");
         return Ok(ExitCode::SUCCESS);
     }
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+
+    if args.first().map(String::as_str) == Some("commit") {
+        return commit(&cwd, &args[1..]);
+    }
+
+    // Called by the agents' hooks with their JSON on stdin, so it never fails
+    if args.first().map(String::as_str) == Some("hook") {
+        let mut input = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+        let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or_default();
+
+        if let Some(reply) = shipcheck::hook::reply(arg(1), arg(2), &input) {
+            println!("{reply}");
+        }
+
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mut rev = "HEAD".to_string();
     let mut fetch = true;
     let mut base = "origin/main".to_string();
     let mut with_logs = false;
     let mut all = false;
+    let mut explicit = false;
+    let mut staged = false;
+    let mut home_ok = false;
     let mut rest = args.iter().skip(1);
 
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--sha" => {
                 rev = rest.next().ok_or("--sha needs a revision")?.clone();
+                explicit = true;
+            }
+            "--staged" => {
+                staged = true;
             }
             "--no-fetch" => {
                 fetch = false;
@@ -55,6 +103,9 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             "--all" => {
                 all = true;
             }
+            "--home-ok" => {
+                home_ok = true;
+            }
             "--base" => {
                 // For trials: read shipcheck.toml and the workflows from another ref than origin/main
                 base = rest.next().ok_or("--base needs a ref")?.clone();
@@ -62,6 +113,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             }
             other if !other.starts_with('-') => {
                 rev = other.to_string();
+                explicit = true;
             }
             other => {
                 return Err(format!("unknown option {other}\n{USAGE}"));
@@ -83,7 +135,10 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             }
 
             let started = std::time::Instant::now();
-            let plan = run::plan(&cwd, &rev, &base)?;
+            let (tested, snapshot) = subject(&cwd, &rev, explicit, staged)?;
+            let plan = run::plan(&cwd, &tested, &base)?;
+            let what = snapshot.map_or_else(|| plan.sha[..12].to_string(), String::from);
+            let tree = &plan.tree[..12];
 
             if plan.defaults {
                 println!(
@@ -92,21 +147,55 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
                 );
             }
 
+            if snapshot.is_some() && !staged {
+                warn_untracked(&plan.repo)?;
+            }
+
             let _key = run::lock_key(&plan.key)?;
 
             // Only a pass is reused, a cached failure runs again so a flaky one cannot stick
-            if let Some(entry) = run::lookup(&plan).filter(|e| e.passed) {
-                println!(
-                    "cached result for tree {} in {:.1?}",
-                    plan.tree,
-                    started.elapsed()
-                );
-                return Ok(report(&entry));
+            let entry = match run::lookup(&plan).filter(|e| e.passed) {
+                Some(entry) => {
+                    println!(
+                        "tested {what}, tree {tree}: cached result in {:.1?}",
+                        started.elapsed()
+                    );
+                    entry
+                }
+                None => {
+                    let entry = run::run(&plan, &mut |line| println!("{}", run::printable(line)))?;
+                    println!(
+                        "tested {what}, tree {tree}: ran in {:.1?}",
+                        started.elapsed()
+                    );
+                    entry
+                }
+            };
+            let code = report(&entry);
+
+            if !explicit {
+                run::record_tested(
+                    &plan.repo,
+                    &run::Tested {
+                        tree: plan.tree.clone(),
+                        staged,
+                        passed: entry.passed,
+                    },
+                )?;
             }
 
-            let entry = run::run(&plan, &mut |line| println!("{}", run::printable(line)))?;
-            println!("ran in {:.1?}", started.elapsed());
-            Ok(report(&entry))
+            if snapshot.is_some() {
+                let git = if staged {
+                    "git commit"
+                } else {
+                    "git add -A && git commit"
+                };
+                println!(
+                    "commit exactly what ran with `shipcheck commit -m <message>` (or `{git}`) to reuse this result"
+                );
+            }
+
+            Ok(code)
         }
         Some("doctor") => {
             let checks = shipcheck::doctor::checks(&cwd, &base);
@@ -128,7 +217,22 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             }
         }
         Some("status") => {
-            let plan = run::plan(&cwd, &rev, &base)?;
+            // Before a commit, whether committing all of it or the index as it is reuses a result
+            if !explicit {
+                for (label, staged) in [("working copy", false), ("index", true)] {
+                    let (tested, _) = subject(&cwd, &rev, false, staged)?;
+                    let plan = run::plan(&cwd, &tested, &base)?;
+                    let verdict = match run::lookup(&plan) {
+                        Some(e) if e.passed => "passed",
+                        Some(_) => "failed",
+                        None => "no result",
+                    };
+                    println!("{label}, tree {}: {verdict}", &plan.tree[..12]);
+                }
+            }
+
+            let (tested, _) = subject(&cwd, &rev, explicit, staged)?;
+            let plan = run::plan(&cwd, &tested, &base)?;
 
             match run::lookup(&plan) {
                 Some(entry) => Ok(report(&entry)),
@@ -139,11 +243,13 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             }
         }
         Some("logs") => {
-            let plan = run::plan(&cwd, &rev, &base)?;
+            let (tested, _) = subject(&cwd, &rev, explicit, staged)?;
+            let plan = run::plan(&cwd, &tested, &base)?;
             print_logs(&run::log_dir(&plan.key))?;
             Ok(ExitCode::SUCCESS)
         }
         Some("post") => {
+            refuse_moved_home(home_ok)?;
             let plan = run::plan(&cwd, &rev, &base)?;
 
             if plan.defaults {
@@ -236,6 +342,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some("daemon") => {
+            refuse_moved_home(home_ok)?;
             let config = shipcheck::daemon::DaemonConfig::load()?;
             let app = github::App::from_env()?;
             println!(
@@ -248,20 +355,141 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
         Some("init") => {
             let root = toplevel(&cwd)?;
 
-            if let Some(file) = setup::init(&root)? {
-                println!("wrote {file}");
+            if let Some(wrote) = setup::init(&root)? {
+                println!("{wrote}");
             }
 
+            for line in agents::instructions(&root)? {
+                println!("{line}");
+            }
+
+            install_agents(&root);
             println!("{}", setup::install(&root)?);
-            println!("next: review shipcheck.toml, commit it, and merge to main");
+            println!("next: review shipcheck.toml and AGENTS.md, commit them, and merge to main");
             Ok(ExitCode::SUCCESS)
         }
         Some("install") => {
+            install_agents(&toplevel(&cwd)?);
             println!("{}", setup::install(&toplevel(&cwd)?)?);
             Ok(ExitCode::SUCCESS)
         }
         _ => Err(USAGE.into()),
     }
+}
+
+fn install_agents(root: &Path) {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+
+    for line in agents::install(root, &home, &run::home()) {
+        println!("{line}");
+    }
+}
+
+/// An agent can point SHIPCHECK_HOME at a folder it wrote, so only a person passes `--home-ok`
+fn refuse_moved_home(home_ok: bool) -> Result<(), String> {
+    if run::home_overridden() && !home_ok {
+        return Err(format!(
+            "SHIPCHECK_HOME is {}, not the default {}, so its results may not come from runs. A person who set it can pass --home-ok",
+            run::home().display(),
+            run::default_home().display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// What `run`, `status` and `logs` test with no revision: the working copy, or the index with
+/// `--staged`, as a commit no ref names, else HEAD when it has no change. Named when not a commit
+fn subject(
+    cwd: &Path,
+    rev: &str,
+    explicit: bool,
+    staged: bool,
+) -> Result<(String, Option<&'static str>), String> {
+    if explicit {
+        return Ok((rev.to_string(), None));
+    }
+
+    let what = if staged {
+        "the index"
+    } else {
+        "the working copy"
+    };
+
+    Ok(match run::snapshot(cwd, staged)? {
+        Some(sha) => (sha, Some(what)),
+        None => (rev.to_string(), None),
+    })
+}
+
+/// Untracked files change the tree, so a stray one makes the commit miss the result
+fn warn_untracked(repo: &Path) -> Result<(), String> {
+    let files = run::untracked(repo)?;
+
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    let mut names = files
+        .iter()
+        .take(20)
+        .map(|f| run::printable(f))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if files.len() > 20 {
+        names.push_str(&format!(" and {} more", files.len() - 20));
+    }
+
+    let count = match files.len() {
+        1 => "1 untracked file is".to_string(),
+        n => format!("{n} untracked files are"),
+    };
+    println!(
+        "{count} part of this run: {names}. Gitignore or delete them if they are not part of the change"
+    );
+    Ok(())
+}
+
+/// `shipcheck commit -m <msg> | -F <file> [--allow-failed] [--no-verify]`: commits the tree the last run tested
+fn commit(cwd: &Path, args: &[String]) -> Result<ExitCode, String> {
+    let mut git_args = Vec::new();
+    let mut allow_failed = false;
+    let mut rest = args.iter();
+
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "-m" | "-F" => {
+                let value = rest.next().ok_or(format!("{arg} needs a value"))?;
+                git_args.extend([arg.clone(), value.clone()]);
+            }
+            "--allow-failed" => {
+                allow_failed = true;
+            }
+            "--no-verify" => {
+                git_args.push(arg.clone());
+            }
+            other => {
+                return Err(format!(
+                    "unknown option {other}\nusage: shipcheck commit -m <message> | -F <file> [--allow-failed] [--no-verify]"
+                ));
+            }
+        }
+    }
+
+    if !git_args.iter().any(|a| a == "-m" || a == "-F") {
+        return Err("shipcheck commit needs -m <message> or -F <file>".into());
+    }
+
+    let tested =
+        run::last_tested(&toplevel(cwd)?).ok_or("no `shipcheck run` of this working copy yet")?;
+    let sha = run::commit(cwd, &tested, &git_args, allow_failed)?;
+    println!(
+        "committed {}, the tree that {} in `shipcheck run`",
+        &sha[..12],
+        if tested.passed { "passed" } else { "failed" }
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn current_branch(cwd: &Path) -> String {
@@ -389,7 +617,9 @@ fn toplevel(cwd: &Path) -> Result<std::path::PathBuf, String> {
 
 fn report(entry: &run::Entry) -> ExitCode {
     if !entry.ci_changes.is_empty() {
-        println!("this commit changes CI, which did not run, the base's versions did:");
+        println!(
+            "this commit changes CI: workflow and shipcheck.toml changes did not run, the base's versions did, changes to what a command runs did run:"
+        );
 
         for change in &entry.ci_changes {
             println!("  {change}");
@@ -411,7 +641,7 @@ fn report(entry: &run::Entry) -> ExitCode {
         };
         println!(
             "{}: {}, {exit}, {attempts}",
-            wf.file,
+            check::name(&wf.file),
             if wf.passed { "passed" } else { "failed" },
         );
 

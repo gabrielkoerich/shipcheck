@@ -1,9 +1,11 @@
+pub mod agents;
 pub mod cache;
 pub mod check;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod github;
+pub mod hook;
 pub mod run;
 pub mod runner;
 pub mod service;

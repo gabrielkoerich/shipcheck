@@ -24,5 +24,16 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # Host mode runs checks in bubblewrap, which Ubuntu's AppArmor blocks from making user namespaces.
+      # These are the commands the install docs give, so CI proves them. Turning the restriction off
+      # with sysctl would also do on a throwaway runner, never on a user's machine
+      - timeout-minutes: 5
+        run: |
+          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          sudo apt-get $apt update -q && sudo apt-get $apt install -y bubblewrap apparmor-profiles
+          sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true
       - run: cargo test
 

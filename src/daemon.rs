@@ -193,6 +193,11 @@ fn handle(
         return Ok(None);
     }
 
+    // Host mode runs a commit's code as this user outside any container, so never a fork's, not even from the cache
+    if plan.config.runner == crate::config::RunnerKind::Host && pr.head_repo != repo {
+        return Ok(Some("not checked, host mode never checks a fork's PR"));
+    }
+
     // Shows the check without a result: in_progress while a run goes, queued while none does
     let mark = |running: bool| -> Result<u64, String> {
         let wanted = if running { "in_progress" } else { "queued" };

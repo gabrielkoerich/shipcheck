@@ -13,7 +13,7 @@
       <path d="M38 22l8-14h28l8 14" fill="#F5C518" stroke="#16181D" stroke-width="4" stroke-linejoin="round"/>
     </svg>
     <h1>Your agent already ran the tests. Let that run be the check.</h1>
-    <p class="lede">shipcheck runs your GitHub Actions workflows on your machine, keeps the result for that exact git tree, and posts the required check. A PR whose tree was already tested gets its check in under a second.</p>
+    <p class="lede">shipcheck runs your checks on your machine, natively in a sandbox or as your GitHub Actions workflows in containers, keeps the result for that exact git tree, and posts the required check. A PR whose tree was already tested gets its check in under a second.</p>
 
     <div class="install" data-tabs>
       <div class="tabs" role="tablist" aria-label="Install with">
@@ -57,9 +57,9 @@
   <section id="how" class="how">
     <h2>How it works</h2>
     <ol class="steps">
-      <li><strong>The agent commits and pushes.</strong> A git hook starts <code>shipcheck</code> in the background for that commit. Nothing waits, and a newer commit stops the older run.</li>
+      <li><strong>The agent runs <code>shipcheck run</code> instead of its tests.</strong> shipcheck tests the working copy as it is, in its own clone, and the agent commits it with <code>shipcheck commit</code>. The commit's tree already ran, so its check needs no new run. A commit nobody tested starts a background run from a git hook.</li>
       <li><strong>shipcheck reads what to run from main.</strong> <code>shipcheck.toml</code> and the workflows come from <code>origin/main</code>, never from the branch, so a PR cannot change what checks it.</li>
-      <li><strong>It runs the workflows in a warm, clean checkout.</strong> A copy-on-write clone of the commit keeps the build caches, act runs the jobs in Docker, and markers added to shipcheck's own copy of each workflow report every job.</li>
+      <li><strong>It runs the checks in a warm, clean checkout.</strong> A copy-on-write clone of the tree keeps the build caches. In host mode the commands run natively in an OS sandbox. In act mode act runs the workflow jobs in Docker, and markers added to shipcheck's own copy of each workflow report every job.</li>
       <li><strong>It keeps the result for the tree.</strong> The key is the git tree plus the config and runner versions, so a rebase or a squash with the same tree needs no new run.</li>
       <li><strong>The PR gets its check.</strong> shipcheck posts the result as the required <code>shipcheck</code> check. GitHub still runs your workflows on main after the merge.</li>
     </ol>

@@ -102,6 +102,33 @@ fn branch_patterns_match(patterns: &Yaml) -> bool {
     })
 }
 
+/// Each one-line `run` step with no expression, by job id, in file order
+pub fn run_steps(source: &str) -> Vec<(String, String)> {
+    let Ok(mut root) = load(source) else {
+        return Vec::new();
+    };
+    let Ok(jobs) = jobs_mut(&mut root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+
+    for (id, job) in jobs.iter() {
+        let (Some(id), Yaml::Array(steps)) = (id.as_str(), &job["steps"]) else {
+            continue;
+        };
+
+        for run in steps.iter().filter_map(|s| s["run"].as_str()) {
+            let run = run.trim();
+
+            if !run.is_empty() && !run.contains('\n') && !run.contains("${{") {
+                out.push((id.to_string(), run.to_string()));
+            }
+        }
+    }
+
+    out
+}
+
 /// Each job id with the ids in its `needs`, in file order
 pub fn job_needs(source: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let mut root = load(source)?;
@@ -160,7 +187,7 @@ pub const MAX_COMPARED: u64 = 1 << 20;
 
 /// Whether a workflow from a commit is safe to load: yaml-rust2 copies each alias as it loads, so a
 /// few hundred bytes of nested aliases take gigabytes. The event scan does not expand them
-fn safe_to_load(src: &str) -> bool {
+pub(crate) fn safe_to_load(src: &str) -> bool {
     if src.len() as u64 > MAX_COMPARED {
         return false;
     }

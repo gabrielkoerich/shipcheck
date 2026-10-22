@@ -20,7 +20,13 @@ test:
 # The end-to-end test, which needs act and Docker
 e2e:
     cargo test --test e2e -- --ignored
+    cargo test --test shard_e2e -- --ignored
+    cargo test --test retry_e2e -- --ignored
 
 # Scan the whole git history for secrets, as the leaks workflow does
 leaks:
     gitleaks git --redact --no-banner .
+
+# Bring the public gabrielkoerich/shipcheck up to main through the split, as one normal commit
+sync-public ref="main":
+    scripts/sync-public.sh {{ ref }}

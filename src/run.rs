@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{self, KeyInputs};
-use crate::config::RepoConfig;
+use crate::config::{RepoConfig, RunnerKind};
+use crate::runner::host::{self as host_runner, HOST};
+use crate::runner::shard::{self, Rejected, ShardRun};
 use crate::runner::{self, RunRequest, Runner};
 use crate::workflow;
 
@@ -41,6 +43,9 @@ pub struct WorkflowResult {
     pub log_sha256: String,
     pub jobs: BTreeMap<String, String>,
     pub passed: bool,
+    /// The jobs that had a sharded pytest step
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shards: BTreeMap<String, ShardRun>,
 }
 
 /// Everything about one commit that the cache key and a run need, read from git
@@ -103,6 +108,49 @@ pub fn home() -> PathBuf {
         PathBuf::from(state).join("shipcheck")
     } else {
         home.join(".local/state/shipcheck")
+    }
+}
+
+/// The home of a user who set nothing, from the passwd entry, since an agent can set any variable
+pub fn default_home() -> PathBuf {
+    let home = user_dir();
+
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/shipcheck")
+    } else {
+        home.join(".local/state/shipcheck")
+    }
+}
+
+/// Whether the results live somewhere else than the default, where an agent may have written them
+pub fn home_overridden() -> bool {
+    home() != default_home()
+}
+
+/// The user's home directory from the passwd entry, empty when there is none, so a check against
+/// it fails closed
+pub fn user_dir() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buf = vec![0 as libc::c_char; 16384];
+    // Safe: getpwuid_r writes only into pwd and buf, and pw_dir points into buf on success
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut found = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            libc::getuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        );
+
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            return PathBuf::new();
+        }
+
+        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
+        PathBuf::from(std::ffi::OsStr::from_bytes(dir))
     }
 }
 
@@ -184,15 +232,23 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
             (text.into_bytes(), true)
         }
     };
-    let config = RepoConfig::parse(&String::from_utf8_lossy(&config_text))?;
+    let mut config = RepoConfig::parse(&String::from_utf8_lossy(&config_text))?;
     let files: BTreeSet<String> = workflows.keys().map(|p| file_name(p)).collect();
     config.validate(&files)?;
+    let tree_files = git_raw(&repo, &["ls-tree", "-r", "-z", "--name-only", &tree])?;
+    config.act.for_tree(
+        String::from_utf8_lossy(&tree_files)
+            .split('\0')
+            .filter(|f| !f.is_empty()),
+    );
 
     // Hash required workflows as they run, so a change to the injection changes the key too
-    let runner = runner::from_config(&config);
+    let runner = runner::from_config(&config, &repo);
+    let host = config.runner == RunnerKind::Host;
     let mut as_run = BTreeMap::new();
 
-    for (path, body) in &workflows {
+    // Host mode runs no workflow, so a change to one does not change its result
+    for (path, body) in workflows.iter().filter(|_| !host) {
         let body = if config.workflows.contains(&file_name(path)) {
             as_run_body(runner.as_ref(), body, &file_name(path), "nonce")?
         } else {
@@ -205,6 +261,8 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         tree: &tree,
         config: &config_text,
         workflows: &as_run,
+        runner_kind: if host { "host" } else { "act" },
+        checks: &config.host.checks,
         runner_version: &runner.identity()?,
         shipcheck_version: env!("CARGO_PKG_VERSION"),
         platforms: &config.act.platforms,
@@ -227,9 +285,196 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
 }
 
 /**
+ * The working copy, or with `staged` the index, as a commit no ref names, with HEAD as parent, like
+ * `git stash create`. The working copy is HEAD's tree with every edit and every file that is not
+ * gitignored. It is built in a copy of the index, so the user's index, branches and stash stay as
+ * they are. None when the tree is HEAD's
+ **/
+pub fn snapshot(cwd: &Path, staged: bool) -> Result<Option<String>, String> {
+    let repo = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
+    let head = git(&repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let (index, temp) = index_paths(&repo)?;
+    let tree = snapshot_tree(&repo, &index, &temp, staged);
+    let _ = fs::remove_file(&temp);
+    let tree = tree?;
+
+    if tree == git(&repo, &["rev-parse", "HEAD^{tree}"])? {
+        return Ok(None);
+    }
+
+    let what = if staged { "index" } else { "working copy" };
+    let sha = git(
+        &repo,
+        &[
+            "-c",
+            "user.name=shipcheck",
+            "-c",
+            "user.email=shipcheck@localhost",
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-m",
+            &format!("shipcheck: the {what}"),
+        ],
+    )?;
+    Ok(Some(sha))
+}
+
+/// The worktree's real index, and the path of this process's copy of it
+fn index_paths(repo: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let index = PathBuf::from(git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?);
+    let temp = index.with_file_name(format!("shipcheck-index-{}", std::process::id()));
+    Ok((index, temp))
+}
+
+fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, staged: bool) -> Result<String, String> {
+    let with_temp = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_INDEX_FILE", temp)
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+
+        if !out.status.success() {
+            return Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    // A copy of the real index keeps its file stats, so git hashes only the files that changed
+    if index.exists() {
+        fs::copy(index, temp).map_err(|e| format!("{}: {e}", index.display()))?;
+    } else {
+        with_temp(&["read-tree", "HEAD"])?;
+    }
+
+    if !staged {
+        with_temp(&["add", "-A"])?;
+    }
+
+    with_temp(&["write-tree"])
+}
+
+/// The untracked files that are not gitignored, which a run of the working copy includes
+pub fn untracked(repo: &Path) -> Result<Vec<String>, String> {
+    let out = git_raw(
+        repo,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    Ok(out
+        .split(|b| *b == 0)
+        .filter(|n| !n.is_empty())
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .collect())
+}
+
+/// What the last `shipcheck run` of a worktree tested, which `shipcheck commit` commits
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tested {
+    pub tree: String,
+    pub staged: bool,
+    pub passed: bool,
+}
+
+fn tested_file(repo: &Path) -> PathBuf {
+    let id = cache::hex(&Sha256::digest(repo.to_string_lossy().as_bytes()));
+    home().join("tested").join(format!("{}.json", &id[..16]))
+}
+
+pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
+    let file = tested_file(repo);
+    fs::create_dir_all(file.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string(tested).map_err(|e| e.to_string())?;
+    fs::write(&file, text).map_err(|e| e.to_string())
+}
+
+pub fn last_tested(repo: &Path) -> Option<Tested> {
+    serde_json::from_str(&fs::read_to_string(tested_file(repo)).ok()?).ok()
+}
+
+/**
+ * Commits exactly the tree the last run tested, through `git commit`, so hooks, signing and the
+ * author work as usual. The commit uses a copy of the index built by the snapshot's rules, and
+ * the tree is compared on that copy, so what is compared is what is committed. The copy becomes
+ * the real index only after the commit. On any refusal the real index is untouched
+ **/
+pub fn commit(
+    cwd: &Path,
+    tested: &Tested,
+    git_args: &[String],
+    allow_failed: bool,
+) -> Result<String, String> {
+    let repo = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
+
+    if !tested.passed && !allow_failed {
+        return Err(
+            "the run failed, fix it and run `shipcheck run` again, or pass --allow-failed".into(),
+        );
+    }
+
+    let (index, temp) = index_paths(&repo)?;
+    let committed = snapshot_tree(&repo, &index, &temp, tested.staged).and_then(|tree| {
+        if tree != tested.tree {
+            return Err("files changed since the run, run `shipcheck run` again".to_string());
+        }
+
+        // From the caller's directory, so a relative `-F` file is found
+        let status = Command::new("git")
+            .current_dir(cwd)
+            .arg("commit")
+            .args(git_args)
+            .env("GIT_INDEX_FILE", &temp)
+            .status()
+            .map_err(|e| format!("git: {e}"))?;
+
+        if !status.success() {
+            return Err("git commit failed".into());
+        }
+
+        fs::rename(&temp, &index).map_err(|e| format!("{}: {e}", index.display()))
+    });
+
+    if committed.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    committed?;
+    let sha = git(&repo, &["rev-parse", "HEAD"])?;
+
+    // A pre-commit hook can change what is committed, then that commit runs again
+    if git(&repo, &["rev-parse", "HEAD^{tree}"])? != tested.tree {
+        return Err(format!(
+            "committed {}, but a hook changed its files, so it is not the tree that ran. Run `shipcheck run --sha HEAD`",
+            &sha[..12]
+        ));
+    }
+
+    Ok(sha)
+}
+
+/**
  * What the commit changes in its workflows and `shipcheck.toml` since it left the base. These never
  * run (PROOF.md), but once merged they change CI for everyone, so the check names them, and the jobs
- * a change lets fail or never runs
+ * a change lets fail or never runs. Also the files that define what a command does, such as
+ * package.json scripts, which do run from the commit in either mode
  **/
 fn ci_changes(repo: &Path, base: &str, sha: &str) -> Result<Vec<String>, String> {
     let Ok(merge_base) = git(repo, &["merge-base", base, sha]) else {
@@ -290,6 +535,62 @@ fn ci_changes(repo: &Path, base: &str, sha: &str) -> Result<Vec<String>, String>
             (None, Some(_)) => found.push(format!("{} is added", workflow::shown(&path))),
             (Some(_), None) => found.push(format!("{} is removed", workflow::shown(&path))),
             (None, None) => {}
+        }
+    }
+
+    // Under act too, since a workflow's `run: npm test` reads the branch's package.json the same way
+    found.extend(check_definition_changes(repo, &merge_base, sha)?);
+
+    Ok(found)
+}
+
+/// Files changed since the merge base whose part that defines what a command runs changed
+fn check_definition_changes(
+    repo: &Path,
+    merge_base: &str,
+    sha: &str,
+) -> Result<Vec<String>, String> {
+    let changed = git_raw(
+        repo,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            merge_base,
+            sha,
+        ],
+    )?;
+    let def = |rev: &str, path: &str| {
+        git_raw(repo, &["show", &format!("{rev}:{path}")])
+            .ok()
+            .and_then(|b| host_runner::check_definition(path, &String::from_utf8_lossy(&b)))
+    };
+    let mut found = Vec::new();
+
+    for path in changed.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = String::from_utf8_lossy(path);
+
+        // Only names that can define a check are read, so a large data file is never loaded
+        if host_runner::check_definition(&path, "").is_none() {
+            continue;
+        }
+
+        let shown = workflow::shown(&path);
+
+        match (def(merge_base, &path), def(sha, &path)) {
+            (Some(old), Some(new)) if old != new => {
+                found.push(format!("{shown} changes what checks may run"));
+            }
+            (None, Some(_)) => {
+                found.push(format!("{shown} is added, it can change what checks run"))
+            }
+            (Some(_), None) => {
+                found.push(format!("{shown} is removed, it can change what checks run"))
+            }
+            _ => {}
         }
     }
 
@@ -569,7 +870,7 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     let slots = home.join("runs").join(&id);
     fs::create_dir_all(&slots).map_err(|e| e.to_string())?;
     let (slot, _slot) = claim_slot(&slots)?;
-    let runner = runner::from_config(&plan.config);
+    let runner = runner::from_config(&plan.config, &plan.repo);
     runner.preflight()?;
     prune(&home, SystemTime::now() - KEEP_RESULTS);
     {
@@ -608,37 +909,11 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
         slots: &slots,
     };
 
-    // Every workflow at once, as on GitHub, with `max_parallel` shared by all their jobs
-    let results = std::thread::scope(|s| {
-        let (tx, rx) = mpsc::channel::<String>();
-        let ctx = &ctx;
-        let handles: Vec<_> = plan
-            .config
-            .workflows
-            .iter()
-            .map(|file| {
-                let tx = tx.clone();
-                s.spawn(move || {
-                    run_workflow(ctx, file, &mut |line: &str| {
-                        let _ = tx.send(line.to_string());
-                    })
-                })
-            })
-            .collect();
-        drop(tx);
-
-        for line in rx {
-            say(&line);
-        }
-
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err("a workflow thread panicked".into()))
-            })
-            .collect::<Result<Vec<_>, String>>()
-    })?;
+    let results = if plan.config.runner == RunnerKind::Host {
+        vec![run_host(&ctx, say)?]
+    } else {
+        run_workflows(&ctx, say)?
+    };
 
     {
         let _git = git_lock(&id)?;
@@ -666,6 +941,133 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     Ok(entry)
 }
 
+/// Every required workflow at once, as on GitHub, with `max_parallel` shared by all their jobs
+fn run_workflows(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, String> {
+    let plan = ctx.plan;
+    std::thread::scope(|s| {
+        let (tx, rx) = mpsc::channel::<String>();
+        let handles: Vec<_> = plan
+            .config
+            .workflows
+            .iter()
+            .map(|file| {
+                let tx = tx.clone();
+                s.spawn(move || {
+                    run_workflow(ctx, file, &mut |line: &str| {
+                        let _ = tx.send(line.to_string());
+                    })
+                })
+            })
+            .collect();
+        drop(tx);
+
+        for line in rx {
+            say(&line);
+        }
+
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("a workflow thread panicked".into()))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+}
+
+/**
+ * Runs every `[host]` check at once, up to `max_parallel`, each in its own clone like a job, as one
+ * result named [`HOST`] whose jobs are the checks. Nothing from the base is written into the clone,
+ * since the commands come from the plan and no workflow runs
+ **/
+fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, String> {
+    let checks = &ctx.plan.config.host.checks;
+    let (templates, checkouts) = (ctx.templates.join(HOST), ctx.slot.join(HOST));
+    fs::create_dir_all(&templates).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&checkouts).map_err(|e| e.to_string())?;
+    fs::create_dir_all(ctx.logs.join(HOST)).map_err(|e| e.to_string())?;
+    git_cow::can_clone(&templates, &checkouts);
+    let deadline = Instant::now() + Duration::from_secs(ctx.plan.config.timeout_minutes * 60);
+
+    let runs: Vec<(String, Result<JobRun, String>)> = std::thread::scope(|s| {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let handles: Vec<_> = checks
+            .keys()
+            .map(|name| {
+                let tx = tx.clone();
+                s.spawn(move || {
+                    let (none, unused) = (BTreeMap::new(), ctx.slot.join(HOST));
+                    (
+                        name.clone(),
+                        run_job(ctx, HOST, name, &none, deadline, &unused, &tx),
+                    )
+                })
+            })
+            .collect();
+        drop(tx);
+
+        for msg in rx {
+            if let Msg::Say(line) = msg {
+                say(&line);
+            }
+        }
+
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| (String::new(), Err("a check thread panicked".into())))
+            })
+            .collect()
+    });
+
+    let mut states = BTreeMap::new();
+    let (mut exit, mut attempts, mut log) = (Some(0), 0, String::new());
+
+    for (name, run) in runs {
+        let state = match run {
+            Ok(run) => {
+                attempts = attempts.max(run.attempts);
+                log.push_str(&run.log);
+
+                if exit == Some(0) && run.exit != Some(0) {
+                    exit = run.exit;
+                }
+
+                match run.exit {
+                    Some(0) => "success",
+                    None => "timed out",
+                    Some(_) => "failure",
+                }
+            }
+            Err(e) => {
+                exit = exit.and(Some(1));
+                say(&format!("{HOST}/{name}: {e}"));
+                "failure, shipcheck could not run it"
+            }
+        };
+        say(&format!("{HOST}/{name}: {state}"));
+        states.insert(name, state.to_string());
+    }
+
+    fs::write(ctx.logs.join(format!("{HOST}.log")), &log).map_err(|e| e.to_string())?;
+    let passed = !states.is_empty() && states.values().all(|s| s == "success");
+    say(&format!(
+        "host checks: {}",
+        if passed { "passed" } else { "failed" }
+    ));
+
+    Ok(WorkflowResult {
+        file: HOST.to_string(),
+        exit,
+        attempts,
+        log_sha256: cache::hex(&Sha256::digest(log.as_bytes())),
+        jobs: states,
+        passed,
+        shards: BTreeMap::new(),
+    })
+}
+
 /// Removes the checkouts and containers a crashed run left in this slot
 fn remove_checkouts(plan: &Plan, runner: &dyn Runner, slot: &Path) {
     if !slot.exists() {
@@ -687,6 +1089,7 @@ fn remove_checkouts(plan: &Plan, runner: &dyn Runner, slot: &Path) {
 
     for dir in dirs {
         runner.reclaim(&dir);
+        mark_ended(&ended_stamp(slot, &dir));
         let _ = git(
             &plan.repo,
             &["worktree", "remove", "--force", &dir.to_string_lossy()],
@@ -759,6 +1162,7 @@ struct JobRun {
     outputs: BTreeMap<String, String>,
     unsupported: Vec<String>,
     log: String,
+    shard: Option<ShardRun>,
 }
 
 /// Runs the jobs of one workflow, each once every job in its `needs` has passed, as GitHub does
@@ -787,6 +1191,7 @@ fn run_workflow(
     let mut outputs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut started = BTreeSet::new();
     let mut logs = Vec::new();
+    let mut shards = BTreeMap::new();
     let (mut attempts, mut exit, mut running) = (0, Some(0), 0);
 
     std::thread::scope(|s| {
@@ -871,6 +1276,11 @@ fn run_workflow(
 
                             attempts = attempts.max(run.attempts);
                             outputs.insert(job.clone(), run.outputs);
+
+                            if let Some(info) = run.shard {
+                                shards.insert(job.clone(), info);
+                            }
+
                             logs.push(run.log);
 
                             if allow {
@@ -919,6 +1329,7 @@ fn run_workflow(
         log_sha256: cache::hex(&Sha256::digest(log.as_bytes())),
         jobs: states,
         passed,
+        shards,
     })
 }
 
@@ -941,6 +1352,10 @@ fn run_job(
         let _ = tx.send(Msg::Say(m));
     };
     let mut attempts = 0;
+    // Attempts before the unsharded run, which gets the full retries of its own
+    let mut before = 0;
+    let mut shard = ctx.plan.config.shard_tests.enabled();
+    let mut info = None;
 
     loop {
         attempts += 1;
@@ -953,6 +1368,7 @@ fn run_job(
                 outputs: BTreeMap::new(),
                 unsupported: Vec::new(),
                 log: String::from_utf8_lossy(&fs::read(&log_path).unwrap_or_default()).into(),
+                shard: info,
             });
         }
 
@@ -963,6 +1379,9 @@ fn run_job(
         }
 
         let link = standalone_git(&dir, &ctx.plan.sha)?;
+        let base_tree = format!("{}^{{tree}}", ctx.plan.base);
+        let on_base = git(&ctx.plan.repo, &["rev-parse", "--verify", "-q", &base_tree])
+            .is_ok_and(|t| t == ctx.plan.tree);
         let workflow = dir.with_extension("workflows").join(file);
         let request = RunRequest {
             run_dir: &dir,
@@ -973,18 +1392,70 @@ fn run_job(
             artifacts,
             repo_id: ctx.repo_id,
             timeout,
+            shard,
+            on_base,
         };
-        let outcome = write_run_files(ctx, &dir, file, &workflow)
-            .and_then(|_| ctx.runner.run(&request, &log_path));
+        let host = ctx.plan.config.runner == RunnerKind::Host;
+        let written = if host {
+            Ok(())
+        } else {
+            write_run_files(ctx, &dir, file, &workflow)
+        };
+
+        // Host checks start no container, so there is no engine view to wait out
+        if !host {
+            wait_for_engine(&ended_stamp(ctx.slot, &dir));
+        }
+
+        let outcome = written.and_then(|_| ctx.runner.run(&request, &log_path));
 
         // A container left running, after a timeout or otherwise, could rewrite the checkout's `.git`
         // while shipcheck warms from it, so none may outlive the job
         ctx.runner.reclaim(&dir);
+        mark_ended(&ended_stamp(ctx.slot, &dir));
+        // Only now, with no container left that could swap them, are the job's reports read
+        let sharded = outcome
+            .as_ref()
+            .ok()
+            .and_then(|o| o.shards.map(|n| (n, o.exit)));
+        let accepted = sharded.map(|(n, exit)| match exit {
+            Some(0) => shard::check(&shard::read_reports(&dir, n), n).map(|items| (n, items)),
+            _ => Err(Rejected::JobFailed),
+        });
 
         finish_job(&dir, &template, link.as_deref(), &say);
         let outcome = outcome?;
 
-        if outcome.exit == Some(0) || attempts > ctx.plan.config.retries {
+        // Any failure of a sharded attempt runs the job again whole, whose result is the result
+        match accepted {
+            Some(Ok((n, items))) => {
+                info = Some(ShardRun {
+                    shards: Some(n),
+                    items: Some(items),
+                    fallback: None,
+                });
+            }
+            Some(Err(why)) => {
+                say(format!(
+                    "{file}/{job}: sharded run not accepted ({why}), running it again unsharded"
+                ));
+                info = Some(ShardRun {
+                    shards: None,
+                    items: None,
+                    fallback: Some(why.to_string()),
+                });
+                let kept = keep_attempt_log(&log_path, attempts)?;
+                say(format!(
+                    "{file}/{job}: the sharded attempt's log is {}",
+                    kept.display()
+                ));
+                (shard, before) = (false, attempts);
+                continue;
+            }
+            None => {}
+        }
+
+        if outcome.exit == Some(0) || attempts - before > ctx.plan.config.retries {
             let log = fs::read(&log_path).map_err(|e| e.to_string())?;
             return Ok(JobRun {
                 exit: outcome.exit,
@@ -992,9 +1463,63 @@ fn run_job(
                 outputs: outcome.outputs,
                 unsupported: outcome.unsupported_jobs,
                 log: String::from_utf8_lossy(&log).into(),
+                shard: info,
             });
         }
+
+        let kept = keep_attempt_log(&log_path, attempts)?;
+        say(format!(
+            "{file}/{job}: attempt {attempts} failed, its log is {}",
+            kept.display()
+        ));
     }
+}
+
+/// How long after a job's containers end the next one at that path waits, measured on Docker Desktop 4.x
+const ENGINE_VIEW: Duration = Duration::from_secs(2);
+
+/// When the last containers of a job checkout ended, kept beside the slot, which a new run deletes
+fn ended_stamp(slot: &Path, dir: &Path) -> PathBuf {
+    let rel = dir
+        .strip_prefix(slot)
+        .ok()
+        .filter(|r| !r.as_os_str().is_empty());
+    slot.with_extension("ended")
+        .join(rel.unwrap_or(Path::new("slot")))
+}
+
+fn mark_ended(stamp: &Path) {
+    if let Some(parent) = stamp.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let _ = fs::write(stamp, b"");
+}
+
+/**
+ * Docker Desktop shows a path as the last container saw it for about a second, so a job, a retry or
+ * the next run's, starts no sooner than ENGINE_VIEW after the last containers at its path ended
+ **/
+fn wait_for_engine(stamp: &Path) {
+    std::thread::sleep(engine_wait(stamp, SystemTime::now()));
+}
+
+fn engine_wait(stamp: &Path, now: SystemTime) -> Duration {
+    let Ok(ended) = fs::metadata(stamp).and_then(|m| m.modified()) else {
+        return Duration::ZERO;
+    };
+
+    // A stamp from the future means the clock moved, so wait the whole gap
+    now.duration_since(ended)
+        .map_or(ENGINE_VIEW, |since| ENGINE_VIEW.saturating_sub(since))
+}
+
+/// Moves a failed attempt's log aside, so the next attempt's `<job>.log` cannot overwrite it
+fn keep_attempt_log(log_path: &Path, attempt: u32) -> Result<PathBuf, String> {
+    let stem = log_path.file_stem().unwrap_or_default().to_string_lossy();
+    let kept = log_path.with_file_name(format!("{stem}.attempt-{attempt}.log"));
+    fs::rename(log_path, &kept).map_err(|e| e.to_string())?;
+    Ok(kept)
 }
 
 /**
@@ -1037,8 +1562,6 @@ fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Res
         let _ = git(&ctx.plan.repo, &["worktree", "prune"]);
     }
 
-    // Host builds in the developer's checkout break in a Linux container, so git-cow must never warm from it
-    // ponytail: relies on git-cow's stamp name, swap for a git-cow option that never warms from the repo
     let parent = template.parent().ok_or("template has no parent")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let stamp = template.with_file_name(format!(
@@ -1046,13 +1569,21 @@ fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Res
         file_name(&template.to_string_lossy())
     ));
 
-    if !stamp.exists() {
-        fs::write(&stamp, b"").map_err(|e| e.to_string())?;
-    }
+    // Host checks build as the developer does, so git-cow warms their template from the
+    // developer's checkout at most hourly, its default
+    let opts = if ctx.plan.config.runner == RunnerKind::Host {
+        git_cow::Options::default()
+    } else {
+        // Host builds in the developer's checkout break in a Linux container, so git-cow must never warm from it
+        // ponytail: relies on git-cow's stamp name, swap for a git-cow option that never warms from the repo
+        if !stamp.exists() {
+            fs::write(&stamp, b"").map_err(|e| e.to_string())?;
+        }
 
-    let opts = git_cow::Options {
-        warm_interval: Duration::MAX,
-        ..Default::default()
+        git_cow::Options {
+            warm_interval: Duration::MAX,
+            ..Default::default()
+        }
     };
 
     if let Err(e) = git_cow::add_with(
@@ -1334,6 +1865,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_home_ignores_the_environment() {
+        if std::env::var_os("SHIPCHECK_HOME_CHILD").is_some() {
+            assert!(
+                !default_home().starts_with("/tmp/fake"),
+                "{}",
+                default_home().display()
+            );
+            assert!(default_home().starts_with(user_dir()));
+            assert!(home_overridden(), "HOME moved the results");
+            return;
+        }
+
+        assert!(user_dir().is_absolute());
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run::tests::default_home_ignores_the_environment",
+            ])
+            .env("SHIPCHECK_HOME_CHILD", "1")
+            .env("HOME", "/tmp/fake")
+            .env("XDG_STATE_HOME", "/tmp/fake/state")
+            .env_remove("SHIPCHECK_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
     fn safe_git_config_follows_the_users_own() {
         let vars: BTreeMap<_, _> = safe_git_env(2).into_iter().collect();
         assert_eq!(vars["GIT_CONFIG_COUNT"], "8");
@@ -1580,6 +2143,155 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_the_working_copy_and_the_index_and_changes_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        sh(repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("a.txt"), "a").unwrap();
+        fs::write(repo.join("b.txt"), "b").unwrap();
+        fs::write(repo.join(".gitignore"), "junk\n").unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "main"]);
+        assert_eq!(snapshot(repo, false).unwrap(), None, "clean means HEAD");
+        assert_eq!(snapshot(repo, true).unwrap(), None);
+
+        fs::write(repo.join("a.txt"), "stashed").unwrap();
+        sh(repo, &["stash", "-q"]);
+        fs::write(repo.join("a.txt"), "a2").unwrap();
+        sh(repo, &["add", "a.txt"]);
+        fs::write(repo.join("a.txt"), "a3").unwrap();
+        fs::remove_file(repo.join("b.txt")).unwrap();
+        fs::write(repo.join("new.txt"), "n").unwrap();
+        fs::write(repo.join("junk"), "j").unwrap();
+        let state = || {
+            (
+                sh(repo, &["--no-optional-locks", "status", "--porcelain"]),
+                fs::read(repo.join(".git/index")).unwrap(),
+                sh(repo, &["for-each-ref"]),
+                sh(repo, &["stash", "list"]),
+            )
+        };
+        let before = state();
+        assert_eq!(untracked(repo).unwrap(), ["new.txt"], "junk is ignored");
+
+        let wc = snapshot(repo, false).unwrap().unwrap();
+        let files = sh(repo, &["ls-tree", "-r", "--name-only", &wc]);
+        assert_eq!(files, ".gitignore\na.txt\nnew.txt");
+        assert_eq!(sh(repo, &["show", &format!("{wc}:a.txt")]), "a3");
+        assert_eq!(
+            sh(repo, &["rev-parse", &format!("{wc}^")]),
+            sh(repo, &["rev-parse", "HEAD"])
+        );
+
+        let staged = snapshot(repo, true).unwrap().unwrap();
+        let files = sh(repo, &["ls-tree", "-r", "--name-only", &staged]);
+        assert_eq!(files, ".gitignore\na.txt\nb.txt");
+        assert_eq!(sh(repo, &["show", &format!("{staged}:a.txt")]), "a2");
+
+        assert!(
+            before == state(),
+            "the index, refs and stash must not change"
+        );
+        let left: Vec<_> = fs::read_dir(repo.join(".git"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("shipcheck-index")
+            })
+            .collect();
+        assert!(left.is_empty(), "the temporary index must go");
+
+        // Committing all of it gives the tree that ran, so the result is found by tree
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "all"]);
+        assert_eq!(
+            sh(repo, &["rev-parse", "HEAD^{tree}"]),
+            sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")])
+        );
+        assert_eq!(snapshot(repo, false).unwrap(), None);
+    }
+
+    #[test]
+    fn commits_only_the_tree_that_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        sh(repo, &["init", "-q", "-b", "main"]);
+        sh(repo, &["config", "user.name", "t"]);
+        sh(repo, &["config", "user.email", "t@t"]);
+        sh(repo, &["config", "commit.gpgsign", "false"]);
+        fs::write(repo.join("a.txt"), "a").unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "main"]);
+        let hook = repo.join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\ntouch \"$(git rev-parse --git-dir)/hook-ran\"\n",
+        )
+        .unwrap();
+        Command::new("chmod").arg("+x").arg(&hook).status().unwrap();
+
+        fs::write(repo.join("a.txt"), "a2").unwrap();
+        sh(repo, &["add", "a.txt"]);
+        fs::write(repo.join("a.txt"), "a3").unwrap();
+        fs::write(repo.join("b.txt"), "b").unwrap();
+        let wc = snapshot(repo, false).unwrap().unwrap();
+        let tested = Tested {
+            tree: sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
+            staged: false,
+            passed: true,
+        };
+        let msg = ["-m".to_string(), "all".to_string()];
+        let head = sh(repo, &["rev-parse", "HEAD"]);
+        let index = || fs::read(repo.join(".git/index")).unwrap();
+        let before = index();
+
+        let failed = Tested {
+            passed: false,
+            ..tested.clone()
+        };
+        assert!(
+            commit(repo, &failed, &msg, false)
+                .unwrap_err()
+                .contains("failed")
+        );
+
+        fs::write(repo.join("c.txt"), "after the run").unwrap();
+        let err = commit(repo, &tested, &msg, false).unwrap_err();
+        assert!(err.contains("files changed since the run"), "{err}");
+        assert_eq!(sh(repo, &["rev-parse", "HEAD"]), head);
+        assert!(index() == before, "a refusal keeps the staged state");
+        fs::remove_file(repo.join("c.txt")).unwrap();
+
+        let sha = commit(repo, &tested, &msg, false).unwrap();
+        assert_eq!(sh(repo, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(sh(repo, &["rev-parse", "HEAD^{tree}"]), tested.tree);
+        assert_eq!(sh(repo, &["rev-parse", "HEAD^"]), head);
+        assert_eq!(sh(repo, &["log", "-1", "--format=%s"]), "all");
+        assert_eq!(
+            sh(repo, &["status", "--porcelain"]),
+            "",
+            "the index follows"
+        );
+        assert!(repo.join(".git/hook-ran").exists(), "git's own hooks run");
+
+        // With --staged, only the index goes in
+        fs::write(repo.join("a.txt"), "a4").unwrap();
+        sh(repo, &["add", "a.txt"]);
+        fs::write(repo.join("d.txt"), "left out").unwrap();
+        let staged = snapshot(repo, true).unwrap().unwrap();
+        let tested = Tested {
+            tree: sh(repo, &["rev-parse", &format!("{staged}^{{tree}}")]),
+            staged: true,
+            passed: true,
+        };
+        commit(repo, &tested, &msg, false).unwrap();
+        assert_eq!(sh(repo, &["rev-parse", "HEAD^{tree}"]), tested.tree);
+        assert_eq!(sh(repo, &["status", "--porcelain"]), "?? d.txt");
+    }
+
+    #[test]
     fn names_ci_changes_since_the_branch_left_the_base() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -1616,6 +2328,38 @@ mod tests {
             ]
         );
         assert!(ci_changes(repo, "main", "main").unwrap().is_empty());
+    }
+
+    #[test]
+    fn names_changes_to_what_commands_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let pkg = |test: &str, dep: &str| {
+            format!(
+                "{{\"scripts\": {{\"test\": \"{test}\"}}, \"dependencies\": {{\"a\": \"{dep}\"}}}}"
+            )
+        };
+        sh(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("web")).unwrap();
+        fs::write(repo.join("package.json"), pkg("jest", "1")).unwrap();
+        fs::write(repo.join("web/package.json"), pkg("jest", "1")).unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "main"]);
+        sh(repo, &["checkout", "-q", "-b", "pr"]);
+        fs::write(repo.join("package.json"), pkg("jest", "2")).unwrap();
+        fs::write(repo.join("web/package.json"), pkg("true", "1")).unwrap();
+        fs::write(repo.join("Makefile"), "test:\n\ttrue\n").unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "cheat"]);
+        let sha = sh(repo, &["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            ci_changes(repo, "main", &sha).unwrap(),
+            [
+                "`Makefile` is added, it can change what checks run",
+                "`web/package.json` changes what checks may run",
+            ]
+        );
     }
 
     /// A repository with `src/lib.rs` and `docs/a.md` on main, and a plan for the commit
@@ -1691,6 +2435,43 @@ mod tests {
             !out.chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
         );
+    }
+
+    #[test]
+    fn a_job_waits_out_the_engine_view_of_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("0");
+        let stamp = ended_stamp(&slot, &slot.join("ci.yml/test"));
+        assert_eq!(stamp, dir.path().join("0.ended/ci.yml/test"));
+        assert_eq!(ended_stamp(&slot, &slot), dir.path().join("0.ended/slot"));
+
+        let now = SystemTime::now();
+        assert_eq!(engine_wait(&stamp, now), Duration::ZERO, "no job ran there");
+        mark_ended(&stamp);
+        let wait = engine_wait(&stamp, SystemTime::now());
+        assert!(
+            wait > Duration::from_millis(1500) && wait <= ENGINE_VIEW,
+            "{wait:?}"
+        );
+        let later = SystemTime::now() + Duration::from_secs(3);
+        assert_eq!(engine_wait(&stamp, later), Duration::ZERO);
+        let earlier = SystemTime::now() - Duration::from_secs(60);
+        assert_eq!(engine_wait(&stamp, earlier), ENGINE_VIEW);
+        // A new run deletes the slot, the stamps beside it stay
+        fs::create_dir_all(slot.join("ci.yml/test")).unwrap();
+        fs::remove_dir_all(&slot).unwrap();
+        assert!(stamp.exists());
+    }
+
+    #[test]
+    fn a_failed_attempt_keeps_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("test.log");
+        fs::write(&log, "attempt 1").unwrap();
+        let kept = keep_attempt_log(&log, 1).unwrap();
+        assert_eq!(kept, dir.path().join("test.attempt-1.log"));
+        fs::write(&log, "attempt 2").unwrap();
+        assert_eq!(fs::read_to_string(kept).unwrap(), "attempt 1");
     }
 
     #[test]

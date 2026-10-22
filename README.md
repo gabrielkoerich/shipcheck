@@ -1,6 +1,6 @@
 # shipcheck
 
-Your agent already ran the tests. shipcheck runs your repository's GitHub Actions workflows on your machine with act, keeps the result for that exact git tree, and posts the required check from its own GitHub App. A PR whose tree was already tested gets its check in under a second.
+Your agent already ran the tests. shipcheck runs your repository's checks on your machine, keeps the result for that exact git tree, and posts the required check from its own GitHub App. By default it runs the commands it finds, such as `cargo test` or `npm test`, natively in an OS sandbox. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run. Or it runs your GitHub Actions workflows in containers with act, the mode closest to GitHub's CI. A PR whose tree was already tested gets its check in under a second.
 
 Time to result on bean, a private Python repository, on an Apple silicon Mac with Docker Desktop against GitHub's hosted runners: after a push TBD vs TBD, after a commit with the hooks TBD vs TBD, a tree already tested TBD vs TBD. Method and numbers in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). A single run can take longer than on GitHub. The gain is no runner queue, no Actions minutes on PR pushes, and no new run for a tree already tested.
 
@@ -45,7 +45,7 @@ Then run `shipcheck init` in your repository. See [the quickstart](https://shipc
 
 Status: early. The one-click hosted GitHub App is not live yet ([#2](https://github.com/gabrielkoerich/shipcheck/issues/2)). Without it, these work on any repository:
 
-- `shipcheck run`: runs the workflows locally and gives the verdict as an exit code.
+- `shipcheck run`: runs the workflows locally on the working copy and gives the verdict as an exit code. `shipcheck commit` then commits exactly that tree, so its check needs no new run.
 - The result cache: a tree that already passed answers at once.
 - The git hooks: start runs in the background on commit or push.
 - `shipcheck status` and `shipcheck logs`: show the stored result and logs of a commit.

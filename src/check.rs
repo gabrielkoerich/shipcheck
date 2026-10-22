@@ -4,6 +4,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::run::Entry;
+use crate::runner::host::HOST;
+use crate::runner::shard::ShardRun;
 
 pub const NAME: &str = "shipcheck";
 const TAIL_LINES: usize = 100;
@@ -24,6 +26,11 @@ fn clip(text: String) -> String {
     format!("[...cut...]\n{}", &text[cut..])
 }
 
+/// How a result's file shows: a workflow file, or the host checks
+pub fn name(file: &str) -> &str {
+    if file == HOST { "host checks" } else { file }
+}
+
 pub fn summary(entry: &Entry) -> String {
     let mut s = format!(
         "| | |\n|---|---|\n| Tree | `{}` |\n| Base | `{}` |\n| Key | `{}` |\n\n",
@@ -31,7 +38,7 @@ pub fn summary(entry: &Entry) -> String {
     );
 
     if !entry.ci_changes.is_empty() {
-        s.push_str("This commit changes CI. These changes did not run, the base's versions did, and they apply to every PR once merged:\n\n");
+        s.push_str("This commit changes CI. Changes to workflows and `shipcheck.toml` did not run, the base's versions did. Changes to what a command runs, such as `package.json` scripts, did run. All of them apply to every PR once merged:\n\n");
 
         for change in &entry.ci_changes {
             s.push_str(&format!("- {change}\n"));
@@ -53,13 +60,23 @@ pub fn summary(entry: &Entry) -> String {
         let jobs = wf
             .jobs
             .iter()
-            .map(|(job, state)| format!("{job}: {state}"))
+            .map(|(job, state)| match wf.shards.get(job) {
+                Some(ShardRun {
+                    fallback: Some(_), ..
+                }) => {
+                    format!("{job}: {state}, after an unsharded rerun")
+                }
+                Some(ShardRun {
+                    shards: Some(n), ..
+                }) => format!("{job}: {state}, tests in {n} shards"),
+                _ => format!("{job}: {state}"),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let exit = wf.exit.map_or("timeout".to_string(), |c| c.to_string());
         s.push_str(&format!(
             "| {} | {} | {exit} | {} | {jobs} | `{}` |\n",
-            wf.file,
+            name(&wf.file),
             if wf.passed { "passed" } else { "failed" },
             wf.attempts,
             &wf.log_sha256[..12.min(wf.log_sha256.len())]
@@ -83,7 +100,7 @@ pub fn failure_text(entry: &Entry, log_dir: &Path, secrets: &[String]) -> String
             tail = tail.replace(secret.as_str(), "***");
         }
 
-        s.push_str(&format!("### {}\n\n```\n{tail}\n```\n\n", wf.file));
+        s.push_str(&format!("### {}\n\n```\n{tail}\n```\n\n", name(&wf.file)));
     }
 
     clip(s)
@@ -122,6 +139,11 @@ pub fn body(sha: &str, entry: &Entry, logs: Option<(&Path, &[String])>) -> Value
         "passed, nothing to run for this change".to_string()
     } else if entry.passed {
         "passed".to_string()
+    } else if let [wf] = entry.workflows.as_slice()
+        && wf.file == HOST
+    {
+        let failed = wf.jobs.values().filter(|s| *s != "success").count();
+        format!("failed, {failed} of {} host checks", wf.jobs.len())
     } else {
         format!("failed, {failed} of {} workflows", entry.workflows.len())
     };
@@ -171,6 +193,14 @@ mod tests {
                     if passed { "success" } else { "failure" }.into(),
                 )]),
                 passed,
+                shards: BTreeMap::from([(
+                    "test".into(),
+                    ShardRun {
+                        shards: Some(4),
+                        items: Some(10),
+                        fallback: None,
+                    },
+                )]),
             }],
             finished_unix: 0,
             ci_changes: Vec::new(),
@@ -195,12 +225,9 @@ mod tests {
         assert_eq!(b["head_sha"], "abc");
         assert_eq!(b["conclusion"], "success");
         assert_eq!(b["output"]["title"], "passed");
-        assert!(
-            b["output"]["summary"]
-                .as_str()
-                .unwrap()
-                .contains("| ci.yml | passed | 0 | 1 | test: success | `abcdef012345` |")
-        );
+        assert!(b["output"]["summary"].as_str().unwrap().contains(
+            "| ci.yml | passed | 0 | 1 | test: success, tests in 4 shards | `abcdef012345` |"
+        ));
         assert_eq!(b["output"]["text"], "");
     }
 
@@ -242,6 +269,25 @@ mod tests {
         assert!(!text.contains("line 50\n"));
         assert!(text.contains("line 120 ***"));
         assert!(!text.contains("hunter2"));
+    }
+
+    #[test]
+    fn names_host_checks() {
+        let mut e = entry(false);
+        e.workflows[0].file = HOST.into();
+        e.workflows[0].jobs = BTreeMap::from([
+            ("lint".into(), "success".into()),
+            ("test".into(), "failure".into()),
+        ]);
+        e.workflows[0].shards.clear();
+        let b = body("abc", &e, None);
+        assert_eq!(b["output"]["title"], "failed, 1 of 2 host checks");
+        assert!(
+            b["output"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("| host checks | failed | 1 | 2 | lint: success, test: failure |")
+        );
     }
 
     #[test]

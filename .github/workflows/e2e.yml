@@ -1,7 +1,7 @@
 name: e2e
 
 # The end-to-end test on Linux, where Docker has no VM between it and the host, the disk has no
-# copy-on-write, and act's host network is the real host
+# copy-on-write, and a bridge container reaches the host only at the bridge gateway
 on:
   push:
     branches: [main]
