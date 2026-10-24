@@ -273,6 +273,19 @@ jobs:
           pattern: shipcheck-*
           merge-multiple: true
           path: artifacts
+      # Before anything is published or tagged, so a missing token leaves no half release
+      - name: Check the release tokens
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          for name in CARGO_REGISTRY_TOKEN HOMEBREW_TAP_TOKEN; do
+            if [ -z "$(printenv "$name")" ]; then
+              echo "::error::$name is not set, a release must reach crates.io and the Homebrew tap"
+              exit 1
+            fi
+          done
+
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Stamp the version
@@ -300,11 +313,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is not set, a release must reach crates.io"
-            exit 1
-          fi
-
           cargo publish --locked --allow-dirty
 
       - name: Create tag
@@ -355,11 +363,6 @@ jobs:
           VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           TAP_REPO="gabrielkoerich/homebrew-tap"
-          if [ -z "${TAP_TOKEN}" ]; then
-            echo "::error::HOMEBREW_TAP_TOKEN is not set, a release must update ${TAP_REPO}"
-            exit 1
-          fi
-
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
           cp Formula/shipcheck.rb formula.rb
           sed -i "s|^  version \"0.0.0\"|  version \"${VERSION#v}\"|" formula.rb
