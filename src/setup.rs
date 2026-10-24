@@ -80,6 +80,7 @@ pub struct Machine {
     pub mac: bool,
     /// The rustup toolchains installed, such as `1.94.1` or `nightly`
     pub toolchains: Vec<String>,
+    pub jdks: Vec<crate::java::Jdk>,
 }
 
 impl Machine {
@@ -89,6 +90,7 @@ impl Machine {
             docker: responds("docker", &["info"]),
             mac: cfg!(target_os = "macos"),
             toolchains: toolchains(),
+            jdks: crate::java::installed(),
         }
     }
 
@@ -337,8 +339,7 @@ pub fn base_only(jobs: &[crate::workflow::Job]) -> BTreeSet<String> {
     }
 }
 
-const PR_ONLY: &str =
-    "its `if:` depends on the PR or the default branch, so it never runs on the base branch";
+const PR_ONLY: &str = "its `if:` reads the PR, such as its labels, or the default branch, so only GitHub can tell if it runs";
 
 /// Why a job stays on GitHub for PRs in host mode, or None when shipcheck may run it here
 fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) -> Option<String> {
@@ -380,6 +381,13 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
 
     if os.mac && !os.linux && !machine.mac {
         return Some("runs on macOS, and this machine is not a Mac".into());
+    }
+
+    // A job with `if:` is left out anyway, and says so
+    if !job.conditional
+        && let Err(why) = crate::java::pick(job, &machine.jdks)
+    {
+        return Some(why);
     }
 
     None
@@ -493,7 +501,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
                     return (job.id.as_str(), None);
                 }
 
-                match job_check(job, &machine.toolchains) {
+                match job_check(job, machine) {
                     Ok((command, exports, notes)) => {
                         d.skipped
                             .extend(notes.iter().map(|n| format!("{file}, job {}: {n}", job.id)));
@@ -634,12 +642,17 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     // A pinned toolchain's own version, since `rustc --version` names the default one
     for check in &d.checks {
         for word in check.command.split_whitespace() {
-            if let Some(t) = word.strip_prefix("RUSTUP_TOOLCHAIN=") {
-                let version = format!("rustc +{t} --version");
+            let version = if let Some(t) = word.strip_prefix("RUSTUP_TOOLCHAIN=") {
+                format!("rustc +{t} --version")
+            } else if let Some(home) = word.strip_prefix("JAVA_HOME=") {
+                // It prints to stderr, and `versions` keep stdout
+                format!("{home}/bin/java -version 2>&1")
+            } else {
+                continue;
+            };
 
-                if !d.versions.contains(&version) {
-                    d.versions.push(version);
-                }
+            if !d.versions.contains(&version) {
+                d.versions.push(version);
             }
         }
     }
@@ -801,6 +814,15 @@ const SETUP: &[&str] = &[
     "echo",
 ];
 
+/// Whether a line sends its output to a file, such as `echo x >> gradle.properties`, which the build may read
+fn writes_a_file(line: &str) -> bool {
+    line.split('>')
+        .skip(1)
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty() && !rest.starts_with('&'))
+        .any(|rest| rest.split_whitespace().next() != Some("/dev/null"))
+}
+
 /// Whether a command or a job id has deploy, publish or release as a word of its own
 fn ships(text: &str, separators: &[char]) -> bool {
     text.to_lowercase()
@@ -950,7 +972,7 @@ fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool
 
         root |= needs_root(line);
 
-        if SETUP.iter().any(|s| line.starts_with(s)) {
+        if SETUP.iter().any(|s| line.starts_with(s)) && !writes_a_file(line) {
             continue;
         }
 
@@ -1181,13 +1203,14 @@ fn rust_need(step: &crate::workflow::RunStep) -> Option<String> {
  * One job's check: its steps' commands joined with ` && `. Returns the command, the job's
  * `NAME=value` exports to put in front, and the steps it left out. Each GitHub step starts in its
  * own shell, so a step of several commands, with `|` or `&`, or with its own directory runs in a
- * subshell. A toolchain from `toolchains` is pinned with `RUSTUP_TOOLCHAIN`
+ * subshell. A rustup toolchain this machine has is pinned with `RUSTUP_TOOLCHAIN`, a JDK with `JAVA_HOME`
  **/
 #[allow(clippy::type_complexity)]
 fn job_check(
     job: &crate::workflow::Job,
-    toolchains: &[String],
+    machine: &Machine,
 ) -> Result<(String, Vec<String>, Vec<String>), String> {
+    let toolchains = &machine.toolchains;
     // A name becomes a TOML key, a directory and a check name
     let id_ok = job
         .id
@@ -1236,6 +1259,13 @@ fn job_check(
         .and_then(|t| assignment("RUSTUP_TOOLCHAIN", t))
         .into_iter()
         .collect();
+
+    // As `setup-java` leaves it, so gradlew and mvnw find the JDK through `JAVA_HOME`
+    if let Some(jdk) = crate::java::pick(job, &machine.jdks)? {
+        let home = jdk.home.display();
+        exports.push(format!("JAVA_HOME={home}"));
+        exports.push(format!("PATH={home}/bin:\"$PATH\""));
+    }
 
     for (name, value) in &job.env {
         if SANDBOX_VARS.contains(&name.as_str()) {
@@ -2416,6 +2446,98 @@ jobs:
                 ..Machine::default()
             },
         )
+    }
+
+    #[test]
+    fn a_jdk_this_machine_has_is_pinned_and_a_missing_one_keeps_the_job_on_github() {
+        let ci = r#"on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            21
+      - run: ./gradlew test
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: 25
+      - run: ./gradlew nativeTest
+"#;
+        let jdk = |version: &str, home: &str, native| crate::java::Jdk {
+            version: version.into(),
+            home: home.into(),
+            native,
+        };
+        let found = detect_on(
+            repo(&[(".github/workflows/ci.yml", ci)]).path(),
+            &Machine {
+                jdks: vec![
+                    jdk("11.0.2", "/jvm/11", false),
+                    jdk("21.0.5", "/jvm/21", false),
+                ],
+                ..Machine::default()
+            },
+        );
+        assert_eq!(found.checks.len(), 1);
+        assert_eq!(
+            found.checks[0].command,
+            "export JAVA_HOME=/jvm/21 PATH=/jvm/21/bin:\"$PATH\" && ./gradlew test"
+        );
+        assert_eq!(found.versions, ["/jvm/21/bin/java -version 2>&1"]);
+        assert_eq!(found.github.len(), 1);
+        assert_eq!(found.github[0].job, "native");
+        assert_eq!(
+            found.github[0].why,
+            "needs GraalVM 25 with native-image, which this machine does not have"
+        );
+
+        // Without a JDK both stay on GitHub
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        assert!(found.checks.is_empty());
+        assert_eq!(
+            found.github[0].why,
+            "needs JDK 11, which this machine does not have"
+        );
+    }
+
+    #[test]
+    fn an_echo_into_a_file_of_the_tree_stays_in_the_check() {
+        let ci = r#"on: pull_request
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'kotlin.jvm.target.validation.mode=ignore' >> ./gradle.properties
+      - run: echo building 2>&1 > /dev/null
+      - run: make test
+"#;
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        assert_eq!(
+            found.checks[0].command,
+            "echo 'kotlin.jvm.target.validation.mode=ignore' >> ./gradle.properties && make test"
+        );
+    }
+
+    #[test]
+    fn a_label_gated_job_that_also_runs_on_main_is_not_said_to_never_run_there() {
+        let ci = r#"on: pull_request
+jobs:
+  providers:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'providers')
+    steps:
+      - run: make test
+"#;
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        assert_eq!(found.github[0].why, PR_ONLY);
+        assert!(!PR_ONLY.contains("never runs"), "{PR_ONLY}");
     }
 
     /// The config `init` writes for a root holding these files, parsed and validated

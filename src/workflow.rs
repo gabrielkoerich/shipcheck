@@ -282,7 +282,7 @@ fn fill(y: &Yaml, leg: &[(String, String)]) -> Yaml {
     }
 }
 
-/// Whether a job's `if:` depends on the PR or the default branch, so on the base branch it never runs
+/// Whether a job's `if:` depends on the PR or the default branch, so only GitHub can tell if it runs
 fn pr_only(job: &Yaml) -> bool {
     let cond = match &job["if"] {
         Yaml::String(c) => c,
