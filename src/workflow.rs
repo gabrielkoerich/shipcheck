@@ -1205,7 +1205,7 @@ jobs: {}
         assert!(gated.starts_with("on:\n  pull_request:\n  push:\n    branches:\n    - master\n"));
         assert_eq!(gated.lines().count(), ripgrep.lines().count());
 
-        // oblivion's ci.yml, trimmed: push on every branch, the PR found from the branch
+        // An Anchor project's ci.yml, trimmed: push on every branch, the PR found from the branch
         let push_only = "on:\n  push:\n\njobs:\n  checks:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bun test\n  tests:\n    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-latest]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test\n";
         let gated = gate_jobs(push_only, &["checks".into()], "main").unwrap();
         assert!(gated.starts_with(
