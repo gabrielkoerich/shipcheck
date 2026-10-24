@@ -791,6 +791,9 @@ fn coverage(
                 cover
                     .missing
                     .push("init found no command in it to compare".into());
+            } else if let Some(step) = setup::dropped_step(job) {
+                // No check runs the step, so no check stands for the job
+                cover.missing.push(format!("no check runs its {step}"));
             }
 
             for (dir, command) in commands {
@@ -1270,10 +1273,18 @@ mod tests {
     const OWN_E2E: &str = include_str!("../tests/fixtures/own/e2e.yml");
     const OWN_LEAKS: &str = include_str!("../tests/fixtures/own/leaks.yml");
 
+    /// OWN_CI without the step that sets AppArmor up with `sudo`, which keeps the test job on GitHub
+    fn own_ci() -> String {
+        let start = OWN_CI.find("      - timeout-minutes: 5").unwrap();
+        let end = OWN_CI.find("      - run: cargo test").unwrap();
+        format!("{}{}", &OWN_CI[..start], &OWN_CI[end..])
+    }
+
     #[test]
     fn coverage_compares_commands_not_names() {
         // ci.yml's test job, without its service job: fmt, clippy and test run its three commands
-        let ci = OWN_CI.split("\n  service:").next().unwrap();
+        let own = own_ci();
+        let ci = own.split("\n  service:").next().unwrap();
         let dir = repo(&[
             (".github/workflows/ci.yml", ci),
             ("shipcheck.toml", SHIPCHECK_TOML),
@@ -1289,9 +1300,31 @@ mod tests {
     }
 
     #[test]
+    fn a_check_of_part_of_a_job_does_not_cover_it() {
+        // curl's checkdocs.yml proselint job: a check of its first step alone passed where proselint never ran
+        let ci = "on:\n  pull_request:\n  push:\njobs:\n  proselint:\n    steps:\n      - run: trim.pl\n      - name: check prose\n        run: |\n          cat <<JSON > rc.json\n          {}\n          JSON\n          proselint check --config rc.json docs\n";
+        let dir = repo(&[
+            (".github/workflows/ci.yml", ci),
+            (
+                "shipcheck.toml",
+                "runner = \"host\"\n[host]\nchecks = { proselint = \"trim.pl\" }\n",
+            ),
+        ]);
+        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        // Not gated: GitHub keeps running it on PRs
+        assert!(plan.workflows.is_empty());
+        assert_eq!(
+            plan.notes,
+            [
+                "ci.yml: GitHub keeps running it on PRs, for proselint, and no job of it runs only in shipcheck"
+            ]
+        );
+    }
+
+    #[test]
     fn coverage_names_the_jobs_no_check_runs() {
         let dir = repo(&[
-            (".github/workflows/ci.yml", OWN_CI),
+            (".github/workflows/ci.yml", &own_ci()),
             (".github/workflows/e2e.yml", OWN_E2E),
             (".github/workflows/leaks.yml", OWN_LEAKS),
             ("shipcheck.toml", SHIPCHECK_TOML),
@@ -1299,7 +1332,13 @@ mod tests {
         let plan = super::plan(dir.path(), App::NotPublic).unwrap();
         let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
         // Without Docker, e2e.yml's matrix stays on GitHub, which tests see on every machine
-        assert_eq!(files, ["ci.yml", "leaks.yml"]);
+        // gitleaks runs only from steps no command stands for, so leaks.yml stays as it is
+        assert_eq!(files, ["ci.yml"]);
+        assert!(
+            plan.notes.contains(&"leaks.yml: GitHub keeps running it on PRs, for gitleaks, and no job of it runs only in shipcheck".to_string()),
+            "{:?}",
+            plan.notes
+        );
         assert!(
             plan.notes[0].starts_with("e2e.yml: GitHub keeps running it on PRs"),
             "{:?}",
@@ -1317,11 +1356,6 @@ mod tests {
             ),
             "{}",
             plan.workflows[0].yes
-        );
-        assert!(
-            warning(1).contains("job gitleaks (init found no command in it to compare)"),
-            "{}",
-            warning(1)
         );
     }
 
@@ -1391,7 +1425,8 @@ mod tests {
             "GitHub keeps running ci.yml on pushes to every branch"
         );
         assert!(
-            plan.notes.contains(&"setup.yml: GitHub keeps running it on pushes to every branch, and no shipcheck check runs its jobs".to_string()),
+            // Its one step is an action no command stands for, so it stays on GitHub
+            plan.notes.contains(&"setup.yml: GitHub keeps running it on PRs, for setup, and no job of it runs only in shipcheck".to_string()),
             "{:?}",
             plan.notes
         );
