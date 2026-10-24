@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, "dependabot/**"]
     paths-ignore: ["Formula/**", "**.md"]
+  # shipcheck checks test and gitleaks on PRs, e2e needs Docker in the job so GitHub runs it
+  pull_request:
+    paths-ignore: ["Formula/**", "**.md"]
   workflow_dispatch: {}
 
 permissions:
@@ -15,6 +18,7 @@ concurrency:
 
 jobs:
   test:
+    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,6 +69,7 @@ jobs:
       - run: cargo test --test e2e --test retry_e2e --test shard_e2e -- --ignored --nocapture
 
   gitleaks:
+    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')
     runs-on: ubuntu-latest
     env:
       GITLEAKS_VERSION: 8.30.1
