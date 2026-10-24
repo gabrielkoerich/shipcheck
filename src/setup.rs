@@ -22,7 +22,7 @@ done
 exit 0
 "#;
 
-const HOOK_LINE: &str = "shipcheck on-push \"$local_ref\" \"$local_sha\"";
+pub const HOOK_LINE: &str = "shipcheck on-push \"$local_ref\" \"$local_sha\"";
 
 pub const POST_COMMIT: &str = r#"#!/bin/sh
 # Installed by `shipcheck install`. Starts a background run of each commit when shipcheck.toml lists commit in on
@@ -31,7 +31,7 @@ if command -v shipcheck >/dev/null 2>&1; then
 fi
 "#;
 
-const COMMIT_LINE: &str = "shipcheck on-commit";
+pub const COMMIT_LINE: &str = "shipcheck on-commit";
 
 pub fn config_for(workflows: &[String]) -> String {
     let list = workflows
