@@ -176,11 +176,16 @@ impl Default for Act {
             // apt fails on a held lock instead of waiting
             slot_paths: vec!["/var/lib/apt/lists".to_string()],
             // A shared ~/.rustup and ~/.cargo broke each other in an Anchor project's trial, and act's one
-            // tool cache for every job gave parallel setup actions half-copied Zig and JDK installs
+            // tool cache for every job gave parallel setup actions half-copied Zig, JDK and Python installs
             job_homes: BTreeMap::from([
                 ("RUSTUP_HOME".to_string(), Home::Dir("rustup".into())),
                 (
                     "RUNNER_TOOL_CACHE".to_string(),
+                    Home::Dir("toolcache".into()),
+                ),
+                // setup-python's installer prefers it to RUNNER_TOOL_CACHE, and the image sets it
+                (
+                    "AGENT_TOOLSDIRECTORY".to_string(),
                     Home::Dir("toolcache".into()),
                 ),
                 (
@@ -801,6 +806,8 @@ mod tests {
             "MIX_HOME",
             "REBAR_CACHE_DIR",
             "CARGO_HOME",
+            "RUNNER_TOOL_CACHE",
+            "AGENT_TOOLSDIRECTORY",
         ] {
             assert!(act.job_homes.contains_key(var), "{var}");
         }
