@@ -57,6 +57,6 @@ class Shipcheck < Formula
   end
 
   test do
-    assert_match "usage: shipcheck", shell_output("#{bin}/shipcheck --help")
+    assert_match "Usage: shipcheck", shell_output("#{bin}/shipcheck --help")
   end
 end

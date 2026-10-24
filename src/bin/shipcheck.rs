@@ -1,4 +1,6 @@
 use std::io::IsTerminal;
+
+use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -7,8 +9,6 @@ use shipcheck::record::Run as Record;
 use shipcheck::service::{self, Poster, Sender};
 use shipcheck::ui::Style;
 use shipcheck::{agents, autostart, background, check, report, run, setup};
-
-const USAGE: &str = "usage: shipcheck run [--sha <rev> | --staged] [--no-fetch] [--base <ref>] [--job <id>]... [--workflow <file>]... [--json] | status [<rev> | --staged] [--json] | logs [<rev>] [--base <ref>] | history [--json] [--limit <n>] | commit -m <message> [--allow-failed] | post [<rev>] [--home-ok] | login | logout [--all] | token [--name <machine>] | clean [--all] | init [--yes] | install | doctor | daemon [--home-ok | --uninstall]";
 
 const PARTIAL: &str = "partial run: not the check, run `shipcheck run` before committing";
 
@@ -25,7 +25,7 @@ fn main() -> ExitCode {
 
     run::migrate_home();
 
-    match cli(std::env::args().skip(1).collect()) {
+    match cli(Cli::parse().command) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{} {e}", Style::stderr().red("shipcheck:"));
@@ -34,58 +34,164 @@ fn main() -> ExitCode {
     }
 }
 
-const COMMANDS: &[&str] = &[
-    "run",
-    "status",
-    "logs",
-    "history",
-    "commit",
-    "post",
-    "login",
-    "logout",
-    "token",
-    "clean",
-    "init",
-    "install",
-    "doctor",
-    "daemon",
-    "on-commit",
-    "on-push",
-];
+/// Run your CI checks locally and post them as the PR's required checks
+#[derive(Parser)]
+#[command(
+    name = "shipcheck",
+    version,
+    arg_required_else_help = true,
+    after_help = "Docs: https://shipcheck.run/docs/"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
 
-fn cli(args: Vec<String>) -> Result<ExitCode, String> {
-    // Help for an unknown command is an error, so a tool can test which commands this version has
-    let known = COMMANDS.contains(&args.first().map(String::as_str).unwrap_or_default());
+#[derive(Subcommand)]
+enum Cmd {
+    /// Set up this repository: shipcheck.toml, agent instructions, hooks
+    Init {
+        /// Take the recommended choices without asking
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Install the hooks and the daemon in another clone
+    Install,
+    /// Run the checks on the working copy and wait for the verdict
+    Run {
+        /// Test this commit instead of the working copy
+        #[arg(long, value_name = "rev", conflicts_with = "staged")]
+        sha: Option<String>,
+        /// Test the index instead of the working copy
+        #[arg(long)]
+        staged: bool,
+        /// Run against the local origin/main without fetching it
+        #[arg(long)]
+        no_fetch: bool,
+        /// Read shipcheck.toml and the workflows from this ref, for a trial
+        #[arg(long, value_name = "ref")]
+        base: Option<String>,
+        /// Run only this job and the jobs it needs, a partial run
+        #[arg(long = "job", value_name = "id")]
+        jobs: Vec<String>,
+        /// Run only the jobs of this workflow, a partial run
+        #[arg(long = "workflow", value_name = "file")]
+        workflows: Vec<String>,
+        /// Print the result as JSON on stdout
+        #[arg(long)]
+        json: bool,
+        /// Set by the hooks and the daemon on a run that posts its checks
+        #[arg(long, hide = true, value_name = "name")]
+        background: Option<String>,
+        #[arg(hide = true)]
+        rev: Option<String>,
+    },
+    /// Commit exactly the tree the last run tested
+    Commit {
+        /// The commit message, as git takes it
+        #[arg(short = 'm', value_name = "message", required_unless_present = "file")]
+        message: Vec<String>,
+        /// Read the commit message from a file
+        #[arg(short = 'F', value_name = "file")]
+        file: Option<String>,
+        /// Commit a tree whose run failed
+        #[arg(long)]
+        allow_failed: bool,
+        /// Skip git's commit hooks
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Print the stored result of a tree
+    Status {
+        /// A commit instead of the working copy
+        rev: Option<String>,
+        /// The index instead of the working copy
+        #[arg(long, conflicts_with = "rev")]
+        staged: bool,
+        /// Print the result as JSON on stdout
+        #[arg(long)]
+        json: bool,
+        /// The ref the run read shipcheck.toml from
+        #[arg(long, value_name = "ref")]
+        base: Option<String>,
+    },
+    /// Print the logs of a tree's last run
+    Logs {
+        /// A commit instead of the working copy
+        rev: Option<String>,
+        /// The index instead of the working copy
+        #[arg(long, conflicts_with = "rev")]
+        staged: bool,
+        /// The ref the run read shipcheck.toml from
+        #[arg(long, value_name = "ref")]
+        base: Option<String>,
+    },
+    /// Post a commit's result as its PR's checks
+    Post {
+        /// The commit to post, HEAD by default
+        rev: Option<String>,
+        /// Post from a SHIPCHECK_HOME other than the default
+        #[arg(long)]
+        home_ok: bool,
+        #[arg(long, hide = true, value_name = "ref")]
+        base: Option<String>,
+    },
+    /// List the last runs of this repository on this machine
+    History {
+        /// Print the runs as JSON on stdout
+        #[arg(long)]
+        json: bool,
+        /// How many runs to list
+        #[arg(long, default_value_t = 20, value_name = "n")]
+        limit: usize,
+    },
+    /// Check this machine and repository, and say what to fix
+    Doctor {
+        #[arg(long, hide = true, value_name = "ref")]
+        base: Option<String>,
+    },
+    /// Sign this machine in, so it can post checks
+    Login,
+    /// Revoke this machine's token
+    Logout {
+        /// Revoke every token of your GitHub user, on every machine
+        #[arg(long)]
+        all: bool,
+    },
+    /// Make a token for another machine
+    Token {
+        /// A name for the machine, shown when it posts
+        #[arg(long, default_value = "token", value_name = "machine")]
+        name: String,
+    },
+    /// Remove what shipcheck keeps for this repository
+    Clean {
+        /// For every repository, and the stored results, logs and daemon too
+        #[arg(long)]
+        all: bool,
+    },
+    /// Watch the open PRs and run each new head, as a service
+    Daemon {
+        /// Run from a SHIPCHECK_HOME other than the default
+        #[arg(long)]
+        home_ok: bool,
+        /// Stop the service and remove it
+        #[arg(long)]
+        uninstall: bool,
+    },
+    /// Called by the post-commit hook
+    #[command(hide = true)]
+    OnCommit,
+    /// Called by the pre-push hook with the pushed ref and commit
+    #[command(hide = true)]
+    OnPush {
+        refname: Option<String>,
+        sha: Option<String>,
+    },
+}
 
-    if args.iter().any(|a| a == "-h" || a == "--help")
-        && (known || matches!(args.first().map(String::as_str), Some("-h" | "--help")))
-    {
-        println!("{USAGE}\n\nDocs: https://shipcheck.run/docs/");
-        return Ok(ExitCode::SUCCESS);
-    }
-
+fn cli(command: Cmd) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-
-    if args.first().map(String::as_str) == Some("commit") {
-        return commit(&cwd, &args[1..]);
-    }
-
-    // Only the token goes to stdout, so a script can capture it
-    if args.first().map(String::as_str) == Some("token") {
-        let name = match args.get(1..).unwrap_or_default() {
-            [] => "token".to_string(),
-            [flag, name] if flag == "--name" => name.clone(),
-            _ => {
-                return Err(USAGE.into());
-            }
-        };
-        println!("{}", service::new_token(&name)?);
-        eprintln!(
-            "set it as SHIPCHECK_TOKEN on the other machine, `shipcheck logout` there or `shipcheck logout --all` anywhere revokes it"
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-
     let mut rev = "HEAD".to_string();
     let mut fetch = true;
     let mut base = "origin/main".to_string();
@@ -101,69 +207,137 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
     let mut uninstall = false;
     // Set by the hooks and the daemon on a background run that posts its checks
     let mut posts: Option<String> = None;
-    let mut rest = args.iter().skip(1);
-
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            "--sha" => {
-                rev = rest.next().ok_or("--sha needs a revision")?.clone();
-                explicit = true;
-            }
-            "--staged" => {
-                staged = true;
-            }
-            "--json" => {
-                json = true;
-            }
-            "--no-fetch" => {
-                fetch = false;
-            }
-            "--all" => {
-                all = true;
-            }
-            "--home-ok" => {
-                home_ok = true;
-            }
-            "--yes" => {
-                yes = true;
-            }
-            "--uninstall" => {
-                uninstall = true;
-            }
-            "--background" => {
-                posts = Some(rest.next().ok_or("--background needs a name")?.clone());
-            }
-            "--job" => {
-                jobs.push(rest.next().ok_or("--job needs a job id")?.clone());
-            }
-            "--workflow" => {
-                workflows.push(rest.next().ok_or("--workflow needs a file")?.clone());
-            }
-            "--limit" => {
-                let n = rest.next().ok_or("--limit needs a number")?;
-                limit = n
-                    .parse()
-                    .map_err(|_| format!("--limit needs a number, not {n}"))?;
-            }
-            "--base" => {
-                // For trials: read shipcheck.toml and the workflows from another ref than origin/main
-                base = rest.next().ok_or("--base needs a ref")?.clone();
-                base_set = true;
-                fetch = false;
-            }
-            other if !other.starts_with('-') => {
-                rev = other.to_string();
-                explicit = true;
-            }
-            other => {
-                return Err(format!("unknown option {other}\n{USAGE}"));
-            }
+    let (mut refname, mut pushed) = (String::new(), None);
+    let on_base = |b: Option<String>, base: &mut String, base_set: &mut bool, fetch: &mut bool| {
+        // For trials: read shipcheck.toml and the workflows from another ref than origin/main
+        if let Some(b) = b {
+            *base = b;
+            *base_set = true;
+            *fetch = false;
         }
-    }
+    };
+    let at = |r: Option<String>, rev: &mut String, explicit: &mut bool| {
+        if let Some(r) = r {
+            *rev = r;
+            *explicit = true;
+        }
+    };
 
-    if (!jobs.is_empty() || !workflows.is_empty()) && args[0] != "run" {
-        return Err("--job and --workflow work only with run".into());
-    }
+    let name = match command {
+        Cmd::Commit {
+            message,
+            file,
+            allow_failed,
+            no_verify,
+        } => {
+            let mut args = Vec::new();
+
+            for m in message {
+                args.extend(["-m".to_string(), m]);
+            }
+
+            if let Some(f) = file {
+                args.extend(["-F".to_string(), f]);
+            }
+
+            if no_verify {
+                args.push("--no-verify".into());
+            }
+
+            return commit(&cwd, &args, allow_failed);
+        }
+        // Only the token goes to stdout, so a script can capture it
+        Cmd::Token { name } => {
+            println!("{}", service::new_token(&name)?);
+            eprintln!(
+                "set it as SHIPCHECK_TOKEN on the other machine, `shipcheck logout` there or `shipcheck logout --all` anywhere revokes it"
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Init { yes: y } => {
+            yes = y;
+            "init"
+        }
+        Cmd::Install => "install",
+        Cmd::Run {
+            sha,
+            staged: st,
+            no_fetch,
+            base: b,
+            jobs: j,
+            workflows: w,
+            json: js,
+            background,
+            rev: r,
+        } => {
+            at(sha.or(r), &mut rev, &mut explicit);
+            staged = st;
+            fetch = !no_fetch;
+            on_base(b, &mut base, &mut base_set, &mut fetch);
+            (jobs, workflows, json, posts) = (j, w, js, background);
+            "run"
+        }
+        Cmd::Status {
+            rev: r,
+            staged: st,
+            json: js,
+            base: b,
+        } => {
+            at(r, &mut rev, &mut explicit);
+            (staged, json) = (st, js);
+            on_base(b, &mut base, &mut base_set, &mut fetch);
+            "status"
+        }
+        Cmd::Logs {
+            rev: r,
+            staged: st,
+            base: b,
+        } => {
+            at(r, &mut rev, &mut explicit);
+            staged = st;
+            on_base(b, &mut base, &mut base_set, &mut fetch);
+            "logs"
+        }
+        Cmd::Post {
+            rev: r,
+            home_ok: h,
+            base: b,
+        } => {
+            at(r, &mut rev, &mut explicit);
+            home_ok = h;
+            on_base(b, &mut base, &mut base_set, &mut fetch);
+            "post"
+        }
+        Cmd::History { json: js, limit: l } => {
+            (json, limit) = (js, l);
+            "history"
+        }
+        Cmd::Doctor { base: b } => {
+            on_base(b, &mut base, &mut base_set, &mut fetch);
+            "doctor"
+        }
+        Cmd::Login => "login",
+        Cmd::Logout { all: a } => {
+            all = a;
+            "logout"
+        }
+        Cmd::Clean { all: a } => {
+            all = a;
+            "clean"
+        }
+        Cmd::Daemon {
+            home_ok: h,
+            uninstall: u,
+        } => {
+            (home_ok, uninstall) = (h, u);
+            "daemon"
+        }
+        Cmd::OnCommit => "on-commit",
+        Cmd::OnPush { refname: r, sha } => {
+            (refname, pushed) = (r.unwrap_or_default(), sha);
+            "on-push"
+        }
+    };
 
     // With --json, stdout holds only the result object
     let style = if json {
@@ -181,8 +355,8 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
         }
     };
 
-    match args.first().map(String::as_str) {
-        Some("run") => {
+    match name {
+        "run" => {
             if fetch {
                 let status = Command::new("git")
                     .args(["fetch", "-q", "origin", "main"])
@@ -336,7 +510,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
 
             Ok(code)
         }
-        Some("doctor") => {
+        "doctor" => {
             let checks = shipcheck::doctor::checks(&cwd, &base);
             let width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
             // Agents and pipes read the plain words, a person at a terminal gets marks and color
@@ -362,7 +536,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
                 Ok(ExitCode::from(1))
             }
         }
-        Some("status") => {
+        "status" => {
             // Before a commit, whether committing all of it or the index as it is reuses a result
             if !explicit {
                 for (label, staged) in [("working copy", false), ("index", true)] {
@@ -400,7 +574,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
                 }
             }
         }
-        Some("history") => {
+        "history" => {
             let repo = run::repo_id(&toplevel(&cwd)?)?;
             let runs = shipcheck::record::runs(&run::home(), &repo, limit);
 
@@ -414,7 +588,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
 
             Ok(ExitCode::SUCCESS)
         }
-        Some("logs") => {
+        "logs" => {
             let (tested, _) = subject(&cwd, &rev, explicit, staged)?;
             let mut plan = run::plan(&cwd, &tested, &base)?;
 
@@ -437,7 +611,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
 
             Ok(ExitCode::SUCCESS)
         }
-        Some("post") => {
+        "post" => {
             refuse_moved_home(home_ok)?;
             let plan = run::plan(&cwd, &rev, &base)?;
 
@@ -485,7 +659,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             shipcheck::record::keep(&repo, &shipcheck::record::event(&repo, "posted", fields));
             Ok(ExitCode::SUCCESS)
         }
-        Some("login") => {
+        "login" => {
             let login = service::login()?;
             let s = Style::stdout();
             let mark = if s.on {
@@ -500,12 +674,12 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Some("logout") => {
+        "logout" => {
             println!("{}", service::logout(all)?);
             Ok(ExitCode::SUCCESS)
         }
         // Called by the hooks, so they never fail and never make a commit or a push wait
-        Some("on-commit") => {
+        "on-commit" => {
             let branch = current_branch(&cwd);
 
             if let Ok(plan) = run::plan(&cwd, "HEAD", &base)
@@ -517,11 +691,10 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
 
             Ok(ExitCode::SUCCESS)
         }
-        Some("on-push") => {
-            let refname = args.get(1).cloned().unwrap_or_default();
+        "on-push" => {
             let branch = refname.trim_start_matches("refs/heads/").to_string();
 
-            if let Some(sha) = args.get(2)
+            if let Some(sha) = &pushed
                 && let Ok(plan) = run::plan(&cwd, sha, &base)
                 && plan.config.runs_on(Trigger::Push)
                 && !run::skip_requested(&plan)
@@ -542,7 +715,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
 
             Ok(ExitCode::SUCCESS)
         }
-        Some("clean") => {
+        "clean" => {
             let repo = if all { None } else { Some(toplevel(&cwd)?) };
 
             for line in run::clean(repo.as_deref(), all)? {
@@ -555,7 +728,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
 
             Ok(ExitCode::SUCCESS)
         }
-        Some("daemon") => {
+        "daemon" => {
             if uninstall {
                 println!("{}", autostart::uninstall()?);
                 return Ok(ExitCode::SUCCESS);
@@ -570,7 +743,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             );
             shipcheck::daemon::serve(home_ok)
         }
-        Some("init") => {
+        "init" => {
             let root = toplevel(&cwd)?;
             let terminal = std::io::stdin().is_terminal()
                 && std::io::stdout().is_terminal()
@@ -606,7 +779,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             println!("next: review shipcheck.toml and AGENTS.md, commit them, and merge to main");
             Ok(ExitCode::SUCCESS)
         }
-        Some("install") => {
+        "install" => {
             let root = toplevel(&cwd)?;
             remove_old_hooks(&root, &mut |line| println!("{line}"));
             println!("{}", setup::install(&root)?);
@@ -614,7 +787,7 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             println!("{}", autostart::install(&root));
             Ok(ExitCode::SUCCESS)
         }
-        _ => Err(USAGE.into()),
+        other => Err(format!("unknown command {other}")),
     }
 }
 
@@ -750,36 +923,8 @@ fn warn_untracked(repo: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `shipcheck commit -m <msg> | -F <file> [--allow-failed] [--no-verify]`: commits the tree the last run tested
-fn commit(cwd: &Path, args: &[String]) -> Result<ExitCode, String> {
-    let mut git_args = Vec::new();
-    let mut allow_failed = false;
-    let mut rest = args.iter();
-
-    while let Some(arg) = rest.next() {
-        match arg.as_str() {
-            "-m" | "-F" => {
-                let value = rest.next().ok_or(format!("{arg} needs a value"))?;
-                git_args.extend([arg.clone(), value.clone()]);
-            }
-            "--allow-failed" => {
-                allow_failed = true;
-            }
-            "--no-verify" => {
-                git_args.push(arg.clone());
-            }
-            other => {
-                return Err(format!(
-                    "unknown option {other}\nusage: shipcheck commit -m <message> | -F <file> [--allow-failed] [--no-verify]"
-                ));
-            }
-        }
-    }
-
-    if !git_args.iter().any(|a| a == "-m" || a == "-F") {
-        return Err("shipcheck commit needs -m <message> or -F <file>".into());
-    }
-
+/// Commits the tree the last run tested, `git_args` being the message and `--no-verify` for git
+fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCode, String> {
     let repo = toplevel(cwd)?;
 
     // Plain `git commit` still works on it, the hooks never block git
@@ -790,7 +935,7 @@ fn commit(cwd: &Path, args: &[String]) -> Result<ExitCode, String> {
     }
 
     let tested = run::last_tested(&repo).ok_or("no `shipcheck run` of this working copy yet")?;
-    let sha = run::commit(cwd, &tested, &git_args, allow_failed)?;
+    let sha = run::commit(cwd, &tested, git_args, allow_failed)?;
     println!(
         "committed {}, the tree that {} in `shipcheck run`",
         &sha[..12],
