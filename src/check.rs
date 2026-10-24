@@ -418,6 +418,8 @@ pub fn body(sha: &str, entry: &Entry, logs: Option<(&Path, &[String])>) -> Value
         "passed, nothing to run for this change".to_string()
     } else if entry.passed {
         "passed".to_string()
+    } else if entry.could_not_run() {
+        "could not run, Docker or the sandbox failed before the code ran".to_string()
     } else if let [wf] = entry.workflows.as_slice()
         && wf.file == HOST
     {
@@ -554,6 +556,32 @@ mod tests {
         let summary = b["output"]["summary"].as_str().unwrap();
         assert!(summary.contains("This commit changes CI"));
         assert!(summary.contains("- .github/workflows/ci.yml: job test gets continue-on-error\n"));
+    }
+
+    #[test]
+    fn a_job_shipcheck_could_not_start_is_not_the_codes_failure() {
+        let mut e = entry(false);
+        let jobs = &mut e.workflows[0].jobs;
+        jobs.insert("test".into(), crate::run::COULD_NOT_RUN.into());
+        jobs.insert(
+            "after".into(),
+            "not run, a job it needs did not pass".into(),
+        );
+        assert!(e.could_not_run());
+        assert_eq!(crate::run::exit_code(&e), 2);
+        assert!(crate::report::text(&e, "abc", &[]).contains("could not run, tree t from abc"));
+        assert_eq!(
+            body("abc", &e, None)["output"]["title"],
+            "could not run, Docker or the sandbox failed before the code ran"
+        );
+
+        // One job that ran and failed makes it the code's failure again
+        e.workflows[0].jobs.insert("lint".into(), "failure".into());
+        assert!(!e.could_not_run());
+        assert_eq!(crate::run::exit_code(&e), 1);
+        assert_eq!(crate::run::exit_code(&entry(true)), 0);
+        assert!(!entry(false).could_not_run());
+        assert!(!entry(true).could_not_run());
     }
 
     #[test]

@@ -1082,11 +1082,7 @@ fn report(entry: &run::Entry, snapshot: Option<&str>, json: bool, partial: bool)
         }
     }
 
-    if entry.passed {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    }
+    ExitCode::from(run::exit_code(entry))
 }
 
 fn print_logs(dir: &Path) -> Result<(), String> {
