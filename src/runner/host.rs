@@ -478,6 +478,22 @@ impl Jail {
         Ok(args)
     }
 
+    /**
+     * The trusted `PATH` and then where `go install`, `cargo install`, `npm install -g` and
+     * `uv tool` or `pipx` put binaries, as GitHub's setup actions add them. Last, so a binary left
+     * in a cache never shadows a tool of the user's
+     **/
+    fn path(&self, trusted: std::ffi::OsString) -> std::ffi::OsString {
+        let bins = [
+            self.cache.join("go/bin"),
+            self.cache.join("cargo/bin"),
+            self.home.join(NPM_PREFIX).join("bin"),
+            self.home.join(".local/bin"),
+        ];
+        let dirs = std::env::split_paths(&trusted).chain(bins);
+        std::env::join_paths(dirs).unwrap_or(trusted)
+    }
+
     /// `sh -c` in the OS sandbox with the filtered environment, in a session of its own with no
     /// controlling terminal, so a timeout stops all of it and it cannot type into the terminal
     fn shell(&self, command: &str, dir: &Path, extra: &[String]) -> Result<Command, String> {
@@ -496,13 +512,14 @@ impl Jail {
             }
         };
         let cache = |dir: &str| self.cache.join(dir);
+        let base = self.path(jail_path());
         let shims = self.home.join(SHIMS);
         let path = if shims.is_dir() {
-            let dirs = std::iter::once(shims)
-                .chain(std::env::split_paths(&jail_path()).collect::<Vec<_>>());
-            std::env::join_paths(dirs).unwrap_or_else(|_| jail_path())
+            let dirs =
+                std::iter::once(shims).chain(std::env::split_paths(&base).collect::<Vec<_>>());
+            std::env::join_paths(dirs).unwrap_or(base)
         } else {
-            jail_path()
+            base
         };
         let rustup = Some(self.home.join(".rustup"))
             .filter(|r| r.is_dir())
@@ -520,6 +537,7 @@ impl Jail {
             .env("BUN_INSTALL_CACHE_DIR", cache("bun"))
             .env("CARGO_HOME", cache("cargo"))
             .env("npm_config_cache", cache("npm"))
+            .env("npm_config_prefix", self.home.join(NPM_PREFIX))
             .env("UV_CACHE_DIR", cache("uv"))
             .env("XDG_CACHE_HOME", cache("xdg"))
             .env("GOPATH", cache("go"))
@@ -607,6 +625,9 @@ fn mktemp_shim(home: &Path) -> Result<(), String> {
     fs::write(&file, MKTEMP).map_err(|e| e.to_string())?;
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
 }
+
+/// The prefix of `npm install -g` in the jail's home, since node's own is read-only here
+const NPM_PREFIX: &str = ".npm-global";
 
 /// Toolchains found only through `$HOME`, linked from the jail's home to the user's, readable as
 /// part of `TOOLCHAINS`. Never all of `~/.docker`, whose config can name a credential store
@@ -1253,6 +1274,48 @@ mod tests {
             0,
             "the grandchild still runs"
         );
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_check_runs_what_it_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let jail = jail(dir.path());
+        let mut exits = Vec::new();
+
+        // As `go install`, `cargo install`, `npm install -g` and `uv tool install` do
+        for (bin, name) in [
+            ("$GOPATH/bin", "probe-go"),
+            ("$CARGO_HOME/bin", "probe-cargo"),
+            ("$npm_config_prefix/bin", "probe-npm"),
+            ("$HOME/.local/bin", "probe-uv"),
+        ] {
+            let cmd = format!(
+                "mkdir -p {bin} && printf '#!/bin/sh\\necho ran\\n' > {bin}/{name} && chmod +x {bin}/{name} && {name}"
+            );
+            let exit = run_command(&cmd, dir.path(), &jail, &[], &log, Duration::from_secs(10));
+            exits.push((name, exit.unwrap(), fs::read_to_string(&log).unwrap()));
+        }
+
+        for (name, exit, log) in exits {
+            assert_eq!(exit, Some(0), "{name}: {log}");
+            assert!(log.ends_with("ran\n"), "{name}: {log}");
+        }
+    }
+
+    #[test]
+    fn installed_binaries_come_after_the_trusted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = jail(dir.path());
+        let path = jail.path("/usr/bin:/bin".into());
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(
+            dirs[..2],
+            [PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+        );
+        assert_eq!(dirs[2], jail.cache.join("go/bin"));
+        assert_eq!(dirs.len(), 6);
     }
 
     #[test]
