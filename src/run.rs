@@ -442,6 +442,24 @@ fn index_paths(repo: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((index, temp))
 }
 
+/**
+ * git rehashes an entry whose file changed no earlier than the index was written, since its stats
+ * cannot tell an edit in that second apart. A copy with a new time loses that, and an edit of the
+ * same size in the same second as `git add` went unseen. Linux's copy takes the time of the copy
+ **/
+fn copy_index(index: &Path, temp: &Path) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("{}: {e}", index.display());
+    fs::copy(index, temp).map_err(err)?;
+    let written = fs::metadata(index)
+        .and_then(|m| m.modified())
+        .map_err(err)?;
+    fs::File::options()
+        .write(true)
+        .open(temp)
+        .and_then(|f| f.set_modified(written))
+        .map_err(|e| format!("{}: {e}", temp.display()))
+}
+
 fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, staged: bool) -> Result<String, String> {
     let with_temp = |args: &[&str]| {
         let out = Command::new("git")
@@ -465,7 +483,7 @@ fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, staged: bool) -> Result
 
     // A copy of the real index keeps its file stats, so git hashes only the files that changed
     if index.exists() {
-        fs::copy(index, temp).map_err(|e| format!("{}: {e}", index.display()))?;
+        copy_index(index, temp)?;
     } else {
         with_temp(&["read-tree", "HEAD"])?;
     }
@@ -2995,6 +3013,23 @@ mod tests {
             sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")])
         );
         assert_eq!(snapshot(repo, false).unwrap(), None);
+    }
+
+    #[test]
+    fn the_index_copy_keeps_the_time_the_index_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, temp) = (dir.path().join("index"), dir.path().join("copy"));
+        fs::write(&index, "entries").unwrap();
+        let written = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        copy_index(&index, &temp).unwrap();
+        assert_eq!(fs::read(&temp).unwrap(), b"entries");
+        assert_eq!(fs::metadata(&temp).unwrap().modified().unwrap(), written);
     }
 
     #[test]
