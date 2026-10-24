@@ -1006,7 +1006,7 @@ jobs:
       # The checkout matches the commit, scripts next to the workflows stay, each job has its own tool cache
       - run: git diff --exit-code && git status --porcelain | grep -v from-a | grep -c . | grep -qx 0
       - run: sh .github/workflows/scripts/hello.sh
-      - run: test \"$RUNNER_TOOL_CACHE\" = /home/runner/.shipcheck/a/toolcache
+      - run: test \"$RUNNER_TOOL_CACHE:$AGENT_TOOLSDIRECTORY\" = /home/runner/.shipcheck/a/toolcache:/home/runner/.shipcheck/a/toolcache
       # The job runs as GitHub's runner user, and can write every mount
       - run: test \"$(id -un):$(id -u):$HOME\" = runner:1001:/home/runner && sudo -n true
       - run: test \"$ImageOS:$RUNNER_TEMP\" = ubuntu24:/home/runner/work/_temp && touch \"$RUNNER_TEMP/t\"
