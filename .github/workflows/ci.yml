@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths-ignore: ["Formula/**", "**.md"]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -34,8 +35,53 @@ jobs:
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true
       - run: cargo test
 
+  # The end-to-end test on Linux, where Docker has no VM between it and the host, the disk has no
+  # copy-on-write, and a bridge container reaches the host only at the bridge gateway
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, act: act_Linux_x86_64.tar.gz, sha: 0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0 }
+          - { os: ubuntu-24.04-arm, act: act_Linux_arm64.tar.gz, sha: daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb }
+    runs-on: ${{ matrix.os }}
+    env:
+      ACT_VERSION: v0.2.89
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Install act
+        env:
+          ACT_ARCHIVE: ${{ matrix.act }}
+          ACT_SHA256: ${{ matrix.sha }}
+        run: |
+          curl -fsSL -o act.tar.gz "https://github.com/nektos/act/releases/download/$ACT_VERSION/$ACT_ARCHIVE"
+          echo "$ACT_SHA256  act.tar.gz" | sha256sum -c -
+          tar -xzf act.tar.gz -C "$RUNNER_TEMP" act
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: docker version
+      - run: act --version
+      - run: cargo test --test e2e -- --ignored --nocapture
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -fsSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "$GITLEAKS_SHA256  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz -C "$RUNNER_TEMP" gitleaks
+      - run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner .'
+
   check-release:
-    needs: test
+    needs: [test, e2e, gitleaks]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:

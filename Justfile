@@ -14,6 +14,6 @@ e2e:
     cargo test --test shard_e2e -- --ignored
     cargo test --test retry_e2e -- --ignored
 
-# Scan the whole git history for secrets, as the leaks workflow does
+# Scan the whole git history for secrets, as the gitleaks job in ci.yml does
 leaks:
     gitleaks git --redact --no-banner .
