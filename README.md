@@ -1,5 +1,7 @@
 # shipcheck
 
+[![CI](https://github.com/gabrielkoerich/shipcheck/actions/workflows/ci.yml/badge.svg)](https://github.com/gabrielkoerich/shipcheck/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/gabrielkoerich/shipcheck)](https://github.com/gabrielkoerich/shipcheck/releases/latest) [![Homebrew](https://img.shields.io/badge/homebrew-gabrielkoerich%2Ftap-orange)](https://github.com/gabrielkoerich/homebrew-tap) [![crates.io](https://img.shields.io/crates/v/shipcheck)](https://crates.io/crates/shipcheck) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Your agent already ran the tests. shipcheck runs your repository's checks on your machine, keeps the result for that exact git tree, and posts the required checks, one per job, from its GitHub App. A PR whose tree was already tested gets its checks in under a second.
 
 It has two modes:
