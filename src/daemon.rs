@@ -1195,7 +1195,8 @@ mod tests {
 
     /// A failed result for the head stored in this home, with a log a same-repo PR's checks show
     fn store_failure(path: &Path, sha: &str) {
-        let key = run::plan(path, sha, "origin/main").unwrap().key;
+        let plan = run::plan(path, sha, "origin/main").unwrap();
+        let key = plan.key.clone();
         let logs = run::log_dir(&key);
         std::fs::create_dir_all(logs.join("ci.yml")).unwrap();
         std::fs::write(logs.join("ci.yml/test.log"), "boom from the head\n").unwrap();
@@ -1203,14 +1204,16 @@ mod tests {
         let result = run::Entry {
             key: key.clone(),
             sha: sha.into(),
-            tree: String::new(),
-            base: String::new(),
+            tree: plan.tree,
+            base: plan.base,
             passed: false,
             workflows: vec![run::WorkflowResult {
                 file: "ci.yml".into(),
                 exit: Some(1),
                 attempts: 1,
-                log_sha256: String::new(),
+                log_sha256: crate::cache::hex(&<sha2::Sha256 as sha2::Digest>::digest(
+                    b"boom from the head\n",
+                )),
                 jobs: BTreeMap::from([("test".into(), "failure".into())]),
                 passed: false,
                 shards: BTreeMap::new(),

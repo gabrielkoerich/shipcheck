@@ -1014,7 +1014,19 @@ fn posting_run(
                     hit = true;
                     Ok(entry)
                 }
-                None => run::run(plan, &mut |line| say(&run::printable(line))),
+                None => {
+                    let mut entry = run::run(plan, &mut |line| say(&run::printable(line)))?;
+
+                    // A fresh pass is checked like a stored one before it is posted, and fails closed
+                    if entry.passed && !run::holds(plan, &entry) {
+                        say(
+                            "the run's tree, base or logs do not match its result, posting a failure",
+                        );
+                        entry.passed = false;
+                    }
+
+                    Ok(entry)
+                }
             }
         },
         |entry| check::final_bodies(plan, entry, true),
