@@ -859,6 +859,11 @@ pub fn cached(key: &str) -> Option<Entry> {
 /// The result for a plan without running it: a pass when `paths` excludes the change, else the cache
 pub fn lookup(plan: &Plan) -> Option<Entry> {
     let mut entry = skipped(plan).or_else(|| cached(&plan.key))?;
+    // The key holds the tree, still a stored file counts only for the plan's tree
+    if entry.tree != plan.tree {
+        return None;
+    }
+
     // A cached result can come from another commit with the same tree, the notes must be this one's
     entry.ci_changes = plan.ci_changes.clone();
     Some(entry)
@@ -2005,7 +2010,8 @@ fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Res
         ));
     }
 
-    touch_tracked(dir)
+    touch_tracked(dir)?;
+    verify_checkout(dir, &ctx.plan.tree)
 }
 
 /**
@@ -2043,6 +2049,50 @@ fn touch_tracked(dir: &Path) -> Result<(), String> {
         fs::File::open(&path)
             .and_then(|f| f.set_modified(now))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+/**
+ * Proves the job's files are the tested tree: every tracked file on disk is hashed again into a new
+ * index, which has no stat cache to skip a file with, and the tree written from it must be the
+ * plan's. A file edited, deleted, relinked or with another mode changes that tree. Ignored and
+ * untracked files, such as warm build output, are not part of a tree, so they never count
+ **/
+fn verify_checkout(dir: &Path, tree: &str) -> Result<(), String> {
+    let index = dir.with_extension("verify-index");
+    let _ = fs::remove_file(&index);
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+
+        if !out.status.success() {
+            return Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let on_disk = git(&["read-tree", "HEAD"])
+        .and_then(|_| git(&["add", "-u"]))
+        .and_then(|_| git(&["write-tree"]));
+    let _ = fs::remove_file(&index);
+    let on_disk = on_disk?;
+
+    if on_disk != tree {
+        return Err(format!(
+            "the checkout in {} is tree {on_disk}, not the tested tree {tree}",
+            dir.display()
+        ));
     }
 
     Ok(())
@@ -2579,6 +2629,59 @@ mod tests {
     }
 
     #[test]
+    fn a_checkout_passes_only_with_the_tested_tree_on_disk() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("job");
+        fs::create_dir(&repo).unwrap();
+        sh(&repo, &["init", "-q"]);
+        fs::write(repo.join("a"), "a").unwrap();
+        fs::write(repo.join("e"), "e").unwrap();
+        fs::set_permissions(repo.join("e"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("a", repo.join("l")).unwrap();
+        fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        sh(&repo, &["add", "."]);
+        sh(&repo, &["commit", "-q", "-m", "i"]);
+        let tree = sh(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let restore = || sh(&repo, &["checkout", "-q", "--", "."]);
+
+        // Build output, untracked files and new mtimes are not the code
+        fs::create_dir(repo.join("target")).unwrap();
+        fs::write(repo.join("target/stale"), "x").unwrap();
+        fs::write(repo.join("untracked"), "x").unwrap();
+        fs::File::open(repo.join("a"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        verify_checkout(&repo, &tree).unwrap();
+        assert!(!repo.with_extension("verify-index").exists());
+
+        let tampers: [(&str, &dyn Fn()); 4] = [
+            ("edited", &|| fs::write(repo.join("a"), "b").unwrap()),
+            ("deleted", &|| fs::remove_file(repo.join("a")).unwrap()),
+            ("mode", &|| {
+                fs::set_permissions(repo.join("e"), fs::Permissions::from_mode(0o644)).unwrap()
+            }),
+            ("relinked", &|| {
+                fs::remove_file(repo.join("l")).unwrap();
+                symlink("e", repo.join("l")).unwrap();
+            }),
+        ];
+        for (name, tamper) in tampers {
+            tamper();
+            assert!(verify_checkout(&repo, &tree).is_err(), "{name} must fail");
+            restore();
+            verify_checkout(&repo, &tree).unwrap();
+        }
+
+        let other = sh(&repo, &["rev-parse", "HEAD^{tree}"]).replace(char::is_alphanumeric, "0");
+        assert!(
+            verify_checkout(&repo, &other).is_err(),
+            "another tree must fail"
+        );
+    }
+
+    #[test]
     fn commit_and_post_refuse_the_default_branch() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -3033,6 +3136,49 @@ mod tests {
             tools: String::new(),
         };
         (dir, plan)
+    }
+
+    #[test]
+    fn a_stored_result_counts_only_for_the_plans_tree() {
+        if std::env::var_os("SHIPCHECK_HOME_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::tests::a_stored_result_counts_only_for_the_plans_tree",
+                ])
+                .env("SHIPCHECK_HOME_CHILD", "1")
+                .env("SHIPCHECK_HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            return;
+        }
+
+        let (_d, plan) = plan_after(|r| fs::write(r.join("src/lib.rs"), "fn b() {}").unwrap());
+        let store = |tree: &str| {
+            let entry = serde_json::json!({
+                "key": plan.key, "sha": plan.sha, "tree": tree, "base": plan.base,
+                "passed": true, "workflows": [], "finished_unix": 0
+            });
+            fs::create_dir_all(home().join("cache")).unwrap();
+            fs::write(
+                home().join(format!("cache/{}.json", plan.key)),
+                entry.to_string(),
+            )
+            .unwrap();
+        };
+        store(&plan.tree);
+        assert!(lookup(&plan).is_some());
+        store(&"0".repeat(40));
+        assert!(
+            lookup(&plan).is_none(),
+            "a result of another tree under this key"
+        );
     }
 
     #[test]
