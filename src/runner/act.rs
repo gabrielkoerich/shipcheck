@@ -167,10 +167,14 @@ impl Runner for Act {
             .filter(|p| *p != "/var/lib/apt/lists")
             .map(|p| format!("\"{p}\" "))
             .collect();
-        // Docker creates a new volume owned by root, and the job runs as `runner`, which has sudo
+        // Docker creates a new volume and the missing dirs above it owned by root, and the job runs
+        // as `runner`, which has sudo. setup-go then writes `~/go/bin` beside `~/go/pkg/mod`
         let own_mounts = format!(
             "for d in {mounts}\"$GITHUB_WORKSPACE/.venv\"; do\n  \
-             [ -w \"$d\" ] || sudo -n chown \"$(id -u):$(id -g)\" \"$d\" || true\ndone\n\
+             while [ -w \"$d\" ] || sudo -n chown \"$(id -u):$(id -g)\" \"$d\" || true; do\n    \
+             d=$(dirname \"$d\")\n    \
+             case $d in \"${{HOME:-/none}}\"/*) ;; *) break ;; esac\n  \
+             done\ndone\n\
              mkdir -p \"$RUNNER_TEMP\" || true\n"
         );
         let label_latest = !self.config.platforms.contains_key("ubuntu-latest");
@@ -2155,6 +2159,41 @@ jobs:
     }
 
     #[test]
+    fn the_homes_step_owns_the_dirs_docker_made_above_a_mount() {
+        use std::os::unix::fs::PermissionsExt;
+        let out = load(&inject(CI, "abc").unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
+        let homes = out["jobs"]["test"]["steps"][1]["run"]
+            .as_str()
+            .unwrap()
+            .replace("/home/runner", &home.to_string_lossy());
+        // As Docker leaves a volume at ~/.bun/install/cache: the dirs above it are root's
+        fs::create_dir_all(home.join(".bun/install/cache")).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("sudo"), "#!/bin/sh\nchmod u+w \"$4\"\n").unwrap();
+        fs::set_permissions(bin.join("sudo"), fs::Permissions::from_mode(0o755)).unwrap();
+        for d in [".bun/install", ".bun"] {
+            fs::set_permissions(home.join(d), fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let status = std::process::Command::new("bash")
+            .args(["-e", "-c", &homes])
+            .env("PATH", path)
+            .env("HOME", &home)
+            .env("GITHUB_WORKSPACE", dir.path())
+            .env("RUNNER_TEMP", dir.path().join("temp"))
+            .env("CARGO_HOME", dir.path().join("cargo"))
+            .env("GITHUB_PATH", dir.path().join("github_path"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(fs::create_dir(home.join(".bun/install/bin")).is_ok());
+        assert!(fs::create_dir(home.join(".bun/bin")).is_ok());
+    }
+
+    #[test]
     fn puts_homes_between_the_markers() {
         let out = load(&inject(CI, "abc").unwrap());
         let steps = out["jobs"]["test"]["steps"].as_vec().unwrap();
@@ -2165,7 +2204,7 @@ jobs:
         );
         let homes = steps[1]["run"].as_str().unwrap();
         assert!(homes.starts_with(
-            "for d in \"/home/runner/.shipcheck\" \"/home/runner/.npm\" \"/home/runner/.bun/install/cache\" \"/home/runner/.cache\" \"$GITHUB_WORKSPACE/.venv\"; do\n  [ -w \"$d\" ] || sudo -n chown"
+            "for d in \"/home/runner/.shipcheck\" \"/home/runner/.npm\" \"/home/runner/.bun/install/cache\" \"/home/runner/.cache\" \"$GITHUB_WORKSPACE/.venv\"; do\n  while [ -w \"$d\" ] || sudo -n chown"
         ));
         assert!(homes.ends_with(
             "done\nmkdir -p \"$RUNNER_TEMP\" || true\nmkdir -p \"$CARGO_HOME/bin\"\necho \"$CARGO_HOME/bin\" >> \"$GITHUB_PATH\"\n"
