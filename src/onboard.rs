@@ -8,7 +8,7 @@ use crate::config::{RepoConfig, RunnerKind};
 use crate::setup;
 use crate::ui::Style;
 
-/// The hosted App's slug and ID, from issue #13
+/// The hosted App's slug and ID
 const APP_SLUG: &str = "shipcheck-run";
 const APP_ID: &str = "5400635";
 
