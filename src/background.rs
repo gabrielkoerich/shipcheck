@@ -124,7 +124,8 @@ pub fn fetch_base(cwd: &Path, base: &str) -> bool {
 }
 
 /// Whether a background run of `sha` goes on this machine, under any branch or PR
-pub fn running_here(repo_id: &str, sha: &str) -> bool {
+/// `posting` counts only the runs that post their own checks
+pub fn running_here(repo_id: &str, sha: &str, posting: bool) -> bool {
     let dir = run::home().join("background").join(repo_id);
 
     fs::read_dir(dir)
@@ -135,7 +136,8 @@ pub fn running_here(repo_id: &str, sha: &str) -> bool {
         .any(|text| {
             text.lines().any(|line| {
                 let mut fields = line.split_whitespace();
-                matches!((fields.next(), fields.next()), (Some(pid), Some(s)) if s == sha && our_run(pid))
+                matches!((fields.next(), fields.next()), (Some(pid), Some(s))
+                    if s == sha && (!posting || fields.next() == Some("post")) && our_run(pid))
             })
         })
 }
@@ -323,8 +325,14 @@ pub fn post_run(
         Err(e) if !unknown_sha(&e) => Ok(Checks::new()),
         other => other,
     };
+    // This run posts the new result, so a check completed by an earlier run gets a new one in progress
+    let open = || -> Result<Checks, String> {
+        let mut checks = found()?;
+        checks.retain(|_, c| c.status != "completed");
+        Ok(checks)
+    };
     let marked = |running: bool| {
-        retry(waits, || mark(send, &found()?, sha, names, running)).unwrap_or_else(|e| {
+        retry(waits, || mark(send, &open()?, sha, names, running)).unwrap_or_else(|e| {
             eprintln!(
                 "{}: could not mark the checks: {e}",
                 &sha[..sha.len().min(12)]
@@ -469,6 +477,41 @@ mod tests {
             fake.posts(),
             vec![("shipcheck".into(), "in_progress".into(), Some(8))],
             "a daemon poll during the final posts must not turn a result back into running"
+        );
+    }
+
+    #[test]
+    fn a_rerun_shows_its_completed_checks_in_progress_again() {
+        let fake = Fake::new(0);
+        let check = |id, status: &str| Check {
+            id,
+            status: status.into(),
+            started_at: String::new(),
+        };
+        let found = Checks::from([
+            ("shipcheck/test".into(), check(7, "completed")),
+            ("shipcheck".into(), check(8, "in_progress")),
+        ]);
+        post_run(
+            &|b, id| fake.send(b, id),
+            &|| Ok(found.clone()),
+            &"a".repeat(40),
+            &names(),
+            None,
+            || Ok(entry()),
+            finals,
+            || true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            fake.posts(),
+            vec![
+                ("shipcheck/test".into(), "in_progress".into(), None),
+                ("shipcheck/test".into(), "completed".into(), Some(101)),
+                ("shipcheck".into(), "completed".into(), Some(8)),
+            ],
+            "the old failed run stays as it was, a new run shows the rerun and gets its result"
         );
     }
 
