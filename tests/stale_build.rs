@@ -44,7 +44,6 @@ fn said(out: &Output) -> String {
 }
 
 #[test]
-#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
 fn a_run_never_uses_build_output_another_tree_left() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");

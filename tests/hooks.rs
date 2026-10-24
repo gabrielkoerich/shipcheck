@@ -38,7 +38,6 @@ fn records(home: &Path) -> String {
 }
 
 #[test]
-#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
 fn on_push_runs_the_pushed_commit_and_on_commit_only_when_asked() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
