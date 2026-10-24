@@ -244,7 +244,7 @@ fn platforms(job: &Yaml) -> Platforms {
 
     for l in labels.iter().map(|l| l.to_lowercase()) {
         p.windows |= l.starts_with("windows");
-        p.mac |= l.starts_with("macos");
+        p.mac |= l.contains("macos") || l.contains("xcode");
         p.linux |= l.starts_with("ubuntu") || l.contains("linux");
     }
 

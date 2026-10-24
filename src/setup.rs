@@ -71,6 +71,8 @@ pub struct Detected {
     pub github: Vec<Kept>,
     /// Why the repository runs in act, when a job runs a matrix act can run
     pub act: Option<String>,
+    /// Each check and a tool it starts that is not on this machine's PATH
+    pub missing: Vec<String>,
 }
 
 /// What `init` needs to know of the machine it runs on
@@ -81,6 +83,8 @@ pub struct Machine {
     /// The rustup toolchains installed, such as `1.94.1` or `nightly`
     pub toolchains: Vec<String>,
     pub jdks: Vec<crate::java::Jdk>,
+    /// The Xcode apps installed, such as `/Applications/Xcode_26.6.app`
+    pub xcodes: Vec<String>,
 }
 
 impl Machine {
@@ -91,6 +95,7 @@ impl Machine {
             mac: cfg!(target_os = "macos"),
             toolchains: toolchains(),
             jdks: crate::java::installed(),
+            xcodes: xcodes(),
         }
     }
 
@@ -123,6 +128,18 @@ fn toolchains() -> Vec<String> {
         .collect()
 }
 
+#[cfg(not(test))]
+fn xcodes() -> Vec<String> {
+    fs::read_dir("/Applications")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("Xcode") && n.ends_with(".app"))
+        .map(|n| format!("/Applications/{n}"))
+        .collect()
+}
+
 impl Detected {
     /// One line per check and per thing left out, for the person who runs `init`
     pub fn explain(&self) -> String {
@@ -135,6 +152,11 @@ impl Detected {
         if !self.skipped.is_empty() {
             out.push("left out:".into());
             out.extend(self.skipped.iter().map(|s| format!("  {s}")));
+        }
+
+        if !self.missing.is_empty() {
+            out.push("not installed here, so these checks fail until it is:".into());
+            out.extend(self.missing.iter().map(|m| format!("  {m}")));
         }
 
         if !self.github.is_empty() {
@@ -363,9 +385,10 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
                     "runs a matrix ({axis}) and Docker is not running, so act cannot run it"
                 ));
             }
+            // act would run it, but not beside the other jobs, which stay
             _ if others_off_linux => {
                 return Some(format!(
-                    "runs a matrix ({axis}), and act cannot run this repository's macOS or Windows jobs"
+                    "runs a matrix ({axis}), and host mode runs only this machine's toolchain"
                 ));
             }
             _ => return None,
@@ -388,6 +411,89 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
         && let Err(why) = crate::java::pick(job, &machine.jdks)
     {
         return Some(why);
+    }
+
+    match xcode(job) {
+        Some(Err(why)) => return Some(why),
+        Some(Ok(app)) if app.is_empty() && machine.xcodes.is_empty() => {
+            return Some("needs Xcode, which this machine does not have".into());
+        }
+        Some(Ok(app)) if !app.is_empty() && !machine.xcodes.contains(&app) => {
+            return Some(format!("needs {app}, which this machine does not have"));
+        }
+        None if machine.xcodes.is_empty()
+            && job.steps.iter().any(|s| s.run.contains("xcodebuild")) =>
+        {
+            return Some("runs xcodebuild, and this machine has no Xcode".into());
+        }
+        _ => {}
+    }
+
+    None
+}
+
+const SETUP_XCODE: &str = "maxim-lobanov/setup-xcode";
+
+fn sets_up_xcode(step: &crate::workflow::RunStep) -> bool {
+    step.uses
+        .as_deref()
+        .is_some_and(|u| u.split('@').next() == Some(SETUP_XCODE))
+}
+
+/**
+ * The Xcode app a job picks with `DEVELOPER_DIR`, `xcode-select -s` or `setup-xcode`, such as
+ * `/Applications/Xcode_26.6.app`, empty for any Xcode. Err, why it stays, for a pick init cannot read
+ **/
+fn xcode(job: &crate::workflow::Job) -> Option<Result<String, String>> {
+    let pick = |path: &str| {
+        let path = path.trim_matches(['"', '\'']);
+
+        if path.contains("${{") || path.contains('$') {
+            return Err("picks its Xcode with an expression".to_string());
+        }
+
+        Ok(match path.find(".app") {
+            Some(i) => path[..i + 4].to_string(),
+            None => path.to_string(),
+        })
+    };
+    let from_env = |env: &[(String, Option<String>)]| {
+        env.iter()
+            .find(|(k, _)| k == "DEVELOPER_DIR")
+            .map(|(_, v)| match v {
+                Some(v) => pick(v),
+                None => Err("picks its Xcode with an expression".into()),
+            })
+    };
+
+    if let Some(x) = from_env(&job.env) {
+        return Some(x);
+    }
+
+    for step in &job.steps {
+        if let Some(x) = from_env(&step.env) {
+            return Some(x);
+        }
+
+        for line in step.run.lines() {
+            let mut words = line.split_whitespace().skip_while(|w| *w == "sudo");
+
+            if words.next() == Some("xcode-select")
+                && let Some(path) = words.skip_while(|w| !["-s", "--switch"].contains(w)).nth(1)
+            {
+                return Some(pick(path));
+            }
+        }
+
+        if sets_up_xcode(step) {
+            return Some(match input(step, "xcode-version") {
+                Some(v) if v.starts_with("latest") => Ok(String::new()),
+                Some(v) if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') => {
+                    Ok(format!("/Applications/Xcode_{v}.app"))
+                }
+                _ => Err("picks its Xcode with a version init cannot match".into()),
+            });
+        }
     }
 
     None
@@ -641,6 +747,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
 
     let tools = tool_versions(&d.checks, &d.versions, answers);
     d.versions.extend(tools);
+    d.missing = missing_tools(&d.checks, on_path);
 
     // A pinned toolchain's own version, since `rustc --version` names the default one
     for check in &d.checks {
@@ -653,6 +760,8 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             } else if let Some(home) = word.strip_prefix("JAVA_HOME=") {
                 // It prints to stderr, and `versions` keep stdout
                 format!("{home}/bin/java -version 2>&1")
+            } else if word.starts_with("DEVELOPER_DIR=") {
+                format!("{word} xcodebuild -version")
             } else {
                 continue;
             };
@@ -738,40 +847,13 @@ const PLAIN: &[&str] = &[
 fn tool_versions(checks: &[Found], known: &[String], answers: fn(&str) -> bool) -> Vec<String> {
     let covered: Vec<&str> = known
         .iter()
-        .filter_map(|v| v.split_whitespace().next())
+        .filter_map(|v| v.split_whitespace().find(|w| !w.contains('=')))
         .collect();
     let mut tools: Vec<String> = Vec::new();
 
-    for check in checks {
-        let words = check
-            .command
-            .replace(['(', ')', '{', '}', ';', '|', '&'], "\n");
-
-        for segment in words.lines() {
-            // The tool `xargs` starts is the one that runs, after its flags
-            let mut after_xargs = false;
-            let tool = segment
-                .split_whitespace()
-                .find(|w| {
-                    after_xargs |= *w == "xargs";
-                    !(["time", "xargs"].contains(w)
-                        || w.contains('=')
-                        || after_xargs && w.starts_with('-'))
-                })
-                .unwrap_or_default();
-            let named = !tool.is_empty()
-                && tool
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c));
-
-            if named
-                && !PLAIN.contains(&tool)
-                && !tool.starts_with("mkfs")
-                && !covered.contains(&tool)
-                && !tools.iter().any(|t| t == tool)
-            {
-                tools.push(tool.to_string());
-            }
+    for tool in checks.iter().flat_map(|c| tools_in(&c.command)) {
+        if !covered.contains(&tool.as_str()) && !tools.contains(&tool) {
+            tools.push(tool);
         }
     }
 
@@ -780,6 +862,58 @@ fn tool_versions(checks: &[Found], known: &[String], answers: fn(&str) -> bool) 
         .filter(|t| answers(t))
         .map(|t| format!("{t} --version"))
         .collect()
+}
+
+/// `<check> calls <tool>` for each tool a check starts that `installed` does not find
+fn missing_tools(checks: &[Found], installed: fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for check in checks {
+        for tool in tools_in(&check.command) {
+            let line = format!("{} calls {tool}", check.name);
+
+            if !installed(&tool) && !out.contains(&line) {
+                out.push(line);
+            }
+        }
+    }
+
+    out
+}
+
+/// The tools a command starts, each once, without builtins, coreutils and setup tools
+fn tools_in(command: &str) -> Vec<String> {
+    let words = command.replace(['(', ')', '{', '}', ';', '|', '&'], "\n");
+    let mut tools: Vec<String> = Vec::new();
+
+    for segment in words.lines() {
+        // The tool `xargs` starts is the one that runs, after its flags
+        let mut after_xargs = false;
+        let tool = segment
+            .split_whitespace()
+            .find(|w| {
+                after_xargs |= *w == "xargs";
+                !(["time", "xargs"].contains(w)
+                    || w.contains('=')
+                    || after_xargs && w.starts_with('-'))
+            })
+            .unwrap_or_default();
+        let named = !tool.is_empty()
+            && tool
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c));
+
+        if named
+            && !PLAIN.contains(&tool)
+            && !STATEFUL.contains(&tool)
+            && !tool.starts_with("mkfs")
+            && !tools.iter().any(|t| t == tool)
+        {
+            tools.push(tool.to_string());
+        }
+    }
+
+    tools
 }
 
 /// Whether `<tool> --version` exits 0 within a few seconds on this machine
@@ -817,6 +951,18 @@ fn responds(tool: &str, args: &[&str]) -> bool {
 #[cfg(test)]
 fn answers(_: &str) -> bool {
     false
+}
+
+/// Whether a file of that name is in a directory of `PATH`
+#[cfg(not(test))]
+fn on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(tool).is_file()))
+}
+
+#[cfg(test)]
+fn on_path(_: &str) -> bool {
+    true
 }
 
 /// The jobs `needs` names, and the jobs those need, each once, every job after the ones it needs
@@ -888,7 +1034,7 @@ const STATEFUL: &[&str] = &[
 /// Commands that move files or talk to git, which pass whatever the code is
 const HOUSEKEEPING: &[&str] = &[
     "cd", "export", "mkdir", "touch", "cp", "mv", "rm", "ln", "chmod", "find", "ls", "cat", "echo",
-    "printf", "tar", "unzip", "install", "git", "sleep", "true", "pwd", "which",
+    "printf", "tar", "unzip", "install", "git", "sleep", "true", "pwd", "which", "sed",
 ];
 
 /// The tool and subcommand of package installs and lockfile updates that `install` does not name
@@ -907,17 +1053,19 @@ const INSTALLS: &[[&str; 2]] = &[
  * the code is. That happens when the job's real work is a `uses:` step or a step left out
  **/
 fn checks_nothing(command: &str) -> bool {
-    command.split(['&', '|', ';', '(', ')', '{', '}']).all(|c| {
-        // `VAR=1` before the command and `+nightly` after cargo do not change what runs
-        let words: Vec<&str> = c
-            .split_whitespace()
-            .filter(|w| !w.contains('=') && !w.starts_with('+'))
-            .collect();
-        words.is_empty()
-            || HOUSEKEEPING.contains(&words[0])
-            || words.contains(&"install")
-            || INSTALLS.iter().any(|i| words.starts_with(i))
-    })
+    unquoted(command)
+        .split(['&', '|', ';', '(', ')', '{', '}'])
+        .all(|c| {
+            // `VAR=1` before the command and `+nightly` after cargo do not change what runs
+            let words: Vec<&str> = c
+                .split_whitespace()
+                .filter(|w| !w.contains('=') && !w.starts_with('+'))
+                .collect();
+            words.is_empty()
+                || HOUSEKEEPING.contains(&words[0])
+                || words.contains(&"install")
+                || INSTALLS.iter().any(|i| words.starts_with(i))
+        })
 }
 
 /// `NAME=value` for the shell, or None for a name a shell cannot export or a value with a control character
@@ -957,6 +1105,26 @@ const CONTROL: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
     "function", "select", "{", "}",
 ];
+
+/// A line without what its quotes hold, so a quoted `;` is not a command separator
+fn unquoted(line: &str) -> String {
+    let mut out = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for c in line.chars() {
+        match (quote, c) {
+            _ if escaped => escaped = false,
+            (Some('"') | None, '\\') => escaped = true,
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, _) => out.push(c),
+            _ => {}
+        }
+    }
+
+    out
+}
 
 /**
  * One step as a command: its lines that are not blank, comments or setup, joined with ` && `,
@@ -1015,8 +1183,13 @@ fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool
             return leave("a step with shell control flow or a function");
         }
 
-        if line.contains(';') {
+        if unquoted(line).contains(';') {
             return leave("a step with `;`, which GitHub's `bash -e` stops at");
+        }
+
+        // The job's Xcode becomes its `DEVELOPER_DIR`, rather than a switch for the whole machine
+        if line.split_whitespace().find(|w| *w != "sudo") == Some("xcode-select") {
+            continue;
         }
 
         root |= needs_root(line);
@@ -1304,9 +1477,16 @@ fn job_check(
 
     let mut parts: Vec<(Option<&str>, String)> = Vec::new();
     let mut notes = Vec::new();
+    let developer_dir = match xcode(job) {
+        Some(Ok(app)) if !app.is_empty() && !job.env.iter().any(|(k, _)| k == "DEVELOPER_DIR") => {
+            assignment("DEVELOPER_DIR", &format!("{app}/Contents/Developer"))
+        }
+        _ => None,
+    };
     let mut exports: Vec<String> = pin
         .and_then(|t| assignment("RUSTUP_TOOLCHAIN", t))
         .into_iter()
+        .chain(developer_dir)
         .collect();
 
     // As `setup-java` leaves it, so gradlew and mvnw find the JDK through `JAVA_HOME`
@@ -1340,6 +1520,11 @@ fn job_check(
         .filter_map(|step| {
             if !step.run.is_empty() {
                 return Some(step.clone());
+            }
+
+            // `xcode` reads it into `DEVELOPER_DIR`
+            if sets_up_xcode(step) {
+                return None;
             }
 
             Some(crate::workflow::RunStep {
@@ -3272,5 +3457,167 @@ jobs:
         assert!(PRE_PUSH.starts_with("#!/bin/sh\n"));
         assert!(PRE_PUSH.contains(MARK));
         assert!(PRE_PUSH.contains(HOOK_LINE));
+    }
+
+    // Alamofire's ci.yml, trimmed
+    const XCODE: &str = r#"on: pull_request
+jobs:
+  env:
+    runs-on: macOS-26
+    env:
+      DEVELOPER_DIR: "/Applications/Xcode_26.6.app/Contents/Developer"
+    steps:
+      - run: xcodebuild -scheme "Alamofire macOS" build
+  select:
+    runs-on: macos-15
+    steps:
+      - run: sudo xcode-select -s /Applications/Xcode_26.6.app
+      - run: swift test
+  action:
+    runs-on: macos-15
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.6'
+      - run: swift build
+"#;
+
+    #[test]
+    fn a_job_that_picks_an_xcode_this_machine_lacks_stays_on_github() {
+        let found = detect_on(
+            repo(&[(".github/workflows/ci.yml", XCODE)]).path(),
+            &Machine {
+                mac: true,
+                xcodes: vec!["/Applications/Xcode_16.4.app".into()],
+                ..Machine::default()
+            },
+        );
+        assert!(found.checks.is_empty());
+        let why: Vec<&str> = found.github.iter().map(|k| k.why.as_str()).collect();
+        assert_eq!(
+            why,
+            ["needs /Applications/Xcode_26.6.app, which this machine does not have"; 3]
+        );
+
+        // With no Xcode at all, a job that runs xcodebuild stays too
+        let bare = "on: pull_request\njobs:\n  b:\n    runs-on: macos-15\n    steps:\n      - run: xcodebuild build\n";
+        let found = detect_on(
+            repo(&[(".github/workflows/ci.yml", bare)]).path(),
+            &Machine {
+                mac: true,
+                ..Machine::default()
+            },
+        );
+        assert_eq!(
+            found.github[0].why,
+            "runs xcodebuild, and this machine has no Xcode"
+        );
+    }
+
+    #[test]
+    fn a_job_that_picks_an_installed_xcode_runs_with_it() {
+        let found = detect_on(
+            repo(&[(".github/workflows/ci.yml", XCODE)]).path(),
+            &Machine {
+                mac: true,
+                xcodes: vec!["/Applications/Xcode_26.6.app".into()],
+                ..Machine::default()
+            },
+        );
+        let dir = "DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer";
+        let checks: Vec<(&str, String)> = found
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.command.clone()))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                (
+                    "env",
+                    format!("export {dir} && xcodebuild -scheme \"Alamofire macOS\" build")
+                ),
+                ("select", format!("export {dir} && swift test")),
+                ("action", format!("export {dir} && swift build")),
+            ]
+        );
+        assert!(
+            found
+                .versions
+                .contains(&format!("{dir} xcodebuild -version")),
+            "{:?}",
+            found.versions
+        );
+    }
+
+    #[test]
+    fn a_quoted_semicolon_is_part_of_its_word() {
+        let ci = "on: pull_request\njobs:\n  quoted:\n    steps:\n      - run: sed -i'' 's;@MainActor;;g' Tests/*.swift\n      - run: swift build\n  bare:\n    steps:\n      - run: make; make test\n  android:\n    steps:\n      - run: sed -i'' 's;@MainActor;;g' Tests/*.swift\n      - uses: skiptools/swift-android-action@v2\n";
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        let checks: Vec<(&str, &str)> = found
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.command.as_str()))
+            .collect();
+        assert_eq!(
+            checks,
+            [(
+                "quoted",
+                "sed -i'' 's;@MainActor;;g' Tests/*.swift && swift build"
+            )]
+        );
+        // A `sed` that edits the tree passes whatever the code is, the action did the work
+        assert!(
+            found.skipped.iter().any(|s| s
+                == "ci.yml, job android: nothing left to check with, it only installs, moves files or runs git"),
+            "{:?}",
+            found.skipped
+        );
+        assert_eq!(unquoted(r#"a "b;c" 'd;e' f\;g ;"#), "a   fg ;");
+    }
+
+    #[test]
+    fn a_stays_reason_is_about_its_own_job() {
+        let ci = r#"on: pull_request
+jobs:
+  visionOS:
+    runs-on: ${{ matrix.runsOn }}
+    strategy:
+      matrix:
+        include:
+          - runsOn: self-xcode266
+          - runsOn: self-xcode264
+    steps:
+      - run: xcodebuild test
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [swift:6.2, swift:6.3]
+    steps:
+      - run: swift build
+"#;
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], true);
+        let why: Vec<&str> = found.github.iter().map(|k| k.why.as_str()).collect();
+        assert_eq!(
+            why,
+            [
+                "runs a matrix (runsOn: self-xcode266, self-xcode264) with macOS entries, which act cannot run",
+                "runs a matrix (image: swift:6.2, swift:6.3), and host mode runs only this machine's toolchain",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_not_on_path_is_named() {
+        let checks = [Found {
+            name: "build".into(),
+            command: "export A=1 && set -o pipefail && xcodebuild build | xcbeautify --renderer github-actions".into(),
+            from: String::new(),
+        }];
+        assert_eq!(
+            missing_tools(&checks, |t| t == "xcodebuild"),
+            ["build calls xcbeautify"]
+        );
     }
 }
