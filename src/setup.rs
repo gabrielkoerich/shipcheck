@@ -80,6 +80,7 @@ pub struct Machine {
     pub mac: bool,
     /// The rustup toolchains installed, such as `1.94.1` or `nightly`
     pub toolchains: Vec<String>,
+    pub jdks: Vec<crate::java::Jdk>,
 }
 
 impl Machine {
@@ -89,6 +90,7 @@ impl Machine {
             docker: responds("docker", &["info"]),
             mac: cfg!(target_os = "macos"),
             toolchains: toolchains(),
+            jdks: crate::java::installed(),
         }
     }
 
@@ -337,8 +339,7 @@ pub fn base_only(jobs: &[crate::workflow::Job]) -> BTreeSet<String> {
     }
 }
 
-const PR_ONLY: &str =
-    "its `if:` depends on the PR or the default branch, so it never runs on the base branch";
+const PR_ONLY: &str = "its `if:` reads the PR, such as its labels, or the default branch, so only GitHub can tell if it runs";
 
 /// Why a job stays on GitHub for PRs in host mode, or None when shipcheck may run it here
 fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) -> Option<String> {
@@ -382,6 +383,13 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
         return Some("runs on macOS, and this machine is not a Mac".into());
     }
 
+    // A job with `if:` is left out anyway, and says so
+    if !job.conditional
+        && let Err(why) = crate::java::pick(job, &machine.jdks)
+    {
+        return Some(why);
+    }
+
     None
 }
 
@@ -399,9 +407,11 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             fs::read_to_string(root.join(".github/workflows").join(&file)).unwrap_or_default();
 
         if !crate::workflow::runs_for_branches(&source) {
-            d.skipped.push(format!(
-                "{file}: GitHub does not run it for feature branches"
-            ));
+            d.skipped.push(if crate::workflow::on_pull_request_target(&source) {
+                format!("{file}: it runs on pull_request_target, from the base branch with its secrets, so it stays on GitHub")
+            } else {
+                format!("{file}: GitHub does not run it for feature branches")
+            });
             continue;
         }
 
@@ -493,7 +503,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
                     return (job.id.as_str(), None);
                 }
 
-                match job_check(job, &machine.toolchains) {
+                match job_check(job, machine) {
                     Ok((command, exports, notes)) => {
                         d.skipped
                             .extend(notes.iter().map(|n| format!("{file}, job {}: {n}", job.id)));
@@ -604,8 +614,9 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
 
     for (name, tool, command, from) in project {
         if from_workflows {
-            let runs_it = all().find(|(_, j)| j.steps.iter().any(|s| s.run.contains(&command)));
-            let why = if d.checks.iter().any(|c| c.command.contains(&command)) {
+            let runs_it =
+                all().find(|(_, j)| j.steps.iter().any(|s| runs_command(&s.run, &command)));
+            let why = if d.checks.iter().any(|c| runs_command(&c.command, &command)) {
                 "already in a workflow check".to_string()
             } else if let Some((file, job)) = runs_it {
                 format!("{file}, job {} runs it on GitHub", job.id.escape_debug())
@@ -634,17 +645,68 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     // A pinned toolchain's own version, since `rustc --version` names the default one
     for check in &d.checks {
         for word in check.command.split_whitespace() {
-            if let Some(t) = word.strip_prefix("RUSTUP_TOOLCHAIN=") {
-                let version = format!("rustc +{t} --version");
+            let version = if let Some(t) = word.strip_prefix("RUSTUP_TOOLCHAIN=") {
+                format!("rustc +{t} --version")
+            } else if let Some(v) = word.strip_prefix("UV_PYTHON=") {
+                // uv downloads a missing one on first use, which then changes the key once
+                format!("uv python find {v} --show-version || echo missing")
+            } else if let Some(home) = word.strip_prefix("JAVA_HOME=") {
+                // It prints to stderr, and `versions` keep stdout
+                format!("{home}/bin/java -version 2>&1")
+            } else {
+                continue;
+            };
 
-                if !d.versions.contains(&version) {
-                    d.versions.push(version);
-                }
+            if !d.versions.contains(&version) {
+                d.versions.push(version);
             }
         }
     }
 
+    // The Python uv picks, which a check without `UV_PYTHON` runs on and which this machine can change
+    let unpinned = d.checks.iter().any(|c| {
+        c.command
+            .split_whitespace()
+            .any(|w| w == "uv" || w == "uvx")
+            && !c.command.contains("UV_PYTHON=")
+    });
+    let found = "uv python find --show-version".to_string();
+
+    if unpinned && !d.versions.contains(&found) {
+        d.versions.push(found);
+    }
+
     d
+}
+
+/**
+ * The literal `python-version` of the job's `setup-python` step, such as `3.13` or `3.14t`, when a
+ * step runs uv, which takes it from `UV_PYTHON`. None for `3.x`, a list, PyPy or an expression
+ **/
+fn setup_python(job: &crate::workflow::Job) -> Option<String> {
+    let runs_uv = job.steps.iter().any(|s| {
+        s.run
+            .split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
+            .any(|w| w == "uv" || w == "uvx")
+    });
+    let version = job
+        .steps
+        .iter()
+        .filter(|s| {
+            s.uses
+                .as_deref()
+                .and_then(|u| u.split('@').next())
+                .is_some_and(|a| a == "actions/setup-python")
+        })
+        .find_map(|s| input(s, "python-version"))?;
+    let number = version.strip_suffix('t').unwrap_or(&version);
+    let plain = !number.is_empty()
+        && number.split('.').count() <= 3
+        && number
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+
+    (runs_uv && plain).then_some(version)
 }
 
 /// A job's command and the `NAME=value` exports it needs in front
@@ -801,6 +863,15 @@ const SETUP: &[&str] = &[
     "echo",
 ];
 
+/// Whether a line sends its output to a file, such as `echo x >> gradle.properties`, which the build may read
+fn writes_a_file(line: &str) -> bool {
+    line.split('>')
+        .skip(1)
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty() && !rest.starts_with('&'))
+        .any(|rest| rest.split_whitespace().next() != Some("/dev/null"))
+}
+
 /// Whether a command or a job id has deploy, publish or release as a word of its own
 fn ships(text: &str, separators: &[char]) -> bool {
     text.to_lowercase()
@@ -950,7 +1021,7 @@ fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool
 
         root |= needs_root(line);
 
-        if SETUP.iter().any(|s| line.starts_with(s)) {
+        if SETUP.iter().any(|s| line.starts_with(s)) && !writes_a_file(line) {
             continue;
         }
 
@@ -1181,13 +1252,14 @@ fn rust_need(step: &crate::workflow::RunStep) -> Option<String> {
  * One job's check: its steps' commands joined with ` && `. Returns the command, the job's
  * `NAME=value` exports to put in front, and the steps it left out. Each GitHub step starts in its
  * own shell, so a step of several commands, with `|` or `&`, or with its own directory runs in a
- * subshell. A toolchain from `toolchains` is pinned with `RUSTUP_TOOLCHAIN`
+ * subshell. A rustup toolchain this machine has is pinned with `RUSTUP_TOOLCHAIN`, a JDK with `JAVA_HOME`
  **/
 #[allow(clippy::type_complexity)]
 fn job_check(
     job: &crate::workflow::Job,
-    toolchains: &[String],
+    machine: &Machine,
 ) -> Result<(String, Vec<String>, Vec<String>), String> {
+    let toolchains = &machine.toolchains;
     // A name becomes a TOML key, a directory and a check name
     let id_ok = job
         .id
@@ -1236,6 +1308,18 @@ fn job_check(
         .and_then(|t| assignment("RUSTUP_TOOLCHAIN", t))
         .into_iter()
         .collect();
+
+    // As `setup-java` leaves it, so gradlew and mvnw find the JDK through `JAVA_HOME`
+    if let Some(jdk) = crate::java::pick(job, &machine.jdks)? {
+        let home = jdk.home.display();
+        exports.push(format!("JAVA_HOME={home}"));
+        exports.push(format!("PATH={home}/bin:\"$PATH\""));
+    }
+
+    // As `setup-python` leaves it for uv. A version file or a matrix leaves uv to choose
+    if let Some(version) = setup_python(job) {
+        exports.push(format!("UV_PYTHON={version}"));
+    }
 
     for (name, value) in &job.env {
         if SANDBOX_VARS.contains(&name.as_str()) {
@@ -1352,6 +1436,51 @@ fn job_check(
     };
 
     Ok((command, exports, notes))
+}
+
+/**
+ * Whether a shell command runs `command`, word by word, as `pnpm lint` in `pnpm run lint`. Flags
+ * between words count as the same command, so `go test -race ./...` runs `go test ./...`
+ **/
+fn runs_command(shell: &str, command: &str) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+
+        for w in s.split_whitespace() {
+            let w = w.trim_start_matches('(').trim_end_matches([')', ';']);
+            // `pnpm run lint`, `yarn run lint` and `npm run test` are `pnpm lint`, `yarn lint` and `npm test`
+            let script = out
+                .last()
+                .is_some_and(|l| matches!(l.as_str(), "npm" | "pnpm" | "yarn"));
+
+            if w == "run" && script {
+                continue;
+            }
+
+            out.push(w.to_string());
+        }
+
+        out
+    };
+    let (hay, want) = (words(shell), words(command));
+    let Some((first, rest)) = want.split_first() else {
+        return false;
+    };
+
+    (0..hay.len()).filter(|&i| &hay[i] == first).any(|i| {
+        let mut at = i + 1;
+
+        rest.iter().enumerate().all(|(k, w)| {
+            // Flags may come after the tool and its subcommand, never inside the tool's name
+            while k > 0 && at < hay.len() && hay[at] != *w && hay[at].starts_with('-') {
+                at += 1;
+            }
+
+            let found = hay.get(at) == Some(w);
+            at += 1;
+            found
+        })
+    })
 }
 
 /**
@@ -1600,6 +1729,10 @@ jobs:
         let (cfg, text, said) = init_with(&[
             (".github/workflows/ci.yml", ci),
             (".github/workflows/tag.yml", tags),
+            (
+                ".github/workflows/title.yml",
+                "on:\n  pull_request_target:\njobs:\n  title:\n    steps:\n      - run: make\n",
+            ),
             ("Cargo.toml", ""),
             ("package.json", r#"{"scripts": {"lint": "eslint ."}}"#),
         ]);
@@ -1651,6 +1784,7 @@ jobs:
             "  ci.yml, job a b: the job id is not letters, digits, `_` and `-`",
             "  ci.yml, job setup-only: no run step to check with",
             "  tag.yml: GitHub does not run it for feature branches",
+            "  title.yml: it runs on pull_request_target, from the base branch with its secrets, so it stays on GitHub",
             "  Cargo.toml: already in a workflow check: `cargo clippy --all-targets -- -D warnings`",
             "  Cargo.toml: already in a workflow check: `cargo test`",
             "  package.json: no workflow runs it: `npm run lint`",
@@ -1662,6 +1796,35 @@ jobs:
             1,
             "{said}"
         );
+    }
+
+    #[test]
+    fn a_script_runs_in_its_package_managers_forms_and_with_flags() {
+        for (shell, command) in [
+            ("pnpm run lint", "pnpm lint"),
+            ("pnpm format && pnpm run lint", "pnpm lint"),
+            ("yarn run lint", "yarn lint"),
+            ("npm run test", "npm test"),
+            ("npm test", "npm test"),
+            ("go test -race -tags=integration ./...", "go test ./..."),
+            ("(cargo test --workspace)", "cargo test"),
+        ] {
+            assert!(runs_command(shell, command), "{shell} runs {command}");
+        }
+
+        for (shell, command) in [
+            ("pnpm run test-unit", "pnpm test"),
+            ("npm run test:ci", "npm test"),
+            ("bun test", "bun run test"),
+            ("go vet ./...", "go test ./..."),
+            ("go -C sub test ./...", "go test ./..."),
+            ("go test ./cmd/...", "go test ./..."),
+        ] {
+            assert!(
+                !runs_command(shell, command),
+                "{shell} does not run {command}"
+            );
+        }
     }
 
     #[test]
@@ -2418,6 +2581,157 @@ jobs:
         )
     }
 
+    #[test]
+    fn a_literal_setup_python_version_pins_uv_and_goes_into_the_key() {
+        let ci = r#"on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: uv run pytest
+  typing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: pyproject.toml
+      - run: uv run mypy
+"#;
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        let command = |name: &str| {
+            let check = found.checks.iter().find(|c| c.name == name).unwrap();
+            check.command.clone()
+        };
+        assert_eq!(command("test"), "export UV_PYTHON=3.13 && uv run pytest");
+        assert_eq!(command("typing"), "uv run mypy");
+        assert!(
+            found
+                .versions
+                .contains(&"uv python find 3.13 --show-version || echo missing".to_string()),
+            "{:?}",
+            found.versions
+        );
+        assert!(
+            found
+                .versions
+                .contains(&"uv python find --show-version".to_string()),
+            "{:?}",
+            found.versions
+        );
+
+        let job = |version: &str, run: &str| {
+            let ci = format!(
+                "on: push\njobs:\n  t:\n    steps:\n      - uses: actions/setup-python@v6\n        with:\n          python-version: {version}\n      - run: {run}\n"
+            );
+            let jobs = crate::workflow::job_runs(&ci);
+            setup_python(&jobs[0])
+        };
+        assert_eq!(job("'3.14t'", "uv run pytest").as_deref(), Some("3.14t"));
+        assert_eq!(
+            job("3.12.4", "cd x && uvx ruff check").as_deref(),
+            Some("3.12.4")
+        );
+        assert_eq!(job("'3.x'", "uv run pytest"), None);
+        assert_eq!(job("pypy-3.11", "uv run pytest"), None);
+        assert_eq!(job("${{ matrix.python }}", "uv run pytest"), None);
+        assert_eq!(job("'3.13'", "pytest"), None);
+    }
+
+    #[test]
+    fn a_jdk_this_machine_has_is_pinned_and_a_missing_one_keeps_the_job_on_github() {
+        let ci = r#"on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            21
+      - run: ./gradlew test
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: 25
+      - run: ./gradlew nativeTest
+"#;
+        let jdk = |version: &str, home: &str, native| crate::java::Jdk {
+            version: version.into(),
+            home: home.into(),
+            native,
+        };
+        let found = detect_on(
+            repo(&[(".github/workflows/ci.yml", ci)]).path(),
+            &Machine {
+                jdks: vec![
+                    jdk("11.0.2", "/jvm/11", false),
+                    jdk("21.0.5", "/jvm/21", false),
+                ],
+                ..Machine::default()
+            },
+        );
+        assert_eq!(found.checks.len(), 1);
+        assert_eq!(
+            found.checks[0].command,
+            "export JAVA_HOME=/jvm/21 PATH=/jvm/21/bin:\"$PATH\" && ./gradlew test"
+        );
+        assert_eq!(found.versions, ["/jvm/21/bin/java -version 2>&1"]);
+        assert_eq!(found.github.len(), 1);
+        assert_eq!(found.github[0].job, "native");
+        assert_eq!(
+            found.github[0].why,
+            "needs GraalVM 25 with native-image, which this machine does not have"
+        );
+
+        // Without a JDK both stay on GitHub
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        assert!(found.checks.is_empty());
+        assert_eq!(
+            found.github[0].why,
+            "needs JDK 11, which this machine does not have"
+        );
+    }
+
+    #[test]
+    fn an_echo_into_a_file_of_the_tree_stays_in_the_check() {
+        let ci = r#"on: pull_request
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'kotlin.jvm.target.validation.mode=ignore' >> ./gradle.properties
+      - run: echo building 2>&1 > /dev/null
+      - run: make test
+"#;
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        assert_eq!(
+            found.checks[0].command,
+            "echo 'kotlin.jvm.target.validation.mode=ignore' >> ./gradle.properties && make test"
+        );
+    }
+
+    #[test]
+    fn a_label_gated_job_that_also_runs_on_main_is_not_said_to_never_run_there() {
+        let ci = r#"on: pull_request
+jobs:
+  providers:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'providers')
+    steps:
+      - run: make test
+"#;
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        assert_eq!(found.github[0].why, PR_ONLY);
+        assert!(!PR_ONLY.contains("never runs"), "{PR_ONLY}");
+    }
+
     /// The config `init` writes for a root holding these files, parsed and validated
     #[test]
     fn a_docker_job_stays_on_github_and_a_base_only_chain_holds_nothing_back() {
@@ -2557,7 +2871,10 @@ jobs:
 
         let (cfg, _, _) = init_with(&[("pyproject.toml", ""), ("uv.lock", "")]);
         assert_eq!(checks(&cfg), [("test", "uv run pytest")]);
-        assert_eq!(cfg.host.versions, ["uv --version"]);
+        assert_eq!(
+            cfg.host.versions,
+            ["uv --version", "uv python find --show-version"]
+        );
         let (cfg, _, _) = init_with(&[("pyproject.toml", "")]);
         assert_eq!(checks(&cfg), [("test", "pytest")]);
 

@@ -372,7 +372,8 @@ impl Jail {
      * toolchains and the jail. Unix sockets connect only in the jail and to the DNS resolver, so
      * Docker's or an agent's socket is out of reach. Mach services only from [`MACH_SERVICES`], and
      * no Apple events, so no copy of `open`, `osascript` or `launchctl` reaches launchd, Launch
-     * Services or another app, which would start a process outside the sandbox
+     * Services or another app, which would start a process outside the sandbox. A pseudo-terminal
+     * only when the check opened it, which the `com.apple.sandbox.pty` extension marks
      **/
     fn profile(&self) -> Result<String, String> {
         let user = Self::user()?;
@@ -405,6 +406,7 @@ impl Jail {
             "(version 1)\n(allow default)\n\
              (deny file-write*)\n\
              (allow file-write*{writable} (literal \"/dev/null\") (regex #\"^/dev/fd/\"))\n\
+             (allow file-write* (literal \"/dev/ptmx\") (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
              (deny file-read-data (subpath {user}))\n\
              (allow file-read-data{readable}{writable})\n\
              (deny file-read*{hidden})\n\
@@ -494,7 +496,14 @@ impl Jail {
             }
         };
         let cache = |dir: &str| self.cache.join(dir);
-        let path = jail_path();
+        let shims = self.home.join(SHIMS);
+        let path = if shims.is_dir() {
+            let dirs = std::iter::once(shims)
+                .chain(std::env::split_paths(&jail_path()).collect::<Vec<_>>());
+            std::env::join_paths(dirs).unwrap_or_else(|_| jail_path())
+        } else {
+            jail_path()
+        };
         let rustup = Some(self.home.join(".rustup"))
             .filter(|r| r.is_dir())
             .unwrap_or_else(|| user_tool("RUSTUP_HOME", ".rustup"));
@@ -565,7 +574,38 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
     toolchains(&path, &crate::run::user_dir())?;
     rustup_home(&path, &user_tool("RUSTUP_HOME", ".rustup"))?;
     sbf_sdk(&path, &jail_path())?;
+
+    if cfg!(target_os = "macos") {
+        mktemp_shim(&path)?;
+    }
+
     Ok((dir, path))
+}
+
+/// Where the jail's own commands go, first on `PATH`
+const SHIMS: &str = ".shipcheck/bin";
+
+/**
+ * macOS `mktemp` with no template ignores `TMPDIR` for the per-user temp dir from `confstr`, which
+ * the jail denies, and no variable moves that dir. This one gives it `-p "$TMPDIR"` then, the
+ * jail's home. A template or `-p` of the caller's own runs as given
+ **/
+const MKTEMP: &str = r#"#!/bin/sh
+for a in "$@"; do
+  case $a in
+    *XXX* | -p* | --tmpdir*) exec /usr/bin/mktemp "$@" ;;
+  esac
+done
+exec /usr/bin/mktemp -p "${TMPDIR:-/tmp}" "$@"
+"#;
+
+fn mktemp_shim(home: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join(SHIMS);
+    fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
+    let file = bin.join("mktemp");
+    fs::write(&file, MKTEMP).map_err(|e| e.to_string())?;
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
 }
 
 /// Toolchains found only through `$HOME`, linked from the jail's home to the user's, readable as
@@ -1325,7 +1365,7 @@ mod tests {
         assert!(profile.contains(&format!(
             "(allow file-write* {paths} (literal \"/dev/null\")"
         )));
-        assert!(!profile.contains("/dev/tty"));
+        assert!(!profile.contains("/dev/tty\""));
         let user = resolved(crate::run::user_dir());
         assert!(profile.contains(&format!(
             "(deny file-read-data (subpath \"{}\"))",
@@ -1390,6 +1430,33 @@ mod tests {
 
     #[test]
     #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn mktemp_makes_its_files_in_the_jails_tmpdir() {
+        let (clone, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_home, home) = temp_home().unwrap();
+        let cache = real_dir(cache.path()).unwrap();
+        let jail = Jail {
+            writable: vec![real_dir(clone.path()).unwrap(), home.clone(), cache.clone()],
+            readable: Vec::new(),
+            home,
+            cache,
+        };
+        let log = clone.path().join("log");
+        // As cli/cli's script/licenses does, then with a prefix, then with a template of its own
+        let cmd = "set -e; for d in \"$(mktemp -d)\" \"$(mktemp -d -t pre)\" \"$(mktemp)\"; do case $d in \"$TMPDIR\"/*) ;; *) exit 9 ;; esac; done; mktemp \"$PWD/own.XXXX\"";
+        let exit = run_command(cmd, clone.path(), &jail, &[], &log, Duration::from_secs(10));
+        let log = fs::read_to_string(&log).unwrap();
+        assert_eq!(exit.unwrap(), Some(0), "{log}");
+        assert!(
+            log.contains(&format!(
+                "{}/own.",
+                clone.path().canonicalize().unwrap().display()
+            )),
+            "{log}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_check_serves_a_unix_socket_in_its_tmpdir_only() {
         // A jail as `run` makes it: the clone, a home of its own that is TMPDIR, and a cache
         let (clone, cache, outside) = (
@@ -1449,6 +1516,35 @@ mod tests {
         assert!(!canary.exists(), "{}", escaped.1);
         // No controlling terminal to type into
         assert_ne!(run("echo x > /dev/tty").0, Some(0));
+        // A pseudo-terminal of its own, as pre-commit's `--color=always` opens, but no one else's
+        let pty = run(
+            "python3 -c 'import os; r, w = os.openpty(); os.write(w, b\"x\"); assert os.read(r, 1) == b\"x\"'",
+        );
+        assert_eq!(pty.0, Some(0), "{}", pty.1);
+        let (mut master, mut slave) = (0, 0);
+        let mut name = [0 as libc::c_char; 128];
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                name.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0);
+        let theirs = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Another terminal of the same user, such as the one shipcheck was started from
+        let open =
+            format!("python3 -c 'import os; os.open(\"{theirs}\", os.O_WRONLY | os.O_NOCTTY)'");
+        assert_ne!(run(&open).0, Some(0), "{theirs}");
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
         // A Unix socket outside the jail, such as Docker's, refuses the connection
         let sock = outside.path().join("s");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();

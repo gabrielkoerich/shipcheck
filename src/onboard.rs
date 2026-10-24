@@ -984,8 +984,9 @@ fn gate(
         file: file.to_string(),
         diff: diff(file, source, &edited),
         yes: format!(
-            "on PRs shipcheck runs {}, GitHub keeps running {stay} on PRs and all of {file} on pushes to {base}",
-            by.join(", ")
+            "on PRs shipcheck runs {}, GitHub keeps running {stay} on PRs and all of {file} on pushes to {base}{}",
+            by.join(", "),
+            elsewhere(source, base)
         ),
         no: format!("GitHub keeps running all of {file} on PRs, beside shipcheck's checks"),
         short_yes: format!("PRs: {}, GitHub {stay}, {base}: GitHub", by.join(", ")),
@@ -994,6 +995,26 @@ fn gate(
         recommended: true,
         edited,
     });
+}
+
+/// Where else GitHub keeps running the gated jobs, since shipcheck runs only PRs into the base
+fn elsewhere(source: &str, base: &str) -> String {
+    let (pushes, prs) = crate::workflow::other_branches(source, base);
+    let mut more: Vec<String> = Vec::new();
+
+    if !pushes.is_empty() {
+        more.push(format!("on pushes to {}", pushes.join(", ")));
+    }
+
+    if prs {
+        more.push("on PRs into other branches".to_string());
+    }
+
+    if more.is_empty() {
+        return String::new();
+    }
+
+    format!(", and {}", more.join(" and "))
 }
 
 /// The changed lines between the first and the last that differ
@@ -1398,7 +1419,7 @@ mod tests {
             fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
             ci.replace(
                 "  test:\n",
-                "  test:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n"
+                "  test:\n    if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n"
             ),
         );
         assert!(
@@ -1429,12 +1450,12 @@ mod tests {
             fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
             ci.replace(
                 "  lint:\n",
-                "  lint:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n"
+                "  lint:\n    if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n"
             ),
         );
         assert_eq!(
             plan.workflows[0].yes,
-            "on PRs shipcheck runs shipcheck/lint, GitHub keeps running tests on PRs and all of ci.yml on pushes to main"
+            "on PRs shipcheck runs shipcheck/lint, GitHub keeps running tests on PRs and all of ci.yml on pushes to main, and on PRs into other branches"
         );
 
         // The matrix needs lint, so lint stays on GitHub too and nothing is gated

@@ -471,6 +471,24 @@ fn index_paths(repo: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((index, temp))
 }
 
+/**
+ * git rehashes an entry whose file changed no earlier than the index was written, since its stats
+ * cannot tell an edit in that second apart. A copy with a new time loses that, and an edit of the
+ * same size in the same second as `git add` went unseen. Linux's copy takes the time of the copy
+ **/
+fn copy_index(index: &Path, temp: &Path) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("{}: {e}", index.display());
+    fs::copy(index, temp).map_err(err)?;
+    let written = fs::metadata(index)
+        .and_then(|m| m.modified())
+        .map_err(err)?;
+    fs::File::options()
+        .write(true)
+        .open(temp)
+        .and_then(|f| f.set_modified(written))
+        .map_err(|e| format!("{}: {e}", temp.display()))
+}
+
 fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, staged: bool) -> Result<String, String> {
     let with_temp = |args: &[&str]| {
         let out = Command::new("git")
@@ -494,7 +512,7 @@ fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, staged: bool) -> Result
 
     // A copy of the real index keeps its file stats, so git hashes only the files that changed
     if index.exists() {
-        fs::copy(index, temp).map_err(|e| format!("{}: {e}", index.display()))?;
+        copy_index(index, temp)?;
     } else {
         with_temp(&["read-tree", "HEAD"])?;
     }
@@ -1800,6 +1818,7 @@ fn run_job(
     let mut before = 0;
     let mut shard = ctx.plan.config.shard_tests.enabled();
     let mut info = None;
+    let mut infra_left = INFRA_RETRIES;
 
     loop {
         attempts += 1;
@@ -1918,6 +1937,17 @@ fn run_job(
             None => {}
         }
 
+        let failed = outcome.exit.is_some_and(|e| e != 0) && outcome.unsupported_jobs.is_empty();
+
+        // A failure of Docker's, such as a pull timeout, gets attempts of its own beside `retries`
+        if failed && !host && infra_left > 0 {
+            let log = fs::read(&log_path).map_err(|e| e.to_string())?;
+
+            if crate::runner::act::never_started(&String::from_utf8_lossy(&log)) {
+                (infra_left, before) = (infra_left - 1, before + 1);
+            }
+        }
+
         if outcome.exit == Some(0) || attempts - before > ctx.plan.config.retries {
             let log = fs::read(&log_path).map_err(|e| e.to_string())?;
             return Ok(JobRun {
@@ -1938,6 +1968,9 @@ fn run_job(
         ));
     }
 }
+
+/// Attempts a job gets when Docker, not the job, failed it before its first step
+const INFRA_RETRIES: u32 = 2;
 
 /// With `SHIPCHECK_TIMINGS` set, prints how long a phase of a job took, for measuring overhead
 pub(crate) fn timing(file: &str, job: &str, phase: &str, since: Instant) {
@@ -3030,6 +3063,23 @@ mod tests {
             sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")])
         );
         assert_eq!(snapshot(repo, false).unwrap(), None);
+    }
+
+    #[test]
+    fn the_index_copy_keeps_the_time_the_index_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, temp) = (dir.path().join("index"), dir.path().join("copy"));
+        fs::write(&index, "entries").unwrap();
+        let written = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        copy_index(&index, &temp).unwrap();
+        assert_eq!(fs::read(&temp).unwrap(), b"entries");
+        assert_eq!(fs::metadata(&temp).unwrap().modified().unwrap(), written);
     }
 
     #[test]
