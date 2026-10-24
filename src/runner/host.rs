@@ -372,7 +372,8 @@ impl Jail {
      * toolchains and the jail. Unix sockets connect only in the jail and to the DNS resolver, so
      * Docker's or an agent's socket is out of reach. Mach services only from [`MACH_SERVICES`], and
      * no Apple events, so no copy of `open`, `osascript` or `launchctl` reaches launchd, Launch
-     * Services or another app, which would start a process outside the sandbox
+     * Services or another app, which would start a process outside the sandbox. A pseudo-terminal
+     * only when the check opened it, which the `com.apple.sandbox.pty` extension marks
      **/
     fn profile(&self) -> Result<String, String> {
         let user = Self::user()?;
@@ -405,6 +406,7 @@ impl Jail {
             "(version 1)\n(allow default)\n\
              (deny file-write*)\n\
              (allow file-write*{writable} (literal \"/dev/null\") (regex #\"^/dev/fd/\"))\n\
+             (allow file-write* (literal \"/dev/ptmx\") (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
              (deny file-read-data (subpath {user}))\n\
              (allow file-read-data{readable}{writable})\n\
              (deny file-read*{hidden})\n\
@@ -1325,7 +1327,7 @@ mod tests {
         assert!(profile.contains(&format!(
             "(allow file-write* {paths} (literal \"/dev/null\")"
         )));
-        assert!(!profile.contains("/dev/tty"));
+        assert!(!profile.contains("/dev/tty\""));
         let user = resolved(crate::run::user_dir());
         assert!(profile.contains(&format!(
             "(deny file-read-data (subpath \"{}\"))",
@@ -1449,6 +1451,35 @@ mod tests {
         assert!(!canary.exists(), "{}", escaped.1);
         // No controlling terminal to type into
         assert_ne!(run("echo x > /dev/tty").0, Some(0));
+        // A pseudo-terminal of its own, as pre-commit's `--color=always` opens, but no one else's
+        let pty = run(
+            "python3 -c 'import os; r, w = os.openpty(); os.write(w, b\"x\"); assert os.read(r, 1) == b\"x\"'",
+        );
+        assert_eq!(pty.0, Some(0), "{}", pty.1);
+        let (mut master, mut slave) = (0, 0);
+        let mut name = [0 as libc::c_char; 128];
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                name.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0);
+        let theirs = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Another terminal of the same user, such as the one shipcheck was started from
+        let open =
+            format!("python3 -c 'import os; os.open(\"{theirs}\", os.O_WRONLY | os.O_NOCTTY)'");
+        assert_ne!(run(&open).0, Some(0), "{theirs}");
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
         // A Unix socket outside the jail, such as Docker's, refuses the connection
         let sock = outside.path().join("s");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
