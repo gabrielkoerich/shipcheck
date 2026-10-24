@@ -272,8 +272,9 @@ pub fn mark(
     let mut ids = BTreeMap::new();
 
     for name in names {
+        // GitHub keeps a completed run's conclusion but takes a new title, so a late mark would say running
         let id = match existing.get(name) {
-            Some(c) if c.status == wanted => c.id,
+            Some(c) if c.status == wanted || c.status == "completed" => c.id,
             Some(c) => send(&check::waiting(name, sha, running), Some(c.id))?.0,
             None => send(&check::waiting(name, sha, running), None)?.0,
         };
@@ -447,6 +448,27 @@ mod tests {
                 ("shipcheck".into(), "completed".into(), Some(102)),
             ],
             "the commit is unknown twice, then each check is created once and completed in place"
+        );
+    }
+
+    #[test]
+    fn mark_leaves_completed_checks() {
+        let fake = Fake::new(0);
+        let check = |id, status: &str| Check {
+            id,
+            status: status.into(),
+            started_at: String::new(),
+        };
+        let existing = Checks::from([
+            ("shipcheck/test".into(), check(7, "completed")),
+            ("shipcheck".into(), check(8, "queued")),
+        ]);
+        let ids = mark(&|b, id| fake.send(b, id), &existing, "s", &names(), true).unwrap();
+        assert_eq!(ids["shipcheck/test"], 7);
+        assert_eq!(
+            fake.posts(),
+            vec![("shipcheck".into(), "in_progress".into(), Some(8))],
+            "a daemon poll during the final posts must not turn a result back into running"
         );
     }
 
