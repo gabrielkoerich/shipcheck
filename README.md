@@ -9,7 +9,7 @@ It has two modes:
 
 Measured on an Apple silicon Mac against GitHub's hosted runners, same commits: a small Rust crate in host mode 1.9 to 2.3 s against about 20 s, a large Rust app in act 105 s against 115 to 124 s warm, and a tree already tested 0.13 s. A first run that starts cold can take longer than GitHub. [Speed](https://shipcheck.run/docs/speed/) has the settings that make runs fast.
 
-Docs: https://shipcheck.run/docs/ (source in `site/content/docs`).
+Docs: https://shipcheck.run/docs/.
 
 ## Install
 
@@ -65,7 +65,6 @@ What a green check proves and what a job can reach: [proof](https://shipcheck.ru
 | Folder | Holds |
 |---|---|
 | `src/` | The `shipcheck` CLI |
-| `site/` | The website and user docs, built with [Zola](https://www.getzola.org): `zola --root site serve` |
 
 ## License
 
