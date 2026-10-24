@@ -786,7 +786,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            if let Some(wrote) = setup::init(&root)? {
+            if let Some(wrote) = shipcheck::onboard::config_only(&root, &mut std::io::stdout())? {
                 println!("{wrote}");
             }
 
