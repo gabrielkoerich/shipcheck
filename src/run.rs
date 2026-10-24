@@ -1697,7 +1697,8 @@ fn job_state(
         "failure"
     };
 
-    if allowed && ["failure", "killed", "timed out"].contains(&state) {
+    // A run that never finished, or hit shipcheck's deadline, is not the job failing
+    if allowed && state == "failure" {
         format!("{state}{ALLOWED}")
     } else {
         state.to_string()
