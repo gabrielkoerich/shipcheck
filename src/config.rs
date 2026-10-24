@@ -175,7 +175,7 @@ impl Default for Act {
             .to_vec(),
             // apt fails on a held lock instead of waiting
             slot_paths: vec!["/var/lib/apt/lists".to_string()],
-            // A shared ~/.rustup and ~/.cargo broke each other in the oblivion trial, and act's one
+            // A shared ~/.rustup and ~/.cargo broke each other in an Anchor project's trial, and act's one
             // tool cache for every job gave parallel setup actions half-copied Zig and JDK installs
             job_homes: BTreeMap::from([
                 ("RUSTUP_HOME".to_string(), Home::Dir("rustup".into())),
@@ -365,7 +365,7 @@ impl Act {
     }
 }
 
-/// Memory a job is given in the `max_parallel` cap. flask's jobs peaked at 0.38 GiB, and one bean job
+/// Memory a job is given in the `max_parallel` cap. flask's jobs peaked at 0.38 GiB, and one job of a Python app
 /// at 2.2 GiB still fits beside light ones
 pub const JOB_MEMORY: u64 = 1 << 30;
 
