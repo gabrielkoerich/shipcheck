@@ -35,3 +35,319 @@ jobs:
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true
       - run: cargo test
 
+  check-release:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      version: ${{ steps.version.outputs.version }}
+      last_tag: ${{ steps.check.outputs.last_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check for new commits since last tag
+        id: check
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$LAST_TAG" ]; then
+            COMMIT_COUNT=$(git rev-list "$LAST_TAG"..HEAD --count)
+          else
+            COMMIT_COUNT=$(git rev-list HEAD --count)
+          fi
+
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "No new commits since $LAST_TAG, skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            # Skip release if ALL commits are chore/docs-only
+            if [ -n "$LAST_TAG" ]; then
+              SUBJECTS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
+            else
+              SUBJECTS=$(git log --pretty=format:"%s")
+            fi
+            NON_RELEASE=$(echo "$SUBJECTS" | grep -cvE '^(chore|docs)(\(.*\))?:' || true)
+            if [ "$NON_RELEASE" -eq 0 ]; then
+              echo "All $COMMIT_COUNT commits are chore/docs, skipping release."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$COMMIT_COUNT new commits since ${LAST_TAG:-beginning} ($NON_RELEASE release-worthy)"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Determine version bump from conventional commits
+        if: steps.check.outputs.skip == 'false'
+        id: version
+        env:
+          LAST_TAG: ${{ steps.check.outputs.last_tag }}
+        run: |
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
+          else
+            COMMITS=$(git log --pretty=format:"%s")
+          fi
+
+          # BREAKING CHANGE: or breaking: is major, feat: is minor, everything else is patch
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qE '^feat(\(.*\))?:'; then
+            BUMP="minor"
+          fi
+          if echo "$COMMITS" | grep -qE '^BREAKING CHANGE:|^breaking(\(.*\))?:'; then
+            BUMP="major"
+          fi
+
+          # Before the first tag the base is the version Cargo.toml already carries
+          CURRENT="${LAST_TAG#v}"
+          if [ -z "$CURRENT" ]; then
+            CURRENT=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          fi
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+
+          # A run that tagged and then failed leaves a tag that `describe` may not see from here
+          while git rev-parse "$NEW_VERSION" >/dev/null 2>&1; do
+            CURRENT="${NEW_VERSION#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            NEW_VERSION="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            echo "tag was taken, trying $NEW_VERSION"
+          done
+
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $NEW_VERSION (${BUMP} bump)"
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.skip == 'false'
+    strategy:
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          # 22.04 keeps the glibc floor at 2.35, so older distros can run the binary
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.os }}
+    # The signing secrets live in this environment, which only main can use
+    environment: macos-signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      # Stamped before the build, so `shipcheck --version` is the version it ships as
+      - name: Stamp the version
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          # An empty version silently writes `version = ""`, which fails much further along
+          [ -n "$VERSION" ] || { echo "::error::the version job produced no version"; exit 1; }
+          python3 - "${VERSION#v}" <<'PY'
+          import re, sys
+          v = sys.argv[1]
+          t = open("Cargo.toml").read()
+          t = re.sub(r'^version = .*$', f'version = "{v}"', t, count=1, flags=re.M)
+          open("Cargo.toml", "w").write(t)
+          l = open("Cargo.lock").read()
+          l = re.sub(r'(^name = "shipcheck"\n)version = .*$',
+                     lambda m: m.group(1) + f'version = "{v}"', l, count=1, flags=re.M)
+          open("Cargo.lock", "w").write(l)
+          PY
+          grep -m1 '^version' Cargo.toml
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      # One stable signature keeps the Keychain's trust in shipcheck across upgrades, and
+      # notarization lets Gatekeeper open it on any Mac. A bare binary cannot be stapled, so Gatekeeper checks online
+      - name: Sign and notarize
+        if: runner.os == 'macOS'
+        env:
+          P12: ${{ secrets.MACOS_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_P12_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          BIN: target/${{ matrix.target }}/release/shipcheck
+        run: |
+          for name in P12 P12_PASSWORD NOTARY_KEY NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [ -z "$(printenv "$name")" ]; then
+              echo "::error::secret for $name is not set, a macOS release must be signed"
+              exit 1
+            fi
+          done
+
+          # Absolute paths, since an earlier step can prepend to PATH through $GITHUB_PATH
+          umask 077
+          dir="$(/usr/bin/mktemp -d)"
+          keychain="$dir/sign.keychain-db"
+          trap '/usr/bin/security delete-keychain "$keychain" 2>/dev/null; /bin/rm -rf "$dir"' EXIT
+          pass="$(/usr/bin/uuidgen)"
+          /usr/bin/security create-keychain -p "$pass" "$keychain"
+          /usr/bin/security set-keychain-settings -lut 900 "$keychain"
+          /usr/bin/security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$P12" | /usr/bin/base64 --decode > "$dir/id.p12"
+          /usr/bin/security import "$dir/id.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          /bin/rm -f "$dir/id.p12"
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$keychain" > /dev/null
+          /usr/bin/security list-keychains -d user -s "$keychain"
+
+          /usr/bin/codesign --force --options runtime --timestamp --identifier run.shipcheck \
+            --sign "Developer ID Application: Gabriel Koerich (ZEY9Z684DK)" --keychain "$keychain" "$BIN"
+          /usr/bin/codesign --verify --strict --verbose=2 "$BIN"
+
+          printf '%s' "$NOTARY_KEY" > "$dir/notary.p8"
+          /usr/bin/ditto -c -k --keepParent "$BIN" "$dir/shipcheck.zip"
+          /usr/bin/xcrun notarytool submit "$dir/shipcheck.zip" --key "$dir/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait --timeout 30m
+      - run: tar -czf shipcheck-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release shipcheck
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shipcheck-${{ matrix.target }}
+          path: shipcheck-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [check-release, build]
+    if: needs.check-release.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: shipcheck-*
+          merge-multiple: true
+          path: artifacts
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Stamp the version
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          # An empty version silently writes `version = ""`, which fails much further along
+          [ -n "$VERSION" ] || { echo "::error::the version job produced no version"; exit 1; }
+          python3 - "${VERSION#v}" <<'PY'
+          import re, sys
+          v = sys.argv[1]
+          t = open("Cargo.toml").read()
+          t = re.sub(r'^version = .*$', f'version = "{v}"', t, count=1, flags=re.M)
+          open("Cargo.toml", "w").write(t)
+          l = open("Cargo.lock").read()
+          l = re.sub(r'(^name = "shipcheck"\n)version = .*$',
+                     lambda m: m.group(1) + f'version = "{v}"', l, count=1, flags=re.M)
+          open("Cargo.lock", "w").write(l)
+          PY
+          grep -m1 '^version' Cargo.toml
+
+      # Publish first: a tag without a crate is worse than a crate without a tag, and a rerun then tags it.
+      # Permanent: a version can be yanked, never deleted, and it publishes the source
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set, skipping crates.io"
+            exit 0
+          fi
+
+          cargo publish --locked --allow-dirty
+
+      - name: Create tag
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Build changelog
+        env:
+          VERSION: ${{ needs.check-release.outputs.version }}
+          LAST_TAG: ${{ needs.check-release.outputs.last_tag }}
+        run: |
+          if [ -n "$LAST_TAG" ]; then
+            RAW=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s (%h)")
+          else
+            RAW=$(git log --pretty=format:"%s (%h)")
+          fi
+
+          BODY="## ${VERSION}"$'\n\n'
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            echo "$line" | grep -qE '^chore(\(.*\))?:' && continue
+            BODY+="- ${line}"$'\n'
+          done <<< "$RAW"
+
+          if [ -n "$LAST_TAG" ]; then
+            BODY+=$'\n'"**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${LAST_TAG}...${VERSION}"
+          fi
+
+          echo "$BODY" > release_notes.md
+          cat release_notes.md
+
+      - run: cd artifacts && sha256sum shipcheck-*.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: gh release create "$VERSION" --title "$VERSION" --notes-file release_notes.md artifacts/shipcheck-*.tar.gz artifacts/SHA256SUMS
+
+      - name: Update the Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.check-release.outputs.version }}
+        run: |
+          TAP_REPO="gabrielkoerich/homebrew-tap"
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set, skipping the ${TAP_REPO} update"
+            exit 0
+          fi
+
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
+          cp Formula/shipcheck.rb formula.rb
+          sed -i "s|^  version \"0.0.0\"|  version \"${VERSION#v}\"|" formula.rb
+
+          # Each platform gets the archive built for it, with the checksum of that archive
+          for pair in \
+            "MACOS_ARM:aarch64-apple-darwin" \
+            "MACOS_INTEL:x86_64-apple-darwin" \
+            "LINUX_ARM:aarch64-unknown-linux-gnu" \
+            "LINUX_INTEL:x86_64-unknown-linux-gnu"; do
+            key="${pair%%:*}"; target="${pair#*:}"
+            file="artifacts/shipcheck-${target}.tar.gz"
+            [ -f "$file" ] || { echo "::error::missing $file"; exit 1; }
+            sum=$(sha256sum "$file" | awk '{print $1}')
+            sed -i "s|URL_${key}\"|${base}/shipcheck-${target}.tar.gz\"|" formula.rb
+            sed -i "s|SHA_${key}\"|${sum}\"|" formula.rb
+          done
+
+          if grep -q 'URL_\|SHA_' formula.rb; then
+            echo "::error::a placeholder was left behind"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap-repo
+          mkdir -p tap-repo/Formula
+          cp formula.rb tap-repo/Formula/shipcheck.rb
+          git -C tap-repo config user.name "github-actions[bot]"
+          git -C tap-repo config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C tap-repo add Formula/shipcheck.rb
+          if git -C tap-repo diff --cached --quiet; then
+            echo "Homebrew formula unchanged"
+            exit 0
+          fi
+
+          git -C tap-repo commit -m "Update shipcheck formula for ${VERSION}"
+          git -C tap-repo push origin main
