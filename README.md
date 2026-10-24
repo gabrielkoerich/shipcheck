@@ -64,7 +64,9 @@ What a green check proves and what a job can reach: [proof](https://shipcheck.ru
 
 | Folder | Holds |
 |---|---|
-| `src/` | The `shipcheck` CLI |
+| `src/` | The `shipcheck` CLI and daemon |
+| `tests/` | Integration and end-to-end tests |
+| `Formula/` | The Homebrew formula template, filled in by the release workflow |
 
 ## License
 

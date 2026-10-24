@@ -704,7 +704,7 @@ fn runs_caches_and_tests_the_working_copy() {
     fs::remove_file(&other).unwrap();
 
     // A branch's run leaves nothing in a later run of main but its ignored build directories and
-    // the cache volumes, which carry over by design (SECURITY.md, Open)
+    // the cache volumes, which carry over by design
     fs::write(work.join(".github/workflows/state.yml"), STATE).unwrap();
     fs::write(work.join(".gitignore"), "build\n.hidden\n").unwrap();
     fs::write(
