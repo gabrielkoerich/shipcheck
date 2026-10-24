@@ -199,11 +199,12 @@ fn the_stamp_writes_cargo_toml_and_cargo_lock() {
         .collect();
     assert_eq!(changed.len(), 1, "{changed:?}");
 
-    // A lock that no longer matches the manifest fails `cargo build --locked` in the build job
+    // A lock that no longer matches the manifest fails `cargo build --locked` in the build job.
+    // `cargo tree` needs only this platform's crates, `metadata` would download every platform's
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::write(dir.join("src/lib.rs"), "").unwrap();
     let out = Command::new(env!("CARGO"))
-        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .args(["tree", "--locked", "--offline"])
         .current_dir(&dir)
         .output()
         .unwrap();
@@ -285,18 +286,33 @@ fn the_formula_gets_the_version_and_every_archive() {
     }
 }
 
-// The version sed matches only two spaces of indent, and the placeholder check greps only URL_ and SHA_
 #[test]
-fn a_formula_left_at_version_0_0_0_is_caught() {
+fn the_formula_version_takes_any_indent() {
     let template = fs::read_to_string(root().join("Formula/shipcheck.rb")).unwrap();
     let template = template.replace("  version \"0.0.0\"", "\tversion \"0.0.0\"");
     let (tmp, out) = fill_formula(&template);
-    let formula = fs::read_to_string(tmp.path().join("formula.rb")).unwrap();
     assert!(
-        !out.status.success(),
-        "the formula step passed with a formula that installs as 0.0.0:\n{}",
-        formula.lines().find(|l| l.contains("version")).unwrap()
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
     );
+    let formula = fs::read_to_string(tmp.path().join("formula.rb")).unwrap();
+    assert!(formula.contains("\n\tversion \"1.2.3\"\n"), "{formula}");
+}
+
+#[test]
+fn a_formula_without_the_version_is_caught() {
+    let template = fs::read_to_string(root().join("Formula/shipcheck.rb")).unwrap();
+    for (from, to) in [("\"0.0.0\"", "'0.0.0'"), ("\"0.0.0\"", "\"0.9.0\"")] {
+        let (tmp, out) = fill_formula(&template.replace(from, to));
+        let formula = fs::read_to_string(tmp.path().join("formula.rb")).unwrap();
+        assert!(
+            !out.status.success(),
+            "the formula step passed with a formula that does not install 1.2.3:\n{}",
+            formula.lines().find(|l| l.contains("version")).unwrap()
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("does not carry version 1.2.3"));
+    }
 }
 
 // A fake `cargo` that answers `publish` as crates.io does, from a file of the versions it holds
@@ -312,8 +328,26 @@ echo "$v" >> "$FAKE_CRATES_IO"
 echo "Published shipcheck v$v at registry crates-io"
 "#;
 
+// A fake `curl` for the crates.io version API, `FAKE_CURL_EXIT` and `FAKE_STATUS` force a failure
+const FAKE_CURL: &str = r#"#!/bin/sh
+[ -z "$FAKE_CURL_EXIT" ] || { echo "curl: (6) Could not resolve host: crates.io" >&2; exit "$FAKE_CURL_EXIT"; }
+[ -z "$FAKE_STATUS" ] || { printf '%s' "$FAKE_STATUS"; exit 0; }
+for arg; do url="$arg"; done
+if grep -qx "${url##*/}" "$FAKE_CRATES_IO" 2>/dev/null; then printf 200; else printf 404; fi
+"#;
+
+fn fake_bin(tmp: &Path) {
+    let bin = tmp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (name, script) in [("cargo", FAKE_CARGO), ("curl", FAKE_CURL)] {
+        fs::write(bin.join(name), script).unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(bin.join(name), mode).unwrap();
+    }
+}
+
 // One release job up to the tag: a new clone, the version, the stamp and the publish
-fn release_until_tag(tmp: &Path, origin: &Path, n: u32) -> (String, Output) {
+fn release_until_tag(tmp: &Path, origin: &Path, n: u32, env: &[(&str, &str)]) -> (String, Output) {
     let dir = tmp.join(format!("run{n}"));
     git(
         tmp,
@@ -335,37 +369,32 @@ fn release_until_tag(tmp: &Path, origin: &Path, n: u32) -> (String, Output) {
         .current_dir(&dir)
         .env("FAKE_CRATES_IO", tmp.join("crates-io"))
         .env("PATH", path)
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     (v, out)
 }
 
-// The publish step claims a rerun then tags it, but with no tag the rerun repeats the version
+// With no tag the rerun repeats the version, which crates.io already has, so it must skip the publish
 #[test]
 fn a_half_release_is_finished_by_the_next_run() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = repo(tmp.path());
     tag(&origin, "v0.1.0");
     commit(&origin, "fix: a");
-    let bin = tmp.path().join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    fs::write(bin.join("cargo"), FAKE_CARGO).unwrap();
-    fs::set_permissions(
-        bin.join("cargo"),
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .unwrap();
+    fake_bin(tmp.path());
 
-    let (first, out) = release_until_tag(tmp.path(), &origin, 1);
+    let (first, out) = release_until_tag(tmp.path(), &origin, 1, &[]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Published shipcheck v0.1.1"));
     assert_eq!(first, "v0.1.1");
     // Cancelled here, before `Create tag`
 
-    let (second, out) = release_until_tag(tmp.path(), &origin, 2);
+    let (second, out) = release_until_tag(tmp.path(), &origin, 2, &[]);
     assert_eq!(
         second, first,
         "the next run picks the version again, since no tag holds it"
@@ -375,4 +404,22 @@ fn a_half_release_is_finished_by_the_next_run() {
         "the next run cannot publish {second}, so it never reaches the tag:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already on crates.io, skipping"));
+}
+
+#[test]
+fn a_crates_io_error_fails_the_publish() {
+    for env in [[("FAKE_CURL_EXIT", "6")], [("FAKE_STATUS", "503")]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = repo(tmp.path());
+        tag(&origin, "v0.1.0");
+        commit(&origin, "fix: a");
+        fake_bin(tmp.path());
+        let (_, out) = release_until_tag(tmp.path(), &origin, 1, &env);
+        assert!(!out.status.success(), "{env:?}");
+        assert!(
+            !tmp.path().join("crates-io").exists(),
+            "{env:?}: it published"
+        );
+    }
 }

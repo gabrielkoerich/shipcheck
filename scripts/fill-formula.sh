@@ -3,7 +3,7 @@
 set -e
 VERSION="$1"
 base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
-subs=(-e "s|^  version \"0.0.0\"|  version \"${VERSION#v}\"|")
+subs=(-e "s|^\\([[:space:]]*\\)version \"0.0.0\"|\\1version \"${VERSION#v}\"|")
 
 # Each platform gets the archive built for it, with the checksum of that archive
 for pair in \
@@ -21,5 +21,10 @@ sed "${subs[@]}" Formula/shipcheck.rb > formula.rb
 
 if grep -q 'URL_\|SHA_' formula.rb; then
   echo "::error::a placeholder was left behind"
+  exit 1
+fi
+
+if ! grep -q "^[[:space:]]*version \"${VERSION#v}\"" formula.rb || grep -q '0\.0\.0' formula.rb; then
+  echo "::error::the formula does not carry version ${VERSION#v}"
   exit 1
 fi
