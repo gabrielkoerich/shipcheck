@@ -343,9 +343,9 @@ fn note(status: &str, step: Option<&str>) -> Option<&'static str> {
         ),
         s if s.starts_with("timed out") => Some("the run went past `timeout_minutes`"),
         s if s.starts_with("killed") => Some("the job started and never ended"),
-        s if s.contains("shipcheck could not run it") => {
-            Some("shipcheck could not start the job, the run's output above says why")
-        }
+        s if s.contains("shipcheck could not run it") => Some(
+            "shipcheck could not start the job, so the code did not run. Docker or the sandbox failed, the run's output says why, and `shipcheck doctor` checks them",
+        ),
         _ => None,
     }
 }
@@ -531,6 +531,11 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
 
     if entry.passed {
         s.push_str(&format!("passed, tree {} from {tested}\n", entry.tree));
+    } else if entry.could_not_run() {
+        s.push_str(&format!(
+            "could not run, tree {} from {tested}: the code did not run. Fix Docker or the sandbox, `shipcheck doctor` checks them, then run again\n",
+            entry.tree
+        ));
     } else {
         s.push_str(&format!(
             "failed, tree {} from {tested}. `shipcheck logs` prints every log\n",
@@ -548,6 +553,7 @@ pub fn json(entry: &Entry, tested: &str, workflows: &[WorkflowReport], partial: 
         "tree": entry.tree,
         "sha": tested,
         "passed": entry.passed,
+        "could_not_run": entry.could_not_run(),
         "skipped": entry.skipped,
         "ci_changes": entry.ci_changes,
         "workflows": workflows,
