@@ -83,6 +83,20 @@ pub fn on_pull_request_target(source: &str) -> bool {
     })
 }
 
+/// Whether GitHub runs a workflow on a PR's commits, by its `pull_request` trigger
+pub fn runs_on_prs(source: &str) -> bool {
+    let Ok(root) = load(source) else {
+        return false;
+    };
+
+    match root.get(&key("on")) {
+        Some(Yaml::String(e)) => e == "pull_request",
+        Some(Yaml::Array(events)) => events.iter().any(|e| e.as_str() == Some("pull_request")),
+        Some(Yaml::Hash(events)) => events.get(&key("pull_request")).is_some_and(pr_runs),
+        _ => false,
+    }
+}
+
 /// Whether a `pull_request` trigger runs on a PR's commits. `types: [closed]` runs once, after merge
 fn pr_runs(filter: &Yaml) -> bool {
     let pushed = |t: &Yaml| matches!(t.as_str(), Some("opened" | "synchronize" | "reopened"));
