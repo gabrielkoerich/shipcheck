@@ -290,9 +290,22 @@ impl Runner for Act {
         fs::write(wf_path, keep_caches(run_dir, &isolated)?).map_err(|e| e.to_string())?;
 
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
+        let labels: BTreeSet<String> = platforms(&self.config)
+            .into_keys()
+            .chain(
+                self.config
+                    .job_images(request.file)
+                    .into_keys()
+                    .map(|j| job_label(&j)),
+            )
+            .collect();
+        // act skips a job with no image without starting a container, and Docker has only about
+        // 30 address pools for bridges, which a matrix of macOS legs would take for nothing
         let network = match self.network {
-            config::Network::None => None,
-            config::Network::Internet => Some(create_network(run_dir)?),
+            config::Network::Internet if runs_here(&isolated, request.job, &labels) => {
+                Some(create_network(run_dir, request.timeout)?)
+            }
+            _ => None,
         };
         let mut cmd = Command::new("act");
         let port = free_port()?;
@@ -1438,7 +1451,10 @@ fn matrix_condition(value: &str, leg: &Hash) -> Option<bool> {
     Some(operand(a)? == operand(b)?)
 }
 
-/// The leg's value for a field that is exactly `${{ matrix.<name> }}`
+/**
+ * The leg's value for a field that is `${{ matrix.<name> }}`, or a chain of them and quoted strings
+ * joined by `||`, such as `${{ matrix.os || 'ubuntu-latest' }}`. None for any other expression
+ **/
 fn resolve_matrix(value: &Yaml, leg: &Hash) -> Option<Yaml> {
     let inner = value
         .as_str()?
@@ -1446,7 +1462,43 @@ fn resolve_matrix(value: &Yaml, leg: &Hash) -> Option<Yaml> {
         .strip_prefix("${{")?
         .strip_suffix("}}")?
         .trim();
-    leg.get(&key(inner.strip_prefix("matrix.")?)).cloned()
+
+    let operands: Vec<&str> = inner.split("||").map(str::trim).collect();
+
+    for (n, operand) in operands.iter().enumerate() {
+        let last = n + 1 == operands.len();
+        let value = match operand
+            .strip_prefix('\'')
+            .and_then(|t| t.strip_suffix('\''))
+        {
+            Some(quoted) if quoted.contains('\'') => return None,
+            Some(quoted) => Some(key(quoted)),
+            None => {
+                let name = operand.strip_prefix("matrix.")?;
+
+                if !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+                {
+                    return None;
+                }
+
+                leg.get(&key(name)).cloned()
+            }
+        };
+        let falsy = match &value {
+            None | Some(Yaml::Null) | Some(Yaml::Boolean(false)) | Some(Yaml::Integer(0)) => true,
+            Some(Yaml::String(s)) => s.is_empty(),
+            _ => false,
+        };
+
+        // As in GitHub, `a || b` is `a` unless it is falsy, and the last operand whatever it is
+        if last || !falsy {
+            return value;
+        }
+    }
+
+    None
 }
 
 /**
@@ -1531,6 +1583,32 @@ fn expand_matrices(jobs: Hash) -> Hash {
     out
 }
 
+/**
+ * Whether a failed job ended before its first step printed, in act's own setup: an image pull that
+ * timed out, a container Docker could not create. That is almost always the machine's failure
+ **/
+pub fn never_started(log: &str) -> bool {
+    !log.contains("| shipcheck-start ")
+}
+
+/// Whether a platform maps the job's `runs-on`. One that is still an expression may, so it counts
+fn runs_here(workflow: &str, job: &str, labels: &BTreeSet<String>) -> bool {
+    let Ok(root) = workflow::load(workflow) else {
+        return true;
+    };
+    let runs_on = &Yaml::Hash(root)["jobs"][job]["runs-on"];
+    let wanted: Vec<&str> = match runs_on {
+        Yaml::String(label) => vec![label.as_str()],
+        Yaml::Array(list) => list.iter().filter_map(Yaml::as_str).collect(),
+        _ => return true,
+    };
+
+    wanted.is_empty()
+        || wanted
+            .iter()
+            .any(|l| l.contains("${{") || labels.contains(*l))
+}
+
 /// Jobs act skipped because no platform maps their `runs-on`, named as act prints them
 fn unsupported_jobs(log: &str) -> Vec<String> {
     log.lines()
@@ -1562,30 +1640,35 @@ struct Network {
  * reaches every port on the host's loopback. A crashed run can leave the name taken, so it is
  * removed first. Jobs with services still get the network act creates for them
  **/
-fn create_network(run_dir: &Path) -> Result<Network, String> {
+fn create_network(run_dir: &Path, wait: Duration) -> Result<Network, String> {
     let name = network_name(run_dir);
     let _ = Command::new("docker")
         .args(["network", "rm", &name])
         .output();
-    let out = Command::new("docker")
-        .args([
-            "network",
-            "create",
-            "--driver",
-            "bridge",
-            "--label",
-            "shipcheck",
-            &name,
-        ])
-        .output()
-        .map_err(|e| format!("docker network create: {e}"))?;
+    let deadline = Instant::now() + wait.min(POOL_WAIT);
+    until_pooled(deadline, Duration::from_secs(5), || {
+        let out = Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--label",
+                "shipcheck",
+                &name,
+            ])
+            .output()
+            .map_err(|e| format!("docker network create: {e}"))?;
 
-    if !out.status.success() {
-        return Err(format!(
+        if out.status.success() {
+            return Ok(());
+        }
+
+        Err(format!(
             "docker network create {name}: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+        ))
+    })?;
 
     let out = Command::new("docker")
         .args(["network", "inspect", &name, "-f"])
@@ -1596,6 +1679,28 @@ fn create_network(run_dir: &Path) -> Result<Network, String> {
     let gateway = gateway(&text)
         .ok_or_else(|| format!("network {name} has no private IPv4 gateway: {text}"))?;
     Ok(Network { name, gateway })
+}
+
+/// How long a job waits for a Docker address pool before it fails
+const POOL_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// Calls `create` until it succeeds, fails for another reason than a lack of address pools, or the
+/// deadline passes. Other runs' jobs hold every pool, and each gives its pool back when it ends
+fn until_pooled(
+    deadline: Instant,
+    pause: Duration,
+    mut create: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    loop {
+        match create() {
+            Err(e) if pools_taken(&e) && Instant::now() < deadline => std::thread::sleep(pause),
+            done => return done,
+        }
+    }
+}
+
+fn pools_taken(err: &str) -> bool {
+    err.contains("all predefined address pools have been fully subnetted")
 }
 
 fn gateway(inspect: &str) -> Option<std::net::Ipv4Addr> {
@@ -2447,6 +2552,100 @@ jobs:
         );
         assert_eq!(out["jobs"]["release"]["needs"][1].as_str(), Some("test__2"));
         assert_eq!(out["jobs"]["test__1"]["steps"].as_vec().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn resolves_a_matrix_runs_on_with_a_fallback() {
+        // pallets/flask's tests.yaml
+        let wf = "\
+on: push
+jobs:
+  tests:
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    strategy:
+      matrix:
+        include:
+          - {python: '3.14', os: windows-latest}
+          - {python: '3.13'}
+          - {python: '3.12', os: ''}
+    steps: [{run: echo}]
+";
+        let out = load(&inject(wf, "n").unwrap());
+        let runs_on = |j: &str| out["jobs"][j]["runs-on"].as_str().map(str::to_string);
+        assert_eq!(runs_on("tests__1").as_deref(), Some("windows-latest"));
+        assert_eq!(runs_on("tests__2").as_deref(), Some("ubuntu-24.04"));
+        assert_eq!(runs_on("tests__3").as_deref(), Some("ubuntu-24.04"));
+
+        let leg = load("{os: macos-latest}").as_hash().unwrap().clone();
+        let resolve = |v: &str| resolve_matrix(&key(v), &leg);
+        assert_eq!(resolve("${{ matrix.os }}"), Some(key("macos-latest")));
+        assert_eq!(
+            resolve("${{ matrix.arch || matrix.os }}"),
+            Some(key("macos-latest"))
+        );
+        assert_eq!(resolve("${{ matrix.arch }}"), None);
+        assert_eq!(resolve("${{ matrix.arch || inputs.os }}"), None);
+        assert_eq!(resolve("${{ matrix.os && 'x' }}"), None);
+    }
+
+    #[test]
+    fn a_job_no_platform_maps_gets_no_network() {
+        let labels: BTreeSet<String> = ["ubuntu-24.04".to_string()].into();
+        let wf = "\
+on: push
+jobs:
+  mac: {runs-on: macos-latest, steps: [{run: echo}]}
+  list: {runs-on: [self-hosted, macos], steps: [{run: echo}]}
+  linux: {runs-on: ubuntu-24.04, steps: [{run: echo}]}
+  either: {runs-on: [macos-latest, ubuntu-24.04], steps: [{run: echo}]}
+  expr: {runs-on: '${{ inputs.os }}', steps: [{run: echo}]}
+  group: {runs-on: {group: big}, steps: [{run: echo}]}
+";
+        assert!(!runs_here(wf, "mac", &labels));
+        assert!(!runs_here(wf, "list", &labels));
+        assert!(runs_here(wf, "linux", &labels));
+        assert!(runs_here(wf, "either", &labels));
+        assert!(runs_here(wf, "expr", &labels));
+        assert!(runs_here(wf, "group", &labels));
+    }
+
+    #[test]
+    fn a_network_waits_for_an_address_pool_until_its_deadline() {
+        let full =
+            "Error response from daemon: all predefined address pools have been fully subnetted";
+        let pause = Duration::from_millis(1);
+        let later = Instant::now() + Duration::from_secs(60);
+        let mut calls = 0;
+        let created = until_pooled(later, pause, || {
+            calls += 1;
+            if calls < 3 { Err(full.into()) } else { Ok(()) }
+        });
+        assert_eq!((created, calls), (Ok(()), 3));
+
+        let mut calls = 0;
+        let other = until_pooled(later, pause, || {
+            calls += 1;
+            Err("permission denied".into())
+        });
+        assert_eq!((other, calls), (Err("permission denied".into()), 1));
+
+        let past = Instant::now();
+        let mut calls = 0;
+        let late = until_pooled(past, pause, || {
+            calls += 1;
+            Err(full.into())
+        });
+        assert_eq!((late, calls), (Err(full.into()), 1));
+    }
+
+    #[test]
+    fn a_job_that_failed_before_its_first_step_never_started() {
+        let pulled = "[CI/a] ⭐ Run Set up job\n[CI/a]   🐳  docker pull image=catthehacker/ubuntu\n\
+                      Error: context deadline exceeded\n";
+        assert!(never_started(pulled));
+        let ran = "[CI/a] ⭐ Run Main echo \"shipcheck-start n ${{ github.job }}\"\n\
+                   [CI/a]   | shipcheck-start n a\n[CI/a]   | sh: cargo: not found\n";
+        assert!(!never_started(ran));
     }
 
     #[test]
