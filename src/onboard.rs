@@ -965,7 +965,7 @@ fn gate(
 
     let Some(edited) = crate::workflow::gate_jobs(source, &gated, base) else {
         plan.notes.push(format!(
-            "{file}: a job has a form shipcheck does not edit. To run {} on GitHub only on {base}, give each `if: github.ref == 'refs/heads/{base}'` by hand",
+            "{file}: a job has a form shipcheck does not edit. To run {} on GitHub only on {base}, give each `if: github.ref == 'refs/heads/{base}' || github.actor == 'dependabot[bot]'` by hand",
             gated.join(", ")
         ));
         return;
@@ -1319,7 +1319,7 @@ mod tests {
         let next = apply(dir.path(), &plan, &a, &mut finish_nothing, &mut said).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
-            "on:\n  push:\n    branches: [main]\njobs:\n  test:\n    steps:\n      - run: cargo test\n"
+            "on:\n  push:\n    branches: [main, \"dependabot/**\"]\njobs:\n  test:\n    steps:\n      - run: cargo test\n"
         );
         assert_eq!(
             fs::read_to_string(dir.path().join(".github/workflows/lint.yml")).unwrap(),
@@ -1394,7 +1394,7 @@ mod tests {
             fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
             ci.replace(
                 "  lint:\n",
-                "  lint:\n    if: github.ref == 'refs/heads/main'\n"
+                "  lint:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n"
             ),
         );
         assert_eq!(
