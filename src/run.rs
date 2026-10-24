@@ -111,12 +111,16 @@ pub fn safe_git_env(existing: usize) -> Vec<(String, String)> {
 }
 
 pub fn home() -> PathBuf {
+    // A relative path would name another folder from every clone and git command that changes directory
+    let absolute =
+        |dir: std::ffi::OsString| std::path::absolute(&dir).unwrap_or_else(|_| dir.into());
+
     if let Some(dir) = std::env::var_os("SHIPCHECK_HOME") {
-        return PathBuf::from(dir);
+        return absolute(dir);
     }
 
     if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(state).join("shipcheck");
+        return absolute(state).join("shipcheck");
     }
 
     env_home().join(".local/state/shipcheck")
@@ -2459,6 +2463,26 @@ mod tests {
         fs::create_dir_all(&old).unwrap();
         assert_eq!(move_home(&old, &new).unwrap(), Migration::Both);
         assert!(old.exists() && new.join("logs/k").exists());
+    }
+
+    #[test]
+    fn a_relative_home_is_made_absolute() {
+        if std::env::var_os("SHIPCHECK_HOME_CHILD").is_some() {
+            assert_eq!(home(), std::env::current_dir().unwrap().join("rel/home"));
+            return;
+        }
+
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "run::tests::a_relative_home_is_made_absolute"])
+            .env("SHIPCHECK_HOME_CHILD", "1")
+            .env("SHIPCHECK_HOME", "rel/home")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     #[test]
