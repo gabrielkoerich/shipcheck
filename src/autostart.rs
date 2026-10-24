@@ -137,8 +137,7 @@ fn try_install(root: &Path) -> Result<String, String> {
         return Ok("daemon not installed, SHIPCHECK_NO_DAEMON=1".into());
     }
 
-    // The service runs with the default home, so it would never see this one's results
-    if run::home_overridden() {
+    if !owns_service(run::home_overridden()) {
         return Ok("daemon not installed, SHIPCHECK_HOME is not the default".into());
     }
 
@@ -191,8 +190,18 @@ pub fn logs_to_legacy_home() -> bool {
     fs::read_to_string(service_file()).is_ok_and(|t| t.contains(&old))
 }
 
+/// The one service belongs to the default home, so a moved SHIPCHECK_HOME, such as a test's,
+/// never installs or removes it
+fn owns_service(home_overridden: bool) -> bool {
+    !home_overridden
+}
+
 /// Stops the service and removes its file
 pub fn uninstall() -> Result<String, String> {
+    if !owns_service(run::home_overridden()) {
+        return Ok("daemon service left alone, SHIPCHECK_HOME is not the default".into());
+    }
+
     let file = service_file();
 
     if cfg!(target_os = "macos") {
@@ -219,6 +228,15 @@ pub fn uninstall() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_default_home_installs_or_removes_the_service() {
+        assert!(owns_service(false));
+        assert!(
+            !owns_service(true),
+            "a test's SHIPCHECK_HOME once ran `clean --all` and removed the developer's daemon"
+        );
+    }
 
     #[test]
     fn launchd_agent() {
