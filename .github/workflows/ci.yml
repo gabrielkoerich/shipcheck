@@ -62,7 +62,7 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - run: docker version
       - run: act --version
-      - run: cargo test --test e2e -- --ignored --nocapture
+      - run: cargo test --test e2e --test retry_e2e --test shard_e2e -- --ignored --nocapture
 
   gitleaks:
     runs-on: ubuntu-latest

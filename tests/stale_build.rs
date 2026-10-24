@@ -44,12 +44,8 @@ fn said(out: &Output) -> String {
 }
 
 #[test]
+#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
 fn a_run_never_uses_build_output_another_tree_left() {
-    // A shipcheck host check runs this test jailed, and macOS refuses a sandbox inside a sandbox
-    if std::env::var_os("SHIPCHECK_JAIL").is_some() {
-        return;
-    }
-
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let origin = tmp.path().join("acme/demo.git");
