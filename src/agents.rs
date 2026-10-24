@@ -9,7 +9,9 @@ pub const BLOCK_VERSION: &str = "v3";
 const START: &str = "<!-- shipcheck:start";
 const END: &str = "<!-- shipcheck:end -->";
 
+// Blank lines inside the markers, which prettier and oxfmt add, so a format check passes on init's commit
 pub const BLOCK: &str = "<!-- shipcheck:start v3 -->
+
 ## Tests and commits
 
 - Work on a branch, never on the default branch: `git switch -c <branch>`. Then `shipcheck run`, `shipcheck commit`, push, and open a PR. The PR carries the checks.
@@ -19,6 +21,7 @@ pub const BLOCK: &str = "<!-- shipcheck:start v3 -->
 - Exit 1: read `shipcheck logs`, fix, then `shipcheck run --job <id>` for the failed job as often as needed. A partial run is never the check, so finish with one full `shipcheck run`, then `shipcheck commit`. Exit 2: shipcheck could not run, so run `shipcheck doctor` and follow it.
 - If `shipcheck` is not on PATH, run the project's tests and commit with git.
 - Never edit `.github/workflows/` or `shipcheck.toml` to get a pass. Details: https://shipcheck.run/llms.txt
+
 <!-- shipcheck:end -->";
 
 /// `text` with the block in it: between the markers when they are there, else appended
@@ -486,6 +489,16 @@ mod tests {
             merge_block(Some(old)),
             format!("# Notes\n\n{BLOCK}\n\nmore\n")
         );
+
+        // A block from before the blank lines is rewritten, and doctor sees no drift in it
+        let tight =
+            "<!-- shipcheck:start v3 -->\n## Tests and commits\n\n- old\n<!-- shipcheck:end -->\n";
+        assert_eq!(merge_block(Some(tight)), format!("{BLOCK}\n"));
+        assert!(BLOCK.starts_with("<!-- shipcheck:start v3 -->\n\n## "));
+        assert!(BLOCK.ends_with(".txt\n\n<!-- shipcheck:end -->"));
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), tight).unwrap();
+        assert!(notes(dir.path()).is_empty(), "{:?}", notes(dir.path()));
 
         let plain = "# Notes\nkeep this\n";
         let merged = merge_block(Some(plain));
