@@ -591,7 +591,7 @@ fn handle(
         return Ok(Some("not checked, daemon = false on main"));
     }
 
-    let same_repo = pr.head_repo == repo;
+    let same_repo = pr.head_repo.eq_ignore_ascii_case(repo);
 
     // Host mode runs a commit's code as this user outside any container, so never a fork's, not even from the cache
     if plan.config.runner == crate::config::RunnerKind::Host && !same_repo {

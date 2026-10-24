@@ -125,7 +125,9 @@ fn same_repo_prs(prs: &Value, repo: &str, sha: &str, base: &str) -> Vec<u64> {
         .filter(|pr| {
             pr["state"] == "open"
                 && pr["head"]["sha"] == sha
-                && pr["head"]["repo"]["full_name"] == repo
+                && pr["head"]["repo"]["full_name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(repo))
                 && pr["base"]["ref"] == base
         })
         .filter_map(|pr| pr["number"].as_u64())
