@@ -550,21 +550,20 @@ pub fn platforms(config: &config::Act) -> BTreeMap<String, String> {
 
 /// catthehacker's `runner-*` images, pinned by index digest for amd64 and arm64, unless
 /// `[act] platforms` maps the label. They run as `runner`, uid 1001, with sudo, as GitHub does.
-/// Without them act stops to ask for a default image, and 0.2.89 has none for `ubuntu-24.04`
-const DEFAULT_PLATFORMS: [(&str, &str); 3] = [
-    (
-        "ubuntu-latest",
-        "catthehacker/ubuntu@sha256:27043bae70b35fd8a5af1ca3a7e3e45e33595a9b7701cd7cc9232027d9fca773",
-    ),
-    (
-        "ubuntu-24.04",
-        "catthehacker/ubuntu@sha256:27043bae70b35fd8a5af1ca3a7e3e45e33595a9b7701cd7cc9232027d9fca773",
-    ),
-    (
-        "ubuntu-22.04",
-        "catthehacker/ubuntu@sha256:942b477bcb64e8b32c2f9bc86c904a016d84d07d48b3a89554d1c317b971302f",
-    ),
+/// Without them act stops to ask for a default image, and 0.2.89 has none for `ubuntu-24.04`.
+/// `ubuntu-slim` is 24.04 with fewer tools, and an `-arm` label runs the index's image for this host
+const DEFAULT_PLATFORMS: [(&str, &str); 6] = [
+    ("ubuntu-latest", UBUNTU_24),
+    ("ubuntu-24.04", UBUNTU_24),
+    ("ubuntu-slim", UBUNTU_24),
+    ("ubuntu-24.04-arm", UBUNTU_24),
+    ("ubuntu-22.04", UBUNTU_22),
+    ("ubuntu-22.04-arm", UBUNTU_22),
 ];
+const UBUNTU_24: &str =
+    "catthehacker/ubuntu@sha256:27043bae70b35fd8a5af1ca3a7e3e45e33595a9b7701cd7cc9232027d9fca773";
+const UBUNTU_22: &str =
+    "catthehacker/ubuntu@sha256:942b477bcb64e8b32c2f9bc86c904a016d84d07d48b3a89554d1c317b971302f";
 
 /// busybox 1.37, pinned, for handing a checkout between the user and the job on Linux
 const BUSYBOX: &str =
@@ -2290,6 +2289,16 @@ jobs:
         assert_eq!(p["ubuntu-22.04"], "img@sha256:1");
         assert!(p["ubuntu-24.04"].contains("27043bae70b3"));
         assert_eq!(p["ubuntu-latest"], p["ubuntu-24.04"]);
+
+        // GitHub's other Linux labels, which act otherwise skips as unsupported
+        let p = platforms(&config::Act::default());
+        for (label, base) in [
+            ("ubuntu-slim", "ubuntu-24.04"),
+            ("ubuntu-24.04-arm", "ubuntu-24.04"),
+            ("ubuntu-22.04-arm", "ubuntu-22.04"),
+        ] {
+            assert_eq!(p.get(label), Some(&p[base]), "{label}");
+        }
     }
 
     #[test]
