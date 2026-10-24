@@ -54,6 +54,35 @@ pub struct WorkflowResult {
     pub summaries: BTreeMap<String, String>,
 }
 
+/// The state of a job shipcheck could not start, such as when Docker failed to create its network
+pub const COULD_NOT_RUN: &str = "failure, shipcheck could not run it";
+
+impl Entry {
+    /// It failed only because shipcheck could not start jobs, so the code never ran
+    pub fn could_not_run(&self) -> bool {
+        let states = || self.workflows.iter().flat_map(|w| w.jobs.values());
+        let fine = |s: &str| s == "success" || s == "skipped" || s.ends_with(ALLOWED);
+
+        !self.passed
+            && states().any(|s| s == COULD_NOT_RUN)
+            && states().all(|s| fine(s) || s == COULD_NOT_RUN || s == NOT_RUN)
+    }
+}
+
+/// The exit code of a finished run: 0 passed, 1 the code failed, 2 shipcheck could not run it
+pub fn exit_code(entry: &Entry) -> u8 {
+    if entry.passed {
+        0
+    } else if entry.could_not_run() {
+        2
+    } else {
+        1
+    }
+}
+
+/// A job whose need did not pass
+const NOT_RUN: &str = "not run, a job it needs did not pass";
+
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1084,6 +1113,12 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
 /// the result
 pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     let entry = execute(plan, None, say)?;
+
+    // Docker or the sandbox failed before the code ran, so there is no verdict to keep
+    if entry.could_not_run() {
+        return Ok(entry);
+    }
+
     let cache_dir = home().join("cache");
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?;
@@ -1423,7 +1458,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
             Err(e) => {
                 exit = exit.and(Some(1));
                 say(&format!("{HOST}/{name}: {e}"));
-                "failure, shipcheck could not run it"
+                COULD_NOT_RUN
             }
         };
         say(&format!("{HOST}/{name}: {state}"));
@@ -1609,7 +1644,7 @@ fn run_workflow(
                         let state = if states[n] == "skipped" {
                             "skipped"
                         } else {
-                            "not run, a job it needs did not pass"
+                            NOT_RUN
                         };
                         started.insert(job.clone());
                         states.insert(job.clone(), state.into());
@@ -1682,7 +1717,7 @@ fn run_workflow(
                             // The state goes into the check, which may be public, so the error with
                             // its host paths stays on this machine
                             say(&format!("{file}/{job}: {e}"));
-                            "failure, shipcheck could not run it".to_string()
+                            COULD_NOT_RUN.to_string()
                         }
                     };
                     say(&format!("{file}/{job}: {state}"));

@@ -27,7 +27,7 @@ On a new machine or repository, run `shipcheck doctor` first. It prints what is 
 |---|---|---|
 | 0 | Every check passed, or nothing under `paths` changed | `shipcheck commit -m <message>`, push when the work is done |
 | 1 | A check failed | Read the failed check, step, tests and output it printed, fix the code, run again (below) |
-| 2 | shipcheck could not run | Read the message. Often `shipcheck.toml` on `main` is invalid, the OS sandbox is missing in host mode, or Docker is not running in act mode |
+| 2 | shipcheck could not run | Read the message. Often `shipcheck.toml` on `main` is invalid, the OS sandbox is missing in host mode, or Docker is not running or failed to start a job in act mode. The code did not run, so do not change it: fix the machine, `shipcheck doctor` helps, then run again |
 
 A tree that already passed answers at once, so a run after a rebase that changed nothing is cheap.
 
