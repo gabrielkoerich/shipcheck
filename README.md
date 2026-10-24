@@ -33,11 +33,12 @@ Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), which do
 cargo binstall shipcheck
 ```
 
-Or build it from source with cargo, Rust 1.89 or later, from crates.io or from this repository. A build gets a new signature each time, so macOS asks once per keychain item after it:
+Or build it from source with cargo, Rust 1.89 or later: from crates.io, from this repository, or from a clone. A build gets a new signature each time, so macOS asks once per keychain item after it:
 
 ```sh
 cargo install shipcheck
 cargo install --git https://github.com/gabrielkoerich/shipcheck shipcheck
+git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path shipcheck
 ```
 
 | Needs | When | Why |
