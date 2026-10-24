@@ -1524,6 +1524,7 @@ enum Msg {
 
 struct JobRun {
     exit: Option<i32>,
+    skipped: bool,
     attempts: u32,
     outputs: BTreeMap<String, String>,
     unsupported: Vec<String>,
@@ -1634,6 +1635,7 @@ fn run_workflow(
                             let state = job_state(
                                 &job,
                                 run.exit,
+                                run.skipped,
                                 !run.unsupported.is_empty(),
                                 &marks,
                                 allowed.contains(&job),
@@ -1706,6 +1708,7 @@ fn run_workflow(
 fn job_state(
     job: &str,
     exit: Option<i32>,
+    skipped: bool,
     unsupported: bool,
     marks: &BTreeMap<String, workflow::JobMarks>,
     allowed: bool,
@@ -1714,8 +1717,11 @@ fn job_state(
         "no image for its runs-on label on this host"
     } else if exit.is_none() {
         "timed out"
-    } else if exit == Some(0) && marks.is_empty() {
+    } else if exit == Some(0) && marks.is_empty() && skipped {
         "skipped"
+    } else if exit == Some(0) && marks.is_empty() {
+        // act ran none of it and never said its `if:` skipped it
+        "failure, act ran nothing"
     } else if exit == Some(0) && marks.contains_key(job) && marks.values().all(|m| m.passed()) {
         "success"
     } else if marks.get(job).is_some_and(|m| m.ended < m.started) {
@@ -1733,11 +1739,12 @@ fn job_state(
 }
 
 /// A workflow passes when every job passed, was skipped or is an allowed failure, and one passed
+/// or was skipped, as act said its `if:` skipped it, so GitHub counts it as passed
 fn workflow_passed(states: &BTreeMap<String, String>) -> bool {
     states
         .values()
         .all(|s| s == "success" || s == "skipped" || s.ends_with(ALLOWED))
-        && states.values().any(|s| s == "success")
+        && states.values().any(|s| s == "success" || s == "skipped")
 }
 
 /// Runs one job in its own clone at a fixed path per slot and job, and a failure again in a new one
@@ -1773,6 +1780,7 @@ fn run_job(
         if timeout.is_zero() {
             return Ok(JobRun {
                 exit: None,
+                skipped: false,
                 attempts,
                 outputs: BTreeMap::new(),
                 unsupported: Vec::new(),
@@ -1887,6 +1895,7 @@ fn run_job(
             let log = fs::read(&log_path).map_err(|e| e.to_string())?;
             return Ok(JobRun {
                 exit: outcome.exit,
+                skipped: outcome.skipped,
                 attempts,
                 outputs: outcome.outputs,
                 unsupported: outcome.unsupported_jobs,
@@ -3416,17 +3425,30 @@ mod tests {
 
         for (exit, unsupported, of, allow, want) in cases {
             assert_eq!(
-                job_state("test", *exit, *unsupported, &marks(of), *allow),
+                job_state(
+                    "test",
+                    *exit,
+                    of.is_empty(),
+                    *unsupported,
+                    &marks(of),
+                    *allow
+                ),
                 *want,
                 "exit {exit:?}, unsupported {unsupported}, marks {of:?}, allowed {allow}"
             );
         }
+
+        // A job act ran none of, with no word that its `if:` skipped it, is not skipped
+        assert_eq!(
+            job_state("test", Some(0), false, false, &marks(&[]), false),
+            "failure, act ran nothing"
+        );
     }
 
     #[test]
     fn continue_on_error_never_allows_a_timeout() {
         // AGENTS.md: a timeout is a failure, and this deadline is shipcheck's own
-        let timed_out = job_state("test", None, false, &marks(&[]), true);
+        let timed_out = job_state("test", None, false, false, &marks(&[]), true);
         let states = BTreeMap::from([
             ("lint".to_string(), "success".to_string()),
             ("test".to_string(), timed_out.clone()),
@@ -3448,6 +3470,7 @@ mod tests {
             "test",
             Some(1),
             false,
+            false,
             &marks(&[("test", 1, 0, false)]),
             true,
         );
@@ -3463,7 +3486,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_passes_only_when_every_job_passed_and_one_succeeded() {
+    fn workflow_passes_only_when_every_job_passed_and_one_succeeded_or_was_skipped() {
         let allowed = format!("failure{ALLOWED}");
         let cases: &[(&[&str], bool)] = &[
             (&[], false),
@@ -3471,10 +3494,11 @@ mod tests {
             (&["success", "success"], true),
             (&["success", "skipped"], true),
             (&["success", &allowed], true),
-            (&["skipped"], false),
-            (&["skipped", "skipped"], false),
+            (&["skipped"], true),
+            (&["skipped", "skipped"], true),
             (&[&allowed], false),
-            (&["skipped", &allowed], false),
+            (&["skipped", &allowed], true),
+            (&["skipped", "failure, act ran nothing"], false),
             (&["success", "failure"], false),
             (&["success", "killed"], false),
             (&["success", "timed out"], false),
