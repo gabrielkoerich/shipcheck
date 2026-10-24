@@ -2565,7 +2565,7 @@ jobs:
 
     #[test]
     fn a_pinned_toolchain_is_pinned_when_rustup_has_it() {
-        // orch's release.yml and oblivion's ci.yml, trimmed
+        // orch's release.yml and an Anchor project's ci.yml, trimmed
         let ci = r#"on: push
 env:
   RUST_VERSION: 1.93.1
@@ -2833,7 +2833,7 @@ jobs:
 
     #[test]
     fn workflow_env_is_exported_once_per_check() {
-        // oblivion's ci.yml, trimmed
+        // An Anchor project's ci.yml, trimmed
         let ci = r#"on: push
 env:
   RUST_VERSION: 1.93.1
