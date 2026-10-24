@@ -398,7 +398,7 @@ fn waiting_body(name: &str, sha: &str, running: bool) -> Value {
         (
             "queued",
             "waiting for a run",
-            "No machine has run this commit's tree yet. `shipcheck run`, or a push with the hooks installed, starts one.",
+            "No machine has run this commit's tree yet. `shipcheck run` or a push with the hooks installed starts one, and the daemon runs a same-repository PR once GitHub says who pushed its head.",
         )
     };
 
