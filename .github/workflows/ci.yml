@@ -22,9 +22,8 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # Host mode runs checks in bubblewrap, which Ubuntu's AppArmor blocks from making user namespaces.
-      # These are the commands the install docs give, so CI proves them. Turning the restriction off
-      # with sysctl would also do on a throwaway runner, never on a user's machine
+      # Ubuntu's AppArmor stops bubblewrap making user namespaces. These are the install docs' commands,
+      # so CI proves them, a sysctl that lifts the restriction is fine here but never on a user's machine
       - timeout-minutes: 5
         run: |
           apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"

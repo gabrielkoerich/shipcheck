@@ -4,13 +4,13 @@ Rules for anyone changing shipcheck, people and agents alike. shipcheck turns a 
 
 ## Invariants
 
-Every change must keep these. Each one closes a way a check could pass without the work behind it.
+Every change must keep these.
 
 - A result comes only from a run shipcheck started. Nothing accepts a result, a log or a verdict from a caller.
 - `shipcheck.toml` and `.github/workflows/` are read from `origin/main`, never from the PR tree or the working copy.
 - Every job gets a new copy-on-write clone checked out at the SHA, at its slot's fixed path for that job. Jobs never share a checkout, and never run in the agent's worktree.
 - A job never reaches the host: no Docker socket, no host token or environment, a `.git` of its own, no network unless `network = "internet"` on main, never `-self-hosted`. The isolation case of the end-to-end test proves it, and must keep passing.
-- A workflow passes only on exit code 0 from an `act` process shipcheck started, with every started job ending in `success`. The cache is written only from such a run.
+- A workflow passes only on exit code 0 from an `act` process shipcheck started, with every started job ending in `success`. A host check passes only on exit code 0 from its command, which shipcheck started. The cache is written only from such a run.
 - The cache key holds the tree, the config from `main`, the workflows as they run, the act and shipcheck versions and the images. Never key by commit SHA.
 - A `paths` skip is never cached, and any doubt about the changed files means run.
 - Hooks never block or fail git. Runs they start go to the background, one per branch, and a newer commit cancels the older one.
