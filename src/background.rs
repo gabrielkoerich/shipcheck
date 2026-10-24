@@ -264,9 +264,13 @@ pub fn run_args(sha: &str, base: &str, name: &str, post: bool, home_ok: bool) ->
     args
 }
 
-/// GitHub answers 422 to a check run on a commit it does not have yet
+/// GitHub answers 422 to a check run on a commit it does not have yet. ureq ends that error with
+/// `http status: 422`, the service says `GitHub refused to <what>: 422 <message>`
 fn unknown_sha(e: &str) -> bool {
-    e.contains("422")
+    e.ends_with("http status: 422")
+        || e.split_once("GitHub refused to ")
+            .and_then(|(_, rest)| rest.split_once(": "))
+            .is_some_and(|(_, answer)| answer.starts_with("422 "))
 }
 
 /// Calls `f` again after each wait while GitHub does not know the commit
