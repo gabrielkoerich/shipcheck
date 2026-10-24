@@ -103,6 +103,9 @@ enum Cmd {
     },
     /// Print the stored result of a tree
     Status {
+        /// Accepted for scripts written for older versions, these commands never fetch
+        #[arg(long, hide = true)]
+        no_fetch: bool,
         /// A commit instead of the working copy
         rev: Option<String>,
         /// The index instead of the working copy
@@ -117,6 +120,9 @@ enum Cmd {
     },
     /// Print the logs of a tree's last run
     Logs {
+        /// Accepted for scripts written for older versions, these commands never fetch
+        #[arg(long, hide = true)]
+        no_fetch: bool,
         /// A commit instead of the working copy
         rev: Option<String>,
         /// The index instead of the working copy
@@ -128,6 +134,9 @@ enum Cmd {
     },
     /// Post a commit's result as its PR's checks
     Post {
+        /// Accepted for scripts written for older versions, these commands never fetch
+        #[arg(long, hide = true)]
+        no_fetch: bool,
         /// The commit to post, HEAD by default
         rev: Option<String>,
         /// Post from a SHIPCHECK_HOME other than the default
@@ -147,6 +156,9 @@ enum Cmd {
     },
     /// Check this machine and repository, and say what to fix
     Doctor {
+        /// Accepted for scripts written for older versions, these commands never fetch
+        #[arg(long, hide = true)]
+        no_fetch: bool,
         #[arg(long, hide = true, value_name = "ref")]
         base: Option<String>,
     },
@@ -282,6 +294,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             staged: st,
             json: js,
             base: b,
+            ..
         } => {
             at(r, &mut rev, &mut explicit);
             (staged, json) = (st, js);
@@ -292,6 +305,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             rev: r,
             staged: st,
             base: b,
+            ..
         } => {
             at(r, &mut rev, &mut explicit);
             staged = st;
@@ -302,6 +316,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             rev: r,
             home_ok: h,
             base: b,
+            ..
         } => {
             at(r, &mut rev, &mut explicit);
             home_ok = h;
@@ -312,7 +327,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             (json, limit) = (js, l);
             "history"
         }
-        Cmd::Doctor { base: b } => {
+        Cmd::Doctor { base: b, .. } => {
             on_base(b, &mut base, &mut base_set, &mut fetch);
             "doctor"
         }
