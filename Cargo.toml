@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["ci", "github-actions", "act", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 # Only the code goes in the crate, not the site or the docs. SKILL.md is compiled in
-include = ["/src/**", "/LICENSE", "/README.md", "/SKILL.md"]
+include = ["/build.rs", "/src/**", "/LICENSE", "/README.md", "/SKILL.md"]
 
 # cargo binstall and mise download the signed release archive instead of building from source
 [package.metadata.binstall]
