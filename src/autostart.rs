@@ -185,6 +185,12 @@ fn try_install(root: &Path) -> Result<String, String> {
     Ok(RUNNING.into())
 }
 
+/// Whether the LaunchAgent still logs into the home from before it left `~/Library`
+pub fn logs_to_legacy_home() -> bool {
+    let old = xml(&run::legacy_home().to_string_lossy());
+    fs::read_to_string(service_file()).is_ok_and(|t| t.contains(&old))
+}
+
 /// Stops the service and removes its file
 pub fn uninstall() -> Result<String, String> {
     let file = service_file();

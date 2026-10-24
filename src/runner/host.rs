@@ -1064,7 +1064,8 @@ mod tests {
             assert!(trusted_in(Path::new("/opt/homebrew/bin"), &user, &[]));
         }
 
-        let kept = trusted_path_in(&path, &user, &[PathBuf::from("/tmp")]);
+        // Linux keeps tempdir() itself under /tmp, so the temp root here must not hold `user`
+        let kept = trusted_path_in(&path, &user, &[PathBuf::from("/tmp/fake")]);
         assert_eq!(
             std::env::split_paths(&kept).collect::<Vec<_>>(),
             [user.join(".cargo/bin"), PathBuf::from("/usr/bin")]

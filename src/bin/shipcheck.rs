@@ -5,6 +5,7 @@ use std::process::{Command, ExitCode};
 use shipcheck::config::Trigger;
 use shipcheck::record::Run as Record;
 use shipcheck::service::{self, Poster, Sender};
+use shipcheck::ui::Style;
 use shipcheck::{agents, autostart, background, check, report, run, setup};
 
 const USAGE: &str = "usage: shipcheck run [--sha <rev> | --staged] [--no-fetch] [--base <ref>] [--job <id>]... [--workflow <file>]... [--json] | status [<rev> | --staged] [--json] | logs [<rev>] [--base <ref>] | history [--json] [--limit <n>] | commit -m <message> [--allow-failed] | post [<rev>] [--home-ok] | login | logout [--all] | token [--name <machine>] | clean [--all] | init [--yes] | install | doctor | daemon [--home-ok | --uninstall]";
@@ -22,10 +23,12 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var(key, value) };
     }
 
+    run::migrate_home();
+
     match cli(std::env::args().skip(1).collect()) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("shipcheck: {e}");
+            eprintln!("{} {e}", Style::stderr().red("shipcheck:"));
             ExitCode::from(2)
         }
     }
@@ -163,7 +166,14 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
     }
 
     // With --json, stdout holds only the result object
+    let style = if json {
+        Style::stderr()
+    } else {
+        Style::stdout()
+    };
     let say = |line: &str| {
+        let line = style.status(line);
+
         if json {
             eprintln!("{line}");
         } else {
@@ -330,16 +340,16 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             let checks = shipcheck::doctor::checks(&cwd, &base);
             let width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
             // Agents and pipes read the plain words, a person at a terminal gets marks and color
-            let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-            let (ok, fix) = if color {
-                ("\x1b[32m✔\x1b[0m", "\x1b[31m✘\x1b[0m")
+            let s = Style::stdout();
+            let (ok, fix) = if s.on {
+                (s.ok(), s.fail())
             } else {
-                ("ok ", "fix")
+                ("ok ".into(), "fix".into())
             };
 
             for c in &checks {
-                let mark = if c.ok { ok } else { fix };
-                println!("{mark}  {:width$}  {}", c.name, c.detail);
+                let mark = if c.ok { &ok } else { &fix };
+                println!("{mark}  {:width$}  {}", c.name, s.dim(&c.detail));
             }
 
             if checks.iter().all(|c| c.ok) {
@@ -431,6 +441,12 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
             refuse_moved_home(home_ok)?;
             let plan = run::plan(&cwd, &rev, &base)?;
 
+            if let Some(branch) = run::on_default_branch(&plan.repo, &base, Some(&plan.sha)) {
+                return Err(format!(
+                    "{branch} is the default branch, PRs carry shipcheck's checks: `git switch -c <branch>`, push it, then `shipcheck post`"
+                ));
+            }
+
             if plan.defaults {
                 return Err(format!(
                     "{base} has no shipcheck.toml, so this result ran the defaults and is not a check. Run `shipcheck init` and merge shipcheck.toml to main"
@@ -471,8 +487,15 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
         }
         Some("login") => {
             let login = service::login()?;
+            let s = Style::stdout();
+            let mark = if s.on {
+                format!("{} ", s.ok())
+            } else {
+                String::new()
+            };
             println!(
-                "signed in as {login}, `shipcheck post` now posts through {}",
+                "{mark}signed in as {}, `shipcheck post` now posts through {}",
+                s.bold(&login),
                 service::api()
             );
             Ok(ExitCode::SUCCESS)
@@ -549,21 +572,28 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
         }
         Some("init") => {
             let root = toplevel(&cwd)?;
+            let terminal = std::io::stdin().is_terminal()
+                && std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal();
+            let finish = &mut |say: &mut dyn FnMut(&str)| machine_setup(&root, say);
 
-            // An agent or a script gets no questions and no change outside the repository
-            if yes || std::io::stdin().is_terminal() {
-                let stdin = std::io::stdin();
-                let mut input = stdin.lock();
-                let mut out = std::io::stdout();
-                shipcheck::onboard::run(
+            // A person gets the wizard, `--yes` the recommended choices, an agent or a script no change outside the repository
+            if yes {
+                shipcheck::onboard::plain(
                     &root,
-                    &mut shipcheck::onboard::Prompt {
-                        input: &mut input,
-                        out: &mut out,
-                        yes,
-                    },
+                    shipcheck::onboard::App::find(),
+                    &mut std::io::stdout(),
+                    finish,
                 )?;
-            } else if let Some(wrote) = setup::init(&root)? {
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            if terminal {
+                shipcheck::onboard::tui(&root, shipcheck::onboard::App::find, finish)?;
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            if let Some(wrote) = setup::init(&root)? {
                 println!("{wrote}");
             }
 
@@ -572,22 +602,15 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            for line in agents::instructions(&root)? {
-                println!("{line}");
-            }
-
-            remove_old_hooks(&root);
-            println!("{}", setup::install(&root)?);
-            sign_in();
-            println!("{}", autostart::install(&root));
+            machine_setup(&root, &mut |line| println!("{line}"))?;
             println!("next: review shipcheck.toml and AGENTS.md, commit them, and merge to main");
             Ok(ExitCode::SUCCESS)
         }
         Some("install") => {
             let root = toplevel(&cwd)?;
-            remove_old_hooks(&root);
+            remove_old_hooks(&root, &mut |line| println!("{line}"));
             println!("{}", setup::install(&root)?);
-            sign_in();
+            sign_in(&mut |line| println!("{line}"));
             println!("{}", autostart::install(&root));
             Ok(ExitCode::SUCCESS)
         }
@@ -595,36 +618,50 @@ fn cli(args: Vec<String>) -> Result<ExitCode, String> {
     }
 }
 
+/// What `init` sets up on the machine once the repository has a shipcheck.toml
+fn machine_setup(root: &Path, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+    for line in agents::instructions(root)? {
+        say(&line);
+    }
+
+    remove_old_hooks(root, say);
+    say(&setup::install(root)?);
+    sign_in(say);
+    say(&autostart::install(root));
+    Ok(())
+}
+
 /// Signs the machine in for `install` and `init` when it cannot post, never failing them
-fn sign_in() {
+fn sign_in(say: &mut dyn FnMut(&str)) {
     let terminal = std::io::stdin().is_terminal();
 
     match service::sign_in(service::poster() != Poster::None, terminal) {
         service::SignIn::Already => {
-            println!(
+            say(&format!(
                 "signed in: checks post with {}",
                 service::identity().unwrap_or_default()
-            );
+            ));
         }
         service::SignIn::Skip => {
-            println!(
-                "not signed in: run `shipcheck login` once, or set SHIPCHECK_TOKEN (see docs)"
-            );
+            say("not signed in: run `shipcheck login` once, or set SHIPCHECK_TOKEN (see docs)");
         }
         service::SignIn::Ask => {
-            println!("signing in with GitHub, so pushes post their checks");
+            say("signing in with GitHub, so pushes post their checks");
 
             match service::login() {
-                Ok(login) => println!("signed in as {login}"),
-                Err(e) => println!("not signed in: {e}, run `shipcheck login` later"),
+                Ok(login) => say(&format!("signed in as {login}")),
+                Err(e) => say(&format!("not signed in: {e}, run `shipcheck login` later")),
             }
         }
     }
 }
 
-fn remove_old_hooks(root: &Path) {
-    for line in agents::remove_old_hooks(root, &[run::home(), run::default_home()]) {
-        println!("{line}");
+fn remove_old_hooks(root: &Path, say: &mut dyn FnMut(&str)) {
+    for line in agents::remove_old_hooks(
+        root,
+        &[run::home(), run::default_home(), run::legacy_home()],
+    ) {
+        say(&line);
     }
 }
 
@@ -705,7 +742,10 @@ fn warn_untracked(repo: &Path) -> Result<(), String> {
         n => format!("{n} untracked files are"),
     };
     println!(
-        "{count} part of this run: {names}. Gitignore or delete them if they are not part of the change"
+        "{}",
+        Style::stdout().yellow(&format!(
+            "{count} part of this run: {names}. Gitignore or delete them if they are not part of the change"
+        ))
     );
     Ok(())
 }
@@ -740,8 +780,16 @@ fn commit(cwd: &Path, args: &[String]) -> Result<ExitCode, String> {
         return Err("shipcheck commit needs -m <message> or -F <file>".into());
     }
 
-    let tested =
-        run::last_tested(&toplevel(cwd)?).ok_or("no `shipcheck run` of this working copy yet")?;
+    let repo = toplevel(cwd)?;
+
+    // Plain `git commit` still works on it, the hooks never block git
+    if let Some(branch) = run::on_default_branch(&repo, "origin/main", None) {
+        return Err(format!(
+            "{branch} is the default branch, PRs carry shipcheck's checks: `git switch -c <branch>`, then `shipcheck commit`"
+        ));
+    }
+
+    let tested = run::last_tested(&repo).ok_or("no `shipcheck run` of this working copy yet")?;
     let sha = run::commit(cwd, &tested, &git_args, allow_failed)?;
     println!(
         "committed {}, the tree that {} in `shipcheck run`",
@@ -850,7 +898,11 @@ fn report(entry: &run::Entry, snapshot: Option<&str>, json: bool, partial: bool)
     if json {
         println!("{}", report::json(entry, tested, &workflows, partial));
     } else {
-        print!("{}", report::text(entry, tested, &workflows));
+        let s = Style::stdout();
+
+        for line in report::text(entry, tested, &workflows).lines() {
+            println!("{}", s.status(line));
+        }
     }
 
     if entry.passed {

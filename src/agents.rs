@@ -5,13 +5,14 @@ use std::process::Command;
 use serde_json::Value;
 
 /// The marker version doctor compares, raised when the block's text changes
-pub const BLOCK_VERSION: &str = "v2";
+pub const BLOCK_VERSION: &str = "v3";
 const START: &str = "<!-- shipcheck:start";
 const END: &str = "<!-- shipcheck:end -->";
 
-pub const BLOCK: &str = "<!-- shipcheck:start v2 -->
+pub const BLOCK: &str = "<!-- shipcheck:start v3 -->
 ## Tests and commits
 
+- Work on a branch, never on the default branch: `git switch -c <branch>`. Then `shipcheck run`, `shipcheck commit`, push, and open a PR. The PR carries the checks.
 - Do not run the test commands (`pytest`, `cargo test`, `npm test`, `go test`, `just test` and the like). Run `shipcheck run`. It runs this repository's CI on your working copy, and its result is the PR's required check.
 - Commit with `shipcheck commit -m \"<subject>\"`, never `git commit`. It commits every file, exactly the tree that passed.
 - Work in small steps: one change, `shipcheck run`, `shipcheck commit`. Delete scratch files first, because every file is committed.
@@ -509,7 +510,7 @@ mod tests {
         assert!(read(&root.join("GEMINI.md")).starts_with(START));
         assert_eq!(read(&root.join("CLAUDE.md")), "@AGENTS.md\n");
         assert!(
-            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v2")
+            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v3")
         );
         assert_eq!(read(&root.join(".gemini/settings.json")), "{}");
         assert!(!root.join(".github").exists());

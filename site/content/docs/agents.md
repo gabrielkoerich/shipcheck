@@ -4,11 +4,11 @@ description = "How a coding agent learns to run shipcheck instead of the tests a
 weight = 30
 +++
 
-An agent should run `shipcheck run` instead of the project's tests, and `shipcheck commit -m "<subject>"` instead of `git commit`. Then the run it waits for is the PR's check, and every commit is a tree that already passed. shipcheck works the same with any agent, or with a person. It writes no agent config, hooks or permissions, since it does not know which agent you use or how you set it up.
+An agent should run `shipcheck run` instead of the project's tests, and `shipcheck commit -m "<subject>"` instead of `git commit`. Then the run it waits for is the PR's check, and every commit is a tree that already passed. The agent works on a branch, since `shipcheck commit` and `shipcheck post` refuse on the default branch. shipcheck works the same with any agent, or with a person. It writes no agent config, hooks or permissions, since it does not know which agent you use or how you set it up.
 
 ## Instructions
 
-`shipcheck init` writes a short block between `<!-- shipcheck:start v2 -->` and `<!-- shipcheck:end -->` markers into the files agents read. Commit the files it changes. Running it again replaces only the text between the markers.
+`shipcheck init` writes a short block between `<!-- shipcheck:start v3 -->` and `<!-- shipcheck:end -->` markers into the files agents read. Commit the files it changes. Running it again replaces only the text between the markers.
 
 | File | When |
 |---|---|

@@ -57,7 +57,7 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary, and it sets the environment before any thread
     unsafe {
-        std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home"));
+        std::env::set_var("SHIPCHECK_HOME", tmp.path().join(".local/state/shipcheck"));
         std::env::set_var("HOST_E2E_TOKEN", "hunter2");
     }
 
@@ -70,7 +70,7 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     );
     let work = tmp.path().join("work");
     git(&work, &["checkout", "-q", "-b", "main"]);
-    let home = tmp.path().join("home");
+    let home = tmp.path().join(".local/state/shipcheck");
     fs::create_dir_all(&home).unwrap();
     let cow = git_cow::can_clone(&home, &home);
     let real_home = run::user_dir().join(format!(".shipcheck-canary-{}", std::process::id()));
@@ -157,6 +157,21 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     );
     let committed = run::plan(&work, "HEAD", "origin/main").unwrap();
     assert!(run::lookup(&committed).unwrap().passed);
+
+    // On the default branch `shipcheck commit` refuses before it commits anything
+    git(&work, &["checkout", "-q", "main"]);
+    let tip = git(&work, &["rev-parse", "HEAD"]);
+    fs::write(work.join("on-main.txt"), "x").unwrap();
+    let out = shipcheck(&["commit", "-m", "on main"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("main is the default branch") && err.contains("git switch -c"),
+        "{err}"
+    );
+    assert_eq!(git(&work, &["rev-parse", "HEAD"]), tip);
+    fs::remove_file(work.join("on-main.txt")).unwrap();
+    git(&work, &["checkout", "-q", "feature"]);
 
     // `--job` runs only that check, and its pass is no result for the tree
     fs::write(work.join("partial.txt"), "x").unwrap();

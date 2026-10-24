@@ -4,8 +4,6 @@ on:
   push:
     branches: [main]
     paths-ignore: ["docs/**", "site/**", "Formula/**", "**.md"]
-  pull_request:
-    paths-ignore: ["docs/**", "site/**", "Formula/**", "**.md"]
 
 permissions:
   contents: read

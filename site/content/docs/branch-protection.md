@@ -20,7 +20,7 @@ In the repository: Settings, Rules, Rulesets, New ruleset, New branch ruleset.
 | Status checks | Add each job check, such as `shipcheck/test` and `shipcheck/lint`, and set the source of each to the shipcheck.run App |
 | Require branches to be up to date before merging | On |
 
-Each job's check is `shipcheck/<job>`, named by the job id or the `[host.checks]` name. A job id that two required workflows share gets the workflow file's name without `.yml` or `.yaml` in front, `shipcheck/<stem>/<job>`, for those workflows only. When those workflows' stems are not all different, as with `ci.yml` and `ci.yaml`, the whole file name goes in front instead, `shipcheck/ci.yml/test`, so no two jobs share a check name. `shipcheck init` prints the names and can create this ruleset for you.
+Each job's check is `shipcheck/<job>`, named by the job id or the `[host.checks]` name. A job id that two required workflows share gets the workflow file's name without `.yml` or `.yaml` in front, `shipcheck/<stem>/<job>`, for those workflows only. When those workflows' stems are not all different, as with `ci.yml` and `ci.yaml`, the whole file name goes in front instead, `shipcheck/ci.yml/test`, so no two jobs share a check name. `shipcheck init` shows the names and, by default, creates this ruleset for you, with Require a pull request before merging turned on and 0 required approvals, so nobody pushes to the default branch directly.
 
 A job check is queued until a machine runs the commit, in progress while it runs, then success or failure.
 

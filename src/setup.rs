@@ -164,6 +164,21 @@ pub fn init_on(root: &Path, machine: &Machine) -> Result<Option<String>, String>
         return Ok(None);
     }
 
+    let (text, said) = propose(root, machine)?;
+
+    let Some(text) = text else {
+        return Ok(Some(said));
+    };
+
+    crate::agents::write_in_repo(root, &config, &text)?;
+    Ok(Some(format!("wrote shipcheck.toml with {said}")))
+}
+
+/**
+ * What `init` would write as shipcheck.toml, writing nothing: the text, and what it holds for
+ * "wrote shipcheck.toml with ...". No text, and why, when there is nothing to run here
+ **/
+pub fn propose(root: &Path, machine: &Machine) -> Result<(Option<String>, String), String> {
     let found = detect_on(root, machine);
 
     if let Some(why) = &found.act {
@@ -182,11 +197,10 @@ pub fn init_on(root: &Path, machine: &Machine) -> Result<Option<String>, String>
             .partition(|f| found.github.iter().any(|k| k.file == *f));
 
         if workflows.is_empty() {
-            return Ok(Some(NOTHING_LOCAL.into()));
+            return Ok((None, NOTHING_LOCAL.into()));
         }
 
-        crate::agents::write_in_repo(root, &config, &act_config(&workflows))?;
-        let mut said = format!("wrote shipcheck.toml with runner = \"act\": {why}");
+        let mut said = format!("runner = \"act\": {why}");
 
         for file in pr_only {
             said.push_str(&format!(
@@ -194,33 +208,33 @@ pub fn init_on(root: &Path, machine: &Machine) -> Result<Option<String>, String>
             ));
         }
 
-        return Ok(Some(said));
+        return Ok((Some(act_config(&workflows)), said));
     }
 
     if found.checks.is_empty() && !found.github.is_empty() {
         // No step 4 follows
         let said = found.explain().replace(&format!("\n{REQUIRE}"), "");
-        return Ok(Some(format!("{NOTHING_LOCAL}\n{said}")));
+        return Ok((None, format!("{NOTHING_LOCAL}\n{said}")));
     }
 
     if !found.checks.is_empty() {
-        crate::agents::write_in_repo(root, &config, &host_config(&found.checks, &found.versions))?;
-        return Ok(Some(format!(
-            "wrote shipcheck.toml with these host checks:\n{}",
-            found.explain()
-        )));
+        return Ok((
+            Some(host_config(&found.checks, &found.versions)),
+            format!("these host checks:\n{}", found.explain()),
+        ));
     }
 
     let workflows = workflow_files(root).ok_or_else(|| {
         "no .github/workflows and no package.json scripts, Cargo.toml, pyproject.toml or go.mod in this repository".to_string()
     })?;
-    crate::agents::write_in_repo(root, &config, &act_config(&workflows))?;
-    Ok(Some(
-        "wrote shipcheck.toml with runner = \"act\": no check found in the workflows' run steps or in a package.json test or lint script, Cargo.toml, pyproject.toml or go.mod, so the GitHub workflows run in containers".into(),
+    Ok((
+        Some(act_config(&workflows)),
+        "runner = \"act\": no check found in the workflows' run steps or in a package.json test or lint script, Cargo.toml, pyproject.toml or go.mod, so the GitHub workflows run in containers".into(),
     ))
 }
 
-const REQUIRE: &str = "  Require their GitHub checks too, step 4 adds them";
+const REQUIRE: &str =
+    "  Require their GitHub checks too, the branch protection step of init adds them";
 
 /// What `init` says when it writes no shipcheck.toml because every job stays on GitHub
 pub const NOTHING_LOCAL: &str = "nothing to run locally: every job stays on GitHub, so init wrote no shipcheck.toml and set nothing up (https://shipcheck.run/docs/how-it-works/#which-jobs-run-where)";
@@ -950,6 +964,50 @@ fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool
     })
 }
 
+/**
+ * The commands of a job that check something, each with its step's directory, for `init` to
+ * compare with the checks of a shipcheck.toml. Steps a check could not run are left out
+ **/
+pub fn job_commands(job: &crate::workflow::Job) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+
+    for step in &job.steps {
+        let step = if step.run.is_empty() {
+            let Some(run) = action_install(step) else {
+                continue;
+            };
+            crate::workflow::RunStep {
+                run,
+                dir: input(step, "working-directory"),
+                ..step.clone()
+            }
+        } else {
+            step.clone()
+        };
+
+        if let Ok(Some(command)) = step_command(&step) {
+            let dir = step.dir.clone().filter(|d| d != ".");
+            out.extend(commands(&command).into_iter().map(|c| (dir.clone(), c)));
+        }
+    }
+
+    out
+}
+
+/// A command's parts between `&&`, whitespace collapsed and grouping cut, without the ones that check nothing
+pub fn commands(command: &str) -> Vec<String> {
+    command
+        .split("&&")
+        .map(|c| {
+            c.trim_matches(|ch: char| ch.is_whitespace() || "(){};".contains(ch))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|c| !c.is_empty() && !checks_nothing(c))
+        .collect()
+}
+
 /// A `uses` step's input, when it is not an expression
 fn input(step: &crate::workflow::RunStep, name: &str) -> Option<String> {
     step.with
@@ -991,10 +1049,18 @@ fn action_install(step: &crate::workflow::RunStep) -> Option<String> {
                 .find(|(k, _)| k == "GITLEAKS_CONFIG")
                 .map(|(_, v)| v.as_deref());
 
+            // A warm clone also holds untracked build output, which is not the commit, so only the
+            // tracked files of HEAD are scanned, in the check's own home, the one place it may write
+            let scan = |config: &str| {
+                format!(
+                    r#"d=$(mktemp -d "$HOME/scan.XXXXXX") && git archive HEAD | tar -x -C "$d" && gitleaks dir --redact{config} "$d""#
+                )
+            };
+
             match config {
-                None => Some("gitleaks dir --redact .".into()),
+                None => Some(scan("")),
                 Some(Some(c)) if assignment("C", c).is_some_and(|a| a == format!("C={c}")) => {
-                    Some(format!("gitleaks dir --redact --config {c} ."))
+                    Some(scan(&format!(" --config {c}")))
                 }
                 Some(_) => None,
             }
@@ -2744,8 +2810,14 @@ jobs:
         assert_eq!(
             checks(&cfg),
             [
-                ("leaks", "gitleaks dir --redact ."),
-                ("secrets", "gitleaks dir --redact --config .gitleaks.toml ."),
+                (
+                    "leaks",
+                    r#"d=$(mktemp -d "$HOME/scan.XXXXXX") && git archive HEAD | tar -x -C "$d" && gitleaks dir --redact "$d""#
+                ),
+                (
+                    "secrets",
+                    r#"d=$(mktemp -d "$HOME/scan.XXXXXX") && git archive HEAD | tar -x -C "$d" && gitleaks dir --redact --config .gitleaks.toml "$d""#
+                ),
             ]
         );
         let found = |command: &str| Found {

@@ -17,4 +17,5 @@ pub mod secret;
 pub mod service;
 pub mod setup;
 pub mod templates;
+pub mod ui;
 pub mod workflow;

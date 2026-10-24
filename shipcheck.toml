@@ -1,5 +1,5 @@
 runner = "host"
 
 [host]
-checks = { fmt = "cargo fmt --check", clippy = "cargo clippy --all-targets -- -D warnings", test = "cargo test" }
-versions = ["cargo --version", "rustc --version"]
+checks = { fmt = "cargo fmt --check", clippy = "cargo clippy --all-targets -- -D warnings", test = "cargo test", service = "cd service && bun install --frozen-lockfile && bun run test && bun run test:worker && bunx tsc --noEmit", gitleaks = "d=$(mktemp -d \"$HOME/scan.XXXXXX\") && git archive HEAD | tar -x -C \"$d\" && gitleaks dir --redact --no-banner \"$d\"" }
+versions = ["cargo --version", "rustc --version", "bun --version", "gitleaks version"]

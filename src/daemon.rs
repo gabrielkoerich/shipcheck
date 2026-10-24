@@ -162,6 +162,8 @@ fn git(entry: &RepoEntry, args: &[&str]) -> bool {
         .arg("-C")
         .arg(&entry.path)
         .args(args)
+        // A service has no terminal, so a credential prompt would hang the daemon
+        .env("GIT_TERMINAL_PROMPT", "0")
         .status()
         .is_ok_and(|s| s.success())
 }

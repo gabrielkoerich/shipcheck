@@ -13,7 +13,7 @@ Docs: https://shipcheck.run/llms.txt
 
 ## The rule
 
-Do not run the project's test commands yourself. Run `shipcheck run`, and when it passes, `shipcheck commit -m <message>`. Work in small steps and commit each one. Every commit is then a tested tree and gets its check at once, with no second run.
+Do not run the project's test commands yourself. Work on a branch: `git switch -c <branch>`. Run `shipcheck run`, and when it passes, `shipcheck commit -m <message>`. `shipcheck commit` and `shipcheck post` refuse on the default branch, since PRs carry the checks. `shipcheck run` works anywhere. Work in small steps and commit each one. Every commit is then a tested tree and gets its check at once, with no second run.
 
 ## Each step
 
@@ -63,7 +63,7 @@ shipcheck init
 ```
 
 1. It writes `shipcheck.toml` with a check for each workflow job it can run here, and prints what it left out and why. When every job has to stay on GitHub, it writes no file and stops.
-2. On a terminal it asks before each further step: which checks to keep, the [shipcheck App](https://github.com/apps/shipcheck-run) link, hosted Actions only on `main`, and a ruleset that requires each `shipcheck/<job>` check. `--yes` takes every default.
+2. On a terminal it walks the further steps: the [shipcheck App](https://github.com/apps/shipcheck-run) link, hosted Actions only on `main`, and a ruleset that requires each `shipcheck/<job>` check and PRs into the default branch. It changes nothing until the person applies the review. `--yes` applies the recommended choices with no questions, but opens no browser and creates no ruleset.
 3. It writes the agent instructions into `AGENTS.md` and the other files agents read, then does what `shipcheck install` does.
 
 Without a terminal it writes every check it finds and the instructions, installs the hooks and starts the daemon, and skips the App, workflow and ruleset steps. Read the checks it wrote, commit `shipcheck.toml` and `AGENTS.md`, and merge them to `main`. The owner installs the App on the repository once.
@@ -80,6 +80,6 @@ It installs the git hooks, starts the daemon, and on a terminal signs the machin
 
 A machine with no person at it, such as a VM, gets a token instead. A person runs `shipcheck token --name <machine>` on their own machine and sets the output as `SHIPCHECK_TOKEN` on the agent's machine. `shipcheck logout` there, or `shipcheck logout --all` anywhere, revokes it.
 
-Once signed in, each push posts its checks, and `shipcheck post` posts the stored result of `HEAD`. `shipcheck doctor` says whether posting works. On macOS a keychain error after an upgrade means the new binary needs access: ask the human to run `shipcheck doctor` at the Mac and choose Always Allow.
+Once signed in, each push posts its checks, and `shipcheck post` posts the stored result of `HEAD`, or of the commit you name. It refuses the tip of the default branch. `shipcheck doctor` says whether posting works. On macOS a keychain error after an upgrade means the new binary needs access: ask the human to run `shipcheck doctor` at the Mac and choose Always Allow.
 
 Settings: https://shipcheck.run/docs/config.md

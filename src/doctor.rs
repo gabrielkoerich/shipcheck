@@ -346,6 +346,32 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         },
     });
 
+    let legacy = run::legacy_home();
+
+    if cfg!(target_os = "macos") && legacy.is_dir() && legacy != run::home() {
+        found.push(Check {
+            name: "old home",
+            ok: false,
+            detail: format!(
+                "{} is still there next to {}, so shipcheck did not move it. Move what you need from it, then trash it",
+                legacy.display(),
+                run::home().display()
+            ),
+        });
+    }
+
+    if cfg!(target_os = "macos") && crate::autostart::logs_to_legacy_home() {
+        found.push(Check {
+            name: "daemon",
+            ok: false,
+            detail: format!(
+                "the LaunchAgent logs to {}, run `shipcheck install` to point it at {}",
+                legacy.display(),
+                run::home().display()
+            ),
+        });
+    }
+
     if run::home_overridden() {
         found.push(Check {
             name: "home",

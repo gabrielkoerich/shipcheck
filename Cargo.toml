@@ -24,4 +24,5 @@ jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 globset = "0.4.20"
 libc = "0.2.191"
 tempfile = "3.27.0"
+cliclack = "0.5.6"
 

@@ -115,26 +115,116 @@ pub fn home() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(state).join("shipcheck");
+    }
 
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/shipcheck")
-    } else if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(state).join("shipcheck")
-    } else {
-        home.join(".local/state/shipcheck")
+    env_home().join(".local/state/shipcheck")
+}
+
+fn env_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+}
+
+/// Where the home was on macOS before it moved to `~/.local/state`
+pub fn legacy_home() -> PathBuf {
+    env_home().join("Library/Application Support/shipcheck")
+}
+
+#[derive(Debug, PartialEq)]
+enum Migration {
+    Nothing,
+    Moved,
+    Both,
+}
+
+/// Renames `old` to `new` when only `old` exists. A rename, since the home holds clones a copy
+/// would inflate
+fn move_home(old: &Path, new: &Path) -> Result<Migration, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match (old.is_dir(), new.exists()) {
+        (false, _) => return Ok(Migration::Nothing),
+        (true, true) => return Ok(Migration::Both),
+        (true, false) => {}
+    }
+
+    if let Some(parent) = new.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+
+    fs::rename(old, new)
+        .and_then(|_| fs::set_permissions(new, fs::Permissions::from_mode(0o700)))
+        .map_err(|e| format!("moving {} to {}: {e}", old.display(), new.display()))?;
+    Ok(Migration::Moved)
+}
+
+/// Moves the macOS home out of `~/Library` on first use. Leaves both alone when both exist, which
+/// `shipcheck doctor` reports
+pub fn migrate_home() {
+    if !cfg!(target_os = "macos") || std::env::var_os("SHIPCHECK_HOME").is_some() {
+        return;
+    }
+
+    let (old, new) = (legacy_home(), home());
+
+    match move_home(&old, &new) {
+        Ok(Migration::Moved) => {
+            eprintln!("shipcheck: moved {} to {}", old.display(), new.display())
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("shipcheck: {e}"),
+    }
+}
+
+/// Clones, run slots and tool caches, which every run can rebuild and which hold hundreds of GB
+#[cfg(target_os = "macos")]
+const REBUILT: [&str; 3] = ["templates", "runs", "hostcache"];
+
+/**
+ * Keeps Time Machine off what a run can rebuild, so a backup holds the results and logs and not
+ * clones of every repository. `tmutil addexclusion` sets a flag on the folder itself, needs no root
+ * and follows the folder, so it runs only when the flag is missing
+ **/
+#[cfg(not(target_os = "macos"))]
+fn exclude_from_backup(_: &Path) {}
+
+#[cfg(target_os = "macos")]
+fn exclude_from_backup(home: &Path) {
+    for dir in REBUILT.map(|d| home.join(d)) {
+        if fs::create_dir_all(&dir).is_err() || excluded(&dir) {
+            continue;
+        }
+
+        let _ = Command::new("tmutil")
+            .arg("addexclusion")
+            .arg(&dir)
+            .output();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn excluded(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // Safe: a size query with a null buffer reads nothing
+    unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"com.apple.metadata:com_apple_backup_excludeItem".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        ) > 0
     }
 }
 
 /// The home of a user who set nothing, from the passwd entry, since an agent can set any variable
 pub fn default_home() -> PathBuf {
-    let home = user_dir();
-
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/shipcheck")
-    } else {
-        home.join(".local/state/shipcheck")
-    }
+    user_dir().join(".local/state/shipcheck")
 }
 
 /// Whether the results live somewhere else than the default, where an agent may have written them
@@ -421,6 +511,28 @@ pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
     fs::create_dir_all(file.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
     let text = serde_json::to_string(tested).map_err(|e| e.to_string())?;
     fs::write(&file, text).map_err(|e| e.to_string())
+}
+
+/**
+ * The default branch, `base` without `origin/`, when `commit` (no `sha`) runs with HEAD on it, or
+ * when `post` names its tip, locally or on `base`. Both refuse there, PRs carry the checks
+ **/
+pub fn on_default_branch(repo: &Path, base: &str, sha: Option<&str>) -> Option<String> {
+    let name = base.strip_prefix("origin/").unwrap_or(base);
+    let tip = |r: &str| {
+        git(
+            repo,
+            &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")],
+        )
+    };
+    let on = match sha {
+        None => git(repo, &["symbolic-ref", "--short", "-q", "HEAD"]).is_ok_and(|b| b == name),
+        Some(sha) => [format!("refs/heads/{name}"), base.to_string()]
+            .iter()
+            .any(|r| tip(r).is_ok_and(|t| t == sha)),
+    };
+
+    on.then(|| name.to_string())
 }
 
 pub fn last_tested(repo: &Path) -> Option<Tested> {
@@ -1048,6 +1160,7 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     // Results, logs, secrets and the App key live here, other users of the machine read none of it
     let private = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700);
     fs::set_permissions(&home, private).map_err(|e| format!("{}: {e}", home.display()))?;
+    exclude_from_backup(&home);
     let id = repo_id(&plan.repo)?;
     let templates = home.join("templates").join(&id);
     let slots = home.join("runs").join(&id);
@@ -2196,6 +2309,30 @@ mod tests {
     }
 
     #[test]
+    fn home_moves_once_and_never_merges() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("Library/Application Support/shipcheck");
+        let new = dir.path().join(".local/state/shipcheck");
+        assert_eq!(move_home(&old, &new).unwrap(), Migration::Nothing);
+
+        fs::create_dir_all(old.join("logs")).unwrap();
+        fs::write(old.join("logs/k"), "log").unwrap();
+        assert_eq!(move_home(&old, &new).unwrap(), Migration::Moved);
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(new.join("logs/k")).unwrap(), "log");
+        assert_eq!(
+            fs::metadata(&new).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        fs::create_dir_all(&old).unwrap();
+        assert_eq!(move_home(&old, &new).unwrap(), Migration::Both);
+        assert!(old.exists() && new.join("logs/k").exists());
+    }
+
+    #[test]
     fn default_home_ignores_the_environment() {
         if std::env::var_os("SHIPCHECK_HOME_CHILD").is_some() {
             assert!(
@@ -2378,6 +2515,44 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn commit_and_post_refuse_the_default_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        sh(repo, &["init", "-q", "-b", "main"]);
+        sh(repo, &["commit", "-q", "--allow-empty", "-m", "main"]);
+        let main = sh(repo, &["rev-parse", "HEAD"]);
+        let main_branch = Some("main".to_string());
+        assert_eq!(on_default_branch(repo, "origin/main", None), main_branch);
+        assert_eq!(
+            on_default_branch(repo, "origin/main", Some(&main)),
+            main_branch
+        );
+
+        sh(repo, &["switch", "-q", "-c", "feature"]);
+        sh(repo, &["commit", "-q", "--allow-empty", "-m", "feature"]);
+        let feature = sh(repo, &["rev-parse", "HEAD"]);
+        assert_eq!(on_default_branch(repo, "origin/main", None), None);
+        assert_eq!(on_default_branch(repo, "origin/main", Some(&feature)), None);
+
+        // A PR's commit posts from anywhere, main's tip from nowhere
+        sh(repo, &["switch", "-q", "--detach", &feature]);
+        assert_eq!(on_default_branch(repo, "origin/main", Some(&feature)), None);
+        assert_eq!(
+            on_default_branch(repo, "origin/main", Some(&main)),
+            main_branch
+        );
+        sh(repo, &["switch", "-q", "main"]);
+        assert_eq!(on_default_branch(repo, "origin/main", Some(&feature)), None);
+
+        // The remote's tip counts too, and `base` names the branch
+        sh(repo, &["update-ref", "refs/remotes/origin/trunk", &feature]);
+        assert_eq!(
+            on_default_branch(repo, "origin/trunk", Some(&feature)),
+            Some("trunk".into())
+        );
     }
 
     #[test]

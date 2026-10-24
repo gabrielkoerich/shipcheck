@@ -43,6 +43,8 @@ Tested on macOS with Docker Desktop on Apple silicon. Host mode uses macOS's own
 
 macOS disks use APFS, so each job's checkout is a copy-on-write clone and costs no disk. On Apple silicon, jobs run arm64 images. A job whose tools ship no arm64 build can get an amd64 image of its own with `act.jobs` in [`shipcheck.toml`](@/docs/config.md). Turn on Rosetta in Docker Desktop's settings so amd64 images run faster.
 
+shipcheck keeps its results, logs and checkouts in `~/.local/state/shipcheck`. An older shipcheck kept them in `~/Library/Application Support/shipcheck`: the first command of a newer one moves that folder and says so. Then run `shipcheck install` once, so the daemon logs to the new folder. `shipcheck doctor` says when it still logs to the old one.
+
 ## Set up Linux
 
 Tested on Debian 13 with Docker Engine 29 on x86_64.
@@ -169,7 +171,7 @@ These work on any repository, with no App:
 
 shipcheck keeps three secrets: the machine token from `shipcheck login`, the App key `app.pem`, and the secrets act jobs get, one file per repository at `secrets/<owner>/<repo>.env` in `SHIPCHECK_HOME`, in act's `NAME=value` format. `shipcheck token` prints a token for another machine and keeps no copy.
 
-On macOS, shipcheck moves each of them into an item of your login keychain the first time it reads the file, moves the file to the Trash and prints one line saying so. Only shipcheck reads an item without asking, so an agent running as you gets a keychain prompt instead of the key. To change a secret, write the file again.
+On macOS, shipcheck moves each of them into an item of your login keychain the first time it reads the file, moves the file to the Trash and prints one line saying so. Only shipcheck reads an item without asking, so an agent running as you gets a keychain prompt instead of the key. To change a secret, write the file again. An item an older shipcheck kept under its old home, `~/Library/Application Support/shipcheck`, gets its new name the first time shipcheck reads it.
 
 The keychain knows shipcheck by its code signature. Release builds, from Homebrew or the install script, are signed with one Developer ID and notarized by Apple, so an upgrade keeps access. A build from `cargo install` or from source gets a new signature each time: macOS then asks once per item whether the new shipcheck may read it. Run `shipcheck doctor` at the Mac and choose Always Allow. Choose it only for shipcheck, never for `security` or another program.
 

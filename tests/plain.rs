@@ -1,0 +1,53 @@
+use std::fs;
+use std::process::{Command, Stdio};
+
+// Agents parse this output, so without a terminal it carries no escape codes
+#[test]
+fn output_is_plain_without_a_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+    fs::write(
+        repo.join(".github/workflows/ci.yml"),
+        "on: [push, pull_request]\njobs:\n  test:\n    steps:\n      - run: cargo test\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("shipcheck.toml"),
+        "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    for args in [&["init", "--yes"][..], &["doctor"], &["nope"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+            .args(args)
+            .current_dir(&repo)
+            .env("SHIPCHECK_HOME", tmp.path().join("home"))
+            .env("SHIPCHECK_NO_DAEMON", "1")
+            .env("SHIPCHECK_APP_ID", "1")
+            .env_remove("NO_COLOR")
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!said.contains('\x1b'), "{args:?}: {said:?}");
+        assert!(!said.is_empty(), "{args:?}");
+
+        if args[0] == "init" {
+            assert!(said.contains("wrote .github/workflows/ci.yml"), "{said}");
+        }
+    }
+}
