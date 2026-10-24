@@ -199,13 +199,12 @@ fn cycle(
         }
     }
 
-    // A head that a new one replaced before its push showed is never known to be allowed
+    // Never refused: silence about who pushed it says nothing against them
     for (number, old) in abandoned(waits, repo, &prs) {
         println!(
-            "{repo}#{number}: {} replaced before GitHub listed its push, refused",
+            "{repo}#{number}: {} replaced before GitHub named who pushed it",
             &old[..old.len().min(12)]
         );
-        refuse(&refused_path(repo), &old, run::unix_now());
         let fields = serde_json::json!({"pr": number, "sha": old, "reason": "abandoned_while_waiting_for_push"});
         record::keep(repo, &record::event(repo, "skipped", fields));
         waits.remove(&(repo.to_string(), number));
@@ -254,7 +253,7 @@ fn cycle(
     Ok(())
 }
 
-// GitHub lists events from 30 seconds to hours late, past this a head with no push event stays unrun
+// GitHub lists events from 30 seconds to hours late, past this a head no source names stays unrun
 const PUSH_WAIT: Duration = Duration::from_secs(30 * 60);
 
 type State<'a> = (
@@ -385,8 +384,9 @@ fn tainted(checkout: &Path, head: &str, refused: &BTreeMap<String, u64>) -> Opti
 #[derive(Debug, PartialEq)]
 enum Pushed {
     Run,
-    /// No push event for the head yet
+    /// No source names the pusher yet
     Wait,
+    /// No source named the pusher in PUSH_WAIT, which is no evidence against them
     GiveUp,
     /// Another login pushed it, and main does not list them
     Other,
@@ -419,14 +419,21 @@ fn pushed(
     }
 }
 
-/// Why a head does not run, which also marks it refused, or None when it runs or still waits
-fn refusal(verdict: &Pushed) -> Option<&'static str> {
+/// Why a head does not run, its `skipped` reason, and whether to mark it refused. None when it
+/// runs or still waits
+fn refusal(verdict: &Pushed) -> Option<(&'static str, &'static str, bool)> {
     match verdict {
         Pushed::Run | Pushed::Wait => None,
-        Pushed::GiveUp => Some("not run, GitHub lists no push of this head after 30 minutes"),
-        Pushed::Other => Some(
+        Pushed::GiveUp => Some((
+            "not run, no source named who pushed this head after 30 minutes",
+            "pusher_unknown",
+            false,
+        )),
+        Pushed::Other => Some((
             "not run, opened or pushed by a login that is not this machine's and daemon_authors on main does not list",
-        ),
+            "pusher_not_allowed",
+            true,
+        )),
     }
 }
 
@@ -615,11 +622,19 @@ fn handle(
                 return Ok(Some("not run, it contains a head this machine refused"));
             }
 
-            let pusher = sender.pusher(&pr.branch, sha)?;
+            let pusher = sender.pusher(number, &pr.branch, sha)?;
+
+            if let Some((login, source)) = &pusher {
+                println!(
+                    "{repo}#{number}: {login} pushed {}, from {source}",
+                    &sha[..12]
+                );
+            }
+
             let me = me.as_deref().unwrap_or_default();
             let verdict = pushed(
                 &pr.author,
-                pusher.as_deref(),
+                pusher.as_ref().map(|(login, _)| login.as_str()),
                 me,
                 &plan.config.daemon_authors,
                 since,
@@ -635,10 +650,13 @@ fn handle(
 
             waits.remove(&(repo.to_string(), number));
 
-            // A head with no push event is as unknown as one someone else pushed
-            if let Some(why) = refused {
-                refuse(&marks, sha, run::unix_now());
-                note(repo, "skipped", pr, "pusher_not_allowed");
+            // Only a known pusher who is not allowed marks the head, heads on top of it inherit the mark
+            if let Some((why, reason, mark)) = refused {
+                if mark {
+                    refuse(&marks, sha, run::unix_now());
+                }
+
+                note(repo, "skipped", pr, reason);
                 background::mark(&send, &existing, sha, &names, false)?;
                 return Ok(Some(why));
             }
@@ -843,12 +861,16 @@ mod tests {
     }
 
     #[test]
-    fn a_head_with_no_push_event_is_refused_like_a_teammates() {
+    fn only_a_known_pusher_who_is_not_allowed_marks_a_head_refused() {
+        let (_, reason, mark) = refusal(&Pushed::GiveUp).unwrap();
+        assert_eq!(reason, "pusher_unknown");
         assert!(
-            refusal(&Pushed::GiveUp).is_some(),
-            "marked refused, so heads on top of it are too"
+            !mark,
+            "silence is no evidence, heads on top of it still run"
         );
-        assert!(refusal(&Pushed::Other).is_some());
+        let (_, reason, mark) = refusal(&Pushed::Other).unwrap();
+        assert_eq!(reason, "pusher_not_allowed");
+        assert!(mark);
         assert!(refusal(&Pushed::Wait).is_none());
         assert!(refusal(&Pushed::Run).is_none());
     }

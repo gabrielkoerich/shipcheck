@@ -485,23 +485,37 @@ impl Sender {
         }
     }
 
-    /// Who pushed `sha` to `branch`, None while GitHub has no event for it
-    pub fn pusher(&self, branch: &str, sha: &str) -> Result<Option<String>, String> {
+    /// Who pushed head `sha` of PR `pr`, and the source that said so, None while none does
+    pub fn pusher(
+        &self,
+        pr: u64,
+        branch: &str,
+        sha: &str,
+    ) -> Result<Option<(String, String)>, String> {
         match &self.how {
             How::Service(token) => {
+                let pr = pr.to_string();
                 let res = get_json(
                     token,
                     "/v1/pusher",
-                    &[("repo", &self.repo), ("ref", branch), ("sha", sha)],
+                    &[
+                        ("repo", &self.repo),
+                        ("pr", &pr),
+                        ("ref", branch),
+                        ("sha", sha),
+                    ],
                 )?;
-                Ok(res["login"].as_str().map(String::from))
+                let source = res["source"].as_str().unwrap_or("events").to_string();
+                Ok(res["login"].as_str().map(|l| (l.to_string(), source)))
             }
-            How::Key(app, cache) => crate::github::find_pusher(
+            How::Key(app, cache) => Ok(crate::github::find_pusher(
                 &self.installation_token(app, cache)?,
                 &self.repo,
+                pr,
                 branch,
                 sha,
-            ),
+            )?
+            .map(|(login, source)| (login, source.to_string()))),
         }
     }
 
