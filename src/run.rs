@@ -2005,6 +2005,46 @@ fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Res
         ));
     }
 
+    touch_tracked(dir)
+}
+
+/**
+ * The clone keeps the template's modification times, and git rewrites only the files that differ
+ * from the template's base. The template's build output can come from another tree and another
+ * slot, so cargo or make would trust it for a file this tree has unchanged. Every tracked file is
+ * made newer than any build output, so each run builds its own tree in its own slot
+ **/
+fn touch_tracked(dir: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let out = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let now = SystemTime::now();
+
+    for name in out.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+
+        // A symlink or a submodule's directory keeps its time, only regular files are built from
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+
+        fs::File::open(&path)
+            .and_then(|f| f.set_modified(now))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+
     Ok(())
 }
 
