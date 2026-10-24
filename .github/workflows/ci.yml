@@ -1,9 +1,9 @@
 name: ci
 
 on:
-  # Every branch and every change, for e2e: it needs Docker in the job, and shipcheck checks the
-  # rest on PRs. A path filter would leave a required check unposted and block the PR
+  # shipcheck checks PRs locally, e2e needs Docker in the job, so it runs here after each merge
   push:
+    branches: [main, "dependabot/**"]
   workflow_dispatch: {}
 
 permissions:
@@ -15,7 +15,6 @@ concurrency:
 
 jobs:
   test:
-    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -63,7 +62,6 @@ jobs:
       - run: cargo test --test e2e --test retry_e2e --test shard_e2e -- --ignored --nocapture
 
   gitleaks:
-    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')
     runs-on: ubuntu-latest
     env:
       GITLEAKS_VERSION: 8.30.1
