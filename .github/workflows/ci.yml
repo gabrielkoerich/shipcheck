@@ -102,18 +102,18 @@ jobs:
             BUMP="major"
           fi
 
-          if [ -z "$LAST_TAG" ]; then
-            NEW_VERSION="v0.1.0"
-          else
-            CURRENT="${LAST_TAG#v}"
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-            case "$BUMP" in
-              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-              patch) PATCH=$((PATCH + 1)) ;;
-            esac
-            NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          # Before the first tag the base is the version Cargo.toml already carries
+          CURRENT="${LAST_TAG#v}"
+          if [ -z "$CURRENT" ]; then
+            CURRENT=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           fi
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
 
           # A run that tagged and then failed leaves a tag that `describe` may not see from here
           while git rev-parse "$NEW_VERSION" >/dev/null 2>&1; do
