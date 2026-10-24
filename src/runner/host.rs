@@ -163,6 +163,54 @@ pub fn sandbox() -> Result<&'static str, String> {
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
+/**
+ * Whether this process already runs in a jail as strict as a host check's, as shipcheck's own
+ * tests do inside its host checks. The kernel answers through `sandbox_check`, which job code
+ * cannot fake, for what the profile denies: reading and writing the home, and Docker's socket.
+ * An agent's looser sandbox fails one of them, so its checks still get their own jail
+ **/
+#[cfg(target_os = "macos")]
+pub fn in_a_jail() -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            kind: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    // From sandbox.h: no filter asks whether there is a sandbox at all, 1 filters by path
+    const NONE: libc::c_int = 0;
+    const PATH: libc::c_int = 1;
+    let home = crate::run::user_dir();
+    let denied = |operation: &str, path: &Path| {
+        let (Ok(op), Ok(path)) = (
+            CString::new(operation),
+            CString::new(path.as_os_str().as_bytes()),
+        ) else {
+            return false;
+        };
+        // Safe: both strings outlive the call, which only reads them
+        unsafe { sandbox_check(libc::getpid(), op.as_ptr(), PATH, path.as_ptr()) == 1 }
+    };
+
+    // Safe: a null operation with no filter takes no further argument
+    let sandboxed = unsafe { sandbox_check(libc::getpid(), std::ptr::null(), NONE) } == 1;
+    sandboxed
+        && denied("file-read-data", &home)
+        && denied("file-write-data", &home.join(".shipcheck-probe"))
+        && denied("network-outbound", &home.join(".docker/run/docker.sock"))
+        && denied("network-outbound", Path::new("/var/run/docker.sock"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn in_a_jail() -> bool {
+    false
+}
+
 /// The AppArmor profile that lets only bwrap create user namespaces, from apparmor's extra profiles
 const BWRAP_PROFILE: &str = "/etc/apparmor.d/bwrap-userns-restrict";
 
@@ -432,6 +480,8 @@ impl Jail {
     /// controlling terminal, so a timeout stops all of it and it cannot type into the terminal
     fn shell(&self, command: &str, dir: &Path, extra: &[String]) -> Result<Command, String> {
         let mut cmd = match sandbox()? {
+            // macOS refuses a sandbox inside a sandbox, and the one around this process is as strict
+            "sandbox-exec" if in_a_jail() => Command::new("/usr/bin/env"),
             "sandbox-exec" => {
                 let mut cmd = Command::new(SANDBOX_EXEC);
                 cmd.arg("-p").arg(self.profile()?);
@@ -1296,6 +1346,12 @@ mod tests {
             cache: "/j".into(),
         };
         assert!(bad.profile().unwrap_err().contains("not UTF-8"));
+    }
+
+    #[test]
+    fn knows_it_runs_in_a_jail_only_inside_a_host_check() {
+        let inside = std::env::var_os("SHIPCHECK_JAIL").is_some() && cfg!(target_os = "macos");
+        assert_eq!(in_a_jail(), inside);
     }
 
     #[test]
