@@ -859,14 +859,32 @@ pub fn cached(key: &str) -> Option<Entry> {
 /// The result for a plan without running it: a pass when `paths` excludes the change, else the cache
 pub fn lookup(plan: &Plan) -> Option<Entry> {
     let mut entry = skipped(plan).or_else(|| cached(&plan.key))?;
-    // The key holds the tree, still a stored file counts only for the plan's tree
-    if entry.tree != plan.tree {
+    if !holds(plan, &entry) {
         return None;
     }
 
     // A cached result can come from another commit with the same tree, the notes must be this one's
     entry.ci_changes = plan.ci_changes.clone();
     Some(entry)
+}
+
+/**
+ * What a check shows of a stored result must hold before it is posted again, or the result does not
+ * count and the commit runs: the plan's tree, a base on the plan's base, and each log hashing to its
+ * digest. The key holds the tree, still the stored file is checked, never trusted
+ **/
+pub fn holds(plan: &Plan, entry: &Entry) -> bool {
+    let on_base = Command::new("git")
+        .arg("-C")
+        .arg(&plan.repo)
+        .args(["merge-base", "--is-ancestor", &entry.base, &plan.base])
+        .status()
+        .is_ok_and(|s| s.success());
+    let logs = entry.workflows.iter().all(|wf| {
+        fs::read(log_dir(&entry.key).join(format!("{}.log", wf.file)))
+            .is_ok_and(|log| cache::hex(&Sha256::digest(&log)) == wf.log_sha256)
+    });
+    entry.tree == plan.tree && on_base && logs
 }
 
 /**
@@ -3139,13 +3157,13 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_result_counts_only_for_the_plans_tree() {
+    fn a_stored_result_counts_only_when_what_it_shows_holds() {
         if std::env::var_os("SHIPCHECK_HOME_CHILD").is_none() {
             let home = tempfile::tempdir().unwrap();
             let out = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "run::tests::a_stored_result_counts_only_for_the_plans_tree",
+                    "run::tests::a_stored_result_counts_only_when_what_it_shows_holds",
                 ])
                 .env("SHIPCHECK_HOME_CHILD", "1")
                 .env("SHIPCHECK_HOME", home.path())
@@ -3160,10 +3178,12 @@ mod tests {
         }
 
         let (_d, plan) = plan_after(|r| fs::write(r.join("src/lib.rs"), "fn b() {}").unwrap());
-        let store = |tree: &str| {
+        let store = |tree: &str, base: &str, log: &str| {
             let entry = serde_json::json!({
-                "key": plan.key, "sha": plan.sha, "tree": tree, "base": plan.base,
-                "passed": true, "workflows": [], "finished_unix": 0
+                "key": plan.key, "sha": plan.sha, "tree": tree, "base": base,
+                "passed": true, "finished_unix": 0,
+                "workflows": [{"file": HOST, "exit": 0, "attempts": 1, "jobs": {"t": "success"},
+                    "passed": true, "log_sha256": cache::hex(&Sha256::digest(b"the log"))}]
             });
             fs::create_dir_all(home().join("cache")).unwrap();
             fs::write(
@@ -3171,14 +3191,28 @@ mod tests {
                 entry.to_string(),
             )
             .unwrap();
+            fs::create_dir_all(log_dir(&plan.key)).unwrap();
+            fs::write(log_dir(&plan.key).join(format!("{HOST}.log")), log).unwrap();
         };
-        store(&plan.tree);
+        store(&plan.tree, &plan.base, "the log");
         assert!(lookup(&plan).is_some());
-        store(&"0".repeat(40));
+        store(&"0".repeat(40), &plan.base, "the log");
         assert!(
             lookup(&plan).is_none(),
             "a result of another tree under this key"
         );
+        store(&plan.tree, &plan.sha, "the log");
+        assert!(
+            lookup(&plan).is_none(),
+            "a base that is not on the plan's base"
+        );
+        store(&plan.tree, &plan.base, "another log");
+        assert!(
+            lookup(&plan).is_none(),
+            "a log that does not hash to its digest"
+        );
+        fs::remove_file(log_dir(&plan.key).join(format!("{HOST}.log"))).unwrap();
+        assert!(lookup(&plan).is_none(), "a missing log");
     }
 
     #[test]
