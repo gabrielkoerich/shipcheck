@@ -12,6 +12,12 @@ categories = ["command-line-utilities", "development-tools"]
 # Only the code goes in the crate, not the site or the docs. SKILL.md is compiled in
 include = ["/src/**", "/LICENSE", "/README.md", "/SKILL.md"]
 
+# cargo binstall and mise download the signed release archive instead of building from source
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/shipcheck-{ target }.tar.gz"
+bin-dir = "shipcheck{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
