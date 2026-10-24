@@ -205,15 +205,7 @@ fn spawn(
         .open(log_dir.join("background.log"))
         .map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut args = vec!["run", "--no-fetch", "--sha", &plan.sha, "--base", base];
-
-    if post {
-        args.extend(["--background", name]);
-    }
-
-    if home_ok {
-        args.push("--home-ok");
-    }
+    let args = run_args(&plan.sha, base, name, post, home_ok);
 
     // Its own process group, so Ctrl-C in the terminal after a commit does not stop the run.
     // git points hooks at the commit's index, which would break every git call the run makes
@@ -233,6 +225,23 @@ fn spawn(
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(child.id())
+}
+
+/// What a background run passes to its own binary, which the binary's tests parse
+pub fn run_args(sha: &str, base: &str, name: &str, post: bool, home_ok: bool) -> Vec<String> {
+    let mut args: Vec<String> = ["run", "--no-fetch", "--sha", sha, "--base", base]
+        .map(String::from)
+        .into();
+
+    if post {
+        args.extend(["--background".to_string(), name.to_string()]);
+    }
+
+    if home_ok {
+        args.push("--home-ok".into());
+    }
+
+    args
 }
 
 /// GitHub answers 422 to a check run on a commit it does not have yet
@@ -428,6 +437,26 @@ mod tests {
 
         fn posts(&self) -> Vec<(String, String, Option<u64>)> {
             self.posts.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn retries_only_github_saying_it_has_no_such_commit() {
+        // As the two posters word it: ureq with the App key, and the hosted service
+        for e in [
+            "POST https://api.github.com/repos/acme/app/check-runs: http status: 422",
+            "POST /v1/checks: GitHub refused to create the check run: 422 No commit found for SHA: abc",
+        ] {
+            assert!(unknown_sha(e), "{e}");
+        }
+
+        // A 422 in a URL is no 422 answer, a SHA or a repository name can hold one
+        for e in [
+            "GET https://api.github.com/repos/acme/app/commits/4221aa0000000000000000000000000000000000/check-runs?app_id=1: http status: 404",
+            "POST https://api.github.com/repos/acme/app422/check-runs: http status: 401",
+            "POST /v1/checks: the shipcheck App is not installed on acme/app422",
+        ] {
+            assert!(!unknown_sha(e), "{e}");
         }
     }
 

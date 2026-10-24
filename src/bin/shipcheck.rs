@@ -83,6 +83,9 @@ enum Cmd {
         /// Set by the hooks and the daemon on a run that posts its checks
         #[arg(long, hide = true, value_name = "name")]
         background: Option<String>,
+        /// Set with `--background` when the daemon runs from a moved SHIPCHECK_HOME
+        #[arg(long, hide = true)]
+        home_ok: bool,
         #[arg(hide = true)]
         rev: Option<String>,
     },
@@ -280,9 +283,11 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             workflows: w,
             json: js,
             background,
+            home_ok: h,
             rev: r,
         } => {
             at(sha.or(r), &mut rev, &mut explicit);
+            home_ok = h;
             staged = st;
             fetch = !no_fetch;
             on_base(b, &mut base, &mut base_set, &mut fetch);
@@ -1088,4 +1093,127 @@ fn print_logs(dir: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    fn parses(call: &[&str]) -> bool {
+        Cli::try_parse_from(std::iter::once("shipcheck").chain(call.iter().copied())).is_ok()
+    }
+
+    #[test]
+    fn the_command_line_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    /// Every way shipcheck is called by its own hooks, its own background runs, its tests and its
+    /// docs must keep parsing, since clap refuses a flag a command does not declare
+    #[test]
+    fn every_known_call_parses() {
+        let sha = "0".repeat(40);
+        let sha = sha.as_str();
+        let calls: &[&[&str]] = &[
+            // The hooks, setup.rs
+            &["on-push", "refs/heads/feature", sha],
+            &["on-commit"],
+            // The end-to-end tests
+            &["run", "--no-fetch"],
+            &["run", "--no-fetch", "cheat"],
+            &["status", "--no-fetch"],
+            &["status", sha],
+            &["status", "feature"],
+            &["logs", "main"],
+            &["post"],
+            &["post", "--home-ok"],
+            &["doctor"],
+            &["clean", "--all"],
+            // SKILL.md, the README and the site's docs
+            &["run", "--staged"],
+            &["run", "--sha", "HEAD"],
+            &["run", "--json"],
+            &["run", "--job", "test", "--job", "lint"],
+            &["run", "--workflow", "ci.yml"],
+            &["run", "--base", "shipcheck-base", "--no-fetch"],
+            &["status", "--staged", "--json"],
+            &["logs", "--staged"],
+            &["history", "--json", "--limit", "5"],
+            &["commit", "-m", "subject"],
+            &[
+                "commit",
+                "-m",
+                "subject",
+                "-m",
+                "body",
+                "--allow-failed",
+                "--no-verify",
+            ],
+            &["commit", "-F", "message.txt"],
+            &["init", "--yes"],
+            &["install"],
+            &["login"],
+            &["logout", "--all"],
+            &["token", "--name", "ci-box"],
+            &["clean"],
+            &["daemon", "--home-ok"],
+            &["daemon", "--uninstall"],
+        ];
+
+        for call in calls {
+            assert!(
+                parses(call),
+                "shipcheck {} no longer parses",
+                call.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn what_shipcheck_passes_itself_parses() {
+        let sha = "0".repeat(40);
+
+        for (post, home_ok) in [(false, false), (true, false), (false, true), (true, true)] {
+            let args = background::run_args(&sha, "origin/main", "pr:1", post, home_ok);
+            let call: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert!(
+                parses(&call),
+                "background run: shipcheck {}",
+                call.join(" ")
+            );
+        }
+
+        // The hook lines setup writes, with the values git hands them
+        for line in [setup::HOOK_LINE, setup::COMMIT_LINE] {
+            let call: Vec<String> = line
+                .split_whitespace()
+                .skip(1)
+                .map(|w| {
+                    w.replace("\"$local_ref\"", "refs/heads/feature")
+                        .replace("\"$local_sha\"", &sha)
+                })
+                .collect();
+            let call: Vec<&str> = call.iter().map(String::as_str).collect();
+            assert!(parses(&call), "hook: {line}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_call_is_refused() {
+        for call in [
+            &["frob"][..],
+            &["run", "--frob"],
+            &["run", "--sha", "HEAD", "--staged"],
+            &["commit"],
+            &["history", "--limit", "many"],
+        ] {
+            assert!(
+                !parses(call),
+                "shipcheck {} should be refused",
+                call.join(" ")
+            );
+        }
+    }
 }
