@@ -135,6 +135,14 @@ enum Cmd {
         #[arg(long, value_name = "ref")]
         base: Option<String>,
     },
+    /// Check a commit's stored result: its tree, its base on main, its key and its log digests
+    Verify {
+        /// A commit instead of the working copy
+        rev: Option<String>,
+        /// The index instead of the working copy
+        #[arg(long, conflicts_with = "rev")]
+        staged: bool,
+    },
     /// Post a commit's result as its PR's checks
     Post {
         /// Accepted for scripts written for older versions, these commands never fetch
@@ -316,6 +324,11 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             staged = st;
             on_base(b, &mut base, &mut base_set, &mut fetch);
             "logs"
+        }
+        Cmd::Verify { rev: r, staged: st } => {
+            at(r, &mut rev, &mut explicit);
+            staged = st;
+            "verify"
         }
         Cmd::Post {
             rev: r,
@@ -630,6 +643,22 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             }
 
             Ok(ExitCode::SUCCESS)
+        }
+        "verify" => {
+            let (tested, _) = subject(&cwd, &rev, explicit, staged)?;
+            let mut plan = run::plan(&cwd, &tested, &base)?;
+            last_run_key(&mut plan, false, |k| run::cached(k).is_some());
+            let checks = run::verify(&plan, &base)?;
+
+            for (ok, line) in &checks {
+                println!("{} {line}", if *ok { "ok    " } else { "FAILED" });
+            }
+
+            if checks.iter().all(|(ok, _)| *ok) {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::FAILURE)
+            }
         }
         "post" => {
             refuse_moved_home(home_ok)?;

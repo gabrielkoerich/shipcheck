@@ -856,6 +856,66 @@ pub fn cached(key: &str) -> Option<Entry> {
     (entry.key == key).then_some(entry)
 }
 
+/**
+ * Checks the stored result under the plan's key against the repository: the tree is the commit's,
+ * the base is on `main`, the key computed again from the commit and the base is the same, and each
+ * log hashes to the digest in the result. These are the fields a posted check shows
+ **/
+pub fn verify(plan: &Plan, main: &str) -> Result<Vec<(bool, String)>, String> {
+    let entry = cached(&plan.key).ok_or_else(|| {
+        format!(
+            "no stored result for tree {}, run `shipcheck run` first",
+            plan.tree
+        )
+    })?;
+    let mut checks = Vec::new();
+    let tree = git(
+        &plan.repo,
+        &["rev-parse", &format!("{}^{{tree}}", plan.sha)],
+    )?;
+    checks.push((
+        entry.tree == tree,
+        format!("tree {} is the tree of {}", entry.tree, plan.sha),
+    ));
+
+    let on_main = Command::new("git")
+        .arg("-C")
+        .arg(&plan.repo)
+        .args(["merge-base", "--is-ancestor", &entry.base, main])
+        .status()
+        .is_ok_and(|s| s.success());
+    checks.push((on_main, format!("base {} is on {main}", entry.base)));
+
+    let again = self::plan(&plan.repo, &plan.sha, &entry.base).map(|p| p.key);
+    checks.push(match again {
+        Ok(key) if key == entry.key => (true, format!("key {key} computed again from the commit and the base")),
+        Ok(key) => (false, format!("key {} computed again is {key}: the config, a workflow, a tool version, shipcheck or an image changed since the run", entry.key)),
+        Err(e) => (false, format!("key {} could not be computed again: {e}", entry.key)),
+    });
+
+    for wf in &entry.workflows {
+        let path = log_dir(&entry.key).join(format!("{}.log", wf.file));
+        let short = &wf.log_sha256[..12.min(wf.log_sha256.len())];
+        checks.push(match fs::read(&path) {
+            Ok(log) if cache::hex(&Sha256::digest(&log)) == wf.log_sha256 => (
+                true,
+                format!("log of {} hashes to {short}", crate::check::name(&wf.file)),
+            ),
+            Ok(_) => (
+                false,
+                format!("log {} does not hash to {short}", path.display()),
+            ),
+            Err(e) => (false, format!("log {}: {e}", path.display())),
+        });
+    }
+
+    checks.push((
+        true,
+        format!("result: {}", if entry.passed { "passed" } else { "failed" }),
+    ));
+    Ok(checks)
+}
+
 /// The result for a plan without running it: a pass when `paths` excludes the change, else the cache
 pub fn lookup(plan: &Plan) -> Option<Entry> {
     let mut entry = skipped(plan).or_else(|| cached(&plan.key))?;
@@ -2993,6 +3053,94 @@ mod tests {
             tools: String::new(),
         };
         (dir, plan)
+    }
+
+    #[test]
+    fn verify_fails_on_each_field_that_is_not_true() {
+        if std::env::var_os("SHIPCHECK_HOME_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::tests::verify_fails_on_each_field_that_is_not_true",
+                ])
+                .env("SHIPCHECK_HOME_CHILD", "1")
+                .env("SHIPCHECK_HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        sh(repo, &["init", "-q", "-b", "main"]);
+        fs::write(
+            repo.join("shipcheck.toml"),
+            "runner = \"host\"\n[host]\nchecks = { t = \"true\" }\n",
+        )
+        .unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "main"]);
+        sh(repo, &["switch", "-q", "-c", "feature"]);
+        fs::write(repo.join("a"), "a").unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "a"]);
+        let plan = self::plan(repo, "feature", "main").unwrap();
+        let store = |key: &str, tree: &str, base: &str, log: &str| {
+            let entry = serde_json::json!({
+                "key": key, "sha": plan.sha, "tree": tree, "base": base,
+                "passed": true, "finished_unix": 0,
+                "workflows": [{"file": HOST, "exit": 0, "attempts": 1, "jobs": {"t": "success"}, "passed": true,
+                    "log_sha256": cache::hex(&Sha256::digest(b"the log"))}]
+            });
+            fs::create_dir_all(home().join("cache")).unwrap();
+            fs::write(home().join(format!("cache/{key}.json")), entry.to_string()).unwrap();
+            fs::create_dir_all(log_dir(key)).unwrap();
+            fs::write(log_dir(key).join(format!("{HOST}.log")), log).unwrap();
+        };
+        let failed = |plan: &Plan| -> Vec<String> {
+            verify(plan, "main")
+                .unwrap()
+                .into_iter()
+                .filter(|(ok, _)| !ok)
+                .map(|(_, line)| line)
+                .collect()
+        };
+
+        store(&plan.key, &plan.tree, &plan.base, "the log");
+        assert_eq!(failed(&plan), Vec::<String>::new());
+
+        store(&plan.key, &plan.tree, &plan.base, "another log");
+        assert!(
+            failed(&plan)[0].contains("does not hash"),
+            "{:?}",
+            failed(&plan)
+        );
+
+        store(&plan.key, &"0".repeat(40), &plan.base, "the log");
+        assert!(failed(&plan)[0].starts_with("tree "), "{:?}", failed(&plan));
+
+        store(&plan.key, &plan.tree, &plan.sha, "the log");
+        assert!(
+            failed(&plan)[0].contains("is on main"),
+            "{:?}",
+            failed(&plan)
+        );
+
+        // A result filed under a key its inputs do not give
+        let mut other = self::plan(repo, "feature", "main").unwrap();
+        other.key = "f".repeat(64);
+        store(&other.key, &plan.tree, &plan.base, "the log");
+        assert!(
+            failed(&other)[0].starts_with("key "),
+            "{:?}",
+            failed(&other)
+        );
     }
 
     #[test]
