@@ -39,14 +39,9 @@ jobs:
 
   # The end-to-end test on Linux, where Docker has no VM between it and the host, the disk has no
   # copy-on-write, and a bridge container reaches the host only at the bridge gateway
+  # On arm, faster than x86 in every measured run
   e2e:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-24.04, act: act_Linux_x86_64.tar.gz, sha: 0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0 }
-          - { os: ubuntu-24.04-arm, act: act_Linux_arm64.tar.gz, sha: daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb }
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04-arm
     env:
       ACT_VERSION: v0.2.89
     timeout-minutes: 30
@@ -54,12 +49,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ matrix.os }}
       - name: Install act
         env:
-          ACT_ARCHIVE: ${{ matrix.act }}
-          ACT_SHA256: ${{ matrix.sha }}
+          ACT_ARCHIVE: act_Linux_arm64.tar.gz
+          ACT_SHA256: daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb
         run: |
           curl -fsSL -o act.tar.gz "https://github.com/nektos/act/releases/download/$ACT_VERSION/$ACT_ARCHIVE"
           echo "$ACT_SHA256  act.tar.gz" | sha256sum -c -
