@@ -309,6 +309,34 @@ fn runs_something(job: &crate::workflow::Job) -> bool {
     job.steps.iter().any(|s| !s.run.is_empty())
 }
 
+const DOCKER: &str = "runs Docker, which shipcheck never gives a job";
+
+const BASE_ONLY: &str = "runs only on the base branch, so it is no PR check and stays as it is";
+
+/// The jobs of a file GitHub runs only on the base branch: an `if:` that requires it, or a need that does
+pub fn base_only(jobs: &[crate::workflow::Job]) -> BTreeSet<String> {
+    let mut only: BTreeSet<String> = jobs
+        .iter()
+        .filter(|j| j.base_only)
+        .map(|j| j.id.clone())
+        .collect();
+
+    // GitHub skips a job whose need it skipped, so the set grows until no job joins it
+    loop {
+        let more: Vec<String> = jobs
+            .iter()
+            .filter(|j| !only.contains(&j.id) && j.needs.iter().any(|n| only.contains(n)))
+            .map(|j| j.id.clone())
+            .collect();
+
+        if more.is_empty() {
+            return only;
+        }
+
+        only.extend(more);
+    }
+}
+
 const PR_ONLY: &str =
     "its `if:` depends on the PR or the default branch, so it never runs on the base branch";
 
@@ -318,6 +346,10 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
 
     if job.pr_only {
         return Some(PR_ONLY.into());
+    }
+
+    if job.runs_docker {
+        return Some(DOCKER.into());
     }
 
     if let Some(axis) = job.matrix.as_ref().filter(|_| runs_something(job)) {
@@ -384,8 +416,10 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     let off_linux = all().any(|(_, j)| j.os.mac || j.os.windows);
     let matrix =
         all().find(|(_, j)| j.matrix.is_some() && runs_something(j) && !ships(&j.id, &['-', '_']));
+    // act runs every job of a listed workflow, and a job that runs Docker fails there every time
+    let docker_job = all().any(|(_, j)| j.runs_docker);
 
-    if let Some((file, job)) = matrix.filter(|_| machine.docker && !off_linux) {
+    if let Some((file, job)) = matrix.filter(|_| machine.docker && !off_linux && !docker_job) {
         d.act = Some(format!(
             "{file}, job {} runs a matrix ({}): host mode tests only this machine's toolchain, so this repository runs in act",
             job.id.escape_debug(),
@@ -408,8 +442,10 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     }
 
     for (file, jobs) in &files {
+        let only = base_only(jobs);
         let mut kept: Vec<(String, String)> = jobs
             .iter()
+            .filter(|j| !only.contains(&j.id))
             .filter_map(|j| Some((j.id.clone(), stays(j, machine, off_linux)?)))
             .collect();
 
@@ -446,6 +482,14 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             .iter()
             .map(|job| {
                 if stays_here(&job.id) {
+                    return (job.id.as_str(), None);
+                }
+
+                if only.contains(&job.id) {
+                    d.skipped.push(format!(
+                        "{file}, job {}: {BASE_ONLY}",
+                        job.id.escape_debug()
+                    ));
                     return (job.id.as_str(), None);
                 }
 
@@ -1103,6 +1147,7 @@ fn rust_need(step: &crate::workflow::RunStep) -> Option<String> {
     }
 
     let (action, at) = step.uses.as_deref()?.split_once('@')?;
+    let at = step.ref_name.as_deref().unwrap_or(at);
     let default = match action {
         "dtolnay/rust-toolchain" => at,
         // Without `toolchain` it reads rust-toolchain.toml, which rustup reads here too
@@ -1460,7 +1505,7 @@ fn make_executable(_: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -1859,7 +1904,7 @@ jobs:
         for line in [
             "job pre-commit: nothing left to check with, it only installs, moves files or runs git, it left out a step with `if:` or `continue-on-error`",
             "job test-msrv: nothing left to check with, it only installs, moves files or runs git, it left out a step with an expression",
-            "job docker-build: nothing left to check with, it only installs, moves files or runs git",
+            "job docker-build: runs Docker, which shipcheck never gives a job",
             "job test-win: runs on Windows, which shipcheck does not support yet",
         ] {
             assert!(said.contains(line), "{line}\n{said}");
@@ -2374,6 +2419,52 @@ jobs:
     }
 
     /// The config `init` writes for a root holding these files, parsed and validated
+    #[test]
+    fn a_docker_job_stays_on_github_and_a_base_only_chain_holds_nothing_back() {
+        let (cfg, _, said) = init_with(&[(".github/workflows/ci.yml", CI_WITH_RELEASE)]);
+        assert_eq!(checks(&cfg), [("test", "cargo test")]);
+        for line in [
+            "job e2e: runs Docker, which shipcheck never gives a job",
+            "job check-release: runs only on the base branch",
+            "job build: runs only on the base branch",
+        ] {
+            assert!(said.contains(line), "{line}\n{said}");
+        }
+
+        // Without the comment the SHA names no toolchain, so the job needs one this machine lacks
+        let bare = CI_WITH_RELEASE.replace(" # stable", "");
+        let d = detect_with(&[(".github/workflows/ci.yml", &bare)], true);
+        assert!(d.checks.iter().all(|c| c.name != "test"));
+    }
+
+    pub(crate) const CI_WITH_RELEASE: &str = r#"on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: cargo test
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker version
+      - run: cargo test --test e2e -- --ignored
+  check-release:
+    needs: [test, e2e]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./next-version.sh
+  build:
+    needs: check-release
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: cargo build --release
+"#;
+
     fn init_with(files: &[(&str, &str)]) -> (RepoConfig, String, String) {
         let dir = tempfile::tempdir().unwrap();
 

@@ -128,6 +128,8 @@ pub struct RunStep {
     /// Empty for a `uses` step
     pub run: String,
     pub uses: Option<String>,
+    /// The ref a SHA pin names in its comment, `stable` for `uses: a/b@<sha> # stable`
+    pub ref_name: Option<String>,
     /// A `uses` step's inputs, None for a value that is an expression
     pub with: Vec<(String, Option<String>)>,
     pub dir: Option<String>,
@@ -153,6 +155,10 @@ pub struct Job {
     pub os: Platforms,
     /// Its `if:` depends on the PR or the default branch
     pub pr_only: bool,
+    /// Its `if:` requires one branch, such as a release job's `github.ref == 'refs/heads/main'`
+    pub base_only: bool,
+    /// A step runs `docker` or `act`, or uses a `docker/` action, which needs a Docker daemon in the job
+    pub runs_docker: bool,
     /// The names GitHub gives its check runs, None when they depend on more than this reads
     pub check_names: Option<Vec<String>>,
 }
@@ -293,6 +299,47 @@ fn pr_only(job: &Yaml) -> bool {
     ]
     .iter()
     .any(|p| cond.contains(p))
+}
+
+/**
+ * Whether a job's `if:` requires the ref to be one branch, so it runs only there. An `||` can let it
+ * run elsewhere, as init's own gate for Dependabot does, so a condition with one never counts
+ **/
+// ponytail: reads the condition as text, a parser of GitHub expressions if a real workflow fools it
+fn base_only(job: &Yaml) -> bool {
+    job["if"].as_str().is_some_and(|c| {
+        !c.contains("||")
+            && ["github.ref == ", "github.ref_name == "]
+                .iter()
+                .any(|p| c.contains(p))
+    })
+}
+
+/// A YAML parser drops comments, so the name a SHA pin keeps in one comes from the source line
+fn ref_name(source: &str, uses: &str) -> Option<String> {
+    let (_, at) = uses.split_once('@')?;
+
+    if at.len() != 40 || !at.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    source.lines().find_map(|line| {
+        let comment = line.split_once(uses)?.1.trim().strip_prefix('#')?;
+        comment.split_whitespace().next().map(str::to_string)
+    })
+}
+
+fn runs_docker(step: &RunStep) -> bool {
+    let command = |word: &str| {
+        step.run
+            .split(|c: char| c.is_whitespace() || ";&|()`$".contains(c))
+            .any(|w| w == word)
+    };
+    step.uses
+        .as_deref()
+        .is_some_and(|u| u.starts_with("docker/"))
+        || command("docker")
+        || command("act")
 }
 
 /// One axis of a matrix as `name: a, b, c, ...`, preferring one that is not the runner's OS
@@ -500,7 +547,7 @@ pub fn job_runs(source: &str) -> Vec<Job> {
 
             with
         };
-        let steps = steps_yaml
+        let steps: Vec<RunStep> = steps_yaml
             .iter()
             .filter_map(|s| {
                 let run = s["run"].as_str().map(|r| r.trim().to_string());
@@ -517,6 +564,7 @@ pub fn job_runs(source: &str) -> Vec<Job> {
                         None
                     },
                     run: run.unwrap_or_default(),
+                    ref_name: uses.as_deref().and_then(|u| ref_name(source, u)),
                     uses,
                     with: with_of(&s["with"]),
                     shell: pick(s, "shell"),
@@ -541,6 +589,7 @@ pub fn job_runs(source: &str) -> Vec<Job> {
                 .collect(),
             _ => Vec::new(),
         };
+        let runs_docker = steps.iter().any(runs_docker);
         out.push(Job {
             id: id.to_string(),
             needs,
@@ -556,6 +605,8 @@ pub fn job_runs(source: &str) -> Vec<Job> {
             matrix: matrix_axis(&job["strategy"]["matrix"]),
             os: platforms(job),
             pr_only: pr_only(job),
+            base_only: base_only(job),
+            runs_docker,
             check_names: check_names(id, original),
         });
     }
@@ -1105,6 +1156,27 @@ pub fn read_marks(log: &str, nonce: &str) -> BTreeMap<String, JobMarks> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_base_only_jobs_docker_steps_and_a_sha_pins_name() {
+        let ci = "on: push\njobs:\n  a:\n    if: github.ref == 'refs/heads/main'\n    steps:\n      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable\n      - run: echo\n  b:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n    steps:\n      - run: docker version\n  c:\n    steps:\n      - run: act --version\n  d:\n    steps:\n      - uses: docker/setup-buildx-action@v3\n  e:\n    steps:\n      - uses: actions/checkout@v4 # v4\n      - run: hadolint Dockerfile && echo docker-ish exact\n";
+        let jobs = job_runs(ci);
+        let job = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
+        assert!(job("a").base_only);
+        assert!(!job("b").base_only, "an || can run it off the base branch");
+        assert_eq!(job("a").steps[0].ref_name.as_deref(), Some("stable"));
+        assert_eq!(
+            job("e").steps[0].ref_name,
+            None,
+            "only a SHA pin's comment names its ref"
+        );
+        assert!(!job("a").runs_docker);
+        assert!(job("b").runs_docker && job("c").runs_docker && job("d").runs_docker);
+        assert!(
+            !job("e").runs_docker,
+            "a word that only contains docker is not Docker"
+        );
+    }
 
     #[test]
     fn main_only_edits_on_and_keeps_the_rest() {
