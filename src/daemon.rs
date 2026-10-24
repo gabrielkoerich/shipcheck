@@ -178,11 +178,7 @@ fn cycle(
     let base_branch = entry.base.strip_prefix("origin/").unwrap_or(&entry.base);
     let open = sender.open_prs()?;
     merges(repo, sender, &open, heads);
-    // shipcheck.toml on the configured branch only says what a PR into that branch must pass
-    let prs: Vec<_> = open
-        .into_iter()
-        .filter(|pr| pr.base == base_branch)
-        .collect();
+    let prs = into_base(open, &entry.base);
 
     for pr in &prs {
         let key = (repo.to_string(), pr.number);
@@ -233,7 +229,19 @@ fn cycle(
         // One PR that cannot be checked must not hold back the others
         let since = waiting.get(&id).map_or(Duration::ZERO, Instant::elapsed);
 
-        match handle(config, repo, entry, sender, &pr, since, waits) {
+        let start = |plan: &run::Plan, name: &str| {
+            background::start(
+                &entry.path,
+                plan,
+                &entry.base,
+                name,
+                true,
+                "daemon",
+                config.home_ok,
+            )
+        };
+
+        match handle(config, repo, entry, sender, &pr, since, waits, &start) {
             Ok(Some(verdict)) => {
                 println!("{repo}#{}: {verdict} on {}", pr.number, &pr.sha[..12]);
                 heads.insert((repo.to_string(), pr.number), pr.sha.clone());
@@ -251,6 +259,13 @@ fn cycle(
     }
 
     Ok(())
+}
+
+/// The PRs into `base`, as `origin/main` or `main`
+fn into_base(open: Vec<OpenPr>, base: &str) -> Vec<OpenPr> {
+    let branch = base.strip_prefix("origin/").unwrap_or(base);
+    // shipcheck.toml on the configured branch only says what a PR into that branch must pass
+    open.into_iter().filter(|pr| pr.base == branch).collect()
 }
 
 type State<'a> = (
@@ -432,7 +447,7 @@ fn me(config: &DaemonConfig) -> Option<String> {
 /// Posts the PR comment after the checks, so a comment GitHub refuses costs one line, never the
 /// post. With no secrets to mask it posts none
 pub fn comment(
-    sender: &Sender,
+    sender: &impl Remote,
     prs: Option<&[u64]>,
     plan: &run::Plan,
     base: &str,
@@ -490,15 +505,58 @@ fn decide(existing: &Checks, local: bool, result: bool, may_run: bool, cutoff: &
     }
 }
 
-/// Posts the checks for one PR, or returns None while it waits for a run
+/// What `handle` asks of GitHub, so a test can answer it
+pub trait Remote: Sync {
+    fn send(&self, body: &serde_json::Value, id: Option<u64>) -> Result<(u64, String), String>;
+    fn find_checks(&self, sha: &str) -> Result<Checks, String>;
+    fn pusher(&self, pr: u64, branch: &str, sha: &str) -> Result<Option<(String, String)>, String>;
+    fn comment(
+        &self,
+        prs: Option<&[u64]>,
+        base: &str,
+        sha: &str,
+        entry: &run::Entry,
+        secrets: &[String],
+    ) -> Result<Vec<String>, String>;
+}
+
+impl Remote for Sender {
+    fn send(&self, body: &serde_json::Value, id: Option<u64>) -> Result<(u64, String), String> {
+        Sender::send(self, body, id)
+    }
+
+    fn find_checks(&self, sha: &str) -> Result<Checks, String> {
+        Sender::find_checks(self, sha)
+    }
+
+    fn pusher(&self, pr: u64, branch: &str, sha: &str) -> Result<Option<(String, String)>, String> {
+        Sender::pusher(self, pr, branch, sha)
+    }
+
+    fn comment(
+        &self,
+        prs: Option<&[u64]>,
+        base: &str,
+        sha: &str,
+        entry: &run::Entry,
+        secrets: &[String],
+    ) -> Result<Vec<String>, String> {
+        Sender::comment(self, prs, base, sha, entry, secrets)
+    }
+}
+
+/// Posts the checks for one PR, or returns None while it waits for a run. `start` starts the
+/// background run of a plan, with its name
+#[allow(clippy::too_many_arguments)]
 fn handle(
     config: &DaemonConfig,
     repo: &str,
     entry: &RepoEntry,
-    sender: &Sender,
+    sender: &impl Remote,
     pr: &OpenPr,
     since: Duration,
     waits: &mut BTreeMap<(String, u64), String>,
+    start: &dyn Fn(&run::Plan, &str),
 ) -> Result<Option<&'static str>, String> {
     let (number, sha) = (pr.number, &pr.sha);
     let mut rec = Run::new("daemon", run::unix_now());
@@ -674,15 +732,7 @@ fn handle(
                 &sha[..12]
             );
             note(repo, "rerun", pr, "no_result_for_tree");
-            background::start(
-                &entry.path,
-                &plan,
-                &entry.base,
-                &format!("pr:{number}"),
-                true,
-                "daemon",
-                config.home_ok,
-            );
+            start(&plan, &format!("pr:{number}"));
             Ok(None)
         }
         Action::Queue => {
@@ -694,6 +744,10 @@ fn handle(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use serde_json::Value;
+
     use super::*;
 
     #[test]
@@ -899,5 +953,377 @@ mod tests {
     #[test]
     fn config_rejects_unknown_fields() {
         assert!(toml::from_str::<DaemonConfig>("repos = {}\npoll = 5\n").is_err());
+    }
+
+    #[test]
+    fn handles_only_prs_into_its_branch() {
+        let open = || {
+            vec![
+                open_pr(1, "a", "main", "acme/app"),
+                open_pr(2, "b", "dev", "acme/app"),
+                open_pr(3, "c", "origin/main", "acme/app"),
+            ]
+        };
+        let numbers = |prs: Vec<OpenPr>| prs.iter().map(|pr| pr.number).collect::<Vec<_>>();
+        assert_eq!(numbers(into_base(open(), "origin/main")), vec![1]);
+        assert_eq!(numbers(into_base(open(), "main")), vec![1]);
+        assert_eq!(numbers(into_base(open(), "origin/dev")), vec![2]);
+        assert!(into_base(open(), "origin/release").is_empty());
+    }
+
+    fn open_pr(number: u64, sha: &str, base: &str, head_repo: &str) -> OpenPr {
+        OpenPr {
+            number,
+            sha: sha.into(),
+            base: base.into(),
+            head_repo: head_repo.into(),
+            branch: "fix".into(),
+            author: "ann".into(),
+        }
+    }
+
+    const ACT: &str = "workflows = [\"ci.yml\"]\n";
+    const HOST: &str = "runner = \"host\"\n\n[host]\nchecks = { test = \"true\" }\n";
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A checkout with `config` on origin/main and a PR head on top, and that head
+    fn checkout(origin: &str, config: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        std::fs::create_dir_all(path.join(".github/workflows")).unwrap();
+        let workflow = "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+        std::fs::write(path.join(".github/workflows/ci.yml"), workflow).unwrap();
+        std::fs::write(path.join("shipcheck.toml"), config).unwrap();
+        run_git(path, &["init", "-q", "-b", "main"]);
+        run_git(path, &["add", "-A"]);
+        run_git(path, &["commit", "-q", "-m", "base"]);
+        run_git(path, &["remote", "add", "origin", origin]);
+        run_git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        std::fs::write(path.join("change.txt"), "x").unwrap();
+        run_git(path, &["add", "-A"]);
+        run_git(path, &["commit", "-q", "-m", "head"]);
+        let sha = run_git(path, &["rev-parse", "HEAD"]);
+        (dir, sha)
+    }
+
+    /// Runs test `name` again in a child with a home of its own, and says whether this is the child
+    fn own_home(name: &str) -> bool {
+        if std::env::var_os("SHIPCHECK_DAEMON_CHILD").is_some() {
+            return true;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("daemon::tests::{name}")])
+            .env("SHIPCHECK_DAEMON_CHILD", "1")
+            .env("SHIPCHECK_HOME", home.path())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && said.contains("1 passed"), "{said}");
+        false
+    }
+
+    /// GitHub as `handle` sees it: the checks it was sent, and a rival's claim when set
+    #[derive(Default)]
+    struct Fake {
+        existing: Checks,
+        pusher: Option<String>,
+        rival: Option<u64>,
+        sent: Mutex<Vec<(Value, Option<u64>)>>,
+    }
+
+    impl Remote for Fake {
+        fn send(&self, body: &Value, id: Option<u64>) -> Result<(u64, String), String> {
+            let mut sent = self.sent.lock().unwrap();
+            sent.push((body.clone(), id));
+            Ok((id.unwrap_or(100 + sent.len() as u64), String::new()))
+        }
+
+        fn find_checks(&self, _sha: &str) -> Result<Checks, String> {
+            let sent = self.sent.lock().unwrap();
+            let mut found = self.existing.clone();
+
+            for (i, (body, id)) in sent.iter().enumerate() {
+                let mut c = check(body["status"].as_str().unwrap(), "");
+                c.id = id.unwrap_or(101 + i as u64);
+                found.insert(body["name"].as_str().unwrap().into(), c);
+            }
+
+            if let Some(id) = self.rival.filter(|_| !sent.is_empty()) {
+                let mut c = check("in_progress", "");
+                c.id = id;
+                found.insert(check::NAME.into(), c);
+            }
+
+            Ok(found)
+        }
+
+        fn pusher(
+            &self,
+            _pr: u64,
+            _branch: &str,
+            _sha: &str,
+        ) -> Result<Option<(String, String)>, String> {
+            Ok(self.pusher.clone().map(|l| (l, "events".to_string())))
+        }
+
+        fn comment(
+            &self,
+            _prs: Option<&[u64]>,
+            _base: &str,
+            _sha: &str,
+            _entry: &run::Entry,
+            _secrets: &[String],
+        ) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl Fake {
+        fn by(pusher: &str) -> Self {
+            Fake {
+                pusher: Some(pusher.into()),
+                ..Fake::default()
+            }
+        }
+
+        fn bodies(&self) -> Vec<Value> {
+            let sent = self.sent.lock().unwrap();
+            sent.iter().map(|(body, _)| body.clone()).collect()
+        }
+
+        fn statuses(&self) -> Vec<String> {
+            let bodies = self.bodies();
+            bodies
+                .iter()
+                .map(|b| b["status"].as_str().unwrap().to_string())
+                .collect()
+        }
+    }
+
+    type Handled = (Result<Option<&'static str>, String>, Vec<String>);
+
+    /// `handle` on `pr` of `repo` as login ann, with the names of the runs it started
+    fn run_handle(fake: &Fake, repo: &str, path: &Path, pr: &OpenPr) -> Handled {
+        let config = DaemonConfig {
+            interval_seconds: 10,
+            run_misses: true,
+            login: Some("ann".into()),
+            repos: BTreeMap::new(),
+            home_ok: false,
+        };
+        let entry = RepoEntry {
+            path: path.to_path_buf(),
+            base: "origin/main".into(),
+        };
+        let started = Mutex::new(Vec::new());
+        let start = |_: &run::Plan, name: &str| started.lock().unwrap().push(name.to_string());
+        let mut waits = BTreeMap::new();
+        let got = handle(
+            &config,
+            repo,
+            &entry,
+            fake,
+            pr,
+            Duration::ZERO,
+            &mut waits,
+            &start,
+        );
+        (got, started.into_inner().unwrap())
+    }
+
+    /// The `skipped` reasons in this home's records of `repo`
+    fn skips(repo: &str) -> Vec<String> {
+        let text = std::fs::read_to_string(record::file(&run::home(), repo)).unwrap_or_default();
+        text.lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["event"] == "skipped")
+            .map(|v| v["reason"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_head_with_a_completed_shipcheck_check_sends_nothing() {
+        let mut fake = Fake::by("ann");
+        fake.existing
+            .insert(check::NAME.into(), check("completed", ""));
+        let pr = open_pr(5, "abc", "main", "acme/app");
+        let (got, started) = run_handle(&fake, "acme/app", Path::new("/nonexistent"), &pr);
+        assert_eq!(got, Ok(Some("already checked")));
+        assert!(fake.bodies().is_empty() && started.is_empty());
+    }
+
+    #[test]
+    fn host_mode_never_checks_a_forks_pr() {
+        let (dir, sha) = checkout("https://github.com/acme/app.git", HOST);
+        let fake = Fake::by("ann");
+        let pr = open_pr(5, &sha, "main", "eve/app");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
+        assert_eq!(
+            got,
+            Ok(Some("not checked, host mode never checks a fork's PR"))
+        );
+        assert!(fake.bodies().is_empty() && started.is_empty());
+    }
+
+    /// A failed result for the head stored in this home, with a log a same-repo PR's checks show
+    fn store_failure(path: &Path, sha: &str) {
+        let key = run::plan(path, sha, "origin/main").unwrap().key;
+        let logs = run::log_dir(&key);
+        std::fs::create_dir_all(logs.join("ci.yml")).unwrap();
+        std::fs::write(logs.join("ci.yml/test.log"), "boom from the head\n").unwrap();
+        std::fs::write(logs.join("ci.yml.log"), "boom from the head\n").unwrap();
+        let result = run::Entry {
+            key: key.clone(),
+            sha: sha.into(),
+            tree: String::new(),
+            base: String::new(),
+            passed: false,
+            workflows: vec![run::WorkflowResult {
+                file: "ci.yml".into(),
+                exit: Some(1),
+                attempts: 1,
+                log_sha256: String::new(),
+                jobs: BTreeMap::from([("test".into(), "failure".into())]),
+                passed: false,
+                shards: BTreeMap::new(),
+                times: BTreeMap::new(),
+                summaries: BTreeMap::new(),
+            }],
+            finished_unix: 0,
+            skipped: None,
+            ci_changes: Vec::new(),
+        };
+        let cache = run::home().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let text = serde_json::to_string(&result).unwrap();
+        std::fs::write(cache.join(format!("{key}.json")), text).unwrap();
+    }
+
+    #[test]
+    fn a_forks_pr_never_runs_and_gets_no_log_tail() {
+        if !own_home("a_forks_pr_never_runs_and_gets_no_log_tail") {
+            return;
+        }
+
+        let (dir, sha) = checkout("https://github.com/acme/app.git", ACT);
+        let fork = open_pr(5, &sha, "main", "eve/app");
+        let fake = Fake::by("ann");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &fork);
+        assert_eq!(got, Ok(None));
+        assert!(started.is_empty(), "a fork's PR started a run");
+        assert!(!fake.statuses().is_empty());
+        assert!(
+            fake.statuses().iter().all(|s| s == "queued"),
+            "{:?}",
+            fake.statuses()
+        );
+
+        store_failure(dir.path(), &sha);
+        let tail = |fake: &Fake| fake.bodies().iter().any(|b| b.to_string().contains("boom"));
+        let fake = Fake::by("ann");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &fork);
+        assert_eq!(got, Ok(Some("posted failure")));
+        assert!(started.is_empty());
+        assert!(!tail(&fake), "a fork's check holds its log tail");
+
+        let fake = Fake::by("ann");
+        let same = open_pr(5, &sha, "main", "acme/app");
+        let (got, _) = run_handle(&fake, "acme/app", dir.path(), &same);
+        assert_eq!(got, Ok(Some("posted failure")));
+        // A home with no keychain, such as a host check's jail, posts no tail for any PR
+        if run::secret_values("acme/app").is_ok() {
+            assert!(tail(&fake), "a same-repo PR's check holds its log tail");
+        }
+    }
+
+    #[test]
+    fn a_claim_another_machine_won_starts_no_run() {
+        if !own_home("a_claim_another_machine_won_starts_no_run") {
+            return;
+        }
+
+        let (dir, sha) = checkout("https://github.com/acme/app.git", HOST);
+        let mut fake = Fake::by("ann");
+        fake.rival = Some(999);
+        let pr = open_pr(5, &sha, "main", "acme/app");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
+        assert_eq!(got, Ok(None));
+        assert!(started.is_empty(), "both machines run it");
+        assert_eq!(skips("acme/app"), vec!["claimed_by_another_machine"]);
+    }
+
+    #[test]
+    fn a_claim_this_machine_won_starts_the_run() {
+        if !own_home("a_claim_this_machine_won_starts_the_run") {
+            return;
+        }
+
+        let (dir, sha) = checkout("https://github.com/acme/app.git", HOST);
+        let fake = Fake::by("ann");
+        let pr = open_pr(5, &sha, "main", "acme/app");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
+        assert_eq!(got, Ok(None));
+        assert_eq!(started, vec!["pr:5"]);
+        assert_eq!(
+            fake.bodies()[0]["name"],
+            check::NAME,
+            "the claim goes first"
+        );
+        assert!(fake.statuses().iter().all(|s| s == "in_progress"));
+    }
+
+    #[test]
+    fn a_refused_pusher_is_skipped_and_queued() {
+        if !own_home("a_refused_pusher_is_skipped_and_queued") {
+            return;
+        }
+
+        let (dir, sha) = checkout("https://github.com/acme/app.git", HOST);
+        let fake = Fake::by("eve");
+        let pr = open_pr(5, &sha, "main", "acme/app");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
+        assert!(got.unwrap().unwrap().starts_with("not run"));
+        assert!(started.is_empty());
+        assert_eq!(skips("acme/app"), vec!["pusher_not_allowed"]);
+        assert!(!fake.statuses().is_empty());
+        assert!(
+            fake.statuses().iter().all(|s| s == "queued"),
+            "{:?}",
+            fake.statuses()
+        );
+        assert!(refused(&refused_path("acme/app"), run::unix_now()).contains_key(&sha));
+    }
+
+    #[test]
+    fn a_same_repo_pr_matches_its_repository_in_any_case() {
+        if !own_home("a_same_repo_pr_matches_its_repository_in_any_case") {
+            return;
+        }
+
+        // The daemon keys a repository by its origin URL, GitHub names it in its own case
+        let (dir, sha) = checkout("https://github.com/Acme/App.git", HOST);
+        let repo = run::repo_id(dir.path()).unwrap();
+        assert_eq!(repo, "Acme/App");
+        let fake = Fake::by("ann");
+        let pr = open_pr(5, &sha, "main", "acme/app");
+        let (got, _) = run_handle(&fake, &repo, dir.path(), &pr);
+        assert_ne!(
+            got,
+            Ok(Some("not checked, host mode never checks a fork's PR")),
+            "acme/app is Acme/App, not a fork"
+        );
     }
 }

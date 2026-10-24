@@ -115,8 +115,11 @@ pub fn pull(token: &str, repo: &str, number: u64) -> Result<Value, String> {
 /// The open PRs whose head is `sha` in `repo` itself, never a fork, into `base`
 pub fn prs_for(token: &str, repo: &str, sha: &str, base: &str) -> Result<Vec<u64>, String> {
     let prs = get(&format!("{API}/repos/{repo}/commits/{sha}/pulls"), token)?;
-    Ok(prs
-        .as_array()
+    Ok(same_repo_prs(&prs, repo, sha, base))
+}
+
+fn same_repo_prs(prs: &Value, repo: &str, sha: &str, base: &str) -> Vec<u64> {
+    prs.as_array()
         .into_iter()
         .flatten()
         .filter(|pr| {
@@ -126,7 +129,7 @@ pub fn prs_for(token: &str, repo: &str, sha: &str, base: &str) -> Result<Vec<u64
                 && pr["base"]["ref"] == base
         })
         .filter_map(|pr| pr["number"].as_u64())
-        .collect())
+        .collect()
 }
 
 /// This App's comment on a PR that holds `marker`, as its id and body
@@ -533,6 +536,20 @@ mod tests {
             web_merge(&pr(merge("web-flow", gh, true, "main")), "a"),
             None,
             "not a merge"
+        );
+    }
+
+    #[test]
+    fn a_same_repo_pr_matches_its_repository_in_any_case() {
+        let prs = json!([
+            {"number": 5, "state": "open", "head": {"sha": "a", "repo": {"full_name": "acme/app"}}, "base": {"ref": "main"}},
+            {"number": 6, "state": "open", "head": {"sha": "a", "repo": {"full_name": "eve/app"}}, "base": {"ref": "main"}},
+        ]);
+        assert_eq!(same_repo_prs(&prs, "acme/app", "a", "main"), vec![5]);
+        assert_eq!(
+            same_repo_prs(&prs, "Acme/App", "a", "main"),
+            vec![5],
+            "an origin URL of Acme/App is GitHub's acme/app"
         );
     }
 }
