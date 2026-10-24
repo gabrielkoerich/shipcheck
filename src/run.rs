@@ -1783,6 +1783,7 @@ fn run_job(
     let mut before = 0;
     let mut shard = ctx.plan.config.shard_tests.enabled();
     let mut info = None;
+    let mut infra_left = INFRA_RETRIES;
 
     loop {
         attempts += 1;
@@ -1901,6 +1902,17 @@ fn run_job(
             None => {}
         }
 
+        let failed = outcome.exit.is_some_and(|e| e != 0) && outcome.unsupported_jobs.is_empty();
+
+        // A failure of Docker's, such as a pull timeout, gets attempts of its own beside `retries`
+        if failed && !host && infra_left > 0 {
+            let log = fs::read(&log_path).map_err(|e| e.to_string())?;
+
+            if crate::runner::act::never_started(&String::from_utf8_lossy(&log)) {
+                (infra_left, before) = (infra_left - 1, before + 1);
+            }
+        }
+
         if outcome.exit == Some(0) || attempts - before > ctx.plan.config.retries {
             let log = fs::read(&log_path).map_err(|e| e.to_string())?;
             return Ok(JobRun {
@@ -1921,6 +1933,9 @@ fn run_job(
         ));
     }
 }
+
+/// Attempts a job gets when Docker, not the job, failed it before its first step
+const INFRA_RETRIES: u32 = 2;
 
 /// With `SHIPCHECK_TIMINGS` set, prints how long a phase of a job took, for measuring overhead
 pub(crate) fn timing(file: &str, job: &str, phase: &str, since: Instant) {
