@@ -73,29 +73,15 @@ pub fn start(
         return;
     };
     let path = record(&repo, name);
-    let mut keep = Vec::new();
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let Some((mut keep, older)) = next_record(&text, &plan.sha, post, our_run) else {
+        return;
+    };
 
-    for line in fs::read_to_string(&path).unwrap_or_default().lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(pid), Some(sha)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-
-        if sha == plan.sha && our_run(pid) {
-            if !post || fields.next() == Some("post") {
-                return;
-            }
-
-            keep.push(line.to_string());
-            continue;
-        }
-
-        // Only a group a background run of ours still leads, never a number that may now be another's
-        if our_run(pid) {
-            let _ = Command::new("kill")
-                .args(["-s", "TERM", "--", &format!("-{pid}")])
-                .status();
-        }
+    for pid in older {
+        let _ = Command::new("kill")
+            .args(["-s", "TERM", "--", &format!("-{pid}")])
+            .status();
     }
 
     if let Ok(pid) = spawn(cwd, plan, base, name, post, trigger, home_ok) {
@@ -107,6 +93,40 @@ pub fn start(
         let _ = fs::create_dir_all(path.parent().unwrap_or(&path));
         let _ = fs::write(&path, keep.join("\n") + "\n");
     }
+}
+
+/// Before a run of `sha` starts: None when a run of it that does what this one would is still going,
+/// else the record lines to keep and the process groups of older runs to stop
+fn next_record(
+    record: &str,
+    sha: &str,
+    post: bool,
+    alive: impl Fn(&str) -> bool,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let (mut keep, mut older) = (Vec::new(), Vec::new());
+
+    for line in record.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(s)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+
+        if s == sha && alive(pid) {
+            if !post || fields.next() == Some("post") {
+                return None;
+            }
+
+            keep.push(line.to_string());
+            continue;
+        }
+
+        // Only a group a background run of ours still leads, never a number that may now be another's
+        if alive(pid) {
+            older.push(pid.to_string());
+        }
+    }
+
+    Some((keep, older))
 }
 
 /// Fetches the branch of `base`, such as `origin/main`, from origin
@@ -205,15 +225,7 @@ fn spawn(
         .open(log_dir.join("background.log"))
         .map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut args = vec!["run", "--no-fetch", "--sha", &plan.sha, "--base", base];
-
-    if post {
-        args.extend(["--background", name]);
-    }
-
-    if home_ok {
-        args.push("--home-ok");
-    }
+    let args = run_args(&plan.sha, base, name, post, home_ok);
 
     // Its own process group, so Ctrl-C in the terminal after a commit does not stop the run.
     // git points hooks at the commit's index, which would break every git call the run makes
@@ -235,9 +247,30 @@ fn spawn(
     Ok(child.id())
 }
 
-/// GitHub answers 422 to a check run on a commit it does not have yet
+/// What a background run passes to its own binary, which the binary's tests parse
+pub fn run_args(sha: &str, base: &str, name: &str, post: bool, home_ok: bool) -> Vec<String> {
+    let mut args: Vec<String> = ["run", "--no-fetch", "--sha", sha, "--base", base]
+        .map(String::from)
+        .into();
+
+    if post {
+        args.extend(["--background".to_string(), name.to_string()]);
+    }
+
+    if home_ok {
+        args.push("--home-ok".into());
+    }
+
+    args
+}
+
+/// GitHub answers 422 to a check run on a commit it does not have yet. ureq ends that error with
+/// `http status: 422`, the service says `GitHub refused to <what>: 422 <message>`
 fn unknown_sha(e: &str) -> bool {
-    e.contains("422")
+    e.ends_with("http status: 422")
+        || e.split_once("GitHub refused to ")
+            .and_then(|(_, rest)| rest.split_once(": "))
+            .is_some_and(|(_, answer)| answer.starts_with("422 "))
 }
 
 /// Calls `f` again after each wait while GitHub does not know the commit
@@ -428,6 +461,53 @@ mod tests {
 
         fn posts(&self) -> Vec<(String, String, Option<u64>)> {
             self.posts.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn a_newer_commit_stops_the_older_runs_and_one_run_per_commit_goes() {
+        let alive = |pid: &str| pid != "9";
+        let record = "11 aaa\n12 bbb post\n9 ccc\n";
+
+        // A newer commit stops every older run still going, and forgets the dead one
+        assert_eq!(
+            next_record(record, "ddd", false, alive),
+            Some((vec![], vec!["11".into(), "12".into()]))
+        );
+        // The commit already running is left alone, posting or not
+        assert_eq!(next_record(record, "aaa", false, alive), None);
+        assert_eq!(next_record(record, "bbb", true, alive), None);
+        assert_eq!(next_record(record, "bbb", false, alive), None);
+        // A push after the commit's run adds a run that posts, beside it
+        assert_eq!(
+            next_record(record, "aaa", true, alive),
+            Some((vec!["11 aaa".into()], vec!["12".into()]))
+        );
+        // A run that died is started again
+        assert_eq!(
+            next_record(record, "ccc", false, alive),
+            Some((vec![], vec!["11".into(), "12".into()]))
+        );
+        assert_eq!(next_record("", "aaa", true, alive), Some((vec![], vec![])));
+    }
+
+    #[test]
+    fn retries_only_github_saying_it_has_no_such_commit() {
+        // As the two posters word it: ureq with the App key, and the hosted service
+        for e in [
+            "POST https://api.github.com/repos/acme/app/check-runs: http status: 422",
+            "POST /v1/checks: GitHub refused to create the check run: 422 No commit found for SHA: abc",
+        ] {
+            assert!(unknown_sha(e), "{e}");
+        }
+
+        // A 422 in a URL is no 422 answer, a SHA or a repository name can hold one
+        for e in [
+            "GET https://api.github.com/repos/acme/app/commits/4221aa0000000000000000000000000000000000/check-runs?app_id=1: http status: 404",
+            "POST https://api.github.com/repos/acme/app422/check-runs: http status: 401",
+            "POST /v1/checks: the shipcheck App is not installed on acme/app422",
+        ] {
+            assert!(!unknown_sha(e), "{e}");
         }
     }
 
