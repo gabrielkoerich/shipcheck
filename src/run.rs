@@ -1604,24 +1604,14 @@ fn run_workflow(
                     let state = match result {
                         Ok(run) => {
                             let marks = workflow::read_marks(&run.log, ctx.nonce);
-                            let state = if !run.unsupported.is_empty() {
-                                "no image for its runs-on label on this host"
-                            } else if run.exit.is_none() {
-                                "timed out"
-                            } else if run.exit == Some(0) && marks.is_empty() {
-                                "skipped"
-                            } else if run.exit == Some(0)
-                                && marks.contains_key(&job)
-                                && marks.values().all(|m| m.passed())
-                            {
-                                "success"
-                            } else if marks.get(&job).is_some_and(|m| m.ended < m.started) {
-                                "killed"
-                            } else {
-                                "failure"
-                            };
-                            let allow = allowed.contains(&job)
-                                && ["failure", "killed", "timed out"].contains(&state);
+                            let state = job_state(
+                                &job,
+                                run.exit,
+                                !run.unsupported.is_empty(),
+                                &marks,
+                                allowed.contains(&job),
+                            );
+                            let allow = state.ends_with(ALLOWED);
 
                             if exit == Some(0) && run.exit != Some(0) && !allow {
                                 exit = run.exit;
@@ -1640,11 +1630,7 @@ fn run_workflow(
                                 summaries.insert(job.clone(), run.summary);
                             }
 
-                            if allow {
-                                format!("{state}{ALLOWED}")
-                            } else {
-                                state.to_string()
-                            }
+                            state
                         }
                         Err(e) => {
                             exit = exit.and(Some(1));
@@ -1670,10 +1656,7 @@ fn run_workflow(
 
     let log = logs.concat();
     fs::write(ctx.logs.join(format!("{file}.log")), &log).map_err(|e| e.to_string())?;
-    let passed = states
-        .values()
-        .all(|s| s == "success" || s == "skipped" || s.ends_with(ALLOWED))
-        && states.values().any(|s| s == "success");
+    let passed = workflow_passed(&states);
     say(&format!(
         "{file}: {}",
         if passed { "passed" } else { "failed" }
@@ -1690,6 +1673,43 @@ fn run_workflow(
         times,
         summaries,
     })
+}
+
+/// Turns the act exit code of one job's run and the markers in its log into the job's state
+fn job_state(
+    job: &str,
+    exit: Option<i32>,
+    unsupported: bool,
+    marks: &BTreeMap<String, workflow::JobMarks>,
+    allowed: bool,
+) -> String {
+    let state = if unsupported {
+        "no image for its runs-on label on this host"
+    } else if exit.is_none() {
+        "timed out"
+    } else if exit == Some(0) && marks.is_empty() {
+        "skipped"
+    } else if exit == Some(0) && marks.contains_key(job) && marks.values().all(|m| m.passed()) {
+        "success"
+    } else if marks.get(job).is_some_and(|m| m.ended < m.started) {
+        "killed"
+    } else {
+        "failure"
+    };
+
+    if allowed && ["failure", "killed", "timed out"].contains(&state) {
+        format!("{state}{ALLOWED}")
+    } else {
+        state.to_string()
+    }
+}
+
+/// A workflow passes when every job passed, was skipped or is an allowed failure, and one passed
+fn workflow_passed(states: &BTreeMap<String, String>) -> bool {
+    states
+        .values()
+        .all(|s| s == "success" || s == "skipped" || s.ends_with(ALLOWED))
+        && states.values().any(|s| s == "success")
 }
 
 /// Runs one job in its own clone at a fixed path per slot and job, and a failure again in a new one
@@ -3091,5 +3111,184 @@ mod tests {
             "logs stay 90 days"
         );
         assert!(home.path().join("cache/new.json").exists());
+    }
+
+    type Marks<'a> = &'a [(&'a str, u32, u32, bool)];
+
+    fn marks(of: Marks) -> BTreeMap<String, workflow::JobMarks> {
+        of.iter()
+            .map(|&(job, started, ended, failed)| {
+                let m = workflow::JobMarks {
+                    started,
+                    ended,
+                    failed,
+                };
+                (job.to_string(), m)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn job_state_from_the_act_exit_and_the_markers() {
+        let (ok, cut, bad) = (
+            ("test", 1, 1, false),
+            ("test", 1, 0, false),
+            ("test", 1, 1, true),
+        );
+        let no_image = "no image for its runs-on label on this host";
+        let cases: &[(Option<i32>, bool, Marks, bool, &str)] = &[
+            (Some(0), false, &[ok], false, "success"),
+            (Some(0), false, &[("test", 2, 2, false)], false, "success"),
+            // A job whose `if:` is false prints no markers
+            (Some(0), false, &[], false, "skipped"),
+            (Some(0), false, &[cut], false, "killed"),
+            (Some(0), false, &[("test", 2, 1, false)], false, "killed"),
+            (Some(0), false, &[bad], false, "failure"),
+            (Some(0), false, &[("other", 1, 1, false)], false, "failure"),
+            (
+                Some(0),
+                false,
+                &[ok, ("other", 1, 0, false)],
+                false,
+                "failure",
+            ),
+            (Some(1), false, &[ok], false, "failure"),
+            (Some(1), false, &[], false, "failure"),
+            (Some(1), false, &[cut], false, "killed"),
+            (None, false, &[ok], false, "timed out"),
+            (Some(0), true, &[ok], false, no_image),
+            (Some(0), false, &[ok], true, "success"),
+            (Some(0), false, &[], true, "skipped"),
+            (
+                Some(1),
+                false,
+                &[bad],
+                true,
+                "failure, allowed by continue-on-error",
+            ),
+            (Some(0), true, &[], true, no_image),
+        ];
+
+        for (exit, unsupported, of, allow, want) in cases {
+            assert_eq!(
+                job_state("test", *exit, *unsupported, &marks(of), *allow),
+                *want,
+                "exit {exit:?}, unsupported {unsupported}, marks {of:?}, allowed {allow}"
+            );
+        }
+    }
+
+    #[test]
+    fn continue_on_error_never_allows_a_timeout() {
+        // AGENTS.md: a timeout is a failure, and this deadline is shipcheck's own
+        let timed_out = job_state("test", None, false, &marks(&[]), true);
+        let states = BTreeMap::from([
+            ("lint".to_string(), "success".to_string()),
+            ("test".to_string(), timed_out.clone()),
+        ]);
+        assert!(
+            !workflow_passed(&states),
+            "a workflow passed with a timed out job: {states:?}"
+        );
+        assert_eq!(
+            timed_out, "timed out",
+            "continue-on-error allowed a timeout"
+        );
+    }
+
+    #[test]
+    fn continue_on_error_never_allows_a_killed_job() {
+        // A job that started and never printed its end marker did not end, so no step failed
+        let killed = job_state(
+            "test",
+            Some(1),
+            false,
+            &marks(&[("test", 1, 0, false)]),
+            true,
+        );
+        let states = BTreeMap::from([
+            ("lint".to_string(), "success".to_string()),
+            ("test".to_string(), killed.clone()),
+        ]);
+        assert!(
+            !workflow_passed(&states),
+            "a workflow passed with a killed job: {states:?}"
+        );
+        assert_eq!(killed, "killed", "continue-on-error allowed a killed job");
+    }
+
+    #[test]
+    fn workflow_passes_only_when_every_job_passed_and_one_succeeded() {
+        let allowed = format!("failure{ALLOWED}");
+        let cases: &[(&[&str], bool)] = &[
+            (&[], false),
+            (&["success"], true),
+            (&["success", "success"], true),
+            (&["success", "skipped"], true),
+            (&["success", &allowed], true),
+            (&["skipped"], false),
+            (&["skipped", "skipped"], false),
+            (&[&allowed], false),
+            (&["skipped", &allowed], false),
+            (&["success", "failure"], false),
+            (&["success", "killed"], false),
+            (&["success", "timed out"], false),
+            (
+                &["success", "no image for its runs-on label on this host"],
+                false,
+            ),
+            (&["success", "not run, a job it needs did not pass"], false),
+            (&["success", "not run, its needs form a cycle"], false),
+            (&["success", "failure, shipcheck could not run it"], false),
+        ];
+
+        for (jobs, want) in cases {
+            let states = jobs
+                .iter()
+                .enumerate()
+                .map(|(n, s)| (format!("j{n}"), s.to_string()))
+                .collect();
+            assert_eq!(workflow_passed(&states), *want, "{jobs:?}");
+        }
+    }
+
+    #[test]
+    fn plan_reads_the_config_and_the_workflows_from_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let ci = format!("{WORKFLOWS}/ci.yml");
+        let main_config = "runner = \"host\"\n[host]\nchecks = { test = \"true\" }\n";
+        let main_ci =
+            "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+        sh(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join(WORKFLOWS)).unwrap();
+        fs::write(repo.join(CONFIG), main_config).unwrap();
+        fs::write(repo.join(&ci), main_ci).unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "main"]);
+
+        // The PR edits both files and adds a workflow, and the working copy edits them again
+        sh(repo, &["switch", "-q", "-c", "feature"]);
+        fs::write(
+            repo.join(CONFIG),
+            main_config.replace("\"true\"", "\"exit 0\""),
+        )
+        .unwrap();
+        fs::write(repo.join(&ci), main_ci.replace("run: true", "run: exit 0")).unwrap();
+        fs::write(repo.join(WORKFLOWS).join("new.yml"), main_ci).unwrap();
+        sh(repo, &["add", "-A"]);
+        sh(repo, &["commit", "-qm", "feature"]);
+        fs::write(repo.join(CONFIG), "runner = \"act\"\n").unwrap();
+        fs::write(repo.join(&ci), "on: push\n").unwrap();
+
+        let plan = plan(repo, "HEAD", "main").unwrap();
+        assert_eq!(plan.sha, sh(repo, &["rev-parse", "feature"]));
+        assert_eq!(String::from_utf8_lossy(&plan.config_text), main_config);
+        assert_eq!(plan.config.host.checks["test"], "true");
+        assert!(!plan.defaults);
+        assert_eq!(
+            plan.workflows,
+            BTreeMap::from([(ci.clone(), main_ci.as_bytes().to_vec())])
+        );
     }
 }

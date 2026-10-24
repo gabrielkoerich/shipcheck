@@ -1215,7 +1215,6 @@ jobs:
 ";
 
 #[test]
-#[ignore = "needs act"]
 fn status_names_the_result_for_the_working_copy_and_the_index() {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin.git");
@@ -1229,7 +1228,12 @@ fn status_names_the_result_for_the_working_copy_and_the_index() {
     git(&work, &["checkout", "-q", "-b", "main"]);
     fs::create_dir_all(work.join(".github/workflows")).unwrap();
     fs::write(work.join(".github/workflows/ci.yml"), CI).unwrap();
-    fs::write(work.join("shipcheck.toml"), "workflows = [\"ci.yml\"]\n").unwrap();
+    // Host mode, so the plan's identity needs no act
+    fs::write(
+        work.join("shipcheck.toml"),
+        "runner = \"host\"\n[host]\nchecks = { check = \"test -f marker.txt\" }\n",
+    )
+    .unwrap();
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "main"]);
     git(&work, &["push", "-q", "origin", "main"]);
