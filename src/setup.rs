@@ -399,9 +399,11 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             fs::read_to_string(root.join(".github/workflows").join(&file)).unwrap_or_default();
 
         if !crate::workflow::runs_for_branches(&source) {
-            d.skipped.push(format!(
-                "{file}: GitHub does not run it for feature branches"
-            ));
+            d.skipped.push(if crate::workflow::on_pull_request_target(&source) {
+                format!("{file}: it runs on pull_request_target, from the base branch with its secrets, so it stays on GitHub")
+            } else {
+                format!("{file}: GitHub does not run it for feature branches")
+            });
             continue;
         }
 
@@ -604,8 +606,9 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
 
     for (name, tool, command, from) in project {
         if from_workflows {
-            let runs_it = all().find(|(_, j)| j.steps.iter().any(|s| s.run.contains(&command)));
-            let why = if d.checks.iter().any(|c| c.command.contains(&command)) {
+            let runs_it =
+                all().find(|(_, j)| j.steps.iter().any(|s| runs_command(&s.run, &command)));
+            let why = if d.checks.iter().any(|c| runs_command(&c.command, &command)) {
                 "already in a workflow check".to_string()
             } else if let Some((file, job)) = runs_it {
                 format!("{file}, job {} runs it on GitHub", job.id.escape_debug())
@@ -1355,6 +1358,51 @@ fn job_check(
 }
 
 /**
+ * Whether a shell command runs `command`, word by word, as `pnpm lint` in `pnpm run lint`. Flags
+ * between words count as the same command, so `go test -race ./...` runs `go test ./...`
+ **/
+fn runs_command(shell: &str, command: &str) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+
+        for w in s.split_whitespace() {
+            let w = w.trim_start_matches('(').trim_end_matches([')', ';']);
+            // `pnpm run lint`, `yarn run lint` and `npm run test` are `pnpm lint`, `yarn lint` and `npm test`
+            let script = out
+                .last()
+                .is_some_and(|l| matches!(l.as_str(), "npm" | "pnpm" | "yarn"));
+
+            if w == "run" && script {
+                continue;
+            }
+
+            out.push(w.to_string());
+        }
+
+        out
+    };
+    let (hay, want) = (words(shell), words(command));
+    let Some((first, rest)) = want.split_first() else {
+        return false;
+    };
+
+    (0..hay.len()).filter(|&i| &hay[i] == first).any(|i| {
+        let mut at = i + 1;
+
+        rest.iter().enumerate().all(|(k, w)| {
+            // Flags may come after the tool and its subcommand, never inside the tool's name
+            while k > 0 && at < hay.len() && hay[at] != *w && hay[at].starts_with('-') {
+                at += 1;
+            }
+
+            let found = hay.get(at) == Some(w);
+            at += 1;
+            found
+        })
+    })
+}
+
+/**
  * Host checks and `versions` from the project files at the root: package.json scripts with the
  * package manager its lockfile names, Cargo.toml, pyproject.toml and go.mod. Each check is its
  * name, its tool, which names it when the name is taken, its command and its file
@@ -1600,6 +1648,10 @@ jobs:
         let (cfg, text, said) = init_with(&[
             (".github/workflows/ci.yml", ci),
             (".github/workflows/tag.yml", tags),
+            (
+                ".github/workflows/title.yml",
+                "on:\n  pull_request_target:\njobs:\n  title:\n    steps:\n      - run: make\n",
+            ),
             ("Cargo.toml", ""),
             ("package.json", r#"{"scripts": {"lint": "eslint ."}}"#),
         ]);
@@ -1651,6 +1703,7 @@ jobs:
             "  ci.yml, job a b: the job id is not letters, digits, `_` and `-`",
             "  ci.yml, job setup-only: no run step to check with",
             "  tag.yml: GitHub does not run it for feature branches",
+            "  title.yml: it runs on pull_request_target, from the base branch with its secrets, so it stays on GitHub",
             "  Cargo.toml: already in a workflow check: `cargo clippy --all-targets -- -D warnings`",
             "  Cargo.toml: already in a workflow check: `cargo test`",
             "  package.json: no workflow runs it: `npm run lint`",
@@ -1662,6 +1715,35 @@ jobs:
             1,
             "{said}"
         );
+    }
+
+    #[test]
+    fn a_script_runs_in_its_package_managers_forms_and_with_flags() {
+        for (shell, command) in [
+            ("pnpm run lint", "pnpm lint"),
+            ("pnpm format && pnpm run lint", "pnpm lint"),
+            ("yarn run lint", "yarn lint"),
+            ("npm run test", "npm test"),
+            ("npm test", "npm test"),
+            ("go test -race -tags=integration ./...", "go test ./..."),
+            ("(cargo test --workspace)", "cargo test"),
+        ] {
+            assert!(runs_command(shell, command), "{shell} runs {command}");
+        }
+
+        for (shell, command) in [
+            ("pnpm run test-unit", "pnpm test"),
+            ("npm run test:ci", "npm test"),
+            ("bun test", "bun run test"),
+            ("go vet ./...", "go test ./..."),
+            ("go -C sub test ./...", "go test ./..."),
+            ("go test ./cmd/...", "go test ./..."),
+        ] {
+            assert!(
+                !runs_command(shell, command),
+                "{shell} does not run {command}"
+            );
+        }
     }
 
     #[test]
