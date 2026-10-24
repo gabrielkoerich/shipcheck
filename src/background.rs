@@ -73,29 +73,15 @@ pub fn start(
         return;
     };
     let path = record(&repo, name);
-    let mut keep = Vec::new();
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let Some((mut keep, older)) = next_record(&text, &plan.sha, post, our_run) else {
+        return;
+    };
 
-    for line in fs::read_to_string(&path).unwrap_or_default().lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(pid), Some(sha)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-
-        if sha == plan.sha && our_run(pid) {
-            if !post || fields.next() == Some("post") {
-                return;
-            }
-
-            keep.push(line.to_string());
-            continue;
-        }
-
-        // Only a group a background run of ours still leads, never a number that may now be another's
-        if our_run(pid) {
-            let _ = Command::new("kill")
-                .args(["-s", "TERM", "--", &format!("-{pid}")])
-                .status();
-        }
+    for pid in older {
+        let _ = Command::new("kill")
+            .args(["-s", "TERM", "--", &format!("-{pid}")])
+            .status();
     }
 
     if let Ok(pid) = spawn(cwd, plan, base, name, post, trigger, home_ok) {
@@ -107,6 +93,40 @@ pub fn start(
         let _ = fs::create_dir_all(path.parent().unwrap_or(&path));
         let _ = fs::write(&path, keep.join("\n") + "\n");
     }
+}
+
+/// Before a run of `sha` starts: None when a run of it that does what this one would is still going,
+/// else the record lines to keep and the process groups of older runs to stop
+fn next_record(
+    record: &str,
+    sha: &str,
+    post: bool,
+    alive: impl Fn(&str) -> bool,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let (mut keep, mut older) = (Vec::new(), Vec::new());
+
+    for line in record.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(s)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+
+        if s == sha && alive(pid) {
+            if !post || fields.next() == Some("post") {
+                return None;
+            }
+
+            keep.push(line.to_string());
+            continue;
+        }
+
+        // Only a group a background run of ours still leads, never a number that may now be another's
+        if alive(pid) {
+            older.push(pid.to_string());
+        }
+    }
+
+    Some((keep, older))
 }
 
 /// Fetches the branch of `base`, such as `origin/main`, from origin
@@ -438,6 +458,33 @@ mod tests {
         fn posts(&self) -> Vec<(String, String, Option<u64>)> {
             self.posts.lock().unwrap().clone()
         }
+    }
+
+    #[test]
+    fn a_newer_commit_stops_the_older_runs_and_one_run_per_commit_goes() {
+        let alive = |pid: &str| pid != "9";
+        let record = "11 aaa\n12 bbb post\n9 ccc\n";
+
+        // A newer commit stops every older run still going, and forgets the dead one
+        assert_eq!(
+            next_record(record, "ddd", false, alive),
+            Some((vec![], vec!["11".into(), "12".into()]))
+        );
+        // The commit already running is left alone, posting or not
+        assert_eq!(next_record(record, "aaa", false, alive), None);
+        assert_eq!(next_record(record, "bbb", true, alive), None);
+        assert_eq!(next_record(record, "bbb", false, alive), None);
+        // A push after the commit's run adds a run that posts, beside it
+        assert_eq!(
+            next_record(record, "aaa", true, alive),
+            Some((vec!["11 aaa".into()], vec!["12".into()]))
+        );
+        // A run that died is started again
+        assert_eq!(
+            next_record(record, "ccc", false, alive),
+            Some((vec![], vec!["11".into(), "12".into()]))
+        );
+        assert_eq!(next_record("", "aaa", true, alive), Some((vec![], vec![])));
     }
 
     #[test]
