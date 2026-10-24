@@ -1,9 +1,9 @@
 name: ci
 
 on:
-  # Every branch, for e2e: it needs Docker in the job, and shipcheck checks the rest on PRs
+  # Every branch and every change, for e2e: it needs Docker in the job, and shipcheck checks the
+  # rest on PRs. A path filter would leave a required check unposted and block the PR
   push:
-    paths-ignore: ["Formula/**", "**.md"]
   workflow_dispatch: {}
 
 permissions:
