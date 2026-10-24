@@ -878,6 +878,16 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
             );
         }
 
+        let on_prs = crate::workflow::runs_on_prs(&source);
+
+        // Its branch pushes are no PR check, and no shipcheck check takes their place
+        if by.is_empty() && !on_prs {
+            plan.notes.push(format!(
+                "{file}: GitHub keeps running it on pushes to every branch, and no shipcheck check runs its jobs"
+            ));
+            continue;
+        }
+
         let missing: Vec<&Cover> = covers.iter().filter(|c| !c.missing.is_empty()).collect();
         let runs = if by.is_empty() {
             "nothing runs its jobs".to_string()
@@ -887,7 +897,11 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
         plan.workflows.push(Change {
             diff: diff(&file, &source, &edited),
             yes: format!("on PRs {runs}, GitHub keeps running {file} on pushes to {base}"),
-            no: format!("GitHub keeps running {file} on PRs and on pushes to {base}"),
+            no: if on_prs {
+                format!("GitHub keeps running {file} on PRs and on pushes to {base}")
+            } else {
+                format!("GitHub keeps running {file} on pushes to every branch")
+            },
             short_yes: format!(
                 "PRs: {}, {base}: GitHub",
                 if by.is_empty() {
@@ -896,7 +910,11 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
                     by.join(", ")
                 }
             ),
-            short_no: format!("PRs and {base}: GitHub, as now"),
+            short_no: if on_prs {
+                format!("PRs and {base}: GitHub, as now")
+            } else {
+                "pushes: GitHub, as now".into()
+            },
             warning: (!missing.is_empty()).then(|| {
                 format!(
                     "no shipcheck check runs {}. Change it and PRs run that nowhere",
@@ -1354,6 +1372,29 @@ mod tests {
             ["ok wrote .github/workflows/ci.yml", "ok wrote hooks"]
         );
         assert!(next[0].starts_with("Review shipcheck.toml"), "{next:?}");
+    }
+
+    #[test]
+    fn a_push_workflow_is_offered_only_when_a_check_runs_its_jobs() {
+        const SETUP: &str =
+            "on:\n  push:\n    paths: [x]\njobs:\n  setup:\n    steps:\n      - uses: a/b@v1\n";
+        const PUSH: &str = "on: push\njobs:\n  test:\n    steps:\n      - run: cargo test\n";
+        let dir = repo(&[
+            (".github/workflows/ci.yml", PUSH),
+            (".github/workflows/setup.yml", SETUP),
+        ]);
+        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
+        assert_eq!(files, ["ci.yml"]);
+        assert_eq!(
+            plan.workflows[0].no,
+            "GitHub keeps running ci.yml on pushes to every branch"
+        );
+        assert!(
+            plan.notes.contains(&"setup.yml: GitHub keeps running it on pushes to every branch, and no shipcheck check runs its jobs".to_string()),
+            "{:?}",
+            plan.notes
+        );
     }
 
     #[test]
