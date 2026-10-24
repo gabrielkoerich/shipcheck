@@ -71,6 +71,18 @@ pub fn runs_for_branches(source: &str) -> bool {
     }
 }
 
+/// Whether `pull_request_target` triggers it, which runs the base branch's workflow with its secrets
+pub fn on_pull_request_target(source: &str) -> bool {
+    load(source).is_ok_and(|root| match root.get(&key("on")) {
+        Some(Yaml::String(e)) => e == "pull_request_target",
+        Some(Yaml::Array(events)) => events
+            .iter()
+            .any(|e| e.as_str() == Some("pull_request_target")),
+        Some(Yaml::Hash(events)) => events.contains_key(&key("pull_request_target")),
+        _ => false,
+    })
+}
+
 /// Whether a `pull_request` trigger runs on a PR's commits. `types: [closed]` runs once, after merge
 fn pr_runs(filter: &Yaml) -> bool {
     let pushed = |t: &Yaml| matches!(t.as_str(), Some("opened" | "synchronize" | "reopened"));
@@ -698,9 +710,85 @@ pub fn main_only(source: &str, base: &str) -> Option<String> {
 }
 
 /**
+ * The branches besides `base` that GitHub must still run a gated job for, since the daemon handles
+ * only PRs into `base`: the push filter's patterns that a feature branch does not match, and
+ * whether PRs into another branch trigger it. Negated patterns are dropped, so this errs to more
+ **/
+pub fn other_branches(source: &str, base: &str) -> (Vec<String>, bool) {
+    let Ok(root) = load(source) else {
+        return (Vec::new(), false);
+    };
+    let on = root.get(&key("on")).cloned().unwrap_or(Yaml::BadValue);
+    let list = |y: &Yaml| -> Vec<String> {
+        match y {
+            Yaml::String(p) => vec![p.clone()],
+            Yaml::Array(items) => items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let pushes = match &on["push"]["branches"] {
+        Yaml::BadValue => Vec::new(),
+        patterns => list(patterns)
+            .into_iter()
+            .filter(|p| p != base && !p.starts_with('!') && !p.starts_with("dependabot/"))
+            .filter(|p| !branch_patterns_match(&key(p)))
+            .collect(),
+    };
+    let prs = match &on {
+        Yaml::String(e) => e == "pull_request",
+        Yaml::Array(events) => events.iter().any(|e| e.as_str() == Some("pull_request")),
+        Yaml::Hash(events) => {
+            events
+                .get(&key("pull_request"))
+                .is_some_and(|pr| match &pr["branches"] {
+                    Yaml::BadValue => true,
+                    patterns => list(patterns)
+                        .iter()
+                        .any(|p| p != base && !p.starts_with('!')),
+                })
+        }
+        _ => false,
+    };
+    (pushes, prs)
+}
+
+/// The `if:` condition that is true where GitHub still runs a gated job, before the Dependabot clause
+fn on_branches(source: &str, base: &str) -> String {
+    let quote = |s: &str| s.replace('\'', "''");
+    let (pushes, prs) = other_branches(source, base);
+    let mut refs = vec![format!("github.ref == 'refs/heads/{}'", quote(base))];
+
+    for p in pushes {
+        let cond = match p.find(['*', '?', '[', '+']) {
+            None => format!("github.ref == 'refs/heads/{}'", quote(&p)),
+            // A prefix match runs it on more branches than the pattern, never fewer
+            Some(at) => format!("startsWith(github.ref, 'refs/heads/{}')", quote(&p[..at])),
+        };
+
+        if !refs.contains(&cond) {
+            refs.push(cond);
+        }
+    }
+
+    if prs {
+        refs.push(format!(
+            "(github.event_name == 'pull_request' && github.base_ref != '{}')",
+            quote(base)
+        ));
+    }
+
+    refs.join(" || ")
+}
+
+/**
  * The workflow with `if: github.ref == 'refs/heads/<base>'` on each of `jobs`, and-ed with an
- * `if:` a job has, so on a feature branch GitHub runs only the others. Triggers stay as they are.
- * None when a job's form is one this does not edit, or the result would parse otherwise
+ * `if:` a job has, so on a feature branch GitHub runs only the others. Pushes to the other branches
+ * the workflow names and PRs into them keep the jobs, since shipcheck runs only PRs into `base`.
+ * Triggers stay as they are. None when a job's form is one this does not edit, or the result would
+ * parse otherwise
  **/
 pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
     let plain = |s: &str| {
@@ -713,7 +801,10 @@ pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
         return None;
     }
 
-    let gate = format!("(github.ref == 'refs/heads/{base}' || github.actor == 'dependabot[bot]')");
+    let gate = format!(
+        "({} || github.actor == 'dependabot[bot]')",
+        on_branches(source, base)
+    );
     let root = load(source).ok()?;
     let parsed = Yaml::Hash(root.clone());
     let lines: Vec<&str> = source.lines().collect();
@@ -1261,12 +1352,21 @@ jobs: {}
     }
 
     #[test]
+    fn pull_request_target_is_its_own_trigger() {
+        assert!(on_pull_request_target("on: pull_request_target\n"));
+        assert!(on_pull_request_target(
+            "on:\n  pull_request_target:\n    types: [opened]\n"
+        ));
+        assert!(!on_pull_request_target("on: [pull_request]\n"));
+    }
+
+    #[test]
     fn gate_jobs_runs_local_jobs_on_github_only_on_the_base() {
         // flask's tests.yaml, trimmed: typing runs in shipcheck, the matrix stays
         let flask = "name: Tests\non:\n  pull_request:\n    paths-ignore: ['docs/**', 'README.md']\n  push:\n    branches: [main, stable]\njobs:\n  tests:\n    name: ${{ matrix.name || matrix.python }}\n    strategy:\n      matrix:\n        include:\n          - {python: '3.14'}\n    steps:\n      - run: uv run tox run\n  typing:\n    runs-on: ubuntu-latest\n    steps:\n      - run: uv run tox run -e typing\n";
         let want = flask.replace(
             "  typing:\n",
-            "  typing:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n",
+            "  typing:\n    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/stable' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n",
         );
         assert_eq!(
             gate_jobs(flask, &["typing".into()], "main").as_deref(),
@@ -1277,10 +1377,10 @@ jobs: {}
         let ripgrep = "on:\n  pull_request:\n  push:\n    branches:\n    - master\njobs:\n  test:\n    name: test\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n        - os: windows-latest\n    steps:\n    - run: cargo test\n  rustfmt:\n    runs-on: ubuntu-latest\n    if: (!cancelled() && !failure()) # after the rest\n    steps:\n    - run: cargo fmt --all --check\n  docs:\n    if: ${{ github.event_name != 'schedule' }}\n    runs-on: ubuntu-latest\n    steps:\n    - run: cargo doc\n";
         let gated = gate_jobs(ripgrep, &["rustfmt".into(), "docs".into()], "master").unwrap();
         assert!(gated.contains(
-            "    if: \"((!cancelled() && !failure())) && (github.ref == 'refs/heads/master' || github.actor == 'dependabot[bot]')\"\n"
+            "    if: \"((!cancelled() && !failure())) && (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.base_ref != 'master') || github.actor == 'dependabot[bot]')\"\n"
         ));
         assert!(gated.contains(
-            "    if: \"(github.event_name != 'schedule') && (github.ref == 'refs/heads/master' || github.actor == 'dependabot[bot]')\"\n"
+            "    if: \"(github.event_name != 'schedule') && (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.base_ref != 'master') || github.actor == 'dependabot[bot]')\"\n"
         ));
         assert!(gated.starts_with("on:\n  pull_request:\n  push:\n    branches:\n    - master\n"));
         assert_eq!(gated.lines().count(), ripgrep.lines().count());
@@ -1291,6 +1391,26 @@ jobs: {}
         assert!(gated.starts_with(
             "on:\n  push:\n\njobs:\n  checks:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n    runs-on"
         ));
+
+        // vite's ci.yml, trimmed: pushes to maintenance branches and PRs into them keep lint
+        let vite = "on:\n  push:\n    branches:\n      - main\n      - release/*\n      - \"v[0-9]+\"\n      - \"v[0-9]+.[0-9]+\"\n      - hotfix\n      - \"**\"\n      - \"!wip\"\n  pull_request:\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pnpm run lint\n";
+        let gated = gate_jobs(vite, &["lint".into()], "main").unwrap();
+        assert!(gated.contains(
+            "    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/hotfix' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n"
+        ), "{gated}");
+
+        // PRs only into the base need no clause for other branches
+        let into_main = "on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\njobs:\n  lint:\n    steps:\n      - run: make lint\n";
+        assert!(gate_jobs(into_main, &["lint".into()], "main").unwrap().contains(
+            "    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n"
+        ));
+        assert_eq!(
+            other_branches(
+                "on:\n  pull_request:\n    branches: [main, stable]\n",
+                "main"
+            ),
+            (Vec::new(), true)
+        );
 
         // A job in flow form, a missing job or an unusual base is left for the owner
         let flow = "on: push\njobs:\n  a: {runs-on: x, steps: [{run: make}]}\n";
