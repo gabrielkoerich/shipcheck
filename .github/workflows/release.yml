@@ -141,3 +141,20 @@ jobs:
 
           git -C tap-repo commit -m "Update shipcheck formula for ${VERSION}"
           git -C tap-repo push origin main
+
+  crate:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Permanent: a version can be yanked, never deleted, and it publishes the source
+      - name: Publish the crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set, skipping crates.io"
+            exit 0
+          fi
+
+          cargo publish --locked
