@@ -1,11 +1,8 @@
 name: ci
 
 on:
+  # Every branch, for e2e: it needs Docker in the job, and shipcheck checks the rest on PRs
   push:
-    branches: [main, "dependabot/**"]
-    paths-ignore: ["Formula/**", "**.md"]
-  # shipcheck checks test and gitleaks on PRs, e2e needs Docker in the job so GitHub runs it
-  pull_request:
     paths-ignore: ["Formula/**", "**.md"]
   workflow_dispatch: {}
 
