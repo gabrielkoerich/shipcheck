@@ -558,7 +558,7 @@ fn handle(
 
     let names = check::names(&plan);
     let send = |body: &serde_json::Value, id| sender.send(body, id);
-    let local = run::running(&plan.key) || background::running_here(repo, sha);
+    let local = run::running(&plan.key) || background::running_here(repo, sha, false);
     let result = if local { None } else { run::lookup(&plan) };
     let cutoff = check::iso(run::unix_now().saturating_sub(STALE_CLAIM_SECONDS));
 
@@ -568,7 +568,11 @@ fn handle(
 
     match decide(&existing, local, result.is_some(), may_run, &cutoff) {
         Action::Local => {
-            background::mark(&send, &existing, sha, &names, true)?;
+            // A run that posts marks its own checks, a mark from here could land after its result
+            if !background::running_here(repo, sha, true) {
+                background::mark(&send, &existing, sha, &names, true)?;
+            }
+
             Ok(None)
         }
         Action::Post => {
