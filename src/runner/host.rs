@@ -1011,11 +1011,6 @@ mod tests {
         }
     }
 
-    /// A check that runs `cargo test` is already jailed, and a jail cannot start inside it
-    fn nested() -> bool {
-        std::env::var_os("SHIPCHECK_JAIL").is_some()
-    }
-
     #[test]
     fn a_check_gets_the_toolchains_and_nothing_else_of_docker() {
         let (home, user) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1140,11 +1135,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_timeout_kills_the_whole_process_group() {
-        if nested() {
-            return;
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         let pid = dir.path().join("pid");
@@ -1173,11 +1165,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_finished_check_leaves_nothing_running() {
-        if nested() {
-            return;
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let (log, pid) = (dir.path().join("log"), dir.path().join("pid"));
         let cmd = format!("sleep 30 & echo $! > {}; echo hi; exit 3", pid.display());
@@ -1198,11 +1187,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn the_check_sees_no_token() {
-        if nested() {
-            return;
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         // Safe: tests in this module do not read these variables concurrently
@@ -1223,11 +1209,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_check_writes_its_summary_in_its_jail() {
-        if nested() {
-            return;
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let jail = jail(dir.path());
         let exit = run_command(
@@ -1350,11 +1333,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_check_serves_a_unix_socket_in_its_tmpdir_only() {
-        if nested() {
-            return;
-        }
-
         // A jail as `run` makes it: the clone, a home of its own that is TMPDIR, and a cache
         let (clone, cache, outside) = (
             tempfile::tempdir().unwrap(),
@@ -1389,11 +1369,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_check_writes_only_in_its_jail() {
-        if nested() {
-            return;
-        }
-
         let (dir, outside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let log = outside.path().join("log");
         let canary = outside.path().join("canary");
@@ -1530,11 +1507,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn identity_holds_each_version_output() {
-        if nested() {
-            return;
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let host = |versions: &[&str]| {
             Host::new(

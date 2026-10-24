@@ -48,12 +48,8 @@ versions = ["echo tool 1.0"]
 }
 
 #[test]
+#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
 fn runs_host_checks_caches_by_tree_and_commits() {
-    // A shipcheck host check runs this test jailed, and macOS refuses a sandbox inside a sandbox
-    if std::env::var_os("SHIPCHECK_JAIL").is_some() {
-        return;
-    }
-
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary, and it sets the environment before any thread
     unsafe {

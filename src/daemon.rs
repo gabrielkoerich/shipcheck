@@ -1024,10 +1024,25 @@ mod tests {
         }
 
         let home = tempfile::tempdir().unwrap();
+        // An act-mode plan reads `act --version`, and GitHub's test job has no act
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("act"), "#!/bin/sh\necho act version 0.0.0\n").unwrap();
+        std::fs::set_permissions(
+            bin.join("act"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let out = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &format!("daemon::tests::{name}")])
             .env("SHIPCHECK_DAEMON_CHILD", "1")
             .env("SHIPCHECK_HOME", home.path())
+            .env("PATH", path)
             .output()
             .unwrap();
         let said = String::from_utf8_lossy(&out.stdout);
