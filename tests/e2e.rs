@@ -930,6 +930,15 @@ fn runs_caches_and_tests_the_working_copy() {
     assert!(String::from_utf8_lossy(&post.stderr).contains("--home-ok"));
     let post = cli(&["post", "--home-ok"]);
     assert_eq!(post.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&post.stderr).contains("is the default branch"));
+    // Off the default branch the refusal is the missing config
+    git(&fresh, &["switch", "-q", "-c", "feature"]);
+    fs::write(fresh.join("note.txt"), "x").unwrap();
+    git(&fresh, &["add", "-A"]);
+    git(&fresh, &["commit", "-qm", "note"]);
+    assert_eq!(cli(&["run", "--no-fetch"]).status.code(), Some(0));
+    let post = cli(&["post", "--home-ok"]);
+    assert_eq!(post.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&post.stderr).contains("is not a check"));
 
     // clean removes this repository's warm template and slots, and --all also the results
