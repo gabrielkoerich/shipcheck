@@ -100,8 +100,11 @@ fn push_runs(filter: &Yaml) -> bool {
     }
 }
 
+/// Dependabot's branches, which GitHub's runners test, since no person pushes them from a machine with shipcheck
+pub const DEPENDABOT: &str = "\"dependabot/**\"";
+
 // GitHub's glob rules, where `*` stops at `/`, against an ordinary branch name. `*`, `**` and `**/*`
-// match it, `main`, `main*`, `feature/*` and `release/**` do not
+// match it, `main`, `main*`, `feature/*`, `release/**` and Dependabot's branches do not
 fn branch_patterns_match(patterns: &Yaml) -> bool {
     let list = match patterns {
         Yaml::String(p) => vec![p.as_str()],
@@ -109,12 +112,14 @@ fn branch_patterns_match(patterns: &Yaml) -> bool {
         _ => return false,
     };
 
-    list.iter().any(|p| {
-        globset::GlobBuilder::new(p)
-            .literal_separator(true)
-            .build()
-            .is_ok_and(|g| g.compile_matcher().is_match("shipcheck-any-branch"))
-    })
+    list.iter()
+        .filter(|p| !p.starts_with("dependabot/"))
+        .any(|p| {
+            globset::GlobBuilder::new(p)
+                .literal_separator(true)
+                .build()
+                .is_ok_and(|g| g.compile_matcher().is_match("shipcheck-any-branch"))
+        })
 }
 
 /// One `run` or `uses` step, with the working directory and shell from the step, the job or the workflow
@@ -612,7 +617,10 @@ pub fn main_only(source: &str, base: &str) -> Option<String> {
                 .collect(),
             _ => return None,
         };
-        let mut block = vec!["  push:".to_string(), format!("    branches: [{base}]")];
+        let mut block = vec![
+            "  push:".to_string(),
+            format!("    branches: [{base}, {DEPENDABOT}]"),
+        ];
         block.extend(
             events
                 .iter()
@@ -654,7 +662,7 @@ pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
         return None;
     }
 
-    let gate = format!("github.ref == 'refs/heads/{base}'");
+    let gate = format!("(github.ref == 'refs/heads/{base}' || github.actor == 'dependabot[bot]')");
     let root = load(source).ok()?;
     let parsed = Yaml::Hash(root.clone());
     let lines: Vec<&str> = source.lines().collect();
@@ -799,7 +807,7 @@ fn edit_events(body: &[&str], base: &str, keep_push: bool) -> Vec<String> {
         }
         Some(&(_, s, e)) if value_of(body[s]).is_empty() && e > s + 1 => {
             let (sub, filters) = entries(&body[s + 1..e]);
-            new_push.push(format!("{sub}branches: [{base}]"));
+            new_push.push(format!("{sub}branches: [{base}, {DEPENDABOT}]"));
             let mut at = s + 1;
 
             for (k, fs, fe) in filters {
@@ -811,7 +819,7 @@ fn edit_events(body: &[&str], base: &str, keep_push: bool) -> Vec<String> {
 
             new_push.extend(body[at..e].iter().map(|l| l.to_string()));
         }
-        _ => new_push.push(format!("{indent}  branches: [{base}]")),
+        _ => new_push.push(format!("{indent}  branches: [{base}, {DEPENDABOT}]")),
     }
 
     let mut out = Vec::new();
@@ -1120,7 +1128,7 @@ jobs: {}
 
 on:
   push:
-    branches: [main]
+    branches: [main, "dependabot/**"]
     paths-ignore: ["docs/**"]
   # PRs too
   workflow_dispatch:
@@ -1135,27 +1143,27 @@ jobs: {}
         let cases = [
             (
                 "on: [push, pull_request, workflow_dispatch] # all\n\njobs: {}\n",
-                "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs: {}\n",
+                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\n  workflow_dispatch:\n\njobs: {}\n",
             ),
             (
                 "on: pull_request\njobs: {}\n",
-                "on:\n  push:\n    branches: [trunk]\njobs: {}\n",
+                "on:\n  push:\n    branches: [trunk, \"dependabot/**\"]\njobs: {}\n",
             ),
             (
                 "on:\n  - push\n  - merge_group\njobs: {}\n",
-                "on:\n  push:\n    branches: [main]\n  merge_group:\njobs: {}\n",
+                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\n  merge_group:\njobs: {}\n",
             ),
             (
                 "on:\n  pull_request:\n    types: [opened]\n  schedule:\n    - cron: \"0 0 * * *\"\njobs: {}\n",
-                "on:\n  push:\n    branches: [main]\n  schedule:\n    - cron: \"0 0 * * *\"\njobs: {}\n",
+                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\n  schedule:\n    - cron: \"0 0 * * *\"\njobs: {}\n",
             ),
             (
                 "\"on\":\n    push:\n        branches-ignore:\n            - main\n        tags: [\"v*\"]\njobs: {}\n",
-                "\"on\":\n    push:\n        branches: [main]\n        tags: [\"v*\"]\njobs: {}\n",
+                "\"on\":\n    push:\n        branches: [main, \"dependabot/**\"]\n        tags: [\"v*\"]\njobs: {}\n",
             ),
             (
                 "on:\n  push:\n  pull_request:\njobs: {}",
-                "on:\n  push:\n    branches: [main]\njobs: {}",
+                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\njobs: {}",
             ),
         ];
 
@@ -1186,7 +1194,7 @@ jobs: {}
         let flask = "name: Tests\non:\n  pull_request:\n    paths-ignore: ['docs/**', 'README.md']\n  push:\n    branches: [main, stable]\njobs:\n  tests:\n    name: ${{ matrix.name || matrix.python }}\n    strategy:\n      matrix:\n        include:\n          - {python: '3.14'}\n    steps:\n      - run: uv run tox run\n  typing:\n    runs-on: ubuntu-latest\n    steps:\n      - run: uv run tox run -e typing\n";
         let want = flask.replace(
             "  typing:\n",
-            "  typing:\n    if: github.ref == 'refs/heads/main'\n",
+            "  typing:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n",
         );
         assert_eq!(
             gate_jobs(flask, &["typing".into()], "main").as_deref(),
@@ -1197,10 +1205,10 @@ jobs: {}
         let ripgrep = "on:\n  pull_request:\n  push:\n    branches:\n    - master\njobs:\n  test:\n    name: test\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n        - os: windows-latest\n    steps:\n    - run: cargo test\n  rustfmt:\n    runs-on: ubuntu-latest\n    if: (!cancelled() && !failure()) # after the rest\n    steps:\n    - run: cargo fmt --all --check\n  docs:\n    if: ${{ github.event_name != 'schedule' }}\n    runs-on: ubuntu-latest\n    steps:\n    - run: cargo doc\n";
         let gated = gate_jobs(ripgrep, &["rustfmt".into(), "docs".into()], "master").unwrap();
         assert!(gated.contains(
-            "    if: \"((!cancelled() && !failure())) && github.ref == 'refs/heads/master'\"\n"
+            "    if: \"((!cancelled() && !failure())) && (github.ref == 'refs/heads/master' || github.actor == 'dependabot[bot]')\"\n"
         ));
         assert!(gated.contains(
-            "    if: \"(github.event_name != 'schedule') && github.ref == 'refs/heads/master'\"\n"
+            "    if: \"(github.event_name != 'schedule') && (github.ref == 'refs/heads/master' || github.actor == 'dependabot[bot]')\"\n"
         ));
         assert!(gated.starts_with("on:\n  pull_request:\n  push:\n    branches:\n    - master\n"));
         assert_eq!(gated.lines().count(), ripgrep.lines().count());
@@ -1209,7 +1217,7 @@ jobs: {}
         let push_only = "on:\n  push:\n\njobs:\n  checks:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bun test\n  tests:\n    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-latest]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test\n";
         let gated = gate_jobs(push_only, &["checks".into()], "main").unwrap();
         assert!(gated.starts_with(
-            "on:\n  push:\n\njobs:\n  checks:\n    if: github.ref == 'refs/heads/main'\n    runs-on"
+            "on:\n  push:\n\njobs:\n  checks:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n    runs-on"
         ));
 
         // A job in flow form, a missing job or an unusual base is left for the owner
