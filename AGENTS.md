@@ -22,8 +22,7 @@ Every change must keep these. Each one closes a way a check could pass without t
 
 - Opinionated defaults. Setup is: install the binary, `shipcheck init`, merge `shipcheck.toml`, install the App. Every option has a default that works, and none is required. A change that adds a step, a question or a required option to that path needs a reason in its PR. Otherwise it gets a default.
 - Rust, one crate with one binary, `shipcheck`. The daemon is `shipcheck daemon`.
-- User docs live in `site/content/docs`. Update them in the same commit as a change users can see.
-- `SKILL.md` at the root tells agents how to use shipcheck. Keep it true to the CLI. The site serves it, a `.md` copy of every docs page, `llms.txt` and `llms-full.txt`, all written by `site/scripts/build-agent-files.py` after `zola build`.
+- `SKILL.md` at the root tells agents how to use shipcheck. Keep it true to the CLI. https://shipcheck.run serves it.
 - `Formula/shipcheck.rb` is the Homebrew template. The release workflow fills in versions and checksums and pushes it to `gabrielkoerich/homebrew-tap`.
 - Call `act` and `git` as processes. Do not embed or reimplement them.
 - The cache key needs a test with fixed inputs and a fixed expected digest.
