@@ -48,7 +48,6 @@ versions = ["echo tool 1.0"]
 }
 
 #[test]
-#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
 fn runs_host_checks_caches_by_tree_and_commits() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary, and it sets the environment before any thread
@@ -99,8 +98,10 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     assert_eq!(entry.workflows[0].file, "host");
     assert_eq!(entry.workflows[0].jobs.len(), 4);
     assert!(entry.workflows[0].jobs.values().all(|s| s == "success"));
-    // The sandbox kept the check's writes in its clone
-    assert!(!real_home.exists() && !outside.exists());
+    // The sandbox kept the check's writes in its clone. Nested in a host check, the outer jail
+    // stands in for it and lets its own temp folder be written, where `outside` is
+    assert!(!real_home.exists());
+    assert_eq!(outside.exists(), shipcheck::runner::host::in_a_jail());
     assert!(!log().contains("hunter2"));
     // The checks ran in clones, never in the developer's checkout
     assert_eq!(git(&work, &["status", "--porcelain"]), "");
