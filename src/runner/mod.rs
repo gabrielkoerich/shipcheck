@@ -68,6 +68,8 @@ pub struct Outcome {
     pub shards: Option<u32>,
     /// What the job's steps wrote to `$GITHUB_STEP_SUMMARY`, in step order, cut to [`MAX_SUMMARY`]
     pub summary: String,
+    /// act said the job's `if:` skipped it
+    pub skipped: bool,
 }
 
 /// The most of one job's step summary that is kept, in bytes

@@ -975,6 +975,7 @@ impl Runner for Host {
             outputs: BTreeMap::new(),
             shards: None,
             summary: read_summary(&jail.home),
+            skipped: false,
         })
     }
 
