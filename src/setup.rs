@@ -2651,7 +2651,7 @@ jobs:
 
     #[test]
     fn a_matrix_of_one_combination_is_a_plain_job() {
-        // bean's ci.yml and git-cow's, trimmed
+        // A Python app's ci.yml and git-cow's, trimmed
         let ci = r#"on: push
 jobs:
   test:

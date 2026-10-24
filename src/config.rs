@@ -365,7 +365,7 @@ impl Act {
     }
 }
 
-/// Memory a job is given in the `max_parallel` cap. flask's jobs peaked at 0.38 GiB, and one bean job
+/// Memory a job is given in the `max_parallel` cap. flask's jobs peaked at 0.38 GiB, and one job of a Python app
 /// at 2.2 GiB still fits beside light ones
 pub const JOB_MEMORY: u64 = 1 << 30;
 

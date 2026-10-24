@@ -612,9 +612,9 @@ mod tests {
     #[test]
     fn skips_a_continue_on_error_step_and_names_the_inner_composite_step() {
         let log = format!(
-            "{PREFIX} ⭐ Run Main Run bean-check\n\
+            "{PREFIX} ⭐ Run Main Run app-check\n\
              {PREFIX} Failed but continue next step\n\
-             {PREFIX}   ❌  Failure - Main Run bean-check [1.7s]\n\
+             {PREFIX}   ❌  Failure - Main Run app-check [1.7s]\n\
              {PREFIX} ⭐ Run Main ./.github/actions/setup\n\
              {PREFIX} ⭐ Run Main Install deps\n\
              {PREFIX}   | E: no such package\n\
