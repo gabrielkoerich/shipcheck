@@ -624,6 +624,13 @@ fn handle(
             );
 
             if verdict == Pushed::Wait {
+                if since.is_zero() {
+                    println!(
+                        "{repo}#{number}: GitHub has not said who pushed {} yet, asking again every poll",
+                        &sha[..12]
+                    );
+                }
+
                 waits.insert((repo.to_string(), number), sha.clone());
                 background::mark(&send, &existing, sha, &names, false)?;
                 return Ok(None);
