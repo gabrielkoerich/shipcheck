@@ -938,10 +938,13 @@ fn gate(
         .filter(|id| !local(id))
         .collect();
 
-    // Until no job left on GitHub needs a gated one
+    // A gated job still runs on the base branch, so a job that runs only there may need it
+    let base_only = crate::setup::base_only(jobs);
+
+    // Until no job left on GitHub for PRs needs a gated one
     while let Some(need) = jobs
         .iter()
-        .filter(|j| ungated.contains(&j.id))
+        .filter(|j| ungated.contains(&j.id) && !base_only.contains(&j.id))
         .flat_map(|j| j.needs.iter())
         .find(|n| !ungated.contains(*n))
         .cloned()
@@ -1373,6 +1376,38 @@ mod tests {
         .unwrap();
         assert_eq!(said.0[0], "ok wrote shipcheck.toml");
         assert!(dir.path().join("shipcheck.toml").exists());
+    }
+
+    #[test]
+    fn a_job_that_runs_only_on_main_keeps_no_pr_job_ungated() {
+        let ci = crate::setup::tests::CI_WITH_RELEASE;
+        let config = "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n";
+        let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
+        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let mut said = Said::default();
+        apply(
+            dir.path(),
+            &plan,
+            &plan.recommended(),
+            &mut finish_nothing,
+            &mut said,
+        )
+        .unwrap();
+        // release needs test only on main, where the gate still runs it, and e2e stays on PRs
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
+            ci.replace(
+                "  test:\n",
+                "  test:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n"
+            ),
+        );
+        assert!(
+            plan.workflows[0]
+                .yes
+                .contains("GitHub keeps running e2e on PRs"),
+            "{}",
+            plan.workflows[0].yes
+        );
     }
 
     #[test]
