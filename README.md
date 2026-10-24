@@ -27,22 +27,16 @@ Or with the install script:
 curl -fsSL https://shipcheck.run/install.sh | sh
 ```
 
-Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) or [mise](https://mise.jdx.dev), which download the same signed release binary, no Rust needed:
+Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same signed release binary, no Rust needed:
 
 ```sh
 cargo binstall shipcheck
-mise use -g cargo:shipcheck
 ```
 
-Or build it with cargo, Rust 1.89 or later. A build gets a new signature each time, so macOS asks once per keychain item after it:
+Or build it from source with cargo, Rust 1.89 or later, from crates.io or from this repository. A build gets a new signature each time, so macOS asks once per keychain item after it:
 
 ```sh
 cargo install shipcheck
-```
-
-Or from source:
-
-```sh
 cargo install --git https://github.com/gabrielkoerich/shipcheck shipcheck
 ```
 
