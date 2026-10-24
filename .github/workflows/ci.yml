@@ -8,10 +8,9 @@ on:
 permissions:
   contents: read
 
-# A newer push queues behind a release instead of cancelling it halfway
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -40,6 +39,10 @@ jobs:
     needs: test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Two pushes close together would compute the same next tag, so they queue
+    concurrency:
+      group: release
+      cancel-in-progress: false
     outputs:
       skip: ${{ steps.check.outputs.skip }}
       version: ${{ steps.version.outputs.version }}
@@ -218,6 +221,9 @@ jobs:
     needs: [check-release, build]
     if: needs.check-release.outputs.skip == 'false'
     runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
