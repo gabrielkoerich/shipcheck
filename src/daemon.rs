@@ -253,9 +253,6 @@ fn cycle(
     Ok(())
 }
 
-// GitHub lists events from 30 seconds to hours late, past this a head no source names stays unrun
-const PUSH_WAIT: Duration = Duration::from_secs(30 * 60);
-
 type State<'a> = (
     &'a mut HashSet<(String, String)>,
     &'a mut HashMap<(String, String), Instant>,
@@ -384,10 +381,9 @@ fn tainted(checkout: &Path, head: &str, refused: &BTreeMap<String, u64>) -> Opti
 #[derive(Debug, PartialEq)]
 enum Pushed {
     Run,
-    /// No source names the pusher yet
+    /// No source names the pusher yet. GitHub lists events from 30 seconds to hours late, so the
+    /// head waits and every poll asks again, never giving up on a PR
     Wait,
-    /// No source named the pusher in PUSH_WAIT, which is no evidence against them
-    GiveUp,
     /// Another login pushed it, and main does not list them
     Other,
 }
@@ -397,13 +393,7 @@ enum Pushed {
  * own user or a login `daemon_authors` on main lists, since anyone with write access can push to
  * any PR's branch. Never by a commit's author email, which anyone can set
  **/
-fn pushed(
-    opener: &str,
-    pusher: Option<&str>,
-    me: &str,
-    listed: &[String],
-    since: Duration,
-) -> Pushed {
+fn pushed(opener: &str, pusher: Option<&str>, me: &str, listed: &[String]) -> Pushed {
     let allowed = |login: &str| {
         !login.is_empty()
             && (login.eq_ignore_ascii_case(me)
@@ -414,8 +404,7 @@ fn pushed(
         _ if !allowed(opener) => Pushed::Other,
         Some(p) if allowed(p) => Pushed::Run,
         Some(_) => Pushed::Other,
-        None if since < PUSH_WAIT => Pushed::Wait,
-        None => Pushed::GiveUp,
+        None => Pushed::Wait,
     }
 }
 
@@ -424,11 +413,6 @@ fn pushed(
 fn refusal(verdict: &Pushed) -> Option<(&'static str, &'static str, bool)> {
     match verdict {
         Pushed::Run | Pushed::Wait => None,
-        Pushed::GiveUp => Some((
-            "not run, no source named who pushed this head after 30 minutes",
-            "pusher_unknown",
-            false,
-        )),
         Pushed::Other => Some((
             "not run, opened or pushed by a login that is not this machine's and daemon_authors on main does not list",
             "pusher_not_allowed",
@@ -637,7 +621,6 @@ fn handle(
                 pusher.as_ref().map(|(login, _)| login.as_str()),
                 me,
                 &plan.config.daemon_authors,
-                since,
             );
 
             if verdict == Pushed::Wait {
@@ -761,50 +744,42 @@ mod tests {
     fn runs_only_heads_its_own_user_or_a_listed_login_opened_and_pushed() {
         let none: &[String] = &[];
         let listed = ["Bob".to_string()];
-        let now = Duration::ZERO;
         assert_eq!(
-            pushed("ann", Some("Ann"), "ann", none, now),
+            pushed("ann", Some("Ann"), "ann", none),
             Pushed::Run,
             "logins match in any case"
         );
         assert_eq!(
-            pushed("bob", Some("bob"), "ann", &listed, now),
+            pushed("bob", Some("bob"), "ann", &listed),
             Pushed::Run,
             "main lists bob"
         );
         assert_eq!(
-            pushed("ann", Some("bob"), "ann", &listed, now),
+            pushed("ann", Some("bob"), "ann", &listed),
             Pushed::Run,
             "both allowed"
         );
         assert_eq!(
-            pushed("ann", Some("eve"), "ann", &listed, now),
+            pushed("ann", Some("eve"), "ann", &listed),
             Pushed::Other,
             "a teammate's push onto my PR"
         );
         assert_eq!(
-            pushed("eve", Some("ann"), "ann", &listed, now),
+            pushed("eve", Some("ann"), "ann", &listed),
             Pushed::Other,
             "my push onto a teammate's PR"
         );
         assert_eq!(
-            pushed("eve", None, "ann", none, now),
+            pushed("eve", None, "ann", none),
             Pushed::Other,
             "no wait for a PR it would refuse"
         );
         assert_eq!(
-            pushed("ann", None, "ann", &listed, Duration::from_secs(60)),
+            pushed("ann", None, "ann", &listed),
             Pushed::Wait,
             "no push event yet"
         );
-        assert_eq!(
-            pushed("ann", None, "ann", &listed, PUSH_WAIT),
-            Pushed::GiveUp
-        );
-        assert_eq!(
-            pushed("", Some(""), "", &["".to_string()], now),
-            Pushed::Other
-        );
+        assert_eq!(pushed("", Some(""), "", &["".to_string()]), Pushed::Other);
     }
 
     #[test]
@@ -862,12 +837,6 @@ mod tests {
 
     #[test]
     fn only_a_known_pusher_who_is_not_allowed_marks_a_head_refused() {
-        let (_, reason, mark) = refusal(&Pushed::GiveUp).unwrap();
-        assert_eq!(reason, "pusher_unknown");
-        assert!(
-            !mark,
-            "silence is no evidence, heads on top of it still run"
-        );
         let (_, reason, mark) = refusal(&Pushed::Other).unwrap();
         assert_eq!(reason, "pusher_not_allowed");
         assert!(mark);
