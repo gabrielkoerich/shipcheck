@@ -258,8 +258,9 @@ pub fn parse_checks(runs: &Value) -> Checks {
 /**
  * Who pushed head `sha` of PR `pr`, and which source said so, None while none does. Exact sources
  * first: the PR timeline lists a force-push, such as a rebase "Update branch", at once, and a merge
- * "Update branch" is a commit GitHub signs with the clicker as author. The repository's events
- * cover a plain push, and GitHub lists them from 30 seconds to hours late
+ * "Update branch" is a commit GitHub signs with the clicker as author. A PR merged into the branch,
+ * such as a stacked PR, names who merged it. The repository's events cover a plain push, and GitHub
+ * lists them from 30 seconds to hours late
  **/
 pub fn find_pusher(
     token: &str,
@@ -284,6 +285,22 @@ pub fn find_pusher(
 
     if let Some(login) = web_merge(&commits, sha) {
         return Ok(Some((login, "merge-commit")));
+    }
+
+    // ponytail: the 100 PRs into the branch closed last
+    let closed = get(
+        &format!(
+            "{API}/repos/{repo}/pulls?state=closed&base={branch}&sort=updated&direction=desc&per_page=100"
+        ),
+        token,
+    )?;
+
+    if let Some(number) = merged_into(&closed, branch, sha) {
+        let merged = get(&format!("{API}/repos/{repo}/pulls/{number}"), token)?;
+
+        if let Some(login) = merged["merged_by"]["login"].as_str() {
+            return Ok(Some((login.to_string(), "merged-pr")));
+        }
     }
 
     // ponytail: first 100 events
@@ -335,6 +352,15 @@ pub fn web_merge(commits: &[Value], sha: &str) -> Option<String> {
     }
 
     c["author"]["login"].as_str().map(String::from)
+}
+
+/// The number of the PR into `branch` whose merge made `sha`
+pub fn merged_into(pulls: &Value, branch: &str, sha: &str) -> Option<u64> {
+    pulls.as_array()?.iter().find_map(|p| {
+        let made =
+            p["merge_commit_sha"] == sha && p["base"]["ref"] == branch && !p["merged_at"].is_null();
+        made.then(|| p["number"].as_u64())?
+    })
 }
 
 /// The login of the push event that moved `branch` to `sha`
@@ -449,6 +475,22 @@ mod tests {
             None,
             "a plain push is only a commit"
         );
+    }
+
+    #[test]
+    fn finds_the_pr_whose_merge_made_the_head() {
+        let sha = "7f32acaf1e3db3e0192f492f9c7d3cf2ba0f432f";
+        let pulls = serde_json::json!([
+            {"number": 58, "merge_commit_sha": sha, "base": {"ref": "cloud-only"}, "merged_at": null},
+            {"number": 59, "merge_commit_sha": sha, "base": {"ref": "main"}, "merged_at": "2026-10-24T11:08:29Z"},
+            {"number": 57, "merge_commit_sha": sha, "base": {"ref": "cloud-only"}, "merged_at": "2026-10-24T11:08:29Z"}
+        ]);
+        assert_eq!(
+            merged_into(&pulls, "cloud-only", sha),
+            Some(57),
+            "a closed PR that never merged, or one into another branch, names no one"
+        );
+        assert_eq!(merged_into(&pulls, "cloud-only", &"0".repeat(40)), None);
     }
 
     #[test]
