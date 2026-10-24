@@ -647,6 +647,9 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
         for word in check.command.split_whitespace() {
             let version = if let Some(t) = word.strip_prefix("RUSTUP_TOOLCHAIN=") {
                 format!("rustc +{t} --version")
+            } else if let Some(v) = word.strip_prefix("UV_PYTHON=") {
+                // uv downloads a missing one on first use, which then changes the key once
+                format!("uv python find {v} --show-version || echo missing")
             } else if let Some(home) = word.strip_prefix("JAVA_HOME=") {
                 // It prints to stderr, and `versions` keep stdout
                 format!("{home}/bin/java -version 2>&1")
@@ -660,7 +663,50 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
         }
     }
 
+    // The Python uv picks, which a check without `UV_PYTHON` runs on and which this machine can change
+    let unpinned = d.checks.iter().any(|c| {
+        c.command
+            .split_whitespace()
+            .any(|w| w == "uv" || w == "uvx")
+            && !c.command.contains("UV_PYTHON=")
+    });
+    let found = "uv python find --show-version".to_string();
+
+    if unpinned && !d.versions.contains(&found) {
+        d.versions.push(found);
+    }
+
     d
+}
+
+/**
+ * The literal `python-version` of the job's `setup-python` step, such as `3.13` or `3.14t`, when a
+ * step runs uv, which takes it from `UV_PYTHON`. None for `3.x`, a list, PyPy or an expression
+ **/
+fn setup_python(job: &crate::workflow::Job) -> Option<String> {
+    let runs_uv = job.steps.iter().any(|s| {
+        s.run
+            .split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
+            .any(|w| w == "uv" || w == "uvx")
+    });
+    let version = job
+        .steps
+        .iter()
+        .filter(|s| {
+            s.uses
+                .as_deref()
+                .and_then(|u| u.split('@').next())
+                .is_some_and(|a| a == "actions/setup-python")
+        })
+        .find_map(|s| input(s, "python-version"))?;
+    let number = version.strip_suffix('t').unwrap_or(&version);
+    let plain = !number.is_empty()
+        && number.split('.').count() <= 3
+        && number
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+
+    (runs_uv && plain).then_some(version)
 }
 
 /// A job's command and the `NAME=value` exports it needs in front
@@ -1268,6 +1314,11 @@ fn job_check(
         let home = jdk.home.display();
         exports.push(format!("JAVA_HOME={home}"));
         exports.push(format!("PATH={home}/bin:\"$PATH\""));
+    }
+
+    // As `setup-python` leaves it for uv. A version file or a matrix leaves uv to choose
+    if let Some(version) = setup_python(job) {
+        exports.push(format!("UV_PYTHON={version}"));
     }
 
     for (name, value) in &job.env {
@@ -2531,6 +2582,65 @@ jobs:
     }
 
     #[test]
+    fn a_literal_setup_python_version_pins_uv_and_goes_into_the_key() {
+        let ci = r#"on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: uv run pytest
+  typing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: pyproject.toml
+      - run: uv run mypy
+"#;
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        let command = |name: &str| {
+            let check = found.checks.iter().find(|c| c.name == name).unwrap();
+            check.command.clone()
+        };
+        assert_eq!(command("test"), "export UV_PYTHON=3.13 && uv run pytest");
+        assert_eq!(command("typing"), "uv run mypy");
+        assert!(
+            found
+                .versions
+                .contains(&"uv python find 3.13 --show-version || echo missing".to_string()),
+            "{:?}",
+            found.versions
+        );
+        assert!(
+            found
+                .versions
+                .contains(&"uv python find --show-version".to_string()),
+            "{:?}",
+            found.versions
+        );
+
+        let job = |version: &str, run: &str| {
+            let ci = format!(
+                "on: push\njobs:\n  t:\n    steps:\n      - uses: actions/setup-python@v6\n        with:\n          python-version: {version}\n      - run: {run}\n"
+            );
+            let jobs = crate::workflow::job_runs(&ci);
+            setup_python(&jobs[0])
+        };
+        assert_eq!(job("'3.14t'", "uv run pytest").as_deref(), Some("3.14t"));
+        assert_eq!(
+            job("3.12.4", "cd x && uvx ruff check").as_deref(),
+            Some("3.12.4")
+        );
+        assert_eq!(job("'3.x'", "uv run pytest"), None);
+        assert_eq!(job("pypy-3.11", "uv run pytest"), None);
+        assert_eq!(job("${{ matrix.python }}", "uv run pytest"), None);
+        assert_eq!(job("'3.13'", "pytest"), None);
+    }
+
+    #[test]
     fn a_jdk_this_machine_has_is_pinned_and_a_missing_one_keeps_the_job_on_github() {
         let ci = r#"on: pull_request
 jobs:
@@ -2761,7 +2871,10 @@ jobs:
 
         let (cfg, _, _) = init_with(&[("pyproject.toml", ""), ("uv.lock", "")]);
         assert_eq!(checks(&cfg), [("test", "uv run pytest")]);
-        assert_eq!(cfg.host.versions, ["uv --version"]);
+        assert_eq!(
+            cfg.host.versions,
+            ["uv --version", "uv python find --show-version"]
+        );
         let (cfg, _, _) = init_with(&[("pyproject.toml", "")]);
         assert_eq!(checks(&cfg), [("test", "pytest")]);
 
