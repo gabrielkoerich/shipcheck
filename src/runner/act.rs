@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -413,7 +415,15 @@ impl Runner for Act {
 
         crate::run::timing(file, job, "act prepare", began);
         let spawned = Instant::now();
+        let mut reaper = reaper(run_dir);
+        // A group of its own, so the reaper can stop act and the docker commands it runs
+        cmd.process_group(0);
         let mut child = cmd.spawn().map_err(|e| format!("act: {e}"))?;
+
+        if let Some(stdin) = reaper.as_mut().and_then(|r| r.stdin.as_mut()) {
+            let _ = writeln!(stdin, "{}", child.id());
+        }
+
         let deadline = Instant::now() + request.timeout;
         let timed = std::env::var_os("SHIPCHECK_TIMINGS").is_some();
         // Log lines that end each phase of act's start, printed once each
@@ -441,6 +451,12 @@ impl Runner for Act {
 
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
                 crate::run::timing(file, job, "act total", spawned);
+
+                // act ended by itself and removed its containers, so the reaper has nothing to do
+                if let Some(stdin) = reaper.as_mut().and_then(|r| r.stdin.as_mut()) {
+                    let _ = writeln!(stdin, "done");
+                }
+
                 break status.code();
             }
 
@@ -452,6 +468,12 @@ impl Runner for Act {
 
             std::thread::sleep(Duration::from_millis(if timed { 50 } else { 200 }));
         };
+
+        // Without `done`, as after a timeout, it stops act and removes what act left
+        if let Some(mut reaper) = reaper {
+            drop(reaper.stdin.take());
+            let _ = reaper.wait();
+        }
 
         let at = Instant::now();
         hand_back(run_dir);
@@ -473,18 +495,9 @@ impl Runner for Act {
     }
 
     /// A dead run's containers still mount its slot's directory, and holding the slot's lock proves
-    /// the run is dead. Docker matches the exact mount path, never a parent
+    /// the run is dead
     fn reclaim(&self, run_dir: &Path) {
-        let mut paths = vec![run_dir.to_path_buf()];
-
-        // act mounts the path its working directory resolves to, /private/var for /var on macOS
-        if let (Some(parent), Some(name)) = (run_dir.parent(), run_dir.file_name())
-            && let Ok(real) = parent.canonicalize()
-        {
-            paths.push(real.join(name));
-        }
-
-        for path in paths {
+        for path in mount_paths(run_dir) {
             // Both filters must match, so only act's own job containers can ever be removed
             let Ok(out) = Command::new("docker")
                 .args(["ps", "-aq", "--filter", "name=^act-", "--filter"])
@@ -1620,6 +1633,48 @@ fn unsupported_jobs(log: &str) -> Vec<String> {
         .collect()
 }
 
+/// The paths act's containers mount a run's directory at. Docker matches the exact path, never a
+/// parent, and act mounts the one its working directory resolves to, /private/var for /var on macOS
+fn mount_paths(run_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![run_dir.to_path_buf()];
+
+    if let (Some(parent), Some(name)) = (run_dir.parent(), run_dir.file_name())
+        && let Ok(real) = parent.canonicalize()
+    {
+        paths.push(real.join(name));
+    }
+
+    paths
+}
+
+/**
+ * Stops act and removes its containers and network when shipcheck dies before act ends, by a
+ * signal or a timeout. It reads act's group, then waits: `done` means act ended by itself, and an
+ * end of input without it means shipcheck is gone. Its own group, so a signal to shipcheck's spares it
+ **/
+const REAPER: &str = r#"read -r pgid || exit 0
+read -r done && exit 0
+kill -KILL -- "-$pgid" 2>/dev/null
+net=$1
+shift
+for p in "$@"; do
+  docker ps -aq --filter name=^act- --filter "volume=$p" | while read -r id; do docker rm -f -v "$id"; done
+done
+docker network rm "$net"
+"#;
+
+fn reaper(run_dir: &Path) -> Option<std::process::Child> {
+    Command::new("sh")
+        .args(["-c", REAPER, "sh", &network_name(run_dir)])
+        .args(mount_paths(run_dir))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()
+}
+
 /// What separates a run's act process from another's: its containers, apt volume and network
 fn run_tag(run_dir: &Path) -> String {
     cache::hex(&Sha256::digest(run_dir.to_string_lossy().as_bytes())[..4])
@@ -2295,6 +2350,61 @@ jobs:
         assert!(status.success());
         assert!(fs::create_dir(home.join(".bun/install/bin")).is_ok());
         assert!(fs::create_dir(home.join(".bun/bin")).is_ok());
+    }
+
+    #[test]
+    fn the_reaper_cleans_up_only_when_shipcheck_dies_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("docker.log");
+        let docker = dir.path().join("docker");
+        // `ps` names one container, every call is logged
+        let fake = format!(
+            "#!/bin/sh\necho \"$*\" >> {}\n[ \"$1\" = ps ] && echo c1\nexit 0\n",
+            log.display()
+        );
+        fs::write(&docker, fake).unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+
+        for ended in [true, false] {
+            let _ = fs::remove_file(&log);
+            let mut act = Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut reaper = Command::new("sh")
+                .args(["-c", REAPER, "sh", "net-1", "/runs/0"])
+                .env("PATH", &path)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = reaper.stdin.take().unwrap();
+            writeln!(stdin, "{}", act.id()).unwrap();
+
+            if ended {
+                writeln!(stdin, "done").unwrap();
+            }
+
+            drop(stdin);
+            assert!(reaper.wait().unwrap().success());
+            let calls = fs::read_to_string(&log).unwrap_or_default();
+
+            if ended {
+                assert_eq!(calls, "");
+                assert!(act.try_wait().unwrap().is_none(), "act was killed");
+                let _ = act.kill();
+            } else {
+                assert_eq!(
+                    calls,
+                    "ps -aq --filter name=^act- --filter volume=/runs/0\nrm -f -v c1\nnetwork rm net-1\n"
+                );
+                assert!(act.wait().unwrap().code().is_none(), "act still runs");
+            }
+
+            let _ = act.wait();
+        }
     }
 
     #[test]
