@@ -669,7 +669,10 @@ fn handle(
                 return Ok(None);
             }
 
-            println!("{repo}#{number}: no result for {}, running", &sha[..12]);
+            println!(
+                "{repo}#{number}: new head {}, running its checks",
+                &sha[..12]
+            );
             note(repo, "rerun", pr, "no_result_for_tree");
             background::start(
                 &entry.path,
