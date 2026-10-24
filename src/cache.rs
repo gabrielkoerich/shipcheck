@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 
-/// Everything that decides a run's result, and nothing else (docs/PROOF.md)
+/// Everything that decides a run's result, and nothing else
 pub struct KeyInputs<'a> {
     pub tree: &'a str,
     pub config: &'a [u8],

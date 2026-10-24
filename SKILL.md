@@ -1,11 +1,13 @@
 ---
 name: shipcheck
-description: Run a repository's GitHub Actions CI locally with shipcheck and read its result, so a PR gets its required `shipcheck` check without waiting for hosted CI. Use when a repository has a `shipcheck.toml`, before pushing or opening a PR, when a `shipcheck` check failed, or when asked to set shipcheck up.
+description: Run a repository's CI checks locally with shipcheck and read the result, so a PR gets its required `shipcheck/<job>` checks without waiting for hosted CI. Use when a repository has a `shipcheck.toml`, before pushing or opening a PR, when a `shipcheck` check failed, or when asked to set shipcheck up.
 ---
 
 # shipcheck
 
-shipcheck runs the checks `shipcheck.toml` names on this machine, for your working copy or a commit. With `runner = "host"` these are the owner's commands under `[host] checks`, each in its own clone inside an OS sandbox. With `runner = "act"` they are the listed GitHub workflows, each job in its own container. It keeps the result for that git tree. The GitHub check named `shipcheck` comes from that result, so a passing local run is what lets the PR merge.
+shipcheck runs the checks that `shipcheck.toml` names on this machine, for your working copy or a commit, and keeps the result for that git tree. The PR's required checks, one per job such as `shipcheck/test`, come from that result, so a passing local run is what lets the PR merge.
+
+There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the listed GitHub workflows, and each job runs in its own container.
 
 Docs: https://shipcheck.run/llms.txt
 
@@ -18,49 +20,66 @@ Do not run the project's test commands yourself. Run `shipcheck run`, and when i
 On a new machine or repository, run `shipcheck doctor` first. It prints what is missing and the command that fixes it. Follow it until it exits 0.
 
 1. Run `shipcheck run` before you commit. It tests the working copy: tracked edits and every untracked file that is not gitignored. When it passes, `shipcheck commit -m <message>` commits exactly the tree that ran.
-2. If you stage only part of your work and commit the index, run `shipcheck run --staged` instead, then `shipcheck commit -m <message>`, which commits the index as it ran. `shipcheck status` says whether the working copy and the index already have a result.
+2. To commit only part of your work, stage it and run `shipcheck run --staged`, then `shipcheck commit -m <message>`, which commits the index as it ran. `shipcheck status` says whether the working copy and the index already have a result.
 3. Read the exit code:
 
 | Code | Meaning | Do |
 |---|---|---|
-| 0 | Every workflow passed, or nothing under `paths` changed | `shipcheck commit -m <message>`, push when the work is done |
-| 1 | A workflow failed | Run `shipcheck logs`, fix the code, run again |
-| 2 | shipcheck could not run | Read the message. Usually `shipcheck.toml` is missing on `main` or act or Docker is not running |
+| 0 | Every check passed, or nothing under `paths` changed | `shipcheck commit -m <message>`, push when the work is done |
+| 1 | A check failed | Read the failed check, step, tests and output it printed, fix the code, run again (below) |
+| 2 | shipcheck could not run | Read the message. Often `shipcheck.toml` on `main` is invalid, the OS sandbox is missing in host mode, or Docker is not running in act mode |
 
-A tree that already passed answers at once, so running it again after a rebase that changed nothing is cheap.
+A tree that already passed answers at once, so a run after a rebase that changed nothing is cheap.
 
 `shipcheck run` lists the untracked files it includes. Gitignore or delete the ones that are not part of the change, or the commit's tree differs from the one that ran. `shipcheck commit` refuses when a file changed since the run: run `shipcheck run` again.
 
-With `shipcheck install`, your agent's own hooks deny the test commands and `git commit` with the command to use instead, and stop you from ending a turn with uncommitted or untested work, once. A merge, revert, cherry-pick or rebase in progress may still finish with `git commit`. Never work around a deny with `sh -c` or a script.
-
-If the repository has git hooks installed (`shipcheck install`), a commit or push of a tree that has no result starts a run in the background and never blocks git. `shipcheck run --sha HEAD` tests the last commit and ignores the working copy.
+`shipcheck install` installs git hooks. Each push of a tree with no result starts a run in the background, and so does each commit when `on` in `shipcheck.toml` includes `commit`. Git never waits for it. On a signed-in machine a push is enough: its run posts the checks on the PR, so after `shipcheck commit` you only `git push`. When you rebase or update your PR on GitHub, the daemon that `install` starts runs the new head. `shipcheck run --sha HEAD` tests the last commit and ignores the working copy.
 
 ## When it fails
 
-- `shipcheck logs` prints the full log of every job. Find the first failed step.
-- Fix the cause in the code or the tests. A job state such as `failure, allowed by continue-on-error` does not fail the workflow.
-- `no image for its runs-on label on this host` means a macOS or Windows job, which runs only on GitHub, or a Linux label such as `ubuntu-24.04` with no image mapped in `[act] platforms`. Tell the owner, it is a `shipcheck.toml` question.
-- A job that needs the network fails when `shipcheck.toml` has no `network = "internet"`. Jobs get no network by default. Tell the owner, do not work around it.
-- With `runner = "host"`, each check runs in an OS sandbox. `Operation not permitted` or `Permission denied` on a path outside the clone, in your home, or on a socket means the test reached outside it. Fix the test to use its working directory, `$HOME` or `$TMPDIR`. If a toolchain in your home cannot be read, tell the owner.
-- A refused workflow names the setting it refused, such as a container option or volume. The setting comes from the owner's workflow on `main`, so tell the owner.
+- For each failed job or host check, the output names the step and its exit code in act mode, the failing tests, the last 60 lines of the step or check, and the path of the full log. Start there and fix the cause in the code or the tests. `shipcheck logs` prints every log, and `shipcheck run --json` prints the same report as one object.
+- A failed `shipcheck/<job>` check on the PR lists the failed tests first, then each test's own output, then the last 100 lines of the job's log. `shipcheck logs <sha>` prints the whole log on the machine that ran it.
+- Fix, then run `shipcheck run --job <id>` as often as you need. In act mode it runs only that job and the jobs it `needs`, and in host mode only that check, so you see the result in seconds. `--workflow <file>` runs every job of one workflow, and both flags repeat. A partial run is never the check: it stores no result, and `shipcheck commit` refuses it. Its output ends with `partial run: not the check`. When the job passes, run one full `shipcheck run`, then `shipcheck commit -m <message>`. `shipcheck logs` prints the last partial run's logs after the full ones.
+- In host mode, `--workflow` is an error, since host mode runs checks, not workflows.
+- A job state such as `failure, allowed by continue-on-error` does not fail the workflow.
+- In host mode, `Operation not permitted` or `Permission denied` on a path outside the clone, in your home, or on a socket means the test reached outside the sandbox. Fix the test to use its working directory, `$HOME` or `$TMPDIR`. If a toolchain in your home cannot be read, tell the owner.
+- In act mode, `no image for its runs-on label on this host` means a macOS or Windows job, which runs only on GitHub, or a Linux label such as `ubuntu-24.04` with no image in `[act] platforms`. Tell the owner, since it is a `shipcheck.toml` question.
+- In act mode, jobs get no network by default, so a job that needs it fails unless `shipcheck.toml` sets `network = "internet"`. Tell the owner, do not work around it.
+- A refused workflow names the setting it refused, such as a container option or a volume. The setting comes from the owner's workflow on `main`, so tell the owner.
 
 ## Never
 
-- Never edit `.github/workflows/` or `shipcheck.toml` to make a check pass. shipcheck reads both from `main`, so the edit does not change what runs, and the check names it under "changes CI" for the reviewer. The same goes for what a command runs, such as `package.json` scripts, a `Makefile` or a `justfile`: the check names those changes too.
+- Never edit `.github/workflows/` or `shipcheck.toml` to make a check pass. shipcheck reads both from `main`, so the edit does not change what runs, and the check lists it under "changes CI" for the reviewer. The check also lists changes to what a command runs, such as `package.json` scripts, a `Makefile` or a `justfile`.
 - Never weaken, skip or delete tests to get a pass. The check reports it, and a reviewer reads it.
 - Never write or copy files under `SHIPCHECK_HOME` by hand, and never set `SHIPCHECK_HOME`. Only runs write results.
 - Never run `shipcheck clean` while a run is going. It refuses anyway.
 
-## Set it up
+## Set up a repository: `shipcheck init`
 
-For the owner of a repository:
+The repository owner runs this once per repository, in a clone on `main`:
 
 ```sh
-shipcheck init      # writes shipcheck.toml and the AGENTS.md block, installs the hooks
+shipcheck init
 ```
 
-Then remove deploys and anything that must not run on a laptop from `workflows`, commit `shipcheck.toml`, and merge it to `main`. For each other clone: `shipcheck install`.
+1. It writes `shipcheck.toml` with a check for each workflow job it can run here, and prints what it left out and why. When every job has to stay on GitHub, it writes no file and stops.
+2. On a terminal it asks before each further step: which checks to keep, the [shipcheck App](https://github.com/apps/shipcheck-run) link, hosted Actions only on `main`, and a ruleset that requires each `shipcheck/<job>` check. `--yes` takes every default.
+3. It writes the agent instructions into `AGENTS.md` and the other files agents read, then does what `shipcheck install` does.
 
-To post the `shipcheck` check from this machine, the App must be installed on the repository and the machine signed in once with `shipcheck login`. It prints a code a person enters at github.com/login/device, so ask the human to run it. Then `shipcheck post` posts the result of `HEAD`. `shipcheck doctor` says whether posting works. `shipcheck logout` signs the machine out.
+Without a terminal it writes every check it finds and the instructions, installs the hooks and starts the daemon, and skips the App, workflow and ruleset steps. Read the checks it wrote, commit `shipcheck.toml` and `AGENTS.md`, and merge them to `main`. The owner installs the App on the repository once.
+
+## Set up a machine: `shipcheck install`
+
+Each machine that runs agents runs this once per clone:
+
+```sh
+shipcheck install
+```
+
+It installs the git hooks, starts the daemon, and on a terminal signs the machine in when it cannot post yet, with a code a person enters at github.com/login/device. When it says not signed in, ask the human to run `shipcheck login`.
+
+A machine with no person at it, such as a VM, gets a token instead. A person runs `shipcheck token --name <machine>` on their own machine and sets the output as `SHIPCHECK_TOKEN` on the agent's machine. `shipcheck logout` there, or `shipcheck logout --all` anywhere, revokes it.
+
+Once signed in, each push posts its checks, and `shipcheck post` posts the stored result of `HEAD`. `shipcheck doctor` says whether posting works. On macOS a keychain error after an upgrade means the new binary needs access: ask the human to run `shipcheck doctor` at the Mac and choose Always Allow.
 
 Settings: https://shipcheck.run/docs/config.md

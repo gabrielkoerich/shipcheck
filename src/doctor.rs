@@ -43,6 +43,28 @@ fn output(cmd: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Without the hardened runtime, `DYLD_INSERT_LIBRARIES` loads any program's code into shipcheck
+fn hardened_note() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return String::new();
+    };
+    let flags = Command::new("codesign")
+        .arg("-dv")
+        .arg(&exe)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_default();
+
+    if flags.contains("runtime") {
+        return String::new();
+    }
+
+    format!(
+        ". This binary lacks the hardened runtime, so another program can load code into it and read them: `codesign -f -s - -o runtime {}`",
+        exe.display()
+    )
+}
+
 /**
  * Everything a run needs on this machine and in this repository, each with what to do when it is
  * missing, so an agent can set shipcheck up from the output alone
@@ -76,6 +98,15 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     ));
 
     let home = run::home();
+
+    if let Ok(usage) = runner::gc::usage(&home, &runner::act::home_prefix()) {
+        found.push(Check {
+            name: "disk",
+            ok: true,
+            detail: usage,
+        });
+    }
+
     let (templates, runs) = (home.join("templates"), home.join("runs"));
     let cow = fs::create_dir_all(&templates)
         .and_then(|_| fs::create_dir_all(&runs))
@@ -99,12 +130,50 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         detail: match crate::service::poster() {
             Poster::Key => "`shipcheck post` uses this machine's App key".into(),
             Poster::Service(_) => format!(
-                "`shipcheck post` goes through {} with this machine's token",
-                crate::service::api()
+                "`shipcheck post` goes through {} with {}",
+                crate::service::api(),
+                crate::service::identity().unwrap_or_default()
             ),
-            Poster::None => "not signed in. Optional: `shipcheck login` lets `shipcheck post` put the check on PRs".into(),
+            Poster::None => "not signed in. Optional: `shipcheck login`, or SHIPCHECK_TOKEN from `shipcheck token`, lets `shipcheck post` put the check on PRs".into(),
         },
     });
+
+    let mut secrets = vec![home.join("token"), home.join("app.pem")];
+    secrets.extend(run::repo_id(cwd).ok().map(|id| run::secrets_file(&id)));
+    let secrets: Vec<_> = secrets
+        .into_iter()
+        .filter(|p| crate::secret::exists(p))
+        .collect();
+
+    if !secrets.is_empty() {
+        // Reads each one, so after an upgrade the keychain asks here, where someone can answer
+        let failed: Vec<_> = secrets
+            .iter()
+            .filter_map(|p| crate::secret::read(p).err())
+            .collect();
+        let names: Vec<_> = secrets
+            .iter()
+            .map(|p| p.strip_prefix(&home).unwrap_or(p).display().to_string())
+            .collect();
+        found.push(check(
+            "secrets",
+            if !failed.is_empty() {
+                Err(failed.join(". "))
+            } else if cfg!(target_os = "macos") {
+                Ok(format!(
+                    "{} in the login keychain, readable only by this shipcheck binary{}",
+                    names.join(", "),
+                    hardened_note()
+                ))
+            } else {
+                Ok(format!(
+                    "{} in files of mode 0600 in {}, readable by every process of this user",
+                    names.join(", "),
+                    home.display()
+                ))
+            },
+        ));
+    }
 
     let host = output("sysctl", &["-n", "hw.memsize"], cwd)
         .ok()
@@ -191,6 +260,37 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         }
     }
 
+    if let Ok(p) = &plan
+        && !p.defaults
+        && let Some(required) = required_checks(cwd, base)
+    {
+        let jobs = run::jobs(p).unwrap_or_default();
+        let names: Vec<String> = crate::check::job_names(&jobs)
+            .into_iter()
+            .map(|(_, _, n)| n)
+            .collect();
+        found.push(match ruleset_note(&required, &names) {
+            _ if !required.iter().any(|r| r.starts_with("shipcheck")) => Check {
+                name: "required checks",
+                ok: true,
+                detail: "no branch rule requires shipcheck's checks. Optional: `shipcheck init` sets one up (https://shipcheck.run/docs/branch-protection/)".into(),
+            },
+            None => Check {
+                name: "required checks",
+                ok: true,
+                detail: format!(
+                    "the branch rules require every job check: {}",
+                    names.join(", ")
+                ),
+            },
+            Some(note) => Check {
+                name: "required checks",
+                ok: false,
+                detail: note,
+            },
+        });
+    }
+
     let planned: Result<RepoConfig, String> = plan.map(|p| p.config);
 
     // Host mode runs no container
@@ -218,7 +318,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             detail: match config.network {
                 _ if config.runner == RunnerKind::Host => "as this machine has it: host checks are sandboxed for files, not for the network, and `network` does not apply".into(),
                 Network::None => "none: jobs reach nothing. A job that downloads packages or tools fails, then the owner sets `network = \"internet\"` in shipcheck.toml".into(),
-                Network::Internet => "internet: jobs can download, and can still reach this machine and the local network (docs/SECURITY.md)".into(),
+                Network::Internet => "internet: jobs can download, and can still reach this machine and the local network".into(),
             },
         });
     }
@@ -235,15 +335,16 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         },
     });
 
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-
-    for (name, detail) in crate::agents::notes(Path::new(&top), &home) {
-        found.push(Check {
-            name,
-            ok: true,
-            detail,
-        });
-    }
+    let missing = crate::agents::notes(Path::new(&top));
+    found.push(Check {
+        name: "instructions",
+        ok: true,
+        detail: if missing.is_empty() {
+            "the shipcheck block is in AGENTS.md and the other instruction files".into()
+        } else {
+            missing.join(", ")
+        },
+    });
 
     if run::home_overridden() {
         found.push(Check {
@@ -257,6 +358,75 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     }
 
     found
+}
+
+/// The check names the base branch's rules require, read with the person's `gh`. None when gh cannot read them
+fn required_checks(cwd: &Path, base: &str) -> Option<Vec<String>> {
+    let branch = base.strip_prefix("origin/").unwrap_or(base);
+    let rules = output(
+        "gh",
+        &[
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/rules/branches/{branch}"),
+        ],
+        cwd,
+    )
+    .ok()?;
+    let rules: serde_json::Value = serde_json::from_str(&rules).ok()?;
+    Some(
+        rules
+            .as_array()?
+            .iter()
+            .filter(|r| r["type"] == "required_status_checks")
+            .flat_map(|r| {
+                r["parameters"]["required_status_checks"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|c| c["context"].as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// What to change when the required `shipcheck/` names differ from the current jobs' check names
+fn ruleset_note(required: &[String], jobs: &[String]) -> Option<String> {
+    let required: Vec<&String> = required
+        .iter()
+        .filter(|n| n.starts_with("shipcheck/"))
+        .collect();
+    let add: Vec<&str> = jobs
+        .iter()
+        .filter(|j| !required.contains(j))
+        .map(String::as_str)
+        .collect();
+    let stale: Vec<&str> = required
+        .iter()
+        .filter(|r| !jobs.contains(r))
+        .map(|r| r.as_str())
+        .collect();
+
+    if add.is_empty() && stale.is_empty() {
+        return None;
+    }
+
+    let mut note = Vec::new();
+
+    if !add.is_empty() {
+        note.push(format!("not required yet: {}", add.join(", ")));
+    }
+
+    if !stale.is_empty() {
+        note.push(format!(
+            "required but no job posts it, so every PR waits: {}",
+            stale.join(", ")
+        ));
+    }
+
+    Some(format!(
+        "{}. Update the ruleset in Settings, Rules (https://shipcheck.run/docs/branch-protection/)",
+        note.join(". ")
+    ))
 }
 
 const GIB: u64 = 1 << 30;
@@ -278,6 +448,22 @@ fn memory_note(docker: u64, host: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notes_ruleset_drift() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let jobs = v(&["shipcheck/lint", "shipcheck/test"]);
+        assert!(
+            ruleset_note(
+                &v(&["shipcheck", "shipcheck/lint", "shipcheck/test"]),
+                &jobs
+            )
+            .is_none()
+        );
+        let note = ruleset_note(&v(&["shipcheck/lint", "shipcheck/old"]), &jobs).unwrap();
+        assert!(note.contains("not required yet: shipcheck/test"), "{note}");
+        assert!(note.contains("every PR waits: shipcheck/old"), "{note}");
+    }
 
     #[test]
     fn notes_a_small_docker_vm() {

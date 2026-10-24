@@ -57,7 +57,34 @@ pub fn runs_for_branches(source: &str) -> bool {
     let Ok(root) = load(source) else {
         return false;
     };
-    let unfiltered_push = |filter: &Yaml| match filter {
+
+    match root.get(&key("on")) {
+        Some(Yaml::String(e)) => e == "pull_request" || e == "push",
+        Some(Yaml::Array(events)) => events
+            .iter()
+            .any(|e| matches!(e.as_str(), Some("pull_request" | "push"))),
+        Some(Yaml::Hash(events)) => {
+            events.get(&key("pull_request")).is_some_and(pr_runs)
+                || events.get(&key("push")).is_some_and(push_runs)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a `pull_request` trigger runs on a PR's commits. `types: [closed]` runs once, after merge
+fn pr_runs(filter: &Yaml) -> bool {
+    let pushed = |t: &Yaml| matches!(t.as_str(), Some("opened" | "synchronize" | "reopened"));
+
+    match &filter["types"] {
+        Yaml::String(_) => pushed(&filter["types"]),
+        Yaml::Array(types) => types.iter().any(pushed),
+        _ => true,
+    }
+}
+
+/// Whether a `push` trigger with this filter runs for a feature branch
+fn push_runs(filter: &Yaml) -> bool {
+    match filter {
         Yaml::Null | Yaml::BadValue => true,
         Yaml::Hash(f) => {
             if let Some(patterns) = f.get(&key("branches")) {
@@ -68,18 +95,6 @@ pub fn runs_for_branches(source: &str) -> bool {
                 // Only tag filters mean pushes to branches never trigger it
                 !f.contains_key(&key("tags")) && !f.contains_key(&key("tags-ignore"))
             }
-        }
-        _ => false,
-    };
-
-    match root.get(&key("on")) {
-        Some(Yaml::String(e)) => e == "pull_request" || e == "push",
-        Some(Yaml::Array(events)) => events
-            .iter()
-            .any(|e| matches!(e.as_str(), Some("pull_request" | "push"))),
-        Some(Yaml::Hash(events)) => {
-            events.contains_key(&key("pull_request"))
-                || events.get(&key("push")).is_some_and(unfiltered_push)
         }
         _ => false,
     }
@@ -102,30 +117,725 @@ fn branch_patterns_match(patterns: &Yaml) -> bool {
     })
 }
 
-/// Each one-line `run` step with no expression, by job id, in file order
-pub fn run_steps(source: &str) -> Vec<(String, String)> {
-    let Ok(mut root) = load(source) else {
-        return Vec::new();
+/// One `run` or `uses` step, with the working directory and shell from the step, the job or the workflow
+#[derive(Clone)]
+pub struct RunStep {
+    /// Empty for a `uses` step
+    pub run: String,
+    pub uses: Option<String>,
+    /// A `uses` step's inputs, None for a value that is an expression
+    pub with: Vec<(String, Option<String>)>,
+    pub dir: Option<String>,
+    pub shell: Option<String>,
+    /// It has an `if:`, or `continue-on-error` that is not false, so GitHub may skip it or pass it failed
+    pub conditional: bool,
+    pub env: Vec<(String, Option<String>)>,
+}
+
+pub struct Job {
+    pub id: String,
+    pub needs: Vec<String>,
+    pub conditional: bool,
+    pub steps: Vec<RunStep>,
+    /// The workflow's and the job's `env`, the job's winning. None for a value with an expression
+    pub env: Vec<(String, Option<String>)>,
+    /// The `runs-on` labels, when they are literal
+    pub runs_on: Vec<String>,
+    /// A step uses `actions/download-artifact`
+    pub downloads: bool,
+    /// One axis of `strategy.matrix` and its values, for the person who runs `init`. None without a matrix
+    pub matrix: Option<String>,
+    pub os: Platforms,
+    /// Its `if:` depends on the PR or the default branch
+    pub pr_only: bool,
+    /// The names GitHub gives its check runs, None when they depend on more than this reads
+    pub check_names: Option<Vec<String>>,
+}
+
+/// The kinds of runner a job's `runs-on` can pick, Linux when its labels name none
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Platforms {
+    pub linux: bool,
+    pub mac: bool,
+    pub windows: bool,
+}
+
+/**
+ * The platforms of the runner labels a job can pick: its literal `runs-on`, or for an expression
+ * such as `${{ matrix.os || 'ubuntu-latest' }}` its quoted words and every value of the matrix
+ **/
+fn platforms(job: &Yaml) -> Platforms {
+    let mut labels: Vec<String> = Vec::new();
+    let scalars = |y: &Yaml, out: &mut Vec<String>| match y {
+        Yaml::String(s) => out.push(s.clone()),
+        Yaml::Array(list) => out.extend(list.iter().filter_map(|l| l.as_str().map(str::to_string))),
+        _ => {}
     };
-    let Ok(jobs) = jobs_mut(&mut root) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
+    scalars(&job["runs-on"], &mut labels);
 
-    for (id, job) in jobs.iter() {
-        let (Some(id), Yaml::Array(steps)) = (id.as_str(), &job["steps"]) else {
-            continue;
-        };
+    if labels.iter().any(|l| l.contains("${{")) {
+        let quoted: Vec<String> = labels
+            .iter()
+            .flat_map(|l| {
+                l.split('\'')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        labels.extend(quoted);
 
-        for run in steps.iter().filter_map(|s| s["run"].as_str()) {
-            let run = run.trim();
-
-            if !run.is_empty() && !run.contains('\n') && !run.contains("${{") {
-                out.push((id.to_string(), run.to_string()));
+        if let Yaml::Hash(m) = &job["strategy"]["matrix"] {
+            for (k, v) in m {
+                match k.as_str() {
+                    Some("include") => {
+                        for entry in v.as_vec().into_iter().flatten() {
+                            if let Yaml::Hash(e) = entry {
+                                e.values().for_each(|v| scalars(v, &mut labels));
+                            }
+                        }
+                    }
+                    Some("exclude") => {}
+                    _ => scalars(v, &mut labels),
+                }
             }
         }
     }
 
+    let mut p = Platforms::default();
+
+    for l in labels.iter().map(|l| l.to_lowercase()) {
+        p.windows |= l.starts_with("windows");
+        p.mac |= l.starts_with("macos");
+        p.linux |= l.starts_with("ubuntu") || l.contains("linux");
+    }
+
+    p.linux |= !p.mac && !p.windows;
+    p
+}
+
+fn scalar(y: &Yaml) -> Option<String> {
+    match y {
+        Yaml::String(s) => Some(s.clone()),
+        Yaml::Integer(i) => Some(i.to_string()),
+        Yaml::Real(r) => Some(r.clone()),
+        Yaml::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// The values of a matrix with one combination, such as `python: [3.13]` or one `include` entry
+fn single_leg(matrix: &Yaml) -> Option<Vec<(String, String)>> {
+    let m = matrix.as_hash()?;
+    let mut leg = Vec::new();
+
+    for (k, v) in m {
+        match (k.as_str()?, v) {
+            ("include", Yaml::Array(entries)) if entries.len() == 1 && m.len() == 1 => {
+                for (k, v) in entries[0].as_hash()? {
+                    leg.push((k.as_str()?.to_string(), scalar(v)?));
+                }
+            }
+            ("include" | "exclude", _) => return None,
+            (k, Yaml::Array(values)) if values.len() == 1 => {
+                leg.push((k.to_string(), scalar(&values[0])?));
+            }
+            _ => return None,
+        }
+    }
+
+    (!leg.is_empty()).then_some(leg)
+}
+
+/// `y` with each `${{ matrix.x }}` of `leg` filled in
+fn fill(y: &Yaml, leg: &[(String, String)]) -> Yaml {
+    match y {
+        Yaml::String(s) => {
+            let mut s = s.clone();
+
+            for (k, v) in leg {
+                for form in [
+                    format!("${{{{ matrix.{k} }}}}"),
+                    format!("${{{{matrix.{k}}}}}"),
+                ] {
+                    s = s.replace(&form, v);
+                }
+            }
+
+            Yaml::String(s)
+        }
+        Yaml::Array(a) => Yaml::Array(a.iter().map(|v| fill(v, leg)).collect()),
+        Yaml::Hash(h) => Yaml::Hash(h.iter().map(|(k, v)| (k.clone(), fill(v, leg))).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Whether a job's `if:` depends on the PR or the default branch, so on the base branch it never runs
+fn pr_only(job: &Yaml) -> bool {
+    let cond = match &job["if"] {
+        Yaml::String(c) => c,
+        _ => return false,
+    };
+
+    [
+        "default_branch",
+        "pull_request",
+        "head_ref",
+        "base_ref",
+        "github.ref !=",
+        "github.ref_name !=",
+    ]
+    .iter()
+    .any(|p| cond.contains(p))
+}
+
+/// One axis of a matrix as `name: a, b, c, ...`, preferring one that is not the runner's OS
+fn matrix_axis(matrix: &Yaml) -> Option<String> {
+    let axes: Vec<(String, Vec<String>)> = match matrix {
+        Yaml::BadValue | Yaml::Null => return None,
+        Yaml::Hash(m) => {
+            let mut axes: Vec<(String, Vec<String>)> = m
+                .iter()
+                .filter(|(k, _)| !matches!(k.as_str(), Some("include" | "exclude")))
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.as_str()?.to_string(),
+                        v.as_vec()?.iter().filter_map(scalar).collect(),
+                    ))
+                })
+                .collect();
+
+            for entry in matrix["include"].as_vec().into_iter().flatten() {
+                for (k, v) in entry.as_hash().into_iter().flatten() {
+                    let (Some(k), Some(v)) = (k.as_str(), scalar(v)) else {
+                        continue;
+                    };
+
+                    match axes.iter_mut().find(|(name, _)| name == k) {
+                        Some((_, values)) if !values.contains(&v) => values.push(v),
+                        Some(_) => {}
+                        None => axes.push((k.to_string(), vec![v])),
+                    }
+                }
+            }
+
+            axes
+        }
+        _ => return Some("from an expression".into()),
+    };
+    let os = ["os", "platform", "runner", "runs-on", "name"];
+    let (name, values) = axes
+        .iter()
+        .find(|(k, _)| !os.contains(&k.as_str()))
+        .or(axes.first())?;
+    let mut shown: Vec<&str> = values.iter().take(4).map(String::as_str).collect();
+
+    if values.len() > 4 {
+        shown.push("...");
+    }
+
+    Some(format!("{name}: {}", shown.join(", ")))
+}
+
+/**
+ * GitHub's check names for a job: its `name`, else its id. For a matrix of plain axes, one per
+ * leg, `id (a, b)` or the name with each `${{ matrix.x }}` filled in. None for anything else
+ **/
+fn check_names(id: &str, job: &Yaml) -> Option<Vec<String>> {
+    let name = match &job["name"] {
+        Yaml::BadValue => None,
+        n => Some(n.as_str()?.to_string()),
+    };
+    let matrix = &job["strategy"]["matrix"];
+
+    if matrix.is_badvalue() {
+        return match name {
+            Some(n) if n.contains("${{") => None,
+            n => Some(vec![n.unwrap_or_else(|| id.to_string())]),
+        };
+    }
+
+    let mut legs: Vec<Vec<(String, String)>> = vec![Vec::new()];
+
+    for (k, v) in matrix.as_hash()? {
+        let k = k.as_str().filter(|k| !["include", "exclude"].contains(k));
+        let values: Vec<String> = v.as_vec()?.iter().map(scalar).collect::<Option<_>>()?;
+        let k = k?.to_string();
+        legs = legs
+            .iter()
+            .flat_map(|leg| {
+                values.iter().map(|v| {
+                    let mut leg = leg.clone();
+                    leg.push((k.clone(), v.clone()));
+                    leg
+                })
+            })
+            .collect();
+    }
+
+    legs.into_iter()
+        .map(|leg| match &name {
+            None => Some(format!(
+                "{id} ({})",
+                leg.iter()
+                    .map(|(_, v)| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Some(n) if n.contains("${{") => {
+                let mut n = n.clone();
+
+                for (k, v) in &leg {
+                    for form in [
+                        format!("${{{{ matrix.{k} }}}}"),
+                        format!("${{{{matrix.{k}}}}}"),
+                    ] {
+                        n = n.replace(&form, v);
+                    }
+                }
+
+                (!n.contains("${{")).then_some(n)
+            }
+            // GitHub may add the values to a fixed name
+            Some(_) => None,
+        })
+        .collect()
+}
+
+/// An `env` mapping's names and values, None for a value that is an expression or not a scalar
+fn env_of(y: &Yaml) -> Vec<(String, Option<String>)> {
+    let Yaml::Hash(h) = y else {
+        return Vec::new();
+    };
+    h.iter()
+        .filter_map(|(k, v)| {
+            let value = match v {
+                Yaml::String(s) if !s.contains("${{") => Some(s.clone()),
+                Yaml::Integer(i) => Some(i.to_string()),
+                Yaml::Real(r) => Some(r.clone()),
+                Yaml::Boolean(b) => Some(b.to_string()),
+                _ => None,
+            };
+            Some((k.as_str()?.to_string(), value))
+        })
+        .collect()
+}
+
+/// Each job's `run` steps, trimmed, in file order. `uses` steps are left out
+pub fn job_runs(source: &str) -> Vec<Job> {
+    let Ok(root) = load(source) else {
+        return Vec::new();
+    };
+    let whole = Yaml::Hash(root);
+    let top = &whole["defaults"];
+    let Yaml::Hash(jobs) = &whole["jobs"] else {
+        return Vec::new();
+    };
+    let conditional = |y: &Yaml| {
+        !matches!(y["if"], Yaml::BadValue)
+            || !matches!(
+                y["continue-on-error"],
+                Yaml::BadValue | Yaml::Boolean(false)
+            )
+    };
+    let mut out = Vec::new();
+
+    for (id, original) in jobs.iter() {
+        // A matrix of one combination is a plain job, GitHub only adds the values to its name
+        let filled = single_leg(&original["strategy"]["matrix"]).map(|leg| {
+            let mut job = fill(original, &leg);
+
+            if let Some(Yaml::Hash(s)) = job.as_mut_hash().and_then(|j| j.get_mut(&key("strategy")))
+            {
+                s.remove(&key("matrix"));
+            }
+
+            job
+        });
+        let job = filled.as_ref().unwrap_or(original);
+        let (Some(id), Yaml::Array(steps_yaml)) = (id.as_str(), &job["steps"]) else {
+            continue;
+        };
+        let pick = |step: &Yaml, name: &str| {
+            [
+                &step[name],
+                &job["defaults"]["run"][name],
+                &top["run"][name],
+            ]
+            .into_iter()
+            .find_map(|v| v.as_str())
+            .map(str::to_string)
+        };
+        let mut env = env_of(&whole["env"]);
+
+        for (k, v) in env_of(&job["env"]) {
+            env.retain(|(name, _)| *name != k);
+            env.push((k, v));
+        }
+
+        // A `with` value of just `${{ env.NAME }}` is that variable, such as a toolchain version
+        let with_of = |y: &Yaml| {
+            let mut with = env_of(y);
+
+            for (name, value) in &mut with {
+                let raw = y[name.as_str()].as_str().unwrap_or_default().trim();
+                let var = raw
+                    .strip_prefix("${{")
+                    .and_then(|r| r.strip_suffix("}}"))
+                    .and_then(|r| r.trim().strip_prefix("env."));
+
+                if let Some(var) = var.filter(|_| value.is_none()) {
+                    *value = env
+                        .iter()
+                        .find(|(k, _)| k == var)
+                        .and_then(|(_, v)| v.clone());
+                }
+            }
+
+            with
+        };
+        let steps = steps_yaml
+            .iter()
+            .filter_map(|s| {
+                let run = s["run"].as_str().map(|r| r.trim().to_string());
+                let uses = s["uses"].as_str().map(str::to_string);
+
+                if run.is_none() && uses.is_none() {
+                    return None;
+                }
+
+                Some(RunStep {
+                    dir: if run.is_some() {
+                        pick(s, "working-directory")
+                    } else {
+                        None
+                    },
+                    run: run.unwrap_or_default(),
+                    uses,
+                    with: with_of(&s["with"]),
+                    shell: pick(s, "shell"),
+                    conditional: conditional(s),
+                    env: env_of(&s["env"]),
+                })
+            })
+            .collect();
+        let needs = match &job["needs"] {
+            Yaml::String(n) => vec![n.clone()],
+            Yaml::Array(list) => list
+                .iter()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let runs_on = match &job["runs-on"] {
+            Yaml::String(l) => vec![l.clone()],
+            Yaml::Array(list) => list
+                .iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        out.push(Job {
+            id: id.to_string(),
+            needs,
+            conditional: conditional(job),
+            steps,
+            env,
+            runs_on,
+            downloads: steps_yaml.iter().any(|s| {
+                s["uses"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("actions/download-artifact@"))
+            }),
+            matrix: matrix_axis(&job["strategy"]["matrix"]),
+            os: platforms(job),
+            pr_only: pr_only(job),
+            check_names: check_names(id, original),
+        });
+    }
+
+    out
+}
+
+/**
+ * The workflow with `on:` cut to pushes to `base`: `pull_request` removed, `push` limited to
+ * `branches: [base]`, other events kept. Edits only those lines, so comments and layout elsewhere
+ * stay. None when GitHub already runs it only off feature branches, or its `on:` has a form this
+ * does not edit
+ **/
+pub fn main_only(source: &str, base: &str) -> Option<String> {
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+    };
+
+    if !runs_for_branches(source) || !plain(base) {
+        return None;
+    }
+
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines.iter().position(|l| {
+        ["on:", "\"on\":", "'on':"].iter().any(|k| {
+            l.strip_prefix(k)
+                .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
+        })
+    })?;
+    let end = (start + 1..lines.len())
+        .find(|&i| {
+            let l = lines[i];
+            !l.trim().is_empty() && !l.starts_with([' ', '\t', '#'])
+        })
+        .unwrap_or(lines.len());
+    let inline = value_of(lines[start]);
+    let body = &lines[start + 1..end];
+    let first = body.iter().find(|l| !blank(l));
+
+    let block = if inline.is_empty() && first.is_some_and(|l| !l.trim_start().starts_with('-')) {
+        // A push already kept off feature branches, such as `[main, stable]`, stays as it is
+        let keep_push = load(source)
+            .ok()
+            .and_then(|r| r.get(&key("on")).map(|on| on["push"].clone()))
+            .is_some_and(|push| !matches!(push, Yaml::BadValue) && !push_runs(&push));
+        edit_events(body, base, keep_push)
+    } else if inline.starts_with('{') {
+        return None;
+    } else {
+        // `on: push`, `on: [push, pull_request]` or a list, which name events and nothing else
+        let root = load(source).ok()?;
+        let events: Vec<String> = match root.get(&key("on"))? {
+            Yaml::String(e) => vec![e.clone()],
+            Yaml::Array(list) => list
+                .iter()
+                .filter_map(|e| e.as_str().map(str::to_string))
+                .collect(),
+            _ => return None,
+        };
+        let mut block = vec!["  push:".to_string(), format!("    branches: [{base}]")];
+        block.extend(
+            events
+                .iter()
+                .filter(|e| *e != "push" && *e != "pull_request")
+                .map(|e| format!("  {e}:")),
+        );
+        // What followed the list in the old block, such as a comment before `jobs:`
+        let last = body.iter().rposition(|l| !blank(l)).map_or(0, |i| i + 1);
+        block.extend(body[last..].iter().map(|l| l.to_string()));
+        block
+    };
+
+    let mut out: Vec<String> = lines[..start].iter().map(|l| l.to_string()).collect();
+    out.push(lines[start].split_once(':').map(|(k, _)| format!("{k}:"))?);
+    out.extend(block);
+    out.extend(lines[end..].iter().map(|l| l.to_string()));
+    let mut text = out.join("\n");
+
+    if source.ends_with('\n') {
+        text.push('\n');
+    }
+
+    (text != source && load(&text).is_ok() && !runs_for_branches(&text)).then_some(text)
+}
+
+/**
+ * The workflow with `if: github.ref == 'refs/heads/<base>'` on each of `jobs`, and-ed with an
+ * `if:` a job has, so on a feature branch GitHub runs only the others. Triggers stay as they are.
+ * None when a job's form is one this does not edit, or the result would parse otherwise
+ **/
+pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+    };
+
+    if !plain(base) || jobs.is_empty() {
+        return None;
+    }
+
+    let gate = format!("github.ref == 'refs/heads/{base}'");
+    let root = load(source).ok()?;
+    let parsed = Yaml::Hash(root.clone());
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines.iter().position(|l| {
+        l.strip_prefix("jobs:")
+            .is_some_and(|r| r.trim().is_empty() || r.trim_start().starts_with('#'))
+    })?;
+    let end = (start + 1..lines.len())
+        .find(|&i| !blank(lines[i]) && !lines[i].starts_with([' ', '\t']))
+        .unwrap_or(lines.len());
+    let body = &lines[start + 1..end];
+    let (_, entries_found) = entries(body);
+    let mut want = Vec::new();
+    // Line ranges to replace, in the whole file, and their new lines
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    for id in jobs {
+        let &(_, s, e) = entries_found.iter().find(|(k, _, _)| k == id)?;
+
+        if !value_of(body[s]).is_empty() || e <= s + 1 {
+            return None;
+        }
+
+        let (indent, keys) = entries(&body[s + 1..e]);
+        let old = match &parsed["jobs"][id.as_str()]["if"] {
+            Yaml::BadValue => None,
+            Yaml::String(c) => Some(c.trim().to_string()),
+            Yaml::Boolean(b) => Some(b.to_string()),
+            _ => return None,
+        };
+        let at = start + 1 + s + 1;
+
+        match (old, keys.iter().find(|(k, _, _)| k == "if")) {
+            (None, None) => {
+                want.push((id.clone(), gate.clone()));
+                edits.push((at, at, format!("{indent}if: {gate}")));
+            }
+            (Some(old), Some(&(_, ks, ke))) => {
+                let inner = match old.strip_prefix("${{").and_then(|o| o.strip_suffix("}}")) {
+                    Some(i) if !i.contains("${{") => i.trim().to_string(),
+                    Some(_) => return None,
+                    None if old.contains("${{") => return None,
+                    None => old,
+                };
+                let cond = format!("({inner}) && {gate}");
+                let quoted = format!("\"{}\"", cond.replace('\\', "\\\\").replace('"', "\\\""));
+                want.push((id.clone(), cond));
+                edits.push((at + ks, at + ke, format!("{indent}if: {quoted}")));
+            }
+            _ => return None,
+        }
+    }
+
+    edits.sort_by_key(|(s, _, _)| *s);
+    let mut out: Vec<String> = Vec::new();
+    let mut at = 0;
+
+    for (s, e, line) in edits {
+        out.extend(lines[at..s].iter().map(|l| l.to_string()));
+        out.push(line);
+        at = e;
+    }
+
+    out.extend(lines[at..].iter().map(|l| l.to_string()));
+    let mut text = out.join("\n");
+
+    if source.ends_with('\n') {
+        text.push('\n');
+    }
+
+    // Only the `if:` of those jobs changed
+    let strip = |mut r: Hash| {
+        if let Some(Yaml::Hash(js)) = r.get_mut(&key("jobs")) {
+            for id in jobs {
+                if let Some(Yaml::Hash(j)) = js.get_mut(&key(id)) {
+                    j.remove(&key("if"));
+                }
+            }
+        }
+
+        r
+    };
+    let new = load(&text).ok()?;
+    let ok = want.iter().all(|(id, c)| {
+        new.get(&key("jobs")).map(|j| &j[id.as_str()]["if"]) == Some(&Yaml::String(c.clone()))
+    }) && strip(new) == strip(root);
+    ok.then_some(text)
+}
+
+fn blank(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || t.starts_with('#')
+}
+
+/// The text after a mapping key's colon, without a trailing comment
+fn value_of(line: &str) -> &str {
+    let v = line.split_once(':').map_or("", |(_, v)| v);
+    v.split_once(" #").map_or(v, |(v, _)| v).trim()
+}
+
+/// The mapping entries at the first entry's indentation: key, first line, end past the last line that is not blank or a comment
+fn entries(lines: &[&str]) -> (String, Vec<(String, usize, usize)>) {
+    let indent = lines
+        .iter()
+        .find(|l| !blank(l))
+        .map(|l| l[..l.len() - l.trim_start().len()].to_string())
+        .unwrap_or_default();
+    let starts: Vec<usize> = (0..lines.len())
+        .filter(|&i| {
+            !blank(lines[i])
+                // A `- item` at the key's own indentation belongs to the key above, which YAML allows
+                && lines[i]
+                    .strip_prefix(indent.as_str())
+                    .is_some_and(|r| !r.starts_with([' ', '\t', '-']))
+        })
+        .collect();
+    let entries = starts
+        .iter()
+        .enumerate()
+        .map(|(n, &s)| {
+            let next = starts.get(n + 1).copied().unwrap_or(lines.len());
+            let end = (s + 1..next)
+                .rev()
+                .find(|&i| !blank(lines[i]))
+                .map_or(s + 1, |i| i + 1);
+            let name = lines[s].trim().split(':').next().unwrap_or_default();
+            (name.trim_matches(['"', '\'']).to_string(), s, end)
+        })
+        .collect();
+    (indent, entries)
+}
+
+/// The lines of a block `on:` mapping, with `pull_request` cut and `push` limited to `base`
+fn edit_events(body: &[&str], base: &str, keep_push: bool) -> Vec<String> {
+    let (indent, events) = entries(body);
+    let push = events.iter().find(|(k, _, _)| k == "push");
+    let mut new_push = vec![format!("{indent}push:")];
+
+    match push {
+        Some(&(_, s, e)) if keep_push => {
+            new_push = body[s..e].iter().map(|l| l.to_string()).collect();
+        }
+        Some(&(_, s, e)) if value_of(body[s]).is_empty() && e > s + 1 => {
+            let (sub, filters) = entries(&body[s + 1..e]);
+            new_push.push(format!("{sub}branches: [{base}]"));
+            let mut at = s + 1;
+
+            for (k, fs, fe) in filters {
+                if k == "branches" || k == "branches-ignore" {
+                    new_push.extend(body[at..s + 1 + fs].iter().map(|l| l.to_string()));
+                    at = s + 1 + fe;
+                }
+            }
+
+            new_push.extend(body[at..e].iter().map(|l| l.to_string()));
+        }
+        _ => new_push.push(format!("{indent}  branches: [{base}]")),
+    }
+
+    let mut out = Vec::new();
+    let mut at = 0;
+
+    if push.is_none() {
+        let first = events.first().map_or(0, |&(_, s, _)| s);
+        out.extend(body[..first].iter().map(|l| l.to_string()));
+        out.extend(new_push.clone());
+        at = first;
+    }
+
+    for (k, s, e) in &events {
+        if k == "pull_request" || k == "push" {
+            out.extend(body[at..*s].iter().map(|l| l.to_string()));
+            at = *e;
+
+            if k == "push" {
+                out.extend(new_push.clone());
+            }
+        }
+    }
+
+    out.extend(body[at..].iter().map(|l| l.to_string()));
     out
 }
 
@@ -387,6 +1097,161 @@ pub fn read_marks(log: &str, nonce: &str) -> BTreeMap<String, JobMarks> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_only_edits_on_and_keeps_the_rest() {
+        let block = r#"name: ci
+
+on:
+  push:
+    branches: ["**"] # every branch
+    paths-ignore: ["docs/**"]
+  # PRs too
+  pull_request:
+    paths-ignore: ["docs/**"]
+  workflow_dispatch:
+
+# Read only
+permissions:
+  contents: read
+jobs: {}
+"#;
+        let want = r#"name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**"]
+  # PRs too
+  workflow_dispatch:
+
+# Read only
+permissions:
+  contents: read
+jobs: {}
+"#;
+        assert_eq!(main_only(block, "main").as_deref(), Some(want));
+
+        let cases = [
+            (
+                "on: [push, pull_request, workflow_dispatch] # all\n\njobs: {}\n",
+                "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs: {}\n",
+            ),
+            (
+                "on: pull_request\njobs: {}\n",
+                "on:\n  push:\n    branches: [trunk]\njobs: {}\n",
+            ),
+            (
+                "on:\n  - push\n  - merge_group\njobs: {}\n",
+                "on:\n  push:\n    branches: [main]\n  merge_group:\njobs: {}\n",
+            ),
+            (
+                "on:\n  pull_request:\n    types: [opened]\n  schedule:\n    - cron: \"0 0 * * *\"\njobs: {}\n",
+                "on:\n  push:\n    branches: [main]\n  schedule:\n    - cron: \"0 0 * * *\"\njobs: {}\n",
+            ),
+            (
+                "\"on\":\n    push:\n        branches-ignore:\n            - main\n        tags: [\"v*\"]\njobs: {}\n",
+                "\"on\":\n    push:\n        branches: [main]\n        tags: [\"v*\"]\njobs: {}\n",
+            ),
+            (
+                "on:\n  push:\n  pull_request:\njobs: {}",
+                "on:\n  push:\n    branches: [main]\njobs: {}",
+            ),
+        ];
+
+        for (source, want) in cases {
+            let base = if source.contains("on: pull_request") {
+                "trunk"
+            } else {
+                "main"
+            };
+            assert_eq!(main_only(source, base).as_deref(), Some(want), "{source}");
+        }
+
+        // Already off feature branches, a form it does not edit, or a base it will not write
+        for source in [
+            "on:\n  push:\n    branches: [main]\njobs: {}\n",
+            "on: {pull_request: {}}\njobs: {}\n",
+            "on: workflow_dispatch\njobs: {}\n",
+        ] {
+            assert_eq!(main_only(source, "main"), None, "{source}");
+        }
+
+        assert_eq!(main_only("on: push\njobs: {}\n", "a b"), None);
+    }
+
+    #[test]
+    fn gate_jobs_runs_local_jobs_on_github_only_on_the_base() {
+        // flask's tests.yaml, trimmed: typing runs in shipcheck, the matrix stays
+        let flask = "name: Tests\non:\n  pull_request:\n    paths-ignore: ['docs/**', 'README.md']\n  push:\n    branches: [main, stable]\njobs:\n  tests:\n    name: ${{ matrix.name || matrix.python }}\n    strategy:\n      matrix:\n        include:\n          - {python: '3.14'}\n    steps:\n      - run: uv run tox run\n  typing:\n    runs-on: ubuntu-latest\n    steps:\n      - run: uv run tox run -e typing\n";
+        let want = flask.replace(
+            "  typing:\n",
+            "  typing:\n    if: github.ref == 'refs/heads/main'\n",
+        );
+        assert_eq!(
+            gate_jobs(flask, &["typing".into()], "main").as_deref(),
+            Some(want.as_str())
+        );
+
+        // ripgrep's ci.yml, trimmed, with a job that has an `if:` of its own, plain and in `${{ }}`
+        let ripgrep = "on:\n  pull_request:\n  push:\n    branches:\n    - master\njobs:\n  test:\n    name: test\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n        - os: windows-latest\n    steps:\n    - run: cargo test\n  rustfmt:\n    runs-on: ubuntu-latest\n    if: (!cancelled() && !failure()) # after the rest\n    steps:\n    - run: cargo fmt --all --check\n  docs:\n    if: ${{ github.event_name != 'schedule' }}\n    runs-on: ubuntu-latest\n    steps:\n    - run: cargo doc\n";
+        let gated = gate_jobs(ripgrep, &["rustfmt".into(), "docs".into()], "master").unwrap();
+        assert!(gated.contains(
+            "    if: \"((!cancelled() && !failure())) && github.ref == 'refs/heads/master'\"\n"
+        ));
+        assert!(gated.contains(
+            "    if: \"(github.event_name != 'schedule') && github.ref == 'refs/heads/master'\"\n"
+        ));
+        assert!(gated.starts_with("on:\n  pull_request:\n  push:\n    branches:\n    - master\n"));
+        assert_eq!(gated.lines().count(), ripgrep.lines().count());
+
+        // oblivion's ci.yml, trimmed: push on every branch, the PR found from the branch
+        let push_only = "on:\n  push:\n\njobs:\n  checks:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bun test\n  tests:\n    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-latest]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test\n";
+        let gated = gate_jobs(push_only, &["checks".into()], "main").unwrap();
+        assert!(gated.starts_with(
+            "on:\n  push:\n\njobs:\n  checks:\n    if: github.ref == 'refs/heads/main'\n    runs-on"
+        ));
+
+        // A job in flow form, a missing job or an unusual base is left for the owner
+        let flow = "on: push\njobs:\n  a: {runs-on: x, steps: [{run: make}]}\n";
+        assert_eq!(gate_jobs(flow, &["a".into()], "main"), None);
+        assert_eq!(gate_jobs(flask, &["gone".into()], "main"), None);
+        assert_eq!(gate_jobs(flask, &["typing".into()], "a b"), None);
+    }
+
+    #[test]
+    fn main_only_keeps_a_push_already_off_feature_branches() {
+        // ripgrep's ci.yml: list items at the key's own indentation
+        let ripgrep = "on:\n  pull_request:\n  push:\n    branches:\n    - master\n  schedule:\n  - cron: '00 01 * * *'\n\npermissions:\n  contents: read\njobs: {}\n";
+        assert_eq!(
+            main_only(ripgrep, "master").as_deref(),
+            Some(
+                "on:\n  push:\n    branches:\n    - master\n  schedule:\n  - cron: '00 01 * * *'\n\npermissions:\n  contents: read\njobs: {}\n"
+            )
+        );
+        // flask's tests.yaml: `stable` keeps its hosted runs
+        let flask = "on:\n  pull_request:\n    paths-ignore: ['docs/**', 'README.md']\n  push:\n    branches: [main, stable]\n    paths-ignore: ['docs/**', 'README.md']\npermissions: {}\njobs: {}\n";
+        assert_eq!(
+            main_only(flask, "main").as_deref(),
+            Some(
+                "on:\n  push:\n    branches: [main, stable]\n    paths-ignore: ['docs/**', 'README.md']\npermissions: {}\njobs: {}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_pull_request_closed_trigger_is_not_a_branch_run() {
+        // fastapi's create-draft-release.yml
+        let closed = "on:\n  pull_request:\n    types:\n      - closed\njobs: {}\n";
+        assert!(!runs_for_branches(closed));
+        assert_eq!(main_only(closed, "master"), None);
+        assert!(runs_for_branches(
+            "on:\n  pull_request:\n    types: [opened, synchronize, labeled]\njobs: {}\n"
+        ));
+        assert!(runs_for_branches(
+            "on:\n  pull_request:\n    types: synchronize\njobs: {}\n"
+        ));
+    }
 
     #[test]
     fn shows_names_safely() {

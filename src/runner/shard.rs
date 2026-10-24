@@ -232,7 +232,7 @@ pub fn write_plugin(run_dir: &Path, n: u32) -> Result<(), String> {
 }
 
 /// Opens `name` inside `dir` without following a link at any step, and refuses a FIFO or device
-fn open_at(dir: &fs::File, name: &str, directory: bool) -> std::io::Result<fs::File> {
+pub(crate) fn open_at(dir: &fs::File, name: &str, directory: bool) -> std::io::Result<fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
     let name = std::ffi::CString::new(name)?;

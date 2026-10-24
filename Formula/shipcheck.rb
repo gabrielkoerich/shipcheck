@@ -39,6 +39,8 @@ class Shipcheck < Formula
   def install
     if build.head?
       system "cargo", "install", *std_cargo_args
+      # The hardened runtime stops another program loading code into shipcheck to read its keychain items
+      system "codesign", "--force", "--sign", "-", "--options", "runtime", bin/"shipcheck" if OS.mac?
     else
       bin.install "shipcheck"
     end

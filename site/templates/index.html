@@ -13,7 +13,7 @@
       <path d="M38 22l8-14h28l8 14" fill="#F5C518" stroke="#16181D" stroke-width="4" stroke-linejoin="round"/>
     </svg>
     <h1>Your agent already ran the tests. Let that run be the check.</h1>
-    <p class="lede">shipcheck runs your checks on your machine, natively in a sandbox or as your GitHub Actions workflows in containers, keeps the result for that exact git tree, and posts the required check. A PR whose tree was already tested gets its check in under a second.</p>
+    <p class="lede">shipcheck runs your checks on your machine, natively in a sandbox or as your GitHub Actions workflows in containers, keeps the result for that exact git tree, and posts the required checks. A PR whose tree was already tested gets its checks in under a second. PR checks use none of your GitHub Actions minutes, so they can go to releases and deploys. Your workflows still run on GitHub when a commit lands on main, as a second check.</p>
 
     <div class="install" data-tabs>
       <div class="tabs" role="tablist" aria-label="Install with">
@@ -26,42 +26,44 @@
       <div class="command" role="tabpanel" id="i-script" aria-labelledby="t-script" hidden><code><span class="prompt">$</span> curl -fsSL https://shipcheck.run/install.sh | sh</code><button class="copy" type="button">Copy</button></div>
       <div class="command" role="tabpanel" id="i-cargo" aria-labelledby="t-cargo" hidden><code><span class="prompt">$</span> cargo install shipcheck</code><button class="copy" type="button">Copy</button></div>
       <div class="command" role="tabpanel" id="i-source" aria-labelledby="t-source" hidden><code><span class="prompt">$</span> cargo install --git https://github.com/gabrielkoerich/shipcheck shipcheck</code><button class="copy" type="button">Copy</button></div>
-      <p class="install-note">Then run <code>shipcheck init</code> in your repository. <a href="{{ get_url(path='@/docs/quickstart.md') }}">Quickstart</a></p>
+      <p class="install-note">Releases open on launch day. Then run <code>shipcheck init</code> in your repository. <a href="{{ get_url(path='@/docs/quickstart.md') }}">Quickstart</a></p>
     </div>
 
-    <figure class="pr" aria-label="A pull request whose shipcheck check passed from a cached result">
+    <figure class="pr" aria-label="A pull request whose shipcheck job checks passed from a cached result">
       <div class="pr-title"><strong>Fix parser on empty input</strong> <span>#482, fix-parser into main</span></div>
       <ul class="checks">
+        <li><span class="dot ok" aria-hidden="true"></span><strong>shipcheck/test</strong><span>Required, success</span></li>
+        <li><span class="dot ok" aria-hidden="true"></span><strong>shipcheck/lint</strong><span>Required, success</span></li>
         <li><span class="dot ok" aria-hidden="true"></span><strong>shipcheck</strong><span>Passed, tree already tested</span></li>
-        <li><span class="dot ok" aria-hidden="true"></span><strong>ci.yml / test</strong><span>success, 1 attempt</span></li>
       </ul>
       <div class="pr-merge"><span class="merge-button">Squash and merge</span><span>All checks have passed</span></div>
     </figure>
   </section>
 
   <section class="timing" aria-labelledby="timing-title">
-    <h2 id="timing-title">Time until the check is there</h2>
-    <!-- TBD: fill from docs/BENCHMARKS.md, no other number goes here -->
+    <h2 id="timing-title">How long a check takes</h2>
     <table>
       <thead>
-        <tr><th></th><th>After a push</th><th>After a commit, with the hooks</th><th>Tree already tested, after a rebase or squash</th></tr>
+        <tr><th>Repository and mode</th><th>shipcheck</th><th>GitHub Actions</th></tr>
       </thead>
       <tbody>
-        <tr><th>shipcheck</th><td>TBD</td><td>TBD</td><td>TBD</td></tr>
-        <tr><th>GitHub Actions</th><td>TBD</td><td>TBD</td><td>TBD</td></tr>
+        <tr><th>Small Rust crate, host mode, warm</th><td>1.9 to 2.3 s</td><td>about 20 s</td></tr>
+        <tr><th>Large Rust app, act, warm</th><td>105 s</td><td>115 to 124 s</td></tr>
+        <tr><th>Large Python app, act, tests in shards</th><td>162 to 195 s</td><td>337 to 345 s</td></tr>
+        <tr><th>A tree already tested</th><td>0.13 s</td><td>a full run</td></tr>
       </tbody>
     </table>
-    <p class="note">The CI of bean, a private Python repository of the author's, on the same commit. shipcheck ran on an Apple silicon Mac with Docker Desktop, GitHub on its hosted runners. <a href="https://github.com/gabrielkoerich/shipcheck/blob/main/docs/BENCHMARKS.md">How it was measured</a>. A single run can take longer than on GitHub. The gain is no runner queue, no Actions minutes on PR pushes, and no new run for a tree already tested.</p>
+    <p class="note">shipcheck ran on an Apple silicon Mac, GitHub on its hosted runners, same commits. A first run that starts cold can take longer than GitHub: the large Rust app took 238 s against 116 s.</p>
   </section>
 
   <section id="how" class="how">
     <h2>How it works</h2>
     <ol class="steps">
-      <li><strong>The agent runs <code>shipcheck run</code> instead of its tests.</strong> shipcheck tests the working copy as it is, in its own clone, and the agent commits it with <code>shipcheck commit</code>. The commit's tree already ran, so its check needs no new run. A commit nobody tested starts a background run from a git hook.</li>
-      <li><strong>shipcheck reads what to run from main.</strong> <code>shipcheck.toml</code> and the workflows come from <code>origin/main</code>, never from the branch, so a PR cannot change what checks it.</li>
-      <li><strong>It runs the checks in a warm, clean checkout.</strong> A copy-on-write clone of the tree keeps the build caches. In host mode the commands run natively in an OS sandbox. In act mode act runs the workflow jobs in Docker, and markers added to shipcheck's own copy of each workflow report every job.</li>
-      <li><strong>It keeps the result for the tree.</strong> The key is the git tree plus the config and runner versions, so a rebase or a squash with the same tree needs no new run.</li>
-      <li><strong>The PR gets its check.</strong> shipcheck posts the result as the required <code>shipcheck</code> check. GitHub still runs your workflows on main after the merge.</li>
+      <li>The agent runs <code>shipcheck run</code> instead of its tests. shipcheck tests the working copy as it is, in its own clone, and the agent commits it with <code>shipcheck commit</code>. The commit's tree already ran, so its check needs no new run. A commit nobody tested starts a background run from a git hook.</li>
+      <li>shipcheck reads what to run from main. <code>shipcheck.toml</code> and the workflows come from <code>origin/main</code>, never from the branch, so a PR cannot change what checks it.</li>
+      <li>It runs the checks in a warm, clean checkout. A copy-on-write clone of the tree keeps the build caches. In host mode the commands run natively in an OS sandbox. In act mode act runs the workflow jobs in Docker, and markers added to shipcheck's own copy of each workflow report every job.</li>
+      <li>It keeps the result for the tree. The key is the git tree plus the config and runner versions, so a rebase or a squash with the same tree needs no new run.</li>
+      <li>The PR gets its checks. shipcheck posts one check per job, such as <code>shipcheck/test</code>, as GitHub Actions does, and branch protection requires them. GitHub still runs your workflows on main after the merge.</li>
     </ol>
   </section>
 
@@ -69,16 +71,19 @@
     <h2>What the repository owner sets up</h2>
     <div class="split">
       <div>
-        <p>One file says which workflows a PR must pass. Your workflows stay as they are.</p>
+        <p>One file says which checks a PR must pass. <code>shipcheck init</code> writes it from your workflow jobs.</p>
 <pre><code># shipcheck.toml
-workflows = ["ci.yml"]
+runner = "host"
 on = ["push", "commit"]
-paths = ["src/**"]</code></pre>
+
+[host.checks]
+test = "cargo test"
+clippy = "cargo clippy --all-targets -- -D warnings"</code></pre>
       </div>
       <ul>
-        <li><code>shipcheck init</code> writes the file and installs the hook.</li>
-        <li>A GitHub App posts the check. Today you register your own, a one-click shipcheck App is coming. <a href="{{ get_url(path='@/docs/install.md') }}#what-works-without-the-github-app">What works without it</a></li>
-        <li>A ruleset <a href="{{ get_url(path='@/docs/branch-protection.md') }}">requires the check on main</a>, so a PR merges only after it passes.</li>
+        <li><code>shipcheck init</code> writes the file, installs the hooks, and offers to run hosted Actions only on main.</li>
+        <li>The <a href="https://github.com/apps/shipcheck-run">shipcheck App</a> posts the checks. Install it on the repository. <code>shipcheck init</code> and <code>shipcheck install</code> sign each machine in. <a href="{{ get_url(path='@/docs/install.md') }}#post-the-checks">Post the checks</a></li>
+        <li>A ruleset <a href="{{ get_url(path='@/docs/branch-protection.md') }}">requires the job checks on main</a>, so a PR merges only after every job passes. <code>shipcheck init</code> can create it with your <code>gh</code> login.</li>
         <li>Each teammate runs <code>shipcheck install</code> once per clone.</li>
       </ul>
     </div>
@@ -100,17 +105,14 @@ paths = ["src/**"]</code></pre>
         <h3>It does not stop</h3>
         <ul>
           <li>An agent that deletes or weakens a test. Tests are part of the PR, so review them.</li>
-          <li>Differences between act and GitHub's runners. The hosted run on main catches them.</li>
-          <li>Jobs act cannot run, such as macOS jobs without a Mac, or a job that mounts a loop device.</li>
+          <li>Differences between this machine, or act's containers, and GitHub's runners. The hosted run on main catches them.</li>
+          <li>In act mode, jobs that act cannot run, such as macOS jobs or a job that mounts a loop device.</li>
         </ul>
       </div>
     </div>
+    <p class="note"><a href="{{ get_url(path='@/docs/proof.md') }}">What a green check proves</a> and <a href="{{ get_url(path='@/docs/security.md') }}">what a job can reach</a></p>
   </section>
 
-  <section class="status">
-    <h2>Status</h2>
-    <p>Early. Local runs, the cache, the background hooks and posting the check with your own GitHub App work today. A one-click hosted GitHub App is coming.</p>
-  </section>
 </main>
 <script>
   for (const box of document.querySelectorAll("[data-tabs]")) {

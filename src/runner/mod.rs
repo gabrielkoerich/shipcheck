@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::config::{RepoConfig, RunnerKind};
 
 pub mod act;
+pub mod gc;
 pub mod host;
 pub mod shard;
 
@@ -30,6 +31,11 @@ pub trait Runner: Sync {
 
     /// Removes this runner's caches for one repository, or for all of them
     fn clean(&self, repo_id: Option<&str>) -> Vec<String>;
+
+    /// Removes this runner's state that no run used for a while. Called at the end of a run
+    fn prune(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct RunRequest<'a> {
@@ -60,6 +66,28 @@ pub struct Outcome {
     pub outputs: BTreeMap<String, String>,
     /// How many shards the job's pytest step ran in, when it ran sharded
     pub shards: Option<u32>,
+    /// What the job's steps wrote to `$GITHUB_STEP_SUMMARY`, in step order, cut to [`MAX_SUMMARY`]
+    pub summary: String,
+}
+
+/// The most of one job's step summary that is kept, in bytes
+pub const MAX_SUMMARY: usize = 20_000;
+
+/// The first `MAX_SUMMARY` bytes of a summary, with a note when it was longer
+pub fn cap_summary(text: &str) -> String {
+    let text = text.trim_end();
+
+    if text.len() <= MAX_SUMMARY {
+        return text.to_string();
+    }
+
+    let mut cut = MAX_SUMMARY;
+
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+
+    format!("{}\n\n[...cut at {MAX_SUMMARY} bytes...]", &text[..cut])
 }
 
 /// `repo` is the checkout the run reads git from, where host mode runs its `versions`

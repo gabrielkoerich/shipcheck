@@ -28,6 +28,8 @@ jobs:
         include:
           - { os: ubuntu-24.04, act: act_Linux_x86_64.tar.gz, sha: 0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0 }
           - { os: ubuntu-24.04-arm, act: act_Linux_arm64.tar.gz, sha: daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb }
+    # The private repository's minutes run out: there e2e runs only by hand, the public repository runs it free
+    if: github.repository == 'gabrielkoerich/shipcheck' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:

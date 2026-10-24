@@ -8,3 +8,8 @@ generate_feeds = false
 
 [markdown]
 smart_punctuation = false
+
+# Classes, with the colors in the giallo.css Zola writes, so code keeps the site's background
+[markdown.highlighting]
+theme = "github-light"
+style = "class"

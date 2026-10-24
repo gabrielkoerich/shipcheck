@@ -18,7 +18,7 @@ serde_json = "1.0.154"
 sha2 = "0.10"
 toml = "0.9"
 yaml-rust2 = "0.13"
-git-cow = "0.2.1"
+git-cow = "0.4"
 ureq = { version = "3", features = ["json"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 globset = "0.4.20"

@@ -17,7 +17,7 @@ pub struct RepoConfig {
     pub timeout_minutes: u64,
     #[serde(default = "one")]
     pub retries: u32,
-    /// The most jobs one run starts at once, half the CPUs when unset
+    /// The most jobs one run starts at once. Unset: host CPUs minus 1, capped by Docker's CPUs and memory
     #[serde(default)]
     pub max_parallel: Option<usize>,
     #[serde(default)]
@@ -25,7 +25,7 @@ pub struct RepoConfig {
     /// What jobs can reach. None by default, since job code is a branch's code on this machine
     #[serde(default)]
     pub network: Network,
-    /// Whether failed jobs' log tails go into the check, which is public on a public repository
+    /// Which jobs' log tails go into their checks, which are public on a public repository
     #[serde(default)]
     pub logs: Logs,
     /// Splits a pytest step into parallel shards in the job's container, off unless set
@@ -35,6 +35,12 @@ pub struct RepoConfig {
     pub act: Act,
     #[serde(default)]
     pub host: Host,
+    /// Whether the daemon reruns and posts this repository's PRs that changed on GitHub
+    #[serde(default = "yes")]
+    pub daemon: bool,
+    /// GitHub logins besides the daemon's own whose PRs it may run, for the owner to choose
+    #[serde(default)]
+    pub daemon_authors: Vec<String>,
 }
 
 /// The checks of `runner = "host"`, each a shell command run natively in its own clone
@@ -71,9 +77,9 @@ impl ShardTests {
 #[derive(Debug, Deserialize, PartialEq, Clone, Copy, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Logs {
-    #[default]
-    None,
     Failed,
+    #[default]
+    All,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone, Copy, Default)]
@@ -90,7 +96,7 @@ pub enum Network {
     /// No network at all: not the host, the LAN or the internet
     #[default]
     None,
-    /// A Docker bridge: the internet and the bridge gateway, not the host loopback (docs/SECURITY.md)
+    /// A Docker bridge: the internet and the bridge gateway, not the host loopback
     Internet,
 }
 
@@ -107,6 +113,10 @@ fn on_push() -> Vec<Trigger> {
 
 fn thirty() -> u64 {
     30
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn one() -> u32 {
@@ -157,9 +167,9 @@ impl Default for Act {
             // Parallel jobs share these volumes. Tools that break under sharing get a home per job in JOB_HOMES
             cache_paths: [
                 crate::runner::act::JOB_HOMES,
-                "/root/.npm",
-                "/root/.bun/install/cache",
-                "/root/.cache",
+                "/home/runner/.npm",
+                "/home/runner/.bun/install/cache",
+                "/home/runner/.cache",
             ]
             .map(String::from)
             .to_vec(),
@@ -204,7 +214,7 @@ const JS_LOCKS: &[&str] = &[
 
 /**
  * Shared volumes only for caches that lock themselves, slot volumes and per-job homes for the
- * rest (ARCHITECTURE.md, Package caches). Maven locks only inside one process, Gradle asks for a
+ * rest. Maven locks only inside one process, Gradle asks for a
  * lock by a localhost ping that never reaches another container, yarn v1 has no lock, nub's is
  * unchecked, and Composer, Bundler, Hex and rebar3 write in place or under a PID temp name
  **/
@@ -213,13 +223,13 @@ const ECOSYSTEMS: &[Ecosystem] = &[
         files: JS_LOCKS,
         cache_paths: &[],
         // setup-nub installs from any of these lockfiles
-        slot_paths: &["/root/.local/share/nub"],
+        slot_paths: &["/home/runner/.local/share/nub"],
         job_homes: &[],
     },
     Ecosystem {
         files: &["yarn.lock"],
-        cache_paths: &["/root/.yarn/berry/cache"],
-        slot_paths: &["/usr/local/share/.cache/yarn"],
+        cache_paths: &["/home/runner/.yarn/berry/cache"],
+        slot_paths: &["/home/runner/.cache/yarn"],
         job_homes: &[],
     },
     Ecosystem {
@@ -230,14 +240,14 @@ const ECOSYSTEMS: &[Ecosystem] = &[
     },
     Ecosystem {
         files: &["go.sum", "go.mod"],
-        cache_paths: &["/root/go/pkg/mod"],
+        cache_paths: &["/home/runner/go/pkg/mod"],
         slot_paths: &[],
         job_homes: &[],
     },
     Ecosystem {
         files: &["pom.xml"],
         cache_paths: &[],
-        slot_paths: &["/root/.m2"],
+        slot_paths: &["/home/runner/.m2"],
         job_homes: &[],
     },
     Ecosystem {
@@ -248,13 +258,13 @@ const ECOSYSTEMS: &[Ecosystem] = &[
             "settings.gradle.kts",
         ],
         cache_paths: &[],
-        slot_paths: &["/root/.gradle"],
+        slot_paths: &["/home/runner/.gradle"],
         job_homes: &[],
     },
     Ecosystem {
         files: &["build.sbt"],
         cache_paths: &[],
-        slot_paths: &["/root/.sbt"],
+        slot_paths: &["/home/runner/.sbt"],
         job_homes: &[],
     },
     Ecosystem {
@@ -282,14 +292,14 @@ const ECOSYSTEMS: &[Ecosystem] = &[
     Ecosystem {
         files: &["pubspec.lock", "pubspec.yaml"],
         // setup-dart sets PUB_CACHE to this path, so a home would be overwritten
-        cache_paths: &["/root/.pub-cache"],
+        cache_paths: &["/home/runner/.pub-cache"],
         slot_paths: &[],
         job_homes: &[],
     },
     Ecosystem {
         files: &["*.csproj", "*.fsproj", "*.sln", "global.json"],
         // The whole of ~/.nuget, since NuGet's lock files live in ~/.nuget/lock
-        cache_paths: &["/root/.nuget"],
+        cache_paths: &["/home/runner/.nuget"],
         slot_paths: &[],
         job_homes: &[],
     },
@@ -355,6 +365,19 @@ impl Act {
     }
 }
 
+/// Memory a job is given in the `max_parallel` cap. flask's jobs peaked at 0.38 GiB, and one bean job
+/// at 2.2 GiB still fits beside light ones
+pub const JOB_MEMORY: u64 = 1 << 30;
+
+fn default_parallel(host: usize, engine: Option<(u32, u64)>) -> usize {
+    let cpus = host.saturating_sub(1);
+    let Some((engine_cpus, memory)) = engine else {
+        return cpus.max(1);
+    };
+    let by_memory = usize::try_from(memory / JOB_MEMORY).unwrap_or(usize::MAX);
+    cpus.min(engine_cpus as usize).min(by_memory).max(1)
+}
+
 impl RepoConfig {
     fn host_problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
@@ -369,16 +392,16 @@ impl RepoConfig {
             problems.push("runner is host, but [host] has no checks, so nothing would run".into());
         }
 
-        // A name becomes a directory and a job in the check
+        // A name becomes a directory and a check named as GitHub names a job, so its grammar
         for (name, command) in &self.host.checks {
-            let ok = !name.is_empty()
+            let ok = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
                 && name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c));
 
             if !ok {
                 problems.push(format!(
-                    "host check {name:?} must be letters, digits, _ and -"
+                    "host check {name:?} must start with a letter or _ and be letters, digits, _ and -"
                 ));
             }
 
@@ -428,9 +451,12 @@ impl RepoConfig {
         Ok(config)
     }
 
-    pub fn max_parallel(&self) -> usize {
+    /// `max_parallel`, or one job per CPU the engine and the host share, one host CPU left free,
+    /// at most one per [`JOB_MEMORY`] of the engine's memory. `engine` is from `docker info`
+    pub fn max_parallel(&self, engine: Option<(u32, u64)>) -> usize {
+        let host = std::thread::available_parallelism().map_or(1, |n| n.get());
         self.max_parallel
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() / 2))
+            .unwrap_or_else(|| default_parallel(host, engine))
             .max(1)
     }
 
@@ -572,6 +598,23 @@ impl RepoConfig {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parallel_jobs_leave_one_host_cpu_and_fit_the_engine() {
+        let ample = 64 << 30;
+        assert_eq!(default_parallel(14, Some((14, ample))), 13);
+        assert_eq!(default_parallel(14, Some((8, ample))), 8);
+        assert_eq!(default_parallel(4, Some((4, ample))), 3);
+        assert_eq!(default_parallel(1, Some((1, ample))), 1);
+        assert_eq!(default_parallel(14, None), 13);
+        // Docker Desktop at 16 GB reports 15.6 GiB, room for 15 jobs, so the CPUs decide
+        assert_eq!(default_parallel(14, Some((14, 16_745_295_872))), 13);
+        // Its default 8 GB reports 7.75 GiB
+        assert_eq!(default_parallel(14, Some((14, 8_321_499_136))), 7);
+        assert_eq!(default_parallel(14, Some((14, 1 << 30))), 1);
+        let fixed = RepoConfig::parse("workflows = [\"ci.yml\"]\nmax_parallel = 3").unwrap();
+        assert_eq!(fixed.max_parallel(Some((14, ample))), 3);
+    }
+
     fn workflows(files: &[&str]) -> BTreeSet<String> {
         files.iter().map(|f| f.to_string()).collect()
     }
@@ -584,7 +627,7 @@ mod tests {
         assert!(cfg.paths.is_empty());
         assert_eq!(cfg.timeout_minutes, 30);
         assert_eq!(cfg.retries, 1);
-        assert!(cfg.max_parallel() >= 1);
+        assert!(cfg.max_parallel(None) >= 1);
         assert!(cfg.path_filter().unwrap().is_none());
     }
 
@@ -628,9 +671,10 @@ mod tests {
                 .contains("workflows must be empty")
         );
         let bad = err(
-            "runner = \"host\"\n[host]\nchecks = { \"a/b\" = \"x\", ok = \" \" }\nversions = [\"\"]",
+            "runner = \"host\"\n[host]\nchecks = { \"a/b\" = \"x\", 1x = \"x\", ok = \" \" }\nversions = [\"\"]",
         );
-        assert!(bad.contains("\"a/b\" must be letters"));
+        assert!(bad.contains("\"a/b\" must start with a letter"));
+        assert!(bad.contains("\"1x\" must start with a letter"));
         assert!(bad.contains("\"ok\" has no command"));
         assert!(bad.contains("empty command"));
         assert!(
@@ -674,10 +718,13 @@ mod tests {
     #[test]
     fn parses_logs() {
         let default = RepoConfig::parse(r#"workflows = ["ci.yml"]"#).unwrap();
-        assert_eq!(default.logs, Logs::None);
+        assert_eq!(default.logs, Logs::All);
+        // A failed job always shows its log, so there is no setting that hides it
+        let none = RepoConfig::parse("workflows = [\"ci.yml\"]\nlogs = \"none\"").unwrap_err();
+        assert!(none.contains("unknown variant"), "{none}");
         let failed = RepoConfig::parse("workflows = [\"ci.yml\"]\nlogs = \"failed\"").unwrap();
         assert_eq!(failed.logs, Logs::Failed);
-        assert!(RepoConfig::parse("workflows = [\"ci.yml\"]\nlogs = \"all\"").is_err());
+        assert!(RepoConfig::parse("workflows = [\"ci.yml\"]\nlogs = \"some\"").is_err());
     }
 
     #[test]
@@ -727,21 +774,21 @@ mod tests {
             "src/App.csproj",
         ]);
         for p in [
-            "/root/.npm",
-            "/root/go/pkg/mod",
-            "/root/.pub-cache",
-            "/root/.nuget",
-            "/root/.yarn/berry/cache",
+            "/home/runner/.npm",
+            "/home/runner/go/pkg/mod",
+            "/home/runner/.pub-cache",
+            "/home/runner/.nuget",
+            "/home/runner/.yarn/berry/cache",
         ] {
             assert!(act.cache_paths.iter().any(|c| c == p), "{p}");
         }
         for p in [
             "/var/lib/apt/lists",
-            "/root/.m2",
-            "/root/.gradle",
-            "/root/.sbt",
-            "/usr/local/share/.cache/yarn",
-            "/root/.local/share/nub",
+            "/home/runner/.m2",
+            "/home/runner/.gradle",
+            "/home/runner/.sbt",
+            "/home/runner/.cache/yarn",
+            "/home/runner/.local/share/nub",
         ] {
             assert!(act.slot_paths.iter().any(|c| c == p), "{p}");
             assert!(!act.cache_paths.iter().any(|c| c == p), "{p} is shared");
@@ -761,7 +808,7 @@ mod tests {
 
         let mut npm = Act::default();
         npm.for_tree(["package-lock.json", "a.gemspec"]);
-        assert_eq!(npm.slot_paths[1], "/root/.local/share/nub");
+        assert_eq!(npm.slot_paths[1], "/home/runner/.local/share/nub");
         assert!(npm.job_homes.contains_key("BUNDLE_USER_CACHE"));
         assert!(!npm.job_homes.contains_key("npm_config_store_dir"));
 
@@ -771,7 +818,11 @@ mod tests {
             .act;
         own.for_tree(["pom.xml", "go.sum"]);
         assert!(own.slot_paths.is_empty());
-        assert!(own.cache_paths.iter().any(|c| c == "/root/go/pkg/mod"));
+        assert!(
+            own.cache_paths
+                .iter()
+                .any(|c| c == "/home/runner/go/pkg/mod")
+        );
 
         let cfg = RepoConfig::parse("workflows = [\"ci.yml\"]").unwrap();
         assert_eq!(cfg.validate(&workflows(&["ci.yml"])), Ok(()));
@@ -881,7 +932,7 @@ mod tests {
             paths = ["src/[unclosed"]
             [act]
             platforms = { "ubuntu-latest" = "img:latest", "macos-latest" = "-self-hosted" }
-            cache_paths = ["/root/.cargo", "/x --privileged", "relative"]
+            cache_paths = ["/home/runner/.cargo", "/x --privileged", "relative"]
             job_homes = { GOMODCACHE = "gomod", "A;B" = "x", X = "../up", Y = { dir = "y", path = "b in" } }
             "#,
         )
@@ -895,7 +946,7 @@ mod tests {
         assert!(err.contains("macos-latest maps to -self-hosted"));
         assert!(err.contains("\"/x --privileged\" must be absolute"));
         assert!(err.contains("\"relative\" must be absolute"));
-        assert!(!err.contains("/root/.cargo"));
+        assert!(!err.contains("/home/runner/.cargo"));
         assert!(!err.contains("GOMODCACHE"));
 
         for bad in ["\"A;B\"", "\"X\"", "\"Y\""] {

@@ -2,53 +2,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// The marker version doctor compares, raised when the block's text changes
-pub const BLOCK_VERSION: &str = "v1";
+pub const BLOCK_VERSION: &str = "v2";
 const START: &str = "<!-- shipcheck:start";
 const END: &str = "<!-- shipcheck:end -->";
 
-pub const BLOCK: &str = "<!-- shipcheck:start v1 -->
+pub const BLOCK: &str = "<!-- shipcheck:start v2 -->
 ## Tests and commits
 
 - Do not run the test commands (`pytest`, `cargo test`, `npm test`, `go test`, `just test` and the like). Run `shipcheck run`. It runs this repository's CI on your working copy, and its result is the PR's required check.
 - Commit with `shipcheck commit -m \"<subject>\"`, never `git commit`. It commits every file, exactly the tree that passed.
 - Work in small steps: one change, `shipcheck run`, `shipcheck commit`. Delete scratch files first, because every file is committed.
-- Exit 1: read `shipcheck logs`, fix, run again. Exit 2: shipcheck could not run, so run `shipcheck doctor` and follow it.
+- Exit 1: read `shipcheck logs`, fix, then `shipcheck run --job <id>` for the failed job as often as needed. A partial run is never the check, so finish with one full `shipcheck run`, then `shipcheck commit`. Exit 2: shipcheck could not run, so run `shipcheck doctor` and follow it.
 - If `shipcheck` is not on PATH, run the project's tests and commit with git.
 - Never edit `.github/workflows/` or `shipcheck.toml` to get a pass. Details: https://shipcheck.run/llms.txt
 <!-- shipcheck:end -->";
-
-const SKILL: &str = include_str!("../SKILL.md");
-const SKILL_MARK: &str = "<!-- shipcheck-skill ";
-const HOOK: &str = "shipcheck hook";
-// Only the commands an agent needs run outside its sandbox, never clean, post, daemon or login
-pub const CODEX_RULE: &str = "prefix_rule(pattern=[\"shipcheck\", \"run\"], decision=\"allow\")\n\
-prefix_rule(pattern=[\"shipcheck\", \"commit\"], decision=\"allow\")\n\
-prefix_rule(pattern=[\"shipcheck\", \"status\"], decision=\"allow\")\n\
-prefix_rule(pattern=[\"shipcheck\", \"logs\"], decision=\"allow\")\n\
-prefix_rule(pattern=[\"shipcheck\", \"doctor\"], decision=\"allow\")\n";
-
-const SANDBOX_EXCLUDED: &[&str] = &[
-    "shipcheck run",
-    "shipcheck run *",
-    "shipcheck commit *",
-    "shipcheck status",
-    "shipcheck status *",
-    "shipcheck logs",
-    "shipcheck logs *",
-    "shipcheck doctor",
-];
-
-/// The agents shipcheck writes hooks for, with the binaries that show one is installed
-pub const AGENTS: [(&str, &[&str]); 5] = [
-    ("claude", &["claude"]),
-    ("codex", &["codex"]),
-    ("cursor", &["cursor-agent", "cursor"]),
-    ("gemini", &["gemini"]),
-    ("copilot", &["copilot"]),
-];
 
 /// `text` with the block in it: between the markers when they are there, else appended
 pub fn merge_block(text: Option<&str>) -> String {
@@ -66,13 +36,62 @@ pub fn merge_block(text: Option<&str>) -> String {
     format!("{}\n\n{BLOCK}\n", text.trim_end())
 }
 
-pub fn imports_agents(text: &str) -> bool {
-    text.lines().any(|l| l.trim() == "@AGENTS.md")
+/**
+ * The real path of `path`, resolving each symlink, the last one too and dangling ones, before
+ * applying the `..` after it, as the kernel does. None when it cannot tell: a `..` below a part
+ * that does not exist yet, or links nested too deep
+ **/
+fn resolve(path: &Path) -> Option<PathBuf> {
+    resolve_in(path, &mut 0)
+}
+
+/// Links followed in one resolution, shared by every level, as the kernel's MAXSYMLINKS
+const MAX_LINKS: usize = 40;
+
+fn resolve_in(path: &Path, links: &mut usize) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut real = PathBuf::from("/");
+    let mut exists = true;
+
+    for part in path.components() {
+        match part {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir if exists => {
+                real.pop();
+            }
+            Component::ParentDir => return None,
+            Component::Normal(name) => {
+                let next = real.join(name);
+
+                match fs::symlink_metadata(&next) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        *links += 1;
+
+                        if *links > MAX_LINKS {
+                            return None;
+                        }
+
+                        let target = fs::read_link(&next).ok()?;
+                        real = resolve_in(&real.join(target), links)?;
+                        exists = real.exists();
+                    }
+                    Ok(_) => real = next,
+                    Err(_) => {
+                        real = next;
+                        exists = false;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(real)
 }
 
 /**
  * Refuses a path in the clone that is a symlink, sits under one, or resolves outside the clone. A
- * cloned repository can ship `AGENTS.md` or `.claude` as a link to `~/.zshrc` or `~/.ssh`
+ * cloned repository can ship `AGENTS.md` or `.codex` as a link to `~/.zshrc` or `~/.ssh`
  **/
 pub fn check_in_repo(root: &Path, path: &Path) -> Result<(), String> {
     let rel = path
@@ -96,7 +115,7 @@ pub fn check_in_repo(root: &Path, path: &Path) -> Result<(), String> {
         .canonicalize()
         .map_err(|e| format!("{}: {e}", root.display()))?;
 
-    if !crate::hook::resolve(path).is_some_and(|p| p.starts_with(&real_root)) {
+    if !resolve(path).is_some_and(|p| p.starts_with(&real_root)) {
         return Err(format!("{} is outside the repository", path.display()));
     }
 
@@ -130,282 +149,101 @@ pub fn write_in_repo(root: &Path, path: &Path, text: &str) -> Result<(), String>
     write_nofollow(path, text)
 }
 
-/// With `root`, a file of the clone, where a refusal is a note. Without, a file in the user's home
-fn write_if_changed(
-    root: Option<&Path>,
-    path: &Path,
-    text: &str,
-    done: &mut Vec<String>,
-) -> Result<(), String> {
-    if fs::read_to_string(path).ok().as_deref() == Some(text) {
-        return Ok(());
-    }
-
-    match root {
-        Some(root) => {
-            if let Err(e) = write_in_repo(root, path, text) {
-                done.push(e);
-                return Ok(());
-            }
-        }
-        None => {
-            if let Some(dir) = path.parent() {
-                fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            }
-
-            fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-    }
-
-    done.push(format!("wrote {}", path.display()));
-    Ok(())
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
 }
 
-fn write_block(root: &Path, path: &Path, done: &mut Vec<String>) -> Result<(), String> {
-    let text = fs::read_to_string(path).ok();
-    write_if_changed(Some(root), path, &merge_block(text.as_deref()), done)
+pub fn imports_agents(text: &str) -> bool {
+    text.lines().any(|l| l.trim() == "@AGENTS.md")
 }
 
-/**
- * For `init`: the agent instructions in the files each agent reads. AGENTS.md always. Claude Code
- * reads only CLAUDE.md when both exist, so a CLAUDE.md without `@AGENTS.md` gets the block too
- **/
+/// The instruction files besides AGENTS.md that get the block when they exist. A CLAUDE.md that
+/// imports AGENTS.md has it already
+const OTHER_INSTRUCTIONS: &[&str] = &[
+    "CLAUDE.md",
+    ".claude/CLAUDE.md",
+    "GEMINI.md",
+    ".github/copilot-instructions.md",
+];
+
+/// The instruction files that need the block: AGENTS.md always, the others when they exist
+fn instruction_files(root: &Path) -> Vec<&'static str> {
+    let mut files = vec!["AGENTS.md"];
+
+    for name in OTHER_INSTRUCTIONS {
+        if fs::symlink_metadata(root.join(name)).is_ok() && !imports_agents(&read(&root.join(name)))
+        {
+            files.push(name);
+        }
+    }
+
+    files
+}
+
+/// For `init`: the block in each instruction file. A refusal to write through a symlink is a line
 pub fn instructions(root: &Path) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
-    write_block(root, &root.join("AGENTS.md"), &mut done)?;
 
-    for name in ["CLAUDE.md", ".claude/CLAUDE.md"] {
-        if let Ok(text) = fs::read_to_string(root.join(name))
-            && !imports_agents(&text)
-        {
-            write_block(root, &root.join(name), &mut done)?;
+    for name in instruction_files(root) {
+        let path = root.join(name);
+        let text = fs::read_to_string(&path).ok();
+        let merged = merge_block(text.as_deref());
+
+        if text.as_deref() == Some(merged.as_str()) {
+            continue;
         }
-    }
 
-    let gemini = root.join(".gemini/settings.json");
-
-    if root.join("GEMINI.md").exists() {
-        write_block(root, &root.join("GEMINI.md"), &mut done)?;
-    } else if gemini.exists() {
-        let mut doc = read_json(&gemini)?;
-        add_context_file(&mut doc)?;
-        write_if_changed(Some(root), &gemini, &pretty(&doc), &mut done)?;
-    }
-
-    let copilot = root.join(".github/copilot-instructions.md");
-
-    if copilot.exists() {
-        write_block(root, &copilot, &mut done)?;
-    }
-
-    let aider = root.join(".aider.conf.yml");
-
-    if let Ok(text) = fs::read_to_string(&aider)
-        && !text.contains("AGENTS.md")
-    {
-        if text.lines().any(|l| l.starts_with("read:")) {
-            done.push(format!("add AGENTS.md to `read` in {}", aider.display()));
-        } else {
-            let sep = if text.is_empty() || text.ends_with('\n') {
-                ""
-            } else {
-                "\n"
-            };
-            write_if_changed(
-                Some(root),
-                &aider,
-                &format!("{text}{sep}read: AGENTS.md\n"),
-                &mut done,
-            )?;
-        }
+        done.push(match write_in_repo(root, &path, &merged) {
+            Ok(()) => format!("wrote {}", path.display()),
+            Err(e) => e,
+        });
     }
 
     Ok(done)
 }
 
-/// Gemini reads GEMINI.md by default, so AGENTS.md is added next to whatever it reads
-pub fn add_context_file(doc: &mut Value) -> Result<(), String> {
-    let context = object(doc)?.entry("context").or_insert_with(|| json!({}));
-    let context = context.as_object_mut().ok_or("context is not an object")?;
-    let mut names: Vec<Value> = match context.get("fileName") {
-        Some(Value::String(s)) => vec![json!(s)],
-        Some(Value::Array(a)) => a.clone(),
-        _ => vec![json!("GEMINI.md")],
-    };
+/// For doctor: each instruction file without this version's block
+pub fn notes(root: &Path) -> Vec<String> {
+    let marker = format!("{START} {BLOCK_VERSION} -->");
 
-    if !names.contains(&json!("AGENTS.md")) {
-        names.push(json!("AGENTS.md"));
-    }
+    instruction_files(root)
+        .into_iter()
+        .filter_map(|name| {
+            let text = read(&root.join(name));
 
-    context.insert("fileName".into(), Value::Array(names));
-    Ok(())
-}
-
-fn object(doc: &mut Value) -> Result<&mut serde_json::Map<String, Value>, String> {
-    doc.as_object_mut().ok_or("not a JSON object".to_string())
-}
-
-/// A missing file is an empty object. A file that does not parse is an error, never overwritten
-fn read_json(path: &Path) -> Result<Value, String> {
-    match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not valid JSON, left alone: {e}", path.display())),
-        Err(_) => Ok(json!({})),
-    }
-}
-
-fn pretty(doc: &Value) -> String {
-    format!(
-        "{}\n",
-        serde_json::to_string_pretty(doc).unwrap_or_default()
-    )
-}
-
-fn ours(hook: &Value) -> bool {
-    ["command", "bash"].iter().any(|k| {
-        hook.get(k)
-            .and_then(Value::as_str)
-            .is_some_and(|c| c.starts_with(HOOK))
-    })
-}
-
-/// Puts `entry` in `doc.hooks[event]`, after removing every earlier `shipcheck hook` entry
-pub fn set_hook(doc: &mut Value, event: &str, entry: Value) -> Result<(), String> {
-    let hooks = object(doc)?.entry("hooks").or_insert_with(|| json!({}));
-    let list = hooks
-        .as_object_mut()
-        .ok_or("hooks is not an object")?
-        .entry(event)
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .ok_or(format!("hooks.{event} is not a list"))?;
-
-    list.retain_mut(|e| match e.get_mut("hooks").and_then(Value::as_array_mut) {
-        Some(inner) => {
-            let before = inner.len();
-            inner.retain(|h| !ours(h));
-            before == 0 || !inner.is_empty()
-        }
-        None => !ours(e),
-    });
-    list.push(entry);
-    Ok(())
-}
-
-fn command(agent: &str, event: &str) -> String {
-    format!("{HOOK} {agent} {event}")
-}
-
-/// The Claude, Codex and Gemini shape: a matcher group holding command hooks
-fn group(matcher: Option<&str>, agent: &str, event: &str) -> Value {
-    let mut entry = json!({"hooks": [{"type": "command", "command": command(agent, event)}]});
-
-    if let Some(m) = matcher {
-        entry["matcher"] = json!(m);
-    }
-
-    entry
-}
-
-/// Adds `items` to the list at `doc[key][field]`, once each
-fn add_all(doc: &mut Value, key: &str, field: &str, items: &[String]) -> Result<(), String> {
-    let section = object(doc)?.entry(key).or_insert_with(|| json!({}));
-    let list = section
-        .as_object_mut()
-        .ok_or(format!("{key} is not an object"))?
-        .entry(field)
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .ok_or(format!("{key}.{field} is not a list"))?;
-
-    for item in items {
-        if !list.contains(&json!(item)) {
-            list.push(json!(item));
-        }
-    }
-
-    Ok(())
-}
-
-/// The hook config file of `agent`, relative to the clone, with shipcheck's entries merged in
-pub fn hook_config(agent: &str, doc: &mut Value, home: &Path) -> Result<&'static str, String> {
-    Ok(match agent {
-        "claude" => {
-            let edits = "Bash|Edit|Write|MultiEdit|NotebookEdit";
-            set_hook(doc, "PreToolUse", group(Some(edits), agent, "pre-tool"))?;
-            set_hook(doc, "Stop", group(None, agent, "stop"))?;
-            // `//` makes a rule absolute, a space in the path is a literal in gitignore syntax
-            let home = home.to_string_lossy();
-            let home = home.trim_end_matches('/');
-            let deny = [
-                format!("Edit(/{home}/**)"),
-                format!("Read(/{home}/token)"),
-                format!("Read(/{home}/app.pem)"),
-                format!("Read(/{home}/secrets/**)"),
-            ];
-            add_all(doc, "permissions", "deny", &deny)?;
-            let excluded: Vec<String> = SANDBOX_EXCLUDED.iter().map(|c| c.to_string()).collect();
-            add_all(doc, "sandbox", "excludedCommands", &excluded)?;
-
-            // Earlier installs excluded every shipcheck command
-            if let Some(list) = doc["sandbox"]["excludedCommands"].as_array_mut() {
-                list.retain(|c| c != "shipcheck *");
+            if text.contains(&marker) {
+                None
+            } else if text.contains(START) {
+                Some(format!(
+                    "{name} has an older shipcheck block: `shipcheck init`"
+                ))
+            } else {
+                Some(format!("{name} has no shipcheck block: `shipcheck init`"))
             }
-            ".claude/settings.local.json"
-        }
-        "codex" => {
-            set_hook(doc, "PreToolUse", group(Some("Bash"), agent, "pre-tool"))?;
-            set_hook(doc, "Stop", group(None, agent, "stop"))?;
-            ".codex/hooks.json"
-        }
-        "cursor" => {
-            object(doc)?.entry("version").or_insert(json!(1));
-            set_hook(
-                doc,
-                "beforeShellExecution",
-                json!({"command": command(agent, "pre-tool")}),
-            )?;
-            set_hook(
-                doc,
-                "preToolUse",
-                json!({"command": command(agent, "pre-tool"), "matcher": "Write|Delete"}),
-            )?;
-            set_hook(doc, "stop", json!({"command": command(agent, "stop")}))?;
-            ".cursor/hooks.json"
-        }
-        "gemini" => {
-            let tools = "run_shell_command|write_file|replace";
-            set_hook(doc, "BeforeTool", group(Some(tools), agent, "pre-tool"))?;
-            set_hook(doc, "AfterAgent", group(None, agent, "stop"))?;
-            ".gemini/settings.json"
-        }
-        "copilot" => {
-            object(doc)?.entry("version").or_insert(json!(1));
-            let entry = |event| json!({"type": "command", "bash": command(agent, event)});
-            set_hook(doc, "preToolUse", entry("pre-tool"))?;
-            set_hook(doc, "agentStop", entry("stop"))?;
-            ".github/hooks/shipcheck.json"
-        }
-        other => return Err(format!("no hooks for {other}")),
-    })
-}
-
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
-}
-
-/// The agents with a binary on PATH or a config directory in the user's home or the clone
-pub fn detected(root: &Path, home: &Path) -> Vec<&'static str> {
-    AGENTS
-        .iter()
-        .filter(|(name, bins)| {
-            let dir = format!(".{name}");
-            bins.iter().any(|b| on_path(b)) || home.join(&dir).is_dir() || root.join(&dir).is_dir()
         })
-        .map(|(name, _)| *name)
         .collect()
 }
+
+/// The files older versions wrote agent hooks into, relative to the clone
+const OLD_HOOK_FILES: &[&str] = &[
+    ".claude/settings.local.json",
+    ".codex/hooks.json",
+    ".cursor/hooks.json",
+    ".gemini/settings.json",
+    ".github/hooks/shipcheck.json",
+];
+const OLD_CODEX_RULES: &str = ".codex/rules/shipcheck.rules";
+const OLD_EXCLUDED: &[&str] = &[
+    "shipcheck *",
+    "shipcheck run",
+    "shipcheck run *",
+    "shipcheck commit *",
+    "shipcheck status",
+    "shipcheck status *",
+    "shipcheck logs",
+    "shipcheck logs *",
+    "shipcheck doctor",
+];
 
 fn git_ok(root: &Path, args: &[&str]) -> bool {
     Command::new("git")
@@ -416,13 +254,113 @@ fn git_ok(root: &Path, args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Hides a file shipcheck wrote from git, so it is never part of a run or a commit
-fn exclude(root: &Path, rel: &str) -> Result<(), String> {
-    if git_ok(root, &["check-ignore", "-q", rel]) {
-        return Ok(());
+fn ours(hook: &Value) -> bool {
+    ["command", "bash"].iter().any(|k| {
+        hook.get(k)
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.starts_with("shipcheck hook "))
+    })
+}
+
+/// Drops `items` from the list at `doc[key][field]`
+fn drop_items(doc: &mut Value, key: &str, field: &str, items: &[String]) {
+    if let Some(list) = doc
+        .get_mut(key)
+        .and_then(|s| s.get_mut(field))
+        .and_then(Value::as_array_mut)
+    {
+        list.retain(|v| !v.as_str().is_some_and(|s| items.iter().any(|i| i == s)));
+    }
+}
+
+/// Drops the empty lists and objects at `path` in `doc`, deepest first
+fn prune(doc: &mut Value, path: &[&str]) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut at = &mut *doc;
+
+    for key in parents {
+        match at.get_mut(*key) {
+            Some(next) => at = next,
+            None => return,
+        }
     }
 
-    let out = Command::new("git")
+    if let Some(map) = at.as_object_mut()
+        && map.get(*last).is_some_and(|v| match v {
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        })
+    {
+        map.remove(*last);
+    }
+}
+
+/// Removes the entries older versions wrote, never the user's. Whether anything changed
+fn strip(doc: &mut Value, homes: &[PathBuf]) -> bool {
+    let before = doc.clone();
+
+    if let Some(hooks) = doc.get_mut("hooks").and_then(Value::as_object_mut) {
+        for list in hooks.values_mut().filter_map(Value::as_array_mut) {
+            list.retain_mut(|e| match e.get_mut("hooks").and_then(Value::as_array_mut) {
+                Some(inner) => {
+                    let empty = inner.is_empty();
+                    inner.retain(|h| !ours(h));
+                    empty || !inner.is_empty()
+                }
+                None => !ours(e),
+            });
+        }
+    }
+
+    let deny: Vec<String> = homes
+        .iter()
+        .flat_map(|h| {
+            let h = h.to_string_lossy().trim_end_matches('/').to_string();
+            [
+                format!("Edit(/{h}/**)"),
+                format!("Read(/{h}/token)"),
+                format!("Read(/{h}/app.pem)"),
+                format!("Read(/{h}/secrets/**)"),
+            ]
+        })
+        .collect();
+    drop_items(doc, "permissions", "deny", &deny);
+    let excluded: Vec<String> = OLD_EXCLUDED.iter().map(|c| c.to_string()).collect();
+    drop_items(doc, "sandbox", "excludedCommands", &excluded);
+
+    if *doc == before {
+        return false;
+    }
+
+    let events: Vec<String> = doc
+        .get("hooks")
+        .and_then(Value::as_object)
+        .map(|h| h.keys().cloned().collect())
+        .unwrap_or_default();
+
+    for event in &events {
+        prune(doc, &["hooks", event]);
+    }
+
+    for path in [
+        &["hooks"][..],
+        &["permissions", "deny"],
+        &["permissions"],
+        &["sandbox", "excludedCommands"],
+        &["sandbox"],
+    ] {
+        prune(doc, path);
+    }
+
+    true
+}
+
+/// Drops the `/<rel>` line older versions added to `.git/info/exclude`
+fn unexclude(root: &Path, rel: &str) {
+    let Ok(out) = Command::new("git")
         .arg("-C")
         .arg(root)
         .args([
@@ -432,218 +370,111 @@ fn exclude(root: &Path, rel: &str) -> Result<(), String> {
             "info/exclude",
         ])
         .output()
-        .map_err(|e| e.to_string())?;
+    else {
+        return;
+    };
     let file = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let text = fs::read_to_string(&file).unwrap_or_default();
+    let text = read(&file);
     let line = format!("/{rel}");
 
     if text.lines().any(|l| l == line) {
-        return Ok(());
+        let kept: String = text
+            .lines()
+            .filter(|l| *l != line)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let _ = write_nofollow(&file, &kept);
     }
-
-    if let Some(dir) = file.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-
-    let sep = if text.is_empty() || text.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    write_nofollow(&file, &format!("{text}{sep}{line}\n"))
 }
 
-/// Writes one file of this clone that shipcheck owns. A tracked file is the team's, left alone
-fn write_local(root: &Path, rel: &str, text: &str, done: &mut Vec<String>) -> Result<(), String> {
-    if git_ok(root, &["ls-files", "--error-unmatch", "--", rel]) {
-        done.push(format!(
-            "{rel} is tracked, so shipcheck leaves it alone. Add the `shipcheck hook` entries to it by hand (https://shipcheck.run/docs/agents/)"
-        ));
-        return Ok(());
-    }
-
-    write_if_changed(Some(root), &root.join(rel), text, done)?;
-    exclude(root, rel)
-}
-
-/// The skill as installed, with the version line doctor compares, after the frontmatter
-pub fn skill_text() -> String {
-    let line = format!("{SKILL_MARK}{} -->\n", env!("CARGO_PKG_VERSION"));
-
-    match SKILL
-        .strip_prefix("---\n")
-        .and_then(|rest| rest.find("\n---\n"))
-    {
-        Some(at) => {
-            let end = at + "---\n".len() + "\n---\n".len();
-            format!("{}{line}{}", &SKILL[..end], &SKILL[end..])
+fn remove(root: &Path, rel: &str, done: &mut Vec<String>) {
+    match fs::remove_file(root.join(rel)) {
+        Ok(()) => {
+            unexclude(root, rel);
+            done.push(format!(
+                "removed {rel}, shipcheck no longer writes agent hooks"
+            ));
         }
-        None => format!("{line}{SKILL}"),
+        Err(e) => done.push(format!("{rel}: {e}")),
     }
-}
-
-/// Where each agent's user-level skill goes, for the agents whose config directory exists
-pub fn skill_paths(home: &Path) -> Vec<(&'static str, PathBuf)> {
-    let mut paths = Vec::new();
-
-    if home.join(".claude").is_dir() {
-        paths.push(("claude", home.join(".claude/skills/shipcheck/SKILL.md")));
-    }
-
-    if home.join(".agents").is_dir() || home.join(".codex").is_dir() {
-        paths.push(("codex", home.join(".agents/skills/shipcheck/SKILL.md")));
-    }
-
-    paths
 }
 
 /**
- * For `install`: the hook configs of every detected agent in this clone, and the skill in the
- * user's home. Never fails: a file it cannot merge becomes a line to act on
+ * For `install`: removes the agent hooks older versions wrote into this clone. Only shipcheck's own
+ * entries go, and a file goes only when nothing else is left. Never fails, a problem is a line
  **/
-pub fn install(root: &Path, home: &Path, shipcheck_home: &Path) -> Vec<String> {
-    install_for(root, home, shipcheck_home, &detected(root, home))
-}
-
-pub fn install_for(
-    root: &Path,
-    home: &Path,
-    shipcheck_home: &Path,
-    agents: &[&str],
-) -> Vec<String> {
+pub fn remove_old_hooks(root: &Path, homes: &[PathBuf]) -> Vec<String> {
     let mut done = Vec::new();
 
-    for agent in agents {
-        let result = (|| {
-            let mut doc = json!({});
-            let rel = hook_config(agent, &mut doc, shipcheck_home)?;
-            let mut doc = read_json(&root.join(rel))?;
-            hook_config(agent, &mut doc, shipcheck_home)?;
-            write_local(root, rel, &pretty(&doc), &mut done)?;
+    for rel in OLD_HOOK_FILES {
+        let path = root.join(rel);
 
-            if *agent == "codex" {
-                write_local(root, ".codex/rules/shipcheck.rules", CODEX_RULE, &mut done)?;
-            }
+        if fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
 
-            Ok::<_, String>(())
-        })();
+        if let Err(e) = check_in_repo(root, &path) {
+            done.push(e);
+            continue;
+        }
 
-        if let Err(e) = result {
-            done.push(format!("{agent}: {e}"));
+        let Ok(mut doc) = serde_json::from_str::<Value>(&read(&path)) else {
+            continue;
+        };
+
+        if !strip(&mut doc, homes) {
+            continue;
+        }
+
+        // Older versions never wrote a tracked file, so these entries are the team's
+        if git_ok(root, &["ls-files", "--error-unmatch", "--", rel]) {
+            done.push(format!(
+                "{rel} is tracked and has `shipcheck hook` entries, which this version no longer has: remove them by hand"
+            ));
+            continue;
+        }
+
+        if doc
+            .as_object()
+            .is_some_and(|m| m.keys().all(|k| k == "version"))
+        {
+            remove(root, rel, &mut done);
+            continue;
+        }
+
+        let text = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&doc).unwrap_or_default()
+        );
+
+        match write_nofollow(&path, &text) {
+            Ok(()) => done.push(format!("removed shipcheck's hooks from {rel}")),
+            Err(e) => done.push(e),
         }
     }
 
-    for (_, path) in skill_paths(home) {
-        if let Err(e) = write_if_changed(None, &path, &skill_text(), &mut done) {
-            done.push(e);
-        }
+    let rules = root.join(OLD_CODEX_RULES);
+
+    if check_in_repo(root, &rules).is_ok()
+        && let Ok(text) = fs::read_to_string(&rules)
+        && text
+            .lines()
+            .all(|l| l.trim().is_empty() || l.contains("pattern=[\"shipcheck\","))
+        && !git_ok(
+            root,
+            &["ls-files", "--error-unmatch", "--", OLD_CODEX_RULES],
+        )
+    {
+        remove(root, OLD_CODEX_RULES, &mut done);
     }
 
     done
 }
 
-fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default()
-}
-
-/// Claude Code's sandbox, from the user's and the clone's settings, the last one set wins
-fn claude_sandbox(root: &Path, home: &Path) -> bool {
-    let mut on = false;
-
-    for file in [
-        home.join(".claude/settings.json"),
-        root.join(".claude/settings.json"),
-        root.join(".claude/settings.local.json"),
-    ] {
-        if let Some(v) = serde_json::from_str::<Value>(&read(&file))
-            .ok()
-            .and_then(|d| d.pointer("/sandbox/enabled").and_then(Value::as_bool))
-        {
-            on = v;
-        }
-    }
-
-    on
-}
-
-/// For doctor: per detected agent, what is missing for it to use shipcheck, and what protects the
-/// results from it. Notes, never failures
-pub fn notes(root: &Path, home: &Path) -> Vec<(&'static str, String)> {
-    let agents_md = read(&root.join("AGENTS.md"));
-    let marker = format!("{START} {BLOCK_VERSION} -->");
-    let block = if agents_md.contains(&marker) {
-        None
-    } else if agents_md.contains(START) {
-        Some("AGENTS.md has an older shipcheck block: `shipcheck init`".to_string())
-    } else {
-        Some("AGENTS.md has no shipcheck block: `shipcheck init`".to_string())
-    };
-    let skills = skill_paths(home);
-    let version = format!("{SKILL_MARK}{} -->", env!("CARGO_PKG_VERSION"));
-
-    detected(root, home)
-        .into_iter()
-        .map(|agent| {
-            let mut missing: Vec<String> = block.iter().cloned().collect();
-
-            if agent == "claude" {
-                for name in ["CLAUDE.md", ".claude/CLAUDE.md"] {
-                    let text = read(&root.join(name));
-
-                    if !text.is_empty() && !imports_agents(&text) && !text.contains(&marker) {
-                        missing.push(format!(
-                            "{name} has neither `@AGENTS.md` nor the block: `shipcheck init`"
-                        ));
-                    }
-                }
-            }
-
-            let mut doc = json!({});
-
-            if let Ok(rel) = hook_config(agent, &mut doc, home)
-                && !read(&root.join(rel)).contains(HOOK)
-            {
-                missing.push(format!("no hooks in {rel}: `shipcheck install`"));
-            }
-
-            if agent == "codex" && !root.join(".codex/rules/shipcheck.rules").exists() {
-                missing.push("no .codex/rules/shipcheck.rules: `shipcheck install`".into());
-            }
-
-            if let Some((_, path)) = skills.iter().find(|(a, _)| *a == agent)
-                && !read(path).contains(&version)
-            {
-                missing.push(format!(
-                    "{} is missing or old: `shipcheck install`",
-                    path.display()
-                ));
-            }
-
-            let guard = match agent {
-                "codex" => {
-                    "sandboxed by default, the results are outside its writable roots".to_string()
-                }
-                "claude" if claude_sandbox(root, home) => {
-                    "sandbox on, the results are outside its writable paths".to_string()
-                }
-                "claude" => "sandbox off, results protected only by the hook check".to_string(),
-                "cursor" => "results protected only by the hook check, file edits through preToolUse, whose path fields Cursor does not document".to_string(),
-                _ => "results protected only by the hook check".to_string(),
-            };
-
-            let detail = if missing.is_empty() {
-                format!("instructions, hooks and skill installed. {guard}")
-            } else {
-                format!("{}. {guard}", missing.join(", "))
-            };
-            (agent, detail)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn block_goes_in_a_new_file_between_markers_and_after_other_text() {
@@ -662,154 +493,28 @@ mod tests {
     }
 
     #[test]
-    fn instructions_skip_a_claude_md_that_imports_agents_md() {
+    fn instructions_go_in_every_instruction_file_and_skip_an_import() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
         fs::create_dir_all(root.join(".claude")).unwrap();
         fs::write(root.join(".claude/CLAUDE.md"), "# Mine\n").unwrap();
+        fs::write(root.join("GEMINI.md"), "").unwrap();
         fs::create_dir_all(root.join(".gemini")).unwrap();
-        fs::write(
-            root.join(".gemini/settings.json"),
-            r#"{"context":{"fileName":"NOTES.md"}}"#,
-        )
-        .unwrap();
-        fs::write(root.join(".aider.conf.yml"), "model: x").unwrap();
+        fs::write(root.join(".gemini/settings.json"), "{}").unwrap();
 
-        instructions(root).unwrap();
-
+        assert_eq!(notes(root).len(), 3);
+        assert_eq!(instructions(root).unwrap().len(), 3);
         assert!(read(&root.join("AGENTS.md")).starts_with(START));
+        assert!(read(&root.join("GEMINI.md")).starts_with(START));
         assert_eq!(read(&root.join("CLAUDE.md")), "@AGENTS.md\n");
         assert!(
-            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v1")
+            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v2")
         );
-        let gemini: Value =
-            serde_json::from_str(&read(&root.join(".gemini/settings.json"))).unwrap();
-        assert_eq!(
-            gemini["context"]["fileName"],
-            json!(["NOTES.md", "AGENTS.md"])
-        );
-        assert_eq!(
-            read(&root.join(".aider.conf.yml")),
-            "model: x\nread: AGENTS.md\n"
-        );
-        assert!(!root.join("GEMINI.md").exists());
-
-        // Idempotent: a second run writes nothing
+        assert_eq!(read(&root.join(".gemini/settings.json")), "{}");
+        assert!(!root.join(".github").exists());
+        assert!(notes(root).is_empty());
         assert!(instructions(root).unwrap().is_empty());
-    }
-
-    #[test]
-    fn hook_merge_keeps_other_hooks_and_replaces_its_own() {
-        let home = Path::new("/Users/a b/Library/Application Support/shipcheck");
-        let mut doc = json!({
-            "model": "x",
-            "hooks": {"PreToolUse": [
-                {"matcher": "Bash", "hooks": [
-                    {"type": "command", "command": "other"},
-                    {"type": "command", "command": "shipcheck hook claude old"}
-                ]},
-                {"matcher": "Edit", "hooks": [{"type": "command", "command": "shipcheck hook claude x"}]}
-            ]}
-        });
-        hook_config("claude", &mut doc, home).unwrap();
-        let once = doc.clone();
-        hook_config("claude", &mut doc, home).unwrap();
-        assert_eq!(doc, once);
-
-        assert_eq!(doc["model"], "x");
-        let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 2);
-        assert_eq!(
-            pre[0]["hooks"],
-            json!([{"type": "command", "command": "other"}])
-        );
-        assert_eq!(
-            pre[1]["hooks"][0]["command"],
-            "shipcheck hook claude pre-tool"
-        );
-        assert_eq!(
-            doc["hooks"]["Stop"][0]["hooks"][0]["command"],
-            "shipcheck hook claude stop"
-        );
-        assert_eq!(
-            doc["permissions"]["deny"][0],
-            "Edit(//Users/a b/Library/Application Support/shipcheck/**)"
-        );
-        assert_eq!(doc["sandbox"]["excludedCommands"], json!(SANDBOX_EXCLUDED));
-
-        for agent in ["codex", "cursor", "gemini", "copilot"] {
-            let mut doc = json!({});
-            hook_config(agent, &mut doc, home).unwrap();
-            let once = doc.clone();
-            hook_config(agent, &mut doc, home).unwrap();
-            assert_eq!(doc, once, "{agent}");
-        }
-
-        let mut cursor = json!({});
-        hook_config("cursor", &mut cursor, home).unwrap();
-        assert_eq!(
-            cursor,
-            json!({"version": 1, "hooks": {
-                "beforeShellExecution": [{"command": "shipcheck hook cursor pre-tool"}],
-                "preToolUse": [{"command": "shipcheck hook cursor pre-tool", "matcher": "Write|Delete"}],
-                "stop": [{"command": "shipcheck hook cursor stop"}]
-            }})
-        );
-    }
-
-    #[test]
-    fn install_writes_excluded_files_and_leaves_tracked_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("repo");
-        let home = dir.path().join("home");
-        fs::create_dir_all(home.join(".claude")).unwrap();
-        fs::create_dir_all(root.join(".cursor")).unwrap();
-        let git = |args: &[&str]| assert!(git_ok(&root, args), "git {args:?}");
-        git(&["init", "-q"]);
-        // The user's global gitignore may already hide these files
-        git(&["config", "core.excludesFile", "/dev/null"]);
-        fs::write(root.join(".cursor/hooks.json"), "{}\n").unwrap();
-        git(&["add", ".cursor/hooks.json"]);
-
-        let done = install_for(
-            &root,
-            &home,
-            &home.join("state"),
-            &["claude", "codex", "cursor"],
-        );
-
-        assert!(
-            read(&root.join(".claude/settings.local.json")).contains("shipcheck hook claude stop")
-        );
-        assert_eq!(read(&root.join(".codex/rules/shipcheck.rules")), CODEX_RULE);
-        assert_eq!(read(&root.join(".cursor/hooks.json")), "{}\n");
-        assert!(
-            done.iter()
-                .any(|l| l.contains(".cursor/hooks.json is tracked"))
-        );
-        let exclude = read(&root.join(".git/info/exclude"));
-        assert!(exclude.contains("/.claude/settings.local.json\n"));
-        assert!(exclude.contains("/.codex/hooks.json\n"));
-        assert!(read(&home.join(".claude/skills/shipcheck/SKILL.md")).contains(SKILL_MARK));
-        assert!(!home.join(".agents").exists());
-
-        let again = install_for(
-            &root,
-            &home,
-            &home.join("state"),
-            &["claude", "codex", "cursor"],
-        );
-        assert_eq!(again.len(), 1, "{again:?}");
-        assert_eq!(read(&root.join(".git/info/exclude")), exclude);
-    }
-
-    #[test]
-    fn skill_keeps_its_frontmatter_first() {
-        let text = skill_text();
-        assert!(text.starts_with("---\nname: shipcheck\n"));
-        let after = text.split("\n---\n").nth(1).unwrap();
-        assert!(after.starts_with(SKILL_MARK));
     }
 
     #[test]
@@ -820,29 +525,229 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("zshrc"), "mine\n").unwrap();
+        fs::write(
+            outside.join("hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"shipcheck hook codex stop"}]}]}}"#,
+        )
+        .unwrap();
         std::os::unix::fs::symlink(outside.join("zshrc"), root.join("AGENTS.md")).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join(".claude")).unwrap();
-        fs::write(outside.join("CLAUDE.md"), "# Theirs\n").unwrap();
-        std::os::unix::fs::symlink(outside.join("nothing"), root.join("GEMINI.md")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".codex")).unwrap();
         assert!(git_ok(&root, &["init", "-q"]));
 
         let done = instructions(&root).unwrap();
-        let home = dir.path().join("home");
-        let installed = install_for(&root, &home, &home.join("state"), &["claude"]);
+        let removed = remove_old_hooks(&root, &[]);
 
         assert_eq!(read(&outside.join("zshrc")), "mine\n");
-        assert_eq!(read(&outside.join("CLAUDE.md")), "# Theirs\n");
-        assert!(!outside.join("nothing").exists());
-        assert!(!outside.join("settings.local.json").exists());
-        assert!(
-            done.iter().filter(|l| l.contains("is a symlink")).count() == 2,
-            "{done:?}"
-        );
-        assert!(
-            installed.iter().any(|l| l.contains("is a symlink")),
-            "{installed:?}"
-        );
+        assert!(read(&outside.join("hooks.json")).contains("shipcheck hook"));
+        assert!(done.iter().any(|l| l.contains("is a symlink")), "{done:?}");
+        assert!(removed[0].contains("is a symlink"), "{removed:?}");
         assert!(check_in_repo(&root, &root.join("../outside/x")).is_err());
         assert!(write_nofollow(&root.join("AGENTS.md"), "x").is_err());
+    }
+
+    #[test]
+    fn resolve_follows_links_before_dots_and_stops_long_chains() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(base.join("a/b")).unwrap();
+        std::os::unix::fs::symlink(base.join("a/b"), base.join("link")).unwrap();
+        assert_eq!(resolve(&base.join("link/../x")), Some(base.join("a/x")));
+        assert_eq!(resolve(&base.join("new/../x")), None);
+
+        // Each link of a chain names the one before it 8 times, which cost 8^8 lookups with a
+        // depth limit per level. One budget for the whole path ends it after 40 links
+        fs::create_dir_all(base.join("chain")).unwrap();
+        std::os::unix::fs::symlink(".", base.join("chain/l0")).unwrap();
+
+        for i in 1..30 {
+            let prev = vec![format!("l{}", i - 1); 8].join("/");
+            std::os::unix::fs::symlink(prev, base.join(format!("chain/l{i}"))).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        assert_eq!(resolve(&base.join("chain/l29/x")), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The files older versions wrote, each with shipcheck's entries and, when `theirs`, one of the user's
+    fn old_files(home: &str, theirs: bool) -> Vec<(&'static str, Value)> {
+        let group = |agent: &str, event: &str, matcher: Option<&str>| {
+            let mut g = json!({"hooks": [{"type": "command", "command": format!("shipcheck hook {agent} {event}")}]});
+
+            if let Some(m) = matcher {
+                g["matcher"] = json!(m);
+            }
+
+            g
+        };
+        let mut claude = json!({
+            "hooks": {
+                "PreToolUse": [group("claude", "pre-tool", Some("Bash|Edit|Write|MultiEdit|NotebookEdit"))],
+                "Stop": [group("claude", "stop", None)],
+            },
+            "permissions": {"deny": [
+                format!("Edit(/{home}/**)"),
+                format!("Read(/{home}/token)"),
+                format!("Read(/{home}/app.pem)"),
+                format!("Read(/{home}/secrets/**)"),
+            ]},
+            "sandbox": {"excludedCommands": OLD_EXCLUDED[1..]},
+        });
+        let mut codex = json!({"hooks": {
+            "PreToolUse": [group("codex", "pre-tool", Some("Bash"))],
+            "Stop": [group("codex", "stop", None)],
+        }});
+        let mut cursor = json!({"version": 1, "hooks": {
+            "beforeShellExecution": [{"command": "shipcheck hook cursor pre-tool"}],
+            "preToolUse": [{"command": "shipcheck hook cursor pre-tool", "matcher": "Write|Delete"}],
+            "stop": [{"command": "shipcheck hook cursor stop"}],
+        }});
+        let mut gemini = json!({"hooks": {
+            "BeforeTool": [group("gemini", "pre-tool", Some("run_shell_command|write_file|replace"))],
+            "AfterAgent": [group("gemini", "stop", None)],
+        }});
+        let mut copilot = json!({"version": 1, "hooks": {
+            "preToolUse": [{"type": "command", "bash": "shipcheck hook copilot pre-tool"}],
+            "agentStop": [{"type": "command", "bash": "shipcheck hook copilot stop"}],
+        }});
+
+        if theirs {
+            claude["model"] = json!("x");
+            claude["permissions"]["deny"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("Read(./.env)"));
+            claude["hooks"]["PreToolUse"][0]["hooks"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type": "command", "command": "mine"}));
+            codex["hooks"]["Stop"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"hooks": [{"type": "command", "command": "mine"}]}));
+            cursor["hooks"]["stop"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"command": "mine"}));
+            gemini["context"] = json!({"fileName": ["GEMINI.md", "AGENTS.md"]});
+            copilot["hooks"]["agentStop"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type": "command", "bash": "mine"}));
+        }
+
+        vec![
+            (".claude/settings.local.json", claude),
+            (".codex/hooks.json", codex),
+            (".cursor/hooks.json", cursor),
+            (".gemini/settings.json", gemini),
+            (".github/hooks/shipcheck.json", copilot),
+        ]
+    }
+
+    fn repo(dir: &Path, home: &str, theirs: bool) -> PathBuf {
+        let root = dir.join("repo");
+        fs::create_dir_all(&root).unwrap();
+        assert!(git_ok(&root, &["init", "-q"]));
+        let mut exclude = String::new();
+
+        for (rel, doc) in old_files(home, theirs) {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+            exclude.push_str(&format!("/{rel}\n"));
+        }
+
+        fs::create_dir_all(root.join(".codex/rules")).unwrap();
+        fs::write(
+            root.join(OLD_CODEX_RULES),
+            "prefix_rule(pattern=[\"shipcheck\", \"run\"], decision=\"allow\")\n\
+             prefix_rule(pattern=[\"shipcheck\", \"doctor\"], decision=\"allow\")\n",
+        )
+        .unwrap();
+        exclude.push_str(&format!("/{OLD_CODEX_RULES}\n"));
+        fs::write(root.join(".git/info/exclude"), format!("# mine\n{exclude}")).unwrap();
+        root
+    }
+
+    #[test]
+    fn removes_files_that_hold_only_old_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = "/Users/a b/Library/Application Support/shipcheck";
+        let root = repo(dir.path(), home, false);
+
+        let done = remove_old_hooks(&root, &[PathBuf::from(home)]);
+
+        for (rel, _) in old_files(home, false) {
+            assert!(!root.join(rel).exists(), "{rel}");
+        }
+
+        assert!(!root.join(OLD_CODEX_RULES).exists());
+        assert_eq!(done.len(), 6, "{done:?}");
+        assert_eq!(read(&root.join(".git/info/exclude")), "# mine\n");
+        assert!(remove_old_hooks(&root, &[PathBuf::from(home)]).is_empty());
+    }
+
+    #[test]
+    fn keeps_the_users_entries_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = "/h/shipcheck";
+        let root = repo(dir.path(), home, true);
+        fs::write(
+            root.join(OLD_CODEX_RULES),
+            "prefix_rule(pattern=[\"ls\"])\n",
+        )
+        .unwrap();
+
+        remove_old_hooks(&root, &[PathBuf::from(home)]);
+        let doc = |rel: &str| serde_json::from_str::<Value>(&read(&root.join(rel))).unwrap();
+
+        let mine = json!([{"type": "command", "command": "mine"}]);
+        assert_eq!(
+            doc(".claude/settings.local.json"),
+            json!({
+                "model": "x",
+                "hooks": {"PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit", "hooks": mine}]},
+                "permissions": {"deny": ["Read(./.env)"]},
+            })
+        );
+        assert_eq!(
+            doc(".codex/hooks.json"),
+            json!({"hooks": {"Stop": [{"hooks": mine}]}})
+        );
+        assert_eq!(
+            doc(".cursor/hooks.json"),
+            json!({"version": 1, "hooks": {"stop": [{"command": "mine"}]}})
+        );
+        assert_eq!(
+            doc(".gemini/settings.json"),
+            json!({"context": {"fileName": ["GEMINI.md", "AGENTS.md"]}})
+        );
+        assert_eq!(
+            doc(".github/hooks/shipcheck.json"),
+            json!({"version": 1, "hooks": {"agentStop": [{"type": "command", "bash": "mine"}]}})
+        );
+        assert!(root.join(OLD_CODEX_RULES).exists());
+        assert!(read(&root.join(".git/info/exclude")).contains("/.codex/hooks.json\n"));
+    }
+
+    #[test]
+    fn leaves_a_tracked_file_and_one_that_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo(dir.path(), "/h", false);
+        fs::write(root.join(".gemini/settings.json"), "{ not json").unwrap();
+        assert!(git_ok(&root, &["add", "-f", ".cursor/hooks.json"]));
+        let cursor = read(&root.join(".cursor/hooks.json"));
+
+        let done = remove_old_hooks(&root, &[]);
+
+        assert_eq!(read(&root.join(".cursor/hooks.json")), cursor);
+        assert_eq!(read(&root.join(".gemini/settings.json")), "{ not json");
+        assert!(
+            done.iter()
+                .any(|l| l.contains(".cursor/hooks.json is tracked"))
+        );
+        // The home given was not the one in the deny rules, so those stay
+        assert!(read(&root.join(".claude/settings.local.json")).contains("Edit(//h/**)"));
     }
 }

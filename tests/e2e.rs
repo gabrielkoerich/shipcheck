@@ -49,12 +49,25 @@ jobs:
       - run: exit 1
 ";
 
+/// Removes the Docker volumes and images of the test's home, even when an assertion fails
+struct CleanOnDrop;
+
+impl Drop for CleanOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+            .args(["clean", "--all"])
+            .output();
+    }
+}
+
 #[test]
 #[ignore = "needs act and Docker"]
 fn runs_caches_and_tests_the_working_copy() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary that reads or writes the environment
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
+    // Declared after `tmp`, so it drops first and removes the volumes while the home still exists
+    let _volumes = CleanOnDrop;
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();
@@ -674,6 +687,9 @@ fn runs_caches_and_tests_the_working_copy() {
     );
     assert!(tail.contains("isolation.yml"), "{tail}");
     assert!(!log.contains("own-canary") && !tail.contains("own-canary"));
+    // On a Mac the run moved the secrets file into the keychain
+    assert_eq!(own.exists(), !cfg!(target_os = "macos"));
+    shipcheck::secret::remove(&own).unwrap();
     // `shipcheck logs` hands no control character from a job to the terminal
     let logs = Command::new(bin)
         .args(["logs", "main"])
@@ -685,7 +701,6 @@ fn runs_caches_and_tests_the_working_copy() {
     assert!(logs.status.success(), "{printed}");
     assert!(printed.contains("\\u{1b}]0;from-job"), "{printed}");
     assert!(!logs.stdout.contains(&0x1b) && !logs.stdout.contains(&0x07));
-    fs::remove_file(&own).unwrap();
     fs::remove_file(&other).unwrap();
 
     // A branch's run leaves nothing in a later run of main but its ignored build directories and
@@ -694,7 +709,7 @@ fn runs_caches_and_tests_the_working_copy() {
     fs::write(work.join(".gitignore"), "build\n.hidden\n").unwrap();
     fs::write(
         work.join("shipcheck.toml"),
-        "workflows = [\"state.yml\"]\n[act]\ncache_paths = [\"/root/.shipcheck\"]\n",
+        "workflows = [\"state.yml\"]\n[act]\ncache_paths = [\"/home/runner/.shipcheck\"]\n",
     )
     .unwrap();
     git(&work, &["add", "-A"]);
@@ -982,7 +997,11 @@ jobs:
       # The checkout matches the commit, scripts next to the workflows stay, each job has its own tool cache
       - run: git diff --exit-code && git status --porcelain | grep -v from-a | grep -c . | grep -qx 0
       - run: sh .github/workflows/scripts/hello.sh
-      - run: test \"$RUNNER_TOOL_CACHE\" = /root/.shipcheck/a/toolcache
+      - run: test \"$RUNNER_TOOL_CACHE\" = /home/runner/.shipcheck/a/toolcache
+      # The job runs as GitHub's runner user, and can write every mount
+      - run: test \"$(id -un):$(id -u):$HOME\" = runner:1001:/home/runner && sudo -n true
+      - run: test \"$ImageOS:$RUNNER_TEMP\" = ubuntu24:/home/runner/work/_temp && touch \"$RUNNER_TEMP/t\"
+      - run: test -w .venv
       - run: test \"${{ github.ref }}\" = refs/heads/shipcheck
   b:
     needs: a
@@ -1122,7 +1141,7 @@ jobs:
             mkdir -p .hidden build
             echo planted > .hidden/x
             echo planted > build/x
-            echo planted > /root/.shipcheck/planted
+            echo planted > /home/runner/.shipcheck/planted
             echo planted > /tmp/planted
             git config user.planted yes
             git tag planted
@@ -1135,7 +1154,7 @@ jobs:
           test -z "$(git config user.planted)"
           ! git rev-parse -q --verify planted
           echo "build carried: $(test -f build/x && echo yes || echo no)"
-          echo "volume carried: $(test -f /root/.shipcheck/planted && echo yes || echo no)"
+          echo "volume carried: $(test -f /home/runner/.shipcheck/planted && echo yes || echo no)"
 "#;
 
 const HANG: &str = r#"

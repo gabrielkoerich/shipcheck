@@ -1,0 +1,11 @@
+# The site as a Worker that serves the built files, on the same account as the service
+name = "shipcheck-site"
+compatibility_date = "2026-10-01"
+# Only the custom domain, whose WAF rules apply
+workers_dev = false
+preview_urls = false
+routes = [{ pattern = "shipcheck.run", custom_domain = true }]
+
+[assets]
+directory = "public"
+not_found_handling = "404-page"

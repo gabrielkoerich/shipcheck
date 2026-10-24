@@ -1,8 +1,13 @@
 # shipcheck
 
-Your agent already ran the tests. shipcheck runs your repository's checks on your machine, keeps the result for that exact git tree, and posts the required check from its own GitHub App. By default it runs the commands it finds, such as `cargo test` or `npm test`, natively in an OS sandbox. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run. Or it runs your GitHub Actions workflows in containers with act, the mode closest to GitHub's CI. A PR whose tree was already tested gets its check in under a second.
+Your agent already ran the tests. shipcheck runs your repository's checks on your machine, keeps the result for that exact git tree, and posts the required checks, one per job, from its GitHub App. A PR whose tree was already tested gets its checks in under a second.
 
-Time to result on bean, a private Python repository, on an Apple silicon Mac with Docker Desktop against GitHub's hosted runners: after a push TBD vs TBD, after a commit with the hooks TBD vs TBD, a tree already tested TBD vs TBD. Method and numbers in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). A single run can take longer than on GitHub. The gain is no runner queue, no Actions minutes on PR pushes, and no new run for a tree already tested.
+It has two modes:
+
+- Host mode, which `shipcheck init` writes when it finds your checks, runs the commands of your workflow jobs, such as `cargo test` or `npm test`, natively in an OS sandbox. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run.
+- act mode, the default without `runner`, runs your GitHub Actions workflows in containers with act. It is the mode closest to GitHub's CI.
+
+Measured on an Apple silicon Mac against GitHub's hosted runners, same commits: a small Rust crate in host mode 1.9 to 2.3 s against about 20 s, a large Rust app in act 105 s against 115 to 124 s warm, and a tree already tested 0.13 s. A first run that starts cold can take longer than GitHub. [Speed](https://shipcheck.run/docs/speed/) has the settings that make runs fast.
 
 Docs: https://shipcheck.run/docs/ (source in `site/content/docs`).
 
@@ -32,25 +37,28 @@ Or from source:
 cargo install --git https://github.com/gabrielkoerich/shipcheck shipcheck
 ```
 
-| Needs | Why |
-|---|---|
-| git | shipcheck reads commits, trees and `main` from your clone |
-| Docker | act runs each job in a container. Docker Desktop is recommended. OrbStack and colima are tested, with limits in the install docs |
-| [act](https://github.com/nektos/act) 0.2.89 or later | Runs the workflows. `brew install act` |
-| A copy-on-write filesystem | APFS on macOS, btrfs or XFS on Linux, so a warm checkout costs no disk. On other filesystems shipcheck falls back to a plain git worktree |
+| Needs | When | Why |
+|---|---|---|
+| git | Always | shipcheck reads commits, trees and `main` from your clone |
+| An OS sandbox | Host mode | macOS has `sandbox-exec`. On Linux, install bubblewrap |
+| Docker | act mode | act runs each job in a container. Docker Desktop is recommended. OrbStack and colima are tested, with limits in the install docs |
+| [act](https://github.com/nektos/act) 0.2.89 or later | act mode | Runs the workflows. `brew install act` |
+| A copy-on-write filesystem | Recommended | APFS on macOS, btrfs or XFS on Linux, so a warm checkout costs no disk. On other filesystems shipcheck falls back to a plain git worktree |
 
-Then run `shipcheck init` in your repository. See [the quickstart](https://shipcheck.run/docs/quickstart/).
+## Set up a repository
 
-## What works without the GitHub App
+1. Install the binary, above.
+2. Run `shipcheck init` in a clone of the repository, on `main`.
+3. Commit the `shipcheck.toml` it writes and merge it to `main`.
+4. Install the [shipcheck App](https://github.com/apps/shipcheck-run) on the repository. `init` prints this link.
 
-Status: early. The one-click hosted GitHub App is not live yet ([#2](https://github.com/gabrielkoerich/shipcheck/issues/2)). Without it, these work on any repository:
+[The quickstart](https://shipcheck.run/docs/quickstart/) says what each step does. Each other clone needs `shipcheck install` once. In a terminal, `init` and `install` sign the machine in when it cannot post yet. A machine with no person at it gets a token from `shipcheck token` instead ([unattended machines](https://shipcheck.run/docs/install/#unattended-machines)).
 
-- `shipcheck run`: runs the workflows locally on the working copy and gives the verdict as an exit code. `shipcheck commit` then commits exactly that tree, so its check needs no new run.
-- The result cache: a tree that already passed answers at once.
-- The git hooks: start runs in the background on commit or push.
-- `shipcheck status` and `shipcheck logs`: show the stored result and logs of a commit.
+shipcheck then posts one check per job, such as `shipcheck/test`, as Actions does. Those are the checks branch protection requires. A `shipcheck` check beside them sums up the run. A team can post from [its own App](https://shipcheck.run/docs/install/#your-own-app) instead.
 
-The `shipcheck` check on a PR (`shipcheck post`, `shipcheck daemon`) needs a GitHub App and its private key on the machine that runs shipcheck. Today that means your own App, with `SHIPCHECK_APP_ID` and `SHIPCHECK_APP_KEY_FILE` set. A one-click hosted App is coming.
+Without the App, `shipcheck run`, the result cache, the git hooks, `shipcheck status` and `shipcheck logs` still work on any repository.
+
+What a green check proves and what a job can reach: [proof](https://shipcheck.run/docs/proof/), [security](https://shipcheck.run/docs/security/).
 
 ## Layout
 
@@ -58,7 +66,6 @@ The `shipcheck` check on a PR (`shipcheck post`, `shipcheck daemon`) needs a Git
 |---|---|
 | `src/` | The `shipcheck` CLI |
 | `site/` | The website and user docs, built with [Zola](https://www.getzola.org): `zola --root site serve` |
-| `docs/` | Design notes: why it is built this way, what a check proves, and what a job can reach |
 
 ## License
 

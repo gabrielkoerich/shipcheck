@@ -46,6 +46,19 @@ pub struct WorkflowResult {
     /// The jobs that had a sharded pytest step
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shards: BTreeMap<String, ShardRun>,
+    /// When each job that ran started and ended, in Unix seconds. Entries from before have none
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub times: BTreeMap<String, [u64; 2]>,
+    /// What each job wrote to `$GITHUB_STEP_SUMMARY`, for the PR comment. Entries from before have none
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub summaries: BTreeMap<String, String>,
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Everything about one commit that the cache key and a run need, read from git
@@ -62,6 +75,8 @@ pub struct Plan {
     pub ci_changes: Vec<String>,
     /// The base has no shipcheck.toml, so the plan runs the defaults, and its result is never posted
     pub defaults: bool,
+    /// The runner's identity in the key: act's version, or host mode's tool versions
+    pub tools: String,
 }
 
 /// Config every git process shipcheck starts gets, since git checks out a branch's tree on the host
@@ -257,15 +272,16 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         as_run.insert(path.clone(), body);
     }
 
+    let tools = runner.identity()?;
     let key = cache::key(&KeyInputs {
         tree: &tree,
         config: &config_text,
         workflows: &as_run,
         runner_kind: if host { "host" } else { "act" },
         checks: &config.host.checks,
-        runner_version: &runner.identity()?,
+        runner_version: &tools,
         shipcheck_version: env!("CARGO_PKG_VERSION"),
-        platforms: &config.act.platforms,
+        platforms: &crate::runner::act::platforms(&config.act),
     });
 
     let ci_changes = ci_changes(&repo, &base, &sha)?;
@@ -281,6 +297,7 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         key,
         ci_changes,
         defaults,
+        tools,
     })
 }
 
@@ -472,7 +489,7 @@ pub fn commit(
 
 /**
  * What the commit changes in its workflows and `shipcheck.toml` since it left the base. These never
- * run (PROOF.md), but once merged they change CI for everyone, so the check names them, and the jobs
+ * run, but once merged they change CI for everyone, so the check names them, and the jobs
  * a change lets fail or never runs. Also the files that define what a command does, such as
  * package.json scripts, which do run from the commit in either mode
  **/
@@ -597,6 +614,39 @@ fn check_definition_changes(
     Ok(found)
 }
 
+/// The jobs a run of `config` reports, read from each required workflow's source as `source` gives it
+pub fn expected_jobs(
+    config: &RepoConfig,
+    source: impl Fn(&str) -> Option<String>,
+) -> Result<crate::check::Jobs, String> {
+    if config.runner == RunnerKind::Host {
+        return Ok(BTreeMap::from([(
+            HOST.to_string(),
+            config.host.checks.keys().cloned().collect(),
+        )]));
+    }
+
+    let mut jobs = BTreeMap::new();
+
+    for file in &config.workflows {
+        let body = source(file).ok_or_else(|| format!("{file} is not on the base"))?;
+        let ids = workflow::job_needs(&body)?.into_iter().map(|(id, _)| id);
+        jobs.insert(file.clone(), ids.collect());
+    }
+
+    Ok(jobs)
+}
+
+/// The jobs a run of this plan reports, from the base's workflows
+pub fn jobs(plan: &Plan) -> Result<crate::check::Jobs, String> {
+    expected_jobs(&plan.config, |file| {
+        plan.workflows
+            .iter()
+            .find(|(path, _)| file_name(path) == file)
+            .map(|(_, body)| String::from_utf8_lossy(body).into_owned())
+    })
+}
+
 /// A required workflow as it runs: prepared for the runner, then wrapped in markers
 fn as_run_body(
     runner: &dyn Runner,
@@ -664,6 +714,27 @@ pub fn skip_requested(plan: &Plan) -> bool {
     }
 
     git(&plan.repo, &["log", "-1", "--format=%B", &plan.sha]).is_ok_and(|m| message_skips(&m))
+}
+
+/**
+ * The key and base commit of the last recorded run of `tree` whose key `has` something. `logs` and
+ * `status` read it when the key under origin/main has nothing, such as after a trial with
+ * `--base <branch>`, which keys the run by that branch's shipcheck.toml
+ **/
+pub fn last_run(
+    home: &Path,
+    repo: &str,
+    tree: &str,
+    has: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    crate::record::runs(home, repo, usize::MAX)
+        .into_iter()
+        .rev()
+        .find(|r| r["tree"] == tree && r["key"].as_str().is_some_and(&has))
+        .map(|r| {
+            let field = |k: &str| r[k].as_str().unwrap_or_default().to_string();
+            (field("key"), field("base"))
+        })
 }
 
 pub fn cached(key: &str) -> Option<Entry> {
@@ -753,13 +824,8 @@ pub fn secrets_file(repo_id: &str) -> PathBuf {
 /// The values in a repository's secrets file, longest first, to redact from anything posted. Each
 /// line of a value with `\n` escapes is a value too, since a log prints it line by line
 pub fn secret_values(repo_id: &str) -> Result<Vec<String>, String> {
-    let path = secrets_file(repo_id);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    Ok(parse_secrets(&text))
+    let text = crate::secret::read(&secrets_file(repo_id))?.unwrap_or_default();
+    Ok(parse_secrets(&String::from_utf8_lossy(&text)))
 }
 
 fn parse_secrets(text: &str) -> Vec<String> {
@@ -860,6 +926,123 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
 /// Runs every required workflow of the plan, each job in its own copy-on-write clone, and caches
 /// the result
 pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
+    let entry = execute(plan, None, say)?;
+    let cache_dir = home().join("cache");
+    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?;
+    fs::write(cache_dir.join(format!("{}.json", plan.key)), json).map_err(|e| e.to_string())?;
+    Ok(entry)
+}
+
+/// Runs only the named jobs and workflows and the jobs they need. The result is never cached, so
+/// it is never the check, and its logs go to [`partial_log_dir`]
+pub fn run_partial(
+    plan: &Plan,
+    jobs: &[String],
+    workflows: &[String],
+    say: &mut dyn FnMut(&str),
+) -> Result<Entry, String> {
+    execute(plan, Some((jobs, workflows)), say)
+}
+
+/// The jobs to run per workflow file: every job of each named workflow, each job whose id or
+/// matrix leg matches a name, and every job they need
+pub fn select(
+    graphs: &BTreeMap<String, Vec<(String, Vec<String>)>>,
+    jobs: &[String],
+    workflows: &[String],
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let mut chosen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for wf in workflows {
+        let name = file_name(wf);
+        let graph = graphs.get(&name).ok_or_else(|| {
+            format!(
+                "no workflow {name} in shipcheck.toml's workflows: {}",
+                graphs.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        chosen
+            .entry(name)
+            .or_default()
+            .extend(graph.iter().map(|(j, _)| j.clone()));
+    }
+
+    for job in jobs {
+        let mut found = false;
+
+        for (file, graph) in graphs {
+            for (id, _) in graph {
+                // A matrix job runs as legs `<id>__<n>`, its id names all of them
+                let leg = id
+                    .strip_prefix(job.as_str())
+                    .and_then(|rest| rest.strip_prefix("__"))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+
+                if id == job || leg {
+                    chosen.entry(file.clone()).or_default().insert(id.clone());
+                    found = true;
+                }
+            }
+        }
+
+        if !found {
+            let all: Vec<_> = graphs
+                .values()
+                .flat_map(|g| g.iter().map(|(j, _)| j.as_str()))
+                .collect();
+            return Err(format!("no job {job}, the jobs are: {}", all.join(", ")));
+        }
+    }
+
+    for (file, picked) in &mut chosen {
+        let needs: BTreeMap<_, _> = graphs[file].iter().cloned().collect();
+        let mut todo: Vec<String> = picked.iter().cloned().collect();
+
+        while let Some(job) = todo.pop() {
+            for need in needs.get(&job).into_iter().flatten() {
+                if picked.insert(need.clone()) {
+                    todo.push(need.clone());
+                }
+            }
+        }
+    }
+
+    Ok(chosen)
+}
+
+/// The host checks `--job` names, under the one workflow host mode has. `--workflow` names none
+pub fn select_host(
+    checks: &BTreeMap<String, String>,
+    jobs: &[String],
+    workflows: &[String],
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    if !workflows.is_empty() {
+        return Err(
+            "--workflow picks workflows, host mode runs [host] checks: use --job <check>".into(),
+        );
+    }
+
+    if let Some(missing) = jobs.iter().find(|j| !checks.contains_key(*j)) {
+        return Err(format!(
+            "no check {missing}, the checks are: {}",
+            checks.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    Ok(BTreeMap::from([(
+        HOST.to_string(),
+        jobs.iter().cloned().collect(),
+    )]))
+}
+
+pub fn partial_log_dir(key: &str) -> PathBuf {
+    home().join("logs").join(format!("{key}.partial"))
+}
+
+type Selection<'a> = Option<(&'a [String], &'a [String])>;
+
+fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     let _runner = claim_runner(say)?;
     let home = home();
     // Results, logs, secrets and the App key live here, other users of the machine read none of it
@@ -872,7 +1055,8 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     let (slot, _slot) = claim_slot(&slots)?;
     let runner = runner::from_config(&plan.config, &plan.repo);
     runner.preflight()?;
-    prune(&home, SystemTime::now() - KEEP_RESULTS);
+    prune(&home, SystemTime::now());
+    crate::templates::prune(&home, SystemTime::now(), &slot.with_extension("lock"));
     {
         let _git = git_lock(&id)?;
         remove_checkouts(plan, runner.as_ref(), &slot);
@@ -896,7 +1080,33 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
         bodies.insert(file, body);
     }
 
-    let slots = Slots::new(plan.config.max_parallel());
+    let only = match only {
+        Some((jobs, workflows)) if plan.config.runner == RunnerKind::Host => {
+            Some(select_host(&plan.config.host.checks, jobs, workflows)?)
+        }
+        Some((jobs, workflows)) => {
+            let mut graphs = BTreeMap::new();
+
+            for file in &plan.config.workflows {
+                let body = String::from_utf8_lossy(&bodies[file]).into_owned();
+                graphs.insert(file.clone(), workflow::job_needs(&body)?);
+            }
+
+            Some(select(&graphs, jobs, workflows)?)
+        }
+        None => None,
+    };
+    let logs = if only.is_some() {
+        let dir = partial_log_dir(&plan.key);
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    } else {
+        log_dir(&plan.key)
+    };
+    let slots = Slots::new(
+        plan.config
+            .max_parallel(crate::runner::act::engine_resources()),
+    );
     let ctx = Ctx {
         plan,
         runner: runner.as_ref(),
@@ -905,8 +1115,9 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
         templates: &templates,
         bodies: &bodies,
         nonce: &nonce,
-        logs: log_dir(&plan.key),
+        logs,
         slots: &slots,
+        only: only.as_ref(),
     };
 
     let results = if plan.config.runner == RunnerKind::Host {
@@ -918,6 +1129,10 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     {
         let _git = git_lock(&id)?;
         let _ = git(&plan.repo, &["worktree", "prune"]);
+    }
+
+    for line in runner.prune() {
+        say(&line);
     }
 
     let entry = Entry {
@@ -934,10 +1149,6 @@ pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
         skipped: None,
         ci_changes: plan.ci_changes.clone(),
     };
-    let cache_dir = home.join("cache");
-    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?;
-    fs::write(cache_dir.join(format!("{}.json", plan.key)), json).map_err(|e| e.to_string())?;
     Ok(entry)
 }
 
@@ -950,6 +1161,7 @@ fn run_workflows(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowRes
             .config
             .workflows
             .iter()
+            .filter(|f| ctx.only.is_none_or(|o| o.contains_key(*f)))
             .map(|file| {
                 let tx = tx.clone();
                 s.spawn(move || {
@@ -989,18 +1201,21 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
     git_cow::can_clone(&templates, &checkouts);
     let deadline = Instant::now() + Duration::from_secs(ctx.plan.config.timeout_minutes * 60);
 
-    let runs: Vec<(String, Result<JobRun, String>)> = std::thread::scope(|s| {
+    let runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<Msg>();
         let handles: Vec<_> = checks
             .keys()
+            .filter(|name| {
+                ctx.only
+                    .is_none_or(|o| o.get(HOST).is_some_and(|picked| picked.contains(*name)))
+            })
             .map(|name| {
                 let tx = tx.clone();
                 s.spawn(move || {
                     let (none, unused) = (BTreeMap::new(), ctx.slot.join(HOST));
-                    (
-                        name.clone(),
-                        run_job(ctx, HOST, name, &none, deadline, &unused, &tx),
-                    )
+                    let start = unix_now();
+                    let run = run_job(ctx, HOST, name, &none, deadline, &unused, &tx);
+                    (name.clone(), run, [start, unix_now()])
                 })
             })
             .collect();
@@ -1015,20 +1230,27 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
         handles
             .into_iter()
             .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| (String::new(), Err("a check thread panicked".into())))
+                h.join().unwrap_or_else(|_| {
+                    (String::new(), Err("a check thread panicked".into()), [0; 2])
+                })
             })
             .collect()
     });
 
-    let mut states = BTreeMap::new();
+    let (mut states, mut times) = (BTreeMap::new(), BTreeMap::new());
     let (mut exit, mut attempts, mut log) = (Some(0), 0, String::new());
+    let mut summaries = BTreeMap::new();
 
-    for (name, run) in runs {
+    for (name, run, time) in runs {
+        times.insert(name.clone(), time);
         let state = match run {
             Ok(run) => {
                 attempts = attempts.max(run.attempts);
                 log.push_str(&run.log);
+
+                if !run.summary.is_empty() {
+                    summaries.insert(name.clone(), run.summary);
+                }
 
                 if exit == Some(0) && run.exit != Some(0) {
                     exit = run.exit;
@@ -1065,6 +1287,8 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
         jobs: states,
         passed,
         shards: BTreeMap::new(),
+        times,
+        summaries,
     })
 }
 
@@ -1101,7 +1325,7 @@ fn remove_checkouts(plan: &Plan, runner: &dyn Runner, slot: &Path) {
 }
 
 /// Ends the state of a failed job with `continue-on-error: true`, which does not fail the workflow
-const ALLOWED: &str = ", allowed by continue-on-error";
+pub const ALLOWED: &str = ", allowed by continue-on-error";
 
 /// The job slots of one run, so all its workflows together start at most `max_parallel` jobs
 struct Slots {
@@ -1149,6 +1373,8 @@ struct Ctx<'a> {
     bodies: &'a BTreeMap<String, Vec<u8>>,
     nonce: &'a str,
     logs: PathBuf,
+    /// The jobs a partial run picked per workflow, `None` for every job
+    only: Option<&'a BTreeMap<String, BTreeSet<String>>>,
 }
 
 enum Msg {
@@ -1163,6 +1389,7 @@ struct JobRun {
     unsupported: Vec<String>,
     log: String,
     shard: Option<ShardRun>,
+    summary: String,
 }
 
 /// Runs the jobs of one workflow, each once every job in its `needs` has passed, as GitHub does
@@ -1172,7 +1399,12 @@ fn run_workflow(
     say: &mut dyn FnMut(&str),
 ) -> Result<WorkflowResult, String> {
     let body = String::from_utf8_lossy(&ctx.bodies[file]).into_owned();
-    let graph = workflow::job_needs(&body)?;
+    let mut graph = workflow::job_needs(&body)?;
+
+    if let Some(picked) = ctx.only.and_then(|o| o.get(file)) {
+        graph.retain(|(job, _)| picked.contains(job));
+    }
+
     let allowed = workflow::allowed_failures(&body)?;
     let artifacts = ctx.slot.with_extension("artifacts").join(file);
     let _ = fs::remove_dir_all(&artifacts);
@@ -1190,8 +1422,10 @@ fn run_workflow(
     let mut states: BTreeMap<String, String> = BTreeMap::new();
     let mut outputs: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut started = BTreeSet::new();
+    let mut times: BTreeMap<String, [u64; 2]> = BTreeMap::new();
     let mut logs = Vec::new();
     let mut shards = BTreeMap::new();
+    let mut summaries = BTreeMap::new();
     let (mut attempts, mut exit, mut running) = (0, Some(0), 0);
 
     std::thread::scope(|s| {
@@ -1226,6 +1460,7 @@ fn run_workflow(
                     }
 
                     started.insert(job.clone());
+                    times.insert(job.clone(), [unix_now(); 2]);
 
                     let needed: BTreeMap<String, BTreeMap<String, String>> = needs
                         .iter()
@@ -1248,6 +1483,11 @@ fn run_workflow(
                 Ok(Msg::Say(m)) => say(&m),
                 Ok(Msg::Done(job, result)) => {
                     running -= 1;
+
+                    if let Some(time) = times.get_mut(&job) {
+                        time[1] = unix_now();
+                    }
+
                     let state = match result {
                         Ok(run) => {
                             let marks = workflow::read_marks(&run.log, ctx.nonce);
@@ -1282,6 +1522,10 @@ fn run_workflow(
                             }
 
                             logs.push(run.log);
+
+                            if !run.summary.is_empty() {
+                                summaries.insert(job.clone(), run.summary);
+                            }
 
                             if allow {
                                 format!("{state}{ALLOWED}")
@@ -1330,6 +1574,8 @@ fn run_workflow(
         jobs: states,
         passed,
         shards,
+        times,
+        summaries,
     })
 }
 
@@ -1344,7 +1590,9 @@ fn run_job(
     tx: &mpsc::Sender<Msg>,
 ) -> Result<JobRun, String> {
     // A job of any workflow in this run waits here until fewer than `max_parallel` run
+    let waited = Instant::now();
     let _slot = ctx.slots.take();
+    timing(file, job, "slot wait", waited);
     let dir = ctx.slot.join(file).join(job);
     let template = ctx.templates.join(file).join(job);
     let log_path = ctx.logs.join(file).join(format!("{job}.log"));
@@ -1369,19 +1617,28 @@ fn run_job(
                 unsupported: Vec::new(),
                 log: String::from_utf8_lossy(&fs::read(&log_path).unwrap_or_default()).into(),
                 shard: info,
+                summary: String::new(),
             });
         }
 
         say(format!("{file}/{job}: running, attempt {attempts}"));
         {
+            let at = Instant::now();
             let _git = git_lock(ctx.repo_id)?;
+            timing(file, job, "git lock wait", at);
+            let at = Instant::now();
             checkout(ctx, &template, &dir, &say)?;
+            timing(file, job, "git-cow clone", at);
         }
 
+        let at = Instant::now();
         let link = standalone_git(&dir, &ctx.plan.sha)?;
-        let base_tree = format!("{}^{{tree}}", ctx.plan.base);
-        let on_base = git(&ctx.plan.repo, &["rev-parse", "--verify", "-q", &base_tree])
-            .is_ok_and(|t| t == ctx.plan.tree);
+        timing(file, job, "standalone_git", at);
+        // The remote's default branch, never `--base`, which a caller picks and could point at a branch
+        let on_base = ["origin/HEAD^{tree}", "origin/main^{tree}"]
+            .iter()
+            .find_map(|r| git(&ctx.plan.repo, &["rev-parse", "--verify", "-q", r]).ok())
+            .is_some_and(|t| t == ctx.plan.tree);
         let workflow = dir.with_extension("workflows").join(file);
         let request = RunRequest {
             run_dir: &dir,
@@ -1396,22 +1653,30 @@ fn run_job(
             on_base,
         };
         let host = ctx.plan.config.runner == RunnerKind::Host;
+        let at = Instant::now();
         let written = if host {
             Ok(())
         } else {
             write_run_files(ctx, &dir, file, &workflow)
         };
+        timing(file, job, "write_run_files", at);
 
         // Host checks start no container, so there is no engine view to wait out
         if !host {
+            let at = Instant::now();
             wait_for_engine(&ended_stamp(ctx.slot, &dir));
+            timing(file, job, "engine view wait", at);
         }
 
+        let at = Instant::now();
         let outcome = written.and_then(|_| ctx.runner.run(&request, &log_path));
+        timing(file, job, "runner", at);
 
         // A container left running, after a timeout or otherwise, could rewrite the checkout's `.git`
         // while shipcheck warms from it, so none may outlive the job
+        let at = Instant::now();
         ctx.runner.reclaim(&dir);
+        timing(file, job, "reclaim", at);
         mark_ended(&ended_stamp(ctx.slot, &dir));
         // Only now, with no container left that could swap them, are the job's reports read
         let sharded = outcome
@@ -1423,7 +1688,9 @@ fn run_job(
             _ => Err(Rejected::JobFailed),
         });
 
+        let at = Instant::now();
         finish_job(&dir, &template, link.as_deref(), &say);
+        timing(file, job, "warm and empty", at);
         let outcome = outcome?;
 
         // Any failure of a sharded attempt runs the job again whole, whose result is the result
@@ -1464,6 +1731,7 @@ fn run_job(
                 unsupported: outcome.unsupported_jobs,
                 log: String::from_utf8_lossy(&log).into(),
                 shard: info,
+                summary: outcome.summary,
             });
         }
 
@@ -1472,6 +1740,16 @@ fn run_job(
             "{file}/{job}: attempt {attempts} failed, its log is {}",
             kept.display()
         ));
+    }
+}
+
+/// With `SHIPCHECK_TIMINGS` set, prints how long a phase of a job took, for measuring overhead
+pub(crate) fn timing(file: &str, job: &str, phase: &str, since: Instant) {
+    if std::env::var_os("SHIPCHECK_TIMINGS").is_some() {
+        eprintln!(
+            "timing {file}/{job} {phase} {:.3}",
+            since.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -1564,29 +1842,19 @@ fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Res
 
     let parent = template.parent().ok_or("template has no parent")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let stamp = template.with_file_name(format!(
-        ".{}.warmed",
-        file_name(&template.to_string_lossy())
-    ));
-
     // Host checks build as the developer does, so git-cow warms their template from the
-    // developer's checkout at most hourly, its default
+    // developer's checkout, with the repository's `cow.share` and `cow.warmInterval`
     let opts = if ctx.plan.config.runner == RunnerKind::Host {
-        git_cow::Options::default()
+        git_cow::Options::from_repo(&ctx.plan.repo)
     } else {
-        // Host builds in the developer's checkout break in a Linux container, so git-cow must never warm from it
-        // ponytail: relies on git-cow's stamp name, swap for a git-cow option that never warms from the repo
-        if !stamp.exists() {
-            fs::write(&stamp, b"").map_err(|e| e.to_string())?;
-        }
-
+        // Host builds in the developer's checkout break in a Linux container, so git-cow never warms from it
         git_cow::Options {
             warm_interval: Duration::MAX,
             ..Default::default()
         }
     };
 
-    if let Err(e) = git_cow::add_with(
+    let added = git_cow::add_or_plain(
         &ctx.plan.repo,
         template,
         &ctx.plan.base,
@@ -1594,20 +1862,13 @@ fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Res
         None,
         Some(&ctx.plan.sha),
         &opts,
-    ) {
+    )
+    .map_err(|e| e.to_string())?;
+
+    if let git_cow::Added::Plain(e) = added {
         say(format!(
             "copy-on-write clone failed ({e}), using a plain worktree"
         ));
-        git(
-            &ctx.plan.repo,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                &dir.to_string_lossy(),
-                &ctx.plan.sha,
-            ],
-        )?;
     }
 
     Ok(())
@@ -1664,9 +1925,11 @@ fn standalone_git(dir: &Path, sha: &str) -> Result<Option<String>, String> {
     )?;
     // From the worktree's own git dir, never through the checkout's `.git`
     let source = gitdir.to_string_lossy().into_owned();
+    // A shallow source rejects HEAD without --update-shallow, and the job then has no parents to read
     let mut fetch = vec![
         "fetch",
         "-q",
+        "--update-shallow",
         "--no-tags",
         "--no-write-fetch-head",
         &source,
@@ -1746,7 +2009,11 @@ fn write_run_files(ctx: &Ctx, dir: &Path, file: &str, workflow: &Path) -> Result
 /// Held around `git worktree` changes for one repository, across processes, since a prune while
 /// another job adds its worktree deletes that worktree's half-made admin files
 fn git_lock(repo_id: &str) -> Result<fs::File, String> {
-    let dir = home().join("locks").join("git");
+    git_lock_in(&home(), repo_id)
+}
+
+pub(crate) fn git_lock_in(home: &Path, repo_id: &str) -> Result<fs::File, String> {
+    let dir = home.join("locks").join("git");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let name = repo_id.replace('/', "%2F");
     let lock = fs::File::create(dir.join(format!("{name}.lock"))).map_err(|e| e.to_string())?;
@@ -1754,9 +2021,11 @@ fn git_lock(repo_id: &str) -> Result<fs::File, String> {
     Ok(lock)
 }
 
-/// Deletes results and logs not touched since `cutoff`, so a busy machine does not fill its disk
-pub fn prune(home: &Path, cutoff: SystemTime) {
-    for dir in ["cache", "logs"] {
+/// Deletes results untouched for 14 days and logs untouched for 90, so a busy machine does not fill
+/// its disk. Logs stay longer for reading an old failure, and they are small next to the templates
+pub fn prune(home: &Path, now: SystemTime) {
+    for (dir, keep) in [("cache", KEEP_RESULTS), ("logs", KEEP_LOGS)] {
+        let cutoff = now - keep;
         let Ok(entries) = fs::read_dir(home.join(dir)) else {
             continue;
         };
@@ -1782,11 +2051,12 @@ pub fn prune(home: &Path, cutoff: SystemTime) {
 }
 
 const KEEP_RESULTS: Duration = Duration::from_secs(14 * 24 * 3600);
+const KEEP_LOGS: Duration = Duration::from_secs(90 * 24 * 3600);
 
 /**
  * Removes what shipcheck keeps for one repository: its Docker volumes, warm template and run slots,
- * or for every repository with `all`, which also clears results and logs. Everything rebuilds on the
- * next run, so cleaning is safe and only makes that run slower. Refuses while a run holds a slot
+ * or for every repository with `all`, which also clears results, logs and records. Everything but
+ * the records rebuilds on the next run, which is only slower. Refuses while a run holds a slot
  **/
 pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
     let home = home();
@@ -1816,18 +2086,37 @@ pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
     match &id {
         Some(id) => {
             let template = home.join("templates").join(id);
-            let name = file_name(&template.to_string_lossy());
 
-            // git-cow keeps its stamp and lock next to the template
-            for sibling in [format!(".{name}.warmed"), format!(".{name}.lock")] {
-                let _ = fs::remove_file(template.with_file_name(sibling));
+            // One template per job under `<file>/<job>`, and the single one older runs kept here
+            if let Some(path) = repo {
+                let jobs = fs::read_dir(&template)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .flat_map(|file| fs::read_dir(file.path()).into_iter().flatten().flatten())
+                    .map(|job| job.path())
+                    .filter(|job| job.is_dir());
+
+                for job in jobs.collect::<Vec<_>>() {
+                    let _ = git_cow::remove_template(path, &job);
+                }
+
+                let _ = git_cow::remove_template(path, &template);
             }
 
             dirs.push(template);
         }
-        None => {
-            dirs.extend(["templates", "cache", "logs", "background", "locks"].map(|d| home.join(d)))
-        }
+        None => dirs.extend(
+            [
+                "templates",
+                "cache",
+                "logs",
+                "background",
+                "locks",
+                "records",
+            ]
+            .map(|d| home.join(d)),
+        ),
     }
 
     for dir in dirs.into_iter().filter(|d| d.exists()) {
@@ -1863,6 +2152,48 @@ fn glob_locks(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_picks_host_checks() {
+        let checks = BTreeMap::from([
+            ("lint".to_string(), "make lint".to_string()),
+            ("test".to_string(), "make test".to_string()),
+        ]);
+        assert_eq!(
+            select_host(&checks, &["test".into()], &[]).unwrap(),
+            BTreeMap::from([(HOST.to_string(), BTreeSet::from(["test".to_string()]))])
+        );
+        assert!(
+            select_host(&checks, &["nope".into()], &[])
+                .unwrap_err()
+                .contains("the checks are: lint, test")
+        );
+        assert!(select_host(&checks, &[], &["ci.yml".into()]).is_err());
+    }
+
+    #[test]
+    fn last_run_finds_the_key_a_trial_base_gave_the_tree() {
+        let home = tempfile::tempdir().unwrap();
+
+        for (tree, key, base) in [
+            ("t1", "main", "b1"),
+            ("t1", "trial", "b2"),
+            ("t2", "other", "b3"),
+        ] {
+            let line = serde_json::json!({"event": "run", "tree": tree, "key": key, "base": base});
+            crate::record::append(home.path(), "o/r", &line).unwrap();
+        }
+
+        assert_eq!(
+            last_run(home.path(), "o/r", "t1", |_| true),
+            Some(("trial".into(), "b2".into()))
+        );
+        assert_eq!(
+            last_run(home.path(), "o/r", "t1", |k| k == "main"),
+            Some(("main".into(), "b1".into()))
+        );
+        assert_eq!(last_run(home.path(), "o/r", "t9", |_| true), None);
+    }
 
     #[test]
     fn default_home_ignores_the_environment() {
@@ -1963,6 +2294,49 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_run_picks_jobs_legs_workflows_and_their_needs() {
+        let g = |jobs: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
+            jobs.iter()
+                .map(|(j, n)| (j.to_string(), n.iter().map(|s| s.to_string()).collect()))
+                .collect()
+        };
+        let graphs = BTreeMap::from([
+            (
+                "ci.yml".to_string(),
+                g(&[
+                    ("lint", &[]),
+                    ("build", &[]),
+                    ("test__1", &["build"]),
+                    ("test__2", &["build"]),
+                    ("tests", &[]),
+                    ("deploy", &["test__1", "test__2"]),
+                ]),
+            ),
+            ("docs.yml".to_string(), g(&[("docs", &[])])),
+        ]);
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let set = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<BTreeSet<_>>();
+
+        let picked = select(&graphs, &s(&["test"]), &[]).unwrap();
+        assert_eq!(picked.len(), 1, "only the workflow with the job runs");
+        assert_eq!(picked["ci.yml"], set(&["build", "test__1", "test__2"]));
+
+        let picked = select(&graphs, &s(&["deploy"]), &[]).unwrap();
+        assert_eq!(
+            picked["ci.yml"],
+            set(&["build", "deploy", "test__1", "test__2"])
+        );
+
+        let picked = select(&graphs, &s(&["lint"]), &s(&[".github/workflows/docs.yml"])).unwrap();
+        assert_eq!(picked["ci.yml"], set(&["lint"]));
+        assert_eq!(picked["docs.yml"], set(&["docs"]));
+
+        assert!(select(&graphs, &s(&["nope"]), &[]).is_err());
+        assert!(select(&graphs, &s(&["test__"]), &[]).is_err());
+        assert!(select(&graphs, &[], &s(&["release.yml"])).is_err());
+    }
+
+    #[test]
     fn slots_are_exclusive_and_reused() {
         let dir = tempfile::tempdir().unwrap();
         let (first, lock) = claim_slot(dir.path()).unwrap();
@@ -2021,6 +2395,35 @@ mod tests {
         assert!(!checkout.join(CONFIG).exists());
         assert_eq!(fs::read_to_string(host.join("zshrc")).unwrap(), "mine");
         assert!(host.join("workflows").is_dir());
+    }
+
+    #[test]
+    fn a_shallow_repository_gives_the_job_a_history_it_can_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, clone, job) = (
+            tmp.path().join("repo"),
+            tmp.path().join("clone"),
+            tmp.path().join("job"),
+        );
+        fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+
+        for n in ["a", "b", "c"] {
+            sh(&repo, &["commit", "-q", "--allow-empty", "-m", n]);
+        }
+
+        let url = format!("file://{}", repo.display());
+        let clone_s = clone.to_string_lossy().into_owned();
+        sh(tmp.path(), &["clone", "-q", "--depth", "2", &url, &clone_s]);
+        let sha = sh(&clone, &["rev-parse", "HEAD"]);
+        let job_s = job.to_string_lossy().into_owned();
+        sh(
+            &clone,
+            &["worktree", "add", "-q", "--detach", &job_s, "HEAD"],
+        );
+
+        standalone_git(&job, &sha).unwrap();
+        assert_eq!(sh(&job, &["rev-list", "--count", "HEAD"]), "2");
     }
 
     #[test]
@@ -2391,6 +2794,7 @@ mod tests {
             key: "k".into(),
             ci_changes: Vec::new(),
             defaults: false,
+            tools: String::new(),
         };
         (dir, plan)
     }
@@ -2488,20 +2892,29 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         fs::create_dir_all(home.path().join("cache")).unwrap();
         fs::create_dir_all(home.path().join("logs/oldkey")).unwrap();
+        fs::create_dir_all(home.path().join("logs/monthkey")).unwrap();
         fs::write(home.path().join("cache/old.json"), "{}").unwrap();
         fs::write(home.path().join("cache/new.json"), "{}").unwrap();
-        let long_ago = SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+        let days = |n: u64| SystemTime::now() - Duration::from_secs(n * 24 * 3600);
 
-        for p in ["cache/old.json", "logs/oldkey"] {
+        for (p, age) in [
+            ("cache/old.json", 30),
+            ("logs/monthkey", 30),
+            ("logs/oldkey", 100),
+        ] {
             fs::File::open(home.path().join(p))
                 .unwrap()
-                .set_modified(long_ago)
+                .set_modified(days(age))
                 .unwrap();
         }
 
-        prune(home.path(), SystemTime::now() - KEEP_RESULTS);
+        prune(home.path(), SystemTime::now());
         assert!(!home.path().join("cache/old.json").exists());
         assert!(!home.path().join("logs/oldkey").exists());
+        assert!(
+            home.path().join("logs/monthkey").exists(),
+            "logs stay 90 days"
+        );
         assert!(home.path().join("cache/new.json").exists());
     }
 }

@@ -3,6 +3,7 @@ use std::fs;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{Outcome, RunRequest, Runner};
@@ -48,6 +49,78 @@ pub fn refused_env(name: &str) -> bool {
 /// names, never a refused one
 pub fn keeps_var(name: &str, extra: &[String]) -> bool {
     (BASE_ENV.contains(&name) || extra.iter().any(|e| e == name)) && !refused_env(name)
+}
+
+const TEMP: &[&str] = &[
+    "/tmp",
+    "/private/tmp",
+    "/var/tmp",
+    "/private/var/tmp",
+    "/var/folders",
+    "/private/var/folders",
+    "/dev/shm",
+];
+
+/**
+ * Whether a check may find tools in `dir`. Not in a temp dir or a git checkout, where an agent can
+ * write a fake `cargo` that exits 0 and put it first on the `PATH` it runs `shipcheck run` with.
+ * The user's home is not a checkout here, so a dotfiles repository leaves `~/.cargo/bin` usable
+ **/
+fn trusted_dir(dir: &Path, user: &Path) -> bool {
+    let mut temp: Vec<PathBuf> = TEMP.iter().map(PathBuf::from).collect();
+    temp.push(std::env::temp_dir());
+    trusted_in(dir, user, &temp)
+}
+
+fn trusted_in(dir: &Path, user: &Path, temp: &[PathBuf]) -> bool {
+    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+
+    if !dir.is_absolute()
+        || temp
+            .iter()
+            .any(|t| dir.starts_with(t) || real.starts_with(t))
+    {
+        return false;
+    }
+
+    // Homebrew installs from a git checkout of its own, which an agent's sandbox cannot write
+    if BREW.iter().any(|b| real.starts_with(b)) {
+        return true;
+    }
+
+    let user = user.canonicalize().unwrap_or_else(|_| user.to_path_buf());
+
+    !real
+        .ancestors()
+        .take_while(|a| *a != user && a.parent().is_some())
+        .any(|a| a.join(".git").exists())
+}
+
+const BREW: &[&str] = &["/opt/homebrew", "/home/linuxbrew/.linuxbrew"];
+
+/// The caller's `PATH` without the entries `trusted_dir` refuses
+fn trusted_path(path: &std::ffi::OsStr, user: &Path) -> std::ffi::OsString {
+    let kept: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|d| trusted_dir(d, user))
+        .collect();
+    or_system(std::env::join_paths(kept).unwrap_or_default())
+}
+
+// An empty `PATH` makes the shell search the current directory, which is the branch's clone
+fn or_system(path: std::ffi::OsString) -> std::ffi::OsString {
+    if path.is_empty() {
+        return "/usr/bin:/bin:/usr/sbin:/sbin".into();
+    }
+
+    path
+}
+
+#[cfg(test)]
+fn trusted_path_in(path: &std::ffi::OsStr, user: &Path, temp: &[PathBuf]) -> std::ffi::OsString {
+    let kept: Vec<PathBuf> = std::env::split_paths(path)
+        .filter(|d| trusted_in(d, user, temp))
+        .collect();
+    std::env::join_paths(kept).unwrap_or_default()
 }
 
 /// The OS sandbox host checks run in, an error naming the fix when this machine has none
@@ -150,6 +223,11 @@ const TOOLCHAINS: &[&str] = &[
     ".local/share/mise/shims",
     ".local/share/pnpm",
     "Library/pnpm",
+    ".avm/bin",
+    ".avm/.version",
+    ".local/share/solana/install",
+    ".cache/solana",
+    ".docker/cli-plugins",
 ];
 
 /**
@@ -262,6 +340,12 @@ impl Jail {
                 .collect()
         };
         let writable = subpaths(&self.writable)?;
+        // A `remote unix-socket` filter takes one path, so each writable dir gets its own
+        let sockets: String = self
+            .writable
+            .iter()
+            .map(|p| quote(p).map(|q| format!(" (remote unix-socket (subpath {q}))")))
+            .collect::<Result<_, String>>()?;
         let readable = subpaths(&self.readable(&user))?;
         let hidden = subpaths(&Self::hidden(&user))?;
         let user = quote(&user)?;
@@ -278,7 +362,7 @@ impl Jail {
              (deny file-read*{hidden})\n\
              (deny network-outbound (remote unix-socket))\n\
              (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n\
-             (allow network-outbound (remote unix-socket{writable}))\n\
+             (allow network-outbound{sockets})\n\
              (deny appleevent-send)\n\
              (deny mach-lookup)\n\
              (allow mach-lookup{mach})\n"
@@ -360,17 +444,21 @@ impl Jail {
             }
         };
         let cache = |dir: &str| self.cache.join(dir);
-        let rustup = std::env::var_os("RUSTUP_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| crate::run::user_dir().join(".rustup"));
+        let path = jail_path();
+        let rustup = Some(self.home.join(".rustup"))
+            .filter(|r| r.is_dir())
+            .unwrap_or_else(|| user_tool("RUSTUP_HOME", ".rustup"));
         cmd.args(["sh", "-c", command])
             .current_dir(dir)
             .env_clear()
             .envs(std::env::vars_os().filter(|(k, _)| keeps_var(&k.to_string_lossy(), extra)))
+            .env("PATH", path)
             .env("HOME", &self.home)
             .env("TMPDIR", &self.home)
-            // Toolchains stay where rustup put them, read-only. Caches move to the jail
+            // Toolchains stay where rustup and avm put them, read-only. Caches move to the jail
             .env("RUSTUP_HOME", rustup)
+            .env("AVM_HOME", user_tool("AVM_HOME", ".avm"))
+            .env("BUN_INSTALL_CACHE_DIR", cache("bun"))
             .env("CARGO_HOME", cache("cargo"))
             .env("npm_config_cache", cache("npm"))
             .env("UV_CACHE_DIR", cache("uv"))
@@ -378,7 +466,14 @@ impl Jail {
             .env("GOPATH", cache("go"))
             .env("GOCACHE", cache("go-build"))
             .env("CI", "true")
+            .env("GITHUB_STEP_SUMMARY", self.home.join(STEP_SUMMARY))
+            // Tests of the jail read it, since macOS refuses a sandbox inside a sandbox
+            .env("SHIPCHECK_JAIL", "1")
             .stdin(Stdio::null());
+        if self.home.join(SBF_SDK).is_dir() {
+            cmd.env("SBF_SDK_PATH", self.home.join(SBF_SDK));
+        }
+
         // Safe: setsid is async-signal-safe and changes only this child's session
         unsafe {
             cmd.pre_exec(|| {
@@ -417,7 +512,154 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
         .tempdir()
         .map_err(|e| format!("temp home: {e}"))?;
     let path = dir.path().canonicalize().map_err(|e| e.to_string())?;
+    toolchains(&path, &crate::run::user_dir())?;
+    rustup_home(&path, &user_tool("RUSTUP_HOME", ".rustup"))?;
+    sbf_sdk(&path, &jail_path())?;
     Ok((dir, path))
+}
+
+/// Toolchains found only through `$HOME`, linked from the jail's home to the user's, readable as
+/// part of `TOOLCHAINS`. Never all of `~/.docker`, whose config can name a credential store
+const HOME_LINKS: &[&str] = &[".docker/cli-plugins", ".cache/solana"];
+
+pub(crate) fn jail_path() -> std::ffi::OsString {
+    trusted_path(
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &crate::run::user_dir(),
+    )
+}
+
+/// A toolchain manager's home from its variable when that is trusted, else the default in `~`
+fn user_tool(var: &str, dir: &str) -> PathBuf {
+    let user = crate::run::user_dir();
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| trusted_dir(p, &user))
+        .unwrap_or_else(|| user.join(dir))
+}
+
+/// A rustup home of the jail's own: a link per installed toolchain and a copy of the settings.
+/// cargo-build-sbf relinks its `solana` toolchain to a path under `$HOME`, which the user's
+/// read-only rustup home refuses, so here the link lands in the jail and the toolchains stay as they are
+fn rustup_home(home: &Path, source: &Path) -> Result<(), String> {
+    let Ok(entries) = fs::read_dir(source.join("toolchains")) else {
+        return Ok(());
+    };
+    let jail = home.join(".rustup");
+    fs::create_dir_all(jail.join("toolchains")).map_err(|e| e.to_string())?;
+
+    for entry in entries.flatten() {
+        std::os::unix::fs::symlink(
+            entry.path(),
+            jail.join("toolchains").join(entry.file_name()),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    for file in ["settings.toml", "update-hashes"] {
+        let from = source.join(file);
+
+        if from.is_file() {
+            fs::copy(&from, jail.join(file)).map_err(|e| e.to_string())?;
+        } else if from.is_dir() {
+            std::os::unix::fs::symlink(&from, jail.join(file)).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Where the jail's copy of Solana's SBF SDK goes, named by `SBF_SDK_PATH`
+const SBF_SDK: &str = ".sbf-sdk";
+
+/**
+ * A writable copy of the SBF SDK next to the `cargo-build-sbf` on `PATH`. On every build it
+ * relinks `dependencies/platform-tools` to `$HOME/.cache/solana/<version>`, and when the user's
+ * read-only SDK refuses that it takes the platform tools for broken and tries to delete them
+ **/
+fn sbf_sdk(home: &Path, path: &std::ffi::OsStr) -> Result<(), String> {
+    let Some(sdk) = std::env::split_paths(path)
+        .filter_map(|d| d.join("cargo-build-sbf").canonicalize().ok())
+        .filter_map(|bin| Some(bin.parent()?.join("platform-tools-sdk/sbf")))
+        .find(|sdk| sdk.is_dir())
+    else {
+        return Ok(());
+    };
+    // cp -R copies links as links, and the SDK is a few hundred KB
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(&sdk)
+        .arg(home.join(SBF_SDK))
+        .status()
+        .map_err(|e| format!("cp: {e}"))?;
+
+    if !copied.success() {
+        return Err(format!("could not copy {}", sdk.display()));
+    }
+
+    Ok(())
+}
+
+fn toolchains(home: &Path, user: &Path) -> Result<(), String> {
+    for dir in HOME_LINKS {
+        let target = user.join(dir);
+
+        if !target.is_dir() {
+            continue;
+        }
+
+        let link = home.join(dir);
+        fs::create_dir_all(link.parent().unwrap_or(home)).map_err(|e| e.to_string())?;
+        std::os::unix::fs::symlink(&target, &link).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/**
+ * Each check runs in its own session, outside the run's process group, so the SIGTERM that stops a
+ * superseded background run never reaches it. The run keeps its checks' groups here, and a signal
+ * handler kills them before the run dies. Atomics only, since the handler may read them mid-write
+ **/
+static GROUPS: [AtomicI32; 64] = [const { AtomicI32::new(0) }; 64];
+
+// ponytail: 64 slots, a run with more checks at once leaves the extra ones to outlive a signal
+fn register(pgid: u32) -> Option<usize> {
+    static HANDLER: std::sync::Once = std::sync::Once::new();
+    HANDLER.call_once(|| {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            // Safe: the handler calls only async-signal-safe functions
+            unsafe {
+                libc::signal(sig, stop as *const () as libc::sighandler_t);
+            }
+        }
+    });
+    GROUPS.iter().position(|g| {
+        g.compare_exchange(0, pgid as i32, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    })
+}
+
+fn kill_registered(groups: &[AtomicI32]) {
+    for g in groups {
+        let pgid = g.load(Ordering::SeqCst);
+
+        if pgid > 0 {
+            // Safe: killpg only sends a signal
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+extern "C" fn stop(sig: libc::c_int) {
+    kill_registered(&GROUPS);
+    // Safe: back to the default action, then die of the same signal
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
 }
 
 fn kill_group(pgid: u32) {
@@ -426,6 +668,49 @@ fn kill_group(pgid: u32) {
         libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
     }
 }
+
+/// A check's `$GITHUB_STEP_SUMMARY`, in its jail's home
+const STEP_SUMMARY: &str = "step-summary.md";
+
+/**
+ * What a check wrote to `$GITHUB_STEP_SUMMARY`, empty when it wrote nothing. The check could leave a
+ * link, FIFO or hard link to a file it cannot read there, and the comment is public, so only a
+ * regular file with one link is read, never through a link, and a refusal names nothing of it
+ **/
+fn read_summary(home: &Path) -> String {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(home)
+        .and_then(|dir| crate::runner::shard::open_at(&dir, STEP_SUMMARY, false));
+    let file = match file {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return String::new(),
+        Err(_) => return REFUSED.into(),
+    };
+
+    if file.metadata().map_or(true, |m| m.nlink() != 1) {
+        return REFUSED.into();
+    }
+
+    let mut body = Vec::new();
+
+    if file
+        .take(crate::runner::MAX_SUMMARY as u64 + 1)
+        .read_to_end(&mut body)
+        .is_err()
+    {
+        return REFUSED.into();
+    }
+
+    crate::runner::cap_summary(&String::from_utf8_lossy(&body))
+}
+
+const REFUSED: &str =
+    "shipcheck did not read this summary: it was not a regular file of the check's own";
 
 /// Runs a command until it exits or the timeout passes, then kills its whole process group either
 /// way, so nothing it started outlives it. None on timeout
@@ -447,6 +732,7 @@ pub fn run_command(
         .stderr(file)
         .spawn()
         .map_err(|e| format!("sandbox: {e}"))?;
+    let slot = register(child.id());
     let deadline = Instant::now() + timeout;
 
     let exit = loop {
@@ -468,6 +754,11 @@ pub fn run_command(
     };
 
     kill_group(child.id());
+
+    if let Some(slot) = slot {
+        GROUPS[slot].store(0, Ordering::SeqCst);
+    }
+
     Ok(exit)
 }
 
@@ -593,6 +884,7 @@ impl Runner for Host {
             unsupported_jobs: Vec::new(),
             outputs: BTreeMap::new(),
             shards: None,
+            summary: read_summary(&jail.home),
         })
     }
 
@@ -719,8 +1011,139 @@ mod tests {
         }
     }
 
+    /// A check that runs `cargo test` is already jailed, and a jail cannot start inside it
+    fn nested() -> bool {
+        std::env::var_os("SHIPCHECK_JAIL").is_some()
+    }
+
+    #[test]
+    fn a_check_gets_the_toolchains_and_nothing_else_of_docker() {
+        let (home, user) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        assert!(HOME_LINKS.iter().all(|l| TOOLCHAINS.contains(l)));
+        toolchains(home.path(), user.path()).unwrap();
+        assert!(!home.path().join(".docker").exists());
+        fs::create_dir_all(user.path().join(".docker/cli-plugins")).unwrap();
+        fs::create_dir_all(user.path().join(".cache/solana/v1.52")).unwrap();
+        fs::write(
+            user.path().join(".docker/config.json"),
+            "{\"credsStore\": \"desktop\"}",
+        )
+        .unwrap();
+        toolchains(home.path(), user.path()).unwrap();
+        assert!(home.path().join(".cache/solana/v1.52").is_dir());
+        assert_eq!(
+            fs::read_link(home.path().join(".docker/cli-plugins")).unwrap(),
+            user.path().join(".docker/cli-plugins")
+        );
+        assert!(!home.path().join(".docker/config.json").exists());
+    }
+
+    #[test]
+    fn a_check_finds_no_tool_in_a_temp_dir_or_a_checkout() {
+        let (user, repo) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let user = user.path().canonicalize().unwrap();
+        fs::create_dir_all(user.join(".git")).unwrap();
+        fs::create_dir_all(user.join(".cargo/bin")).unwrap();
+        fs::create_dir_all(user.join("src/app/.git")).unwrap();
+        fs::create_dir_all(user.join("src/app/bin")).unwrap();
+        fs::create_dir(repo.path().join(".git")).unwrap();
+        let path = std::env::join_paths([
+            Path::new("/tmp/fake"),
+            Path::new("bin"),
+            &user.join("src/app/bin"),
+            repo.path(),
+            &user.join(".cargo/bin"),
+            Path::new("/usr/bin"),
+        ])
+        .unwrap();
+        assert_eq!(
+            trusted_path(std::ffi::OsStr::new("/tmp/fake:bin"), &user),
+            "/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+        if Path::new("/opt/homebrew/.git").exists() {
+            assert!(trusted_in(Path::new("/opt/homebrew/bin"), &user, &[]));
+        }
+
+        let kept = trusted_path_in(&path, &user, &[PathBuf::from("/tmp")]);
+        assert_eq!(
+            std::env::split_paths(&kept).collect::<Vec<_>>(),
+            [user.join(".cargo/bin"), PathBuf::from("/usr/bin")]
+        );
+    }
+
+    #[test]
+    fn the_jail_gets_a_copy_of_the_sbf_sdk_it_can_relink() {
+        let (home, release) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let bin = release.path().join("bin");
+        let deps = bin.join("platform-tools-sdk/sbf/dependencies");
+        fs::create_dir_all(&deps).unwrap();
+        fs::write(bin.join("cargo-build-sbf"), "").unwrap();
+        std::os::unix::fs::symlink("/user/.cache/solana/v1.52", deps.join("platform-tools"))
+            .unwrap();
+        sbf_sdk(home.path(), std::ffi::OsStr::new("/nowhere")).unwrap();
+        assert!(!home.path().join(SBF_SDK).exists());
+        sbf_sdk(home.path(), bin.as_os_str()).unwrap();
+        let link = home
+            .path()
+            .join(SBF_SDK)
+            .join("dependencies/platform-tools");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("/user/.cache/solana/v1.52")
+        );
+        // cargo-build-sbf's relink changes the copy and not the user's SDK
+        fs::remove_file(&link).unwrap();
+        assert!(fs::symlink_metadata(deps.join("platform-tools")).is_ok());
+    }
+
+    #[test]
+    fn the_jail_has_a_rustup_home_of_its_own_with_the_toolchains_linked() {
+        let (home, source) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        rustup_home(home.path(), source.path()).unwrap();
+        assert!(!home.path().join(".rustup").exists());
+        fs::create_dir_all(source.path().join("toolchains/stable")).unwrap();
+        fs::create_dir_all(source.path().join("update-hashes")).unwrap();
+        fs::write(
+            source.path().join("settings.toml"),
+            "default_toolchain = \"stable\"\n",
+        )
+        .unwrap();
+        rustup_home(home.path(), source.path()).unwrap();
+        let jail = home.path().join(".rustup");
+        assert_eq!(
+            fs::read_link(jail.join("toolchains/stable")).unwrap(),
+            source.path().join("toolchains/stable")
+        );
+        assert!(
+            fs::symlink_metadata(jail.join("settings.toml"))
+                .unwrap()
+                .is_file()
+        );
+        // A relink, as cargo-build-sbf does, changes the jail's rustup home and not the user's
+        fs::remove_file(jail.join("toolchains/stable")).unwrap();
+        assert!(source.path().join("toolchains/stable").is_dir());
+    }
+
+    #[test]
+    fn a_stopped_run_kills_the_checks_it_registered() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // A list of its own, since GROUPS holds the checks other tests run meanwhile
+        let groups = [AtomicI32::new(child.id() as i32), AtomicI32::new(0)];
+        kill_registered(&groups);
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
     #[test]
     fn a_timeout_kills_the_whole_process_group() {
+        if nested() {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         let pid = dir.path().join("pid");
@@ -750,6 +1173,10 @@ mod tests {
 
     #[test]
     fn a_finished_check_leaves_nothing_running() {
+        if nested() {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let (log, pid) = (dir.path().join("log"), dir.path().join("pid"));
         let cmd = format!("sleep 30 & echo $! > {}; echo hi; exit 3", pid.display());
@@ -771,6 +1198,10 @@ mod tests {
 
     #[test]
     fn the_check_sees_no_token() {
+        if nested() {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         // Safe: tests in this module do not read these variables concurrently
@@ -788,6 +1219,62 @@ mod tests {
         .unwrap();
         assert_eq!(exit, Some(0));
         assert!(!fs::read_to_string(&log).unwrap().contains("hunter2"));
+    }
+
+    #[test]
+    fn a_check_writes_its_summary_in_its_jail() {
+        if nested() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let jail = jail(dir.path());
+        let exit = run_command(
+            "printf '| a |\\n' >> \"$GITHUB_STEP_SUMMARY\" && echo more >> \"$GITHUB_STEP_SUMMARY\"",
+            dir.path(),
+            &jail,
+            &[],
+            &dir.path().join("log"),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(exit, Some(0));
+        assert_eq!(read_summary(&jail.home), "| a |\nmore");
+    }
+
+    #[test]
+    fn a_summary_that_is_not_the_checks_own_file_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("id_ed25519");
+        fs::write(&secret, "PRIVATE KEY").unwrap();
+        let home = |name: &str| {
+            let h = dir.path().join(name);
+            fs::create_dir(&h).unwrap();
+            h
+        };
+        let link = home("link");
+        std::os::unix::fs::symlink(&secret, link.join(STEP_SUMMARY)).unwrap();
+        let hard = home("hard");
+        fs::hard_link(&secret, hard.join(STEP_SUMMARY)).unwrap();
+        let fifo = home("fifo");
+        let path =
+            std::ffi::CString::new(fifo.join(STEP_SUMMARY).into_os_string().into_vec()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // A home that is itself a link to a directory holding the secret as the summary
+        let outside = home("outside");
+        fs::write(outside.join(STEP_SUMMARY), "PRIVATE KEY").unwrap();
+        let parent = dir.path().join("parent");
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+
+        for h in [link, hard, fifo, parent] {
+            assert_eq!(read_summary(&h), REFUSED, "{}", h.display());
+        }
+
+        let big = home("big");
+        fs::write(big.join(STEP_SUMMARY), "x".repeat(50_000)).unwrap();
+        let text = read_summary(&big);
+        assert!(text.len() < 20_100 && text.ends_with("bytes...]"));
+        assert_eq!(read_summary(&home("none")), "");
     }
 
     #[test]
@@ -812,9 +1299,9 @@ mod tests {
         )));
         assert!(profile.contains(&format!("(subpath \"/j/repo\") {paths})")));
         assert!(profile.contains("(deny network-outbound (remote unix-socket))\n"));
-        assert!(profile.contains(&format!(
-            "(allow network-outbound (remote unix-socket {paths}))"
-        )));
+        assert!(profile.contains(
+            r#"(allow network-outbound (remote unix-socket (subpath "/j/clone \"x\"")) (remote unix-socket (subpath "/j/home")))"#
+        ));
         assert!(profile.contains("(deny appleevent-send)"));
         assert!(profile.contains("(deny mach-lookup)\n(allow mach-lookup (global-name"));
         assert!(!profile.contains("SecurityServer") && !profile.contains("launchservicesd"));
@@ -862,7 +1349,50 @@ mod tests {
     }
 
     #[test]
+    fn a_check_serves_a_unix_socket_in_its_tmpdir_only() {
+        if nested() {
+            return;
+        }
+
+        // A jail as `run` makes it: the clone, a home of its own that is TMPDIR, and a cache
+        let (clone, cache, outside) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let (_home, home) = temp_home().unwrap();
+        let cache = real_dir(cache.path()).unwrap();
+        let jail = Jail {
+            writable: vec![real_dir(clone.path()).unwrap(), home.clone(), cache.clone()],
+            readable: Vec::new(),
+            home,
+            cache,
+        };
+        let log = outside.path().join("log");
+        let run = |cmd: &str| {
+            let exit = run_command(cmd, clone.path(), &jail, &[], &log, Duration::from_secs(10));
+            (exit.unwrap(), fs::read_to_string(&log).unwrap_or_default())
+        };
+        // gin's TestUnixSocket, which serves on a socket in os.TempDir()
+        let serve = "python3 -c 'import os, socket; p = os.environ[\"TMPDIR\"] + \"/s\"; l = socket.socket(socket.AF_UNIX); l.bind(p); l.listen(1); socket.socket(socket.AF_UNIX).connect(p)'";
+        let served = run(serve);
+        assert_eq!(served.0, Some(0), "{}", served.1);
+        let sock = outside.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let probe = format!(
+            "python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect(\"{}\")'",
+            sock.display()
+        );
+        let connected = run(&probe);
+        assert_ne!(connected.0, Some(0), "{}", connected.1);
+    }
+
+    #[test]
     fn a_check_writes_only_in_its_jail() {
+        if nested() {
+            return;
+        }
+
         let (dir, outside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let log = outside.path().join("log");
         let canary = outside.path().join("canary");
@@ -1000,6 +1530,10 @@ mod tests {
 
     #[test]
     fn identity_holds_each_version_output() {
+        if nested() {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let host = |versions: &[&str]| {
             Host::new(

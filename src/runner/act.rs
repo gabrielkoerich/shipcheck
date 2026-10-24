@@ -8,13 +8,13 @@ use sha2::{Digest, Sha256};
 use yaml_rust2::Yaml;
 use yaml_rust2::yaml::Hash;
 
-use super::{Outcome, RunRequest, Runner, shard};
+use super::{Outcome, RunRequest, Runner, gc, shard};
 use crate::cache;
 use crate::config;
 use crate::workflow::{self, key, step};
 
 /// Where per-job tool homes live in the job container, a path in `cache_paths` by default
-pub const JOB_HOMES: &str = "/root/.shipcheck";
+pub const JOB_HOMES: &str = "/home/runner/.shipcheck";
 
 /// Runs workflows with nektos/act, each job in a Docker container
 #[derive(Default)]
@@ -161,6 +161,19 @@ impl Runner for Act {
                 ))
             })
             .collect();
+        // apt runs under sudo, so its lists stay root's
+        let mounts: String = (self.config.cache_paths.iter())
+            .chain(&self.config.slot_paths)
+            .filter(|p| *p != "/var/lib/apt/lists")
+            .map(|p| format!("\"{p}\" "))
+            .collect();
+        // Docker creates a new volume owned by root, and the job runs as `runner`, which has sudo
+        let own_mounts = format!(
+            "for d in {mounts}\"$GITHUB_WORKSPACE/.venv\"; do\n  \
+             [ -w \"$d\" ] || sudo -n chown \"$(id -u):$(id -g)\" \"$d\" || true\ndone\n\
+             mkdir -p \"$RUNNER_TEMP\" || true\n"
+        );
+        let label_latest = !self.config.platforms.contains_key("ubuntu-latest");
 
         for (id, job) in jobs.iter_mut() {
             let (Some(id), Yaml::Hash(job)) = (id.as_str(), job) else {
@@ -197,10 +210,24 @@ impl Runner for Act {
                 }
             }
 
-            if let (false, Some(Yaml::Array(steps))) =
-                (path_lines.is_empty(), job.get_mut(&key("steps")))
+            // GitHub's runner keeps it in the home, act gives /tmp, a container job keeps act's
+            if !job.contains_key(&key("container"))
+                && let Some(Yaml::Hash(env)) = job.get_mut(&key("env"))
             {
-                steps.insert(0, step("shipcheck homes", None, path_lines.clone()));
+                env.entry(key("RUNNER_TEMP"))
+                    .or_insert_with(|| key("/home/runner/work/_temp"));
+            }
+
+            // act sets ImageOS from the label and takes `ubuntu-latest` for ubuntu20
+            if label_latest && job.get(&key("runs-on")) == Some(&key("ubuntu-latest")) {
+                job.insert(key("runs-on"), key("ubuntu-24.04"));
+            }
+
+            if let Some(Yaml::Array(steps)) = job.get_mut(&key("steps")) {
+                steps.insert(
+                    0,
+                    step("shipcheck homes", None, format!("{own_mounts}{path_lines}")),
+                );
             }
         }
 
@@ -218,6 +245,8 @@ impl Runner for Act {
 
     fn run(&self, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
         let run_dir = request.run_dir;
+        let began = Instant::now();
+        let (file, job) = (request.file, request.job);
 
         // act reads these from the checkout, so a commit could change how its own run behaves
         for dotfile in [".actrc", ".env", ".secrets", ".vars", ".input"] {
@@ -263,6 +292,12 @@ impl Runner for Act {
         };
         let mut cmd = Command::new("act");
         let port = free_port()?;
+        let home = crate::run::home();
+
+        for (name, _) in volumes(&self.config, request.repo_id, &tag) {
+            gc::stamp(&home, "volumes", &name);
+        }
+
         let volumes = mounts(&self.config, request.repo_id, &tag, run_dir)?;
 
         cmd.arg("workflow_dispatch")
@@ -293,15 +328,7 @@ impl Runner for Act {
             cmd.arg("--container-options").arg(volumes.join(" "));
         }
 
-        let mut platforms: BTreeMap<&str, &str> = DEFAULT_PLATFORMS.into_iter().collect();
-        platforms.extend(
-            self.config
-                .platforms
-                .iter()
-                .map(|(l, i)| (l.as_str(), i.as_str())),
-        );
-
-        for (label, image) in platforms {
+        for (label, image) in platforms(&self.config) {
             cmd.arg("-P").arg(format!("{label}={image}"));
         }
 
@@ -309,19 +336,23 @@ impl Runner for Act {
             cmd.arg("-P").arg(format!("{}={image}", job_label(&job)));
         }
 
-        let secrets = crate::run::secrets_file(request.repo_id);
-        let secrets = if secrets.exists() {
-            secrets
-        } else {
-            PathBuf::from("/dev/null")
-        };
-        cmd.arg("--secret-file").arg(secrets);
+        // On a Mac the secrets live in the keychain, so act reads a private copy that lives as long as it
+        let secrets = crate::secret::read(&crate::run::secrets_file(request.repo_id))?;
+        let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+        fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
+        cmd.arg("--secret-file").arg(secrets_copy.path());
         // Parallel act processes cloning one action into one cache corrupt it, so each job has its own
-        cmd.arg("--action-cache-path").arg(
-            actions_dir(Some(request.repo_id))
-                .join(request.file)
-                .join(request.job),
-        );
+        let actions = actions_dir(Some(request.repo_id))
+            .join(request.file)
+            .join(request.job);
+
+        // Offline, act still clones a missing action but no longer fetches a cached one, which
+        // would fail the run when GitHub does not answer. A damaged clone fails offline, so it fetches
+        if cached_actions_resolve(&actions) {
+            cmd.arg("--action-offline-mode");
+        }
+
+        cmd.arg("--action-cache-path").arg(actions);
         // act's default is the host's network, which reaches every service on the machine and the LAN
         cmd.arg("--network")
             .arg(network.as_ref().map_or("none", |n| n.name.as_str()));
@@ -361,11 +392,38 @@ impl Runner for Act {
             cmd.arg(flag).arg("/dev/null");
         }
 
+        chown_tree(run_dir, Some(RUNNER_ID.into()));
+
+        crate::run::timing(file, job, "act prepare", began);
+        let spawned = Instant::now();
         let mut child = cmd.spawn().map_err(|e| format!("act: {e}"))?;
         let deadline = Instant::now() + request.timeout;
+        let timed = std::env::var_os("SHIPCHECK_TIMINGS").is_some();
+        // Log lines that end each phase of act's start, printed once each
+        let mut marks = vec![
+            ("act until job set up starts", "⭐ Run Set up job"),
+            ("act until container up", "🐳  docker exec"),
+            ("act until first job step", "shipcheck-start"),
+            ("act until job end", "shipcheck-end"),
+        ];
 
         let exit = loop {
+            if timed && !marks.is_empty() {
+                let text =
+                    String::from_utf8_lossy(&fs::read(log_path).unwrap_or_default()).into_owned();
+                marks.retain(|(phase, line)| {
+                    let seen = text.contains(line);
+
+                    if seen {
+                        crate::run::timing(file, job, phase, spawned);
+                    }
+
+                    !seen
+                });
+            }
+
             if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                crate::run::timing(file, job, "act total", spawned);
                 break status.code();
             }
 
@@ -375,17 +433,25 @@ impl Runner for Act {
                 break None;
             }
 
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(if timed { 50 } else { 200 }));
         };
 
+        let at = Instant::now();
         hand_back(run_dir);
+        crate::run::timing(file, job, "hand_back", at);
         let log = fs::read(log_path).map_err(|e| e.to_string())?;
         let log = String::from_utf8_lossy(&log);
+
+        for image in gc::images_in_log(&log) {
+            gc::stamp(&home, "images", &image);
+        }
+
         Ok(Outcome {
             exit,
             unsupported_jobs: unsupported_jobs(&log),
             outputs: read_outputs(&log),
             shards,
+            summary: read_summary(&log),
         })
     }
 
@@ -417,11 +483,23 @@ impl Runner for Act {
             }
         }
 
+        gc::remove_env_volumes(&gc::Docker, &run_tag(run_dir));
         // Only after its containers, since Docker keeps a network that one still uses
         let _ = Command::new("docker")
             .args(["network", "rm", &network_name(run_dir)])
             .output();
         hand_back(run_dir);
+    }
+
+    fn prune(&self) -> Vec<String> {
+        let now = std::time::SystemTime::now();
+        gc::prune(
+            &gc::Docker,
+            &crate::run::home(),
+            &home_prefix(),
+            gc::OLD_PINS,
+            now,
+        )
     }
 
     fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
@@ -434,26 +512,7 @@ impl Runner for Act {
         }
 
         let prefix = repo_id.map(volume_prefix).unwrap_or_else(home_prefix);
-        let Ok(listed) = Command::new("docker")
-            .args(["volume", "ls", "-q", "--filter"])
-            .arg(format!("name={prefix}"))
-            .output()
-        else {
-            return done;
-        };
-
-        let listed = String::from_utf8_lossy(&listed.stdout);
-        let removed = listed
-            .split_whitespace()
-            .filter(|v| v.starts_with(&prefix))
-            .filter(|v| {
-                Command::new("docker")
-                    .args(["volume", "rm", v])
-                    .output()
-                    .is_ok_and(|o| o.status.success())
-            })
-            .map(|v| format!("removed volume {v}"));
-        done.extend(removed);
+        done.extend(gc::clean(&gc::Docker, &crate::run::home(), &prefix));
         // Networks are per slot, not per repository, and Docker refuses to remove one in use
         let prefix = format!("{}net-", home_prefix());
         let Ok(listed) = Command::new("docker")
@@ -480,37 +539,42 @@ impl Runner for Act {
     }
 }
 
-/// Images for the common Ubuntu labels, pinned, unless `[act] platforms` maps the label. Without
-/// them act stops to ask for a default image, and 0.2.89 has none for `ubuntu-24.04`
+/// The image for each label: the defaults below, then `[act] platforms` over them
+pub fn platforms(config: &config::Act) -> BTreeMap<String, String> {
+    DEFAULT_PLATFORMS
+        .into_iter()
+        .map(|(l, i)| (l.to_string(), i.to_string()))
+        .chain(config.platforms.clone())
+        .collect()
+}
+
+/// catthehacker's `runner-*` images, pinned by index digest for amd64 and arm64, unless
+/// `[act] platforms` maps the label. They run as `runner`, uid 1001, with sudo, as GitHub does.
+/// Without them act stops to ask for a default image, and 0.2.89 has none for `ubuntu-24.04`
 const DEFAULT_PLATFORMS: [(&str, &str); 3] = [
     (
         "ubuntu-latest",
-        "catthehacker/ubuntu@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43",
+        "catthehacker/ubuntu@sha256:27043bae70b35fd8a5af1ca3a7e3e45e33595a9b7701cd7cc9232027d9fca773",
     ),
     (
         "ubuntu-24.04",
-        "catthehacker/ubuntu@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43",
+        "catthehacker/ubuntu@sha256:27043bae70b35fd8a5af1ca3a7e3e45e33595a9b7701cd7cc9232027d9fca773",
     ),
     (
         "ubuntu-22.04",
-        "catthehacker/ubuntu@sha256:3488f78aa97770c8d5d835f2913c1a782d3121ad3f2aafb17054fb1d554ea4e1",
+        "catthehacker/ubuntu@sha256:942b477bcb64e8b32c2f9bc86c904a016d84d07d48b3a89554d1c317b971302f",
     ),
 ];
 
-/// busybox 1.37, pinned, for handing a checkout back to the user on Linux
+/// busybox 1.37, pinned, for handing a checkout between the user and the job on Linux
 const BUSYBOX: &str =
     "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
 
-/**
- * On Linux a job runs as root right on the host's kernel, so every file it writes into its bind
- * mounted checkout belongs to root, and shipcheck, running as the user, can neither empty, warm nor
- * clean it. A throwaway container gives the files back. Docker Desktop on a Mac maps them already
- **/
-fn hand_back(dir: &Path) {
-    if !cfg!(target_os = "linux") || !dir.exists() {
-        return;
-    }
+/// The uid and gid of `runner` in the default images and on GitHub
+const RUNNER_ID: &str = "1001:1001";
 
+/// Gives a checkout back to the user after a job, see `chown_tree`
+fn hand_back(dir: &Path) {
     let id = |flag: &str| {
         Command::new("id")
             .arg(flag)
@@ -519,14 +583,25 @@ fn hand_back(dir: &Path) {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     };
-    let (Some(uid), Some(gid)) = (id("-u"), id("-g")) else {
+    chown_tree(dir, id("-u").zip(id("-g")).map(|(u, g)| format!("{u}:{g}")));
+}
+
+/**
+ * On Linux a bind mount keeps the host's uids, so the job's `runner` cannot write a checkout the
+ * user owns, and the user cannot empty, warm or clean the files the job wrote. A throwaway
+ * container hands the tree over before the job and back after it. Docker Desktop on a Mac maps
+ * ownership already
+ **/
+fn chown_tree(dir: &Path, owner: Option<String>) {
+    let Some(owner) = owner.filter(|_| cfg!(target_os = "linux") && dir.exists()) else {
         return;
     };
 
+    gc::stamp(&crate::run::home(), "images", BUSYBOX);
     let _ = Command::new("docker")
         .args(["run", "--rm", "--network", "none", "-v"])
         .arg(format!("{}:/w", dir.display()))
-        .args([BUSYBOX, "chown", "-R", &format!("{uid}:{gid}"), "/w"])
+        .args([BUSYBOX, "chown", "-R", &owner, "/w"])
         .output();
 }
 
@@ -545,6 +620,30 @@ pub fn engine_resources() -> Option<(u32, u64)> {
 fn actions_dir(repo_id: Option<&str>) -> PathBuf {
     let dir = crate::run::home().join("actions");
     repo_id.map_or(dir.clone(), |id| dir.join(id))
+}
+
+/// Whether every action act cloned into `dir`, one `<uses>@<ref>` folder each, still resolves its ref
+fn cached_actions_resolve(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+
+    entries.flatten().all(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((_, git_ref)) = name.rsplit_once('@') else {
+            return true;
+        };
+
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(entry.path().join(".git"))
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("{git_ref}^{{commit}}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
 /// Where older versions kept act's `actions/cache` entries, which `shipcheck clean` still removes
@@ -869,6 +968,39 @@ fn read_outputs(log: &str) -> BTreeMap<String, String> {
     }
 
     out
+}
+
+/**
+ * act empties `$GITHUB_STEP_SUMMARY` before each step and logs what the step left in it as
+ * `[<workflow>/<job>]   ⚙  Summary - <first line>`, the other lines bare. A step's own output
+ * has `|` after the prefix, so it cannot pass for one. The summary ends at the next prefixed line
+ **/
+fn read_summary(log: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut open: Option<&str> = None;
+
+    for line in log.lines() {
+        if let Some(prefix) = open {
+            if line.starts_with(prefix) {
+                open = None;
+            } else if let Some(last) = parts.last_mut() {
+                last.push('\n');
+                last.push_str(line);
+                continue;
+            }
+        }
+
+        let Some(end) = line.find(']').filter(|_| line.starts_with('[')) else {
+            continue;
+        };
+
+        if let Some(first) = line[end + 1..].strip_prefix("   \u{2699}  Summary - ") {
+            open = Some(&line[..=end]);
+            parts.push(first.to_string());
+        }
+    }
+
+    super::cap_summary(&parts.join("\n"))
 }
 
 /**
@@ -1508,7 +1640,7 @@ fn volume_prefix(repo_id: &str) -> String {
 
 /// The start of every volume name under this `SHIPCHECK_HOME`, so `clean --all` of one home leaves
 /// the volumes of another, such as a test's, alone
-fn home_prefix() -> String {
+pub fn home_prefix() -> String {
     let home = crate::run::home();
     let hash = cache::hex(&Sha256::digest(home.to_string_lossy().as_bytes())[..3]);
     format!("shipcheck-{hash}-")
@@ -1738,7 +1870,11 @@ fn local_action(run_dir: &Path, uses: &str) -> Option<PathBuf> {
 /// A new anonymous volume at the checkout's `.venv`, so a Python venv lives off the macOS bind mount
 /// and starts empty each run. act splits its container options as a shell would, hence the quotes
 fn venv_mount(run_dir: &Path) -> Result<String, String> {
-    let dir = run_dir.join(".venv");
+    // act's workspace is the real path, /private/var on a Mac where the run dir is under /var
+    let real = run_dir
+        .canonicalize()
+        .unwrap_or_else(|_| run_dir.to_path_buf());
+    let dir = real.join(".venv");
     let dir = dir
         .to_str()
         .filter(|d| !d.contains(['\'', ',']))
@@ -1751,6 +1887,16 @@ fn venv_mount(run_dir: &Path) -> Result<String, String> {
     Ok(format!("--mount 'type=volume,dst={dir}'"))
 }
 
+/// The volumes `cache_paths` share per repository, and the ones `slot_paths` get per slot and job
+fn volumes<'a>(config: &'a config::Act, repo_id: &str, tag: &str) -> Vec<(String, &'a String)> {
+    let shared = config
+        .cache_paths
+        .iter()
+        .map(|p| (volume_name(repo_id, p), p));
+    let slot = (config.slot_paths.iter()).map(|p| (volume_name(repo_id, &format!("{tag}{p}")), p));
+    shared.chain(slot).collect()
+}
+
 /// `cache_paths` share a volume per repository, `slot_paths` get one per slot and job, as `tag` names
 fn mounts(
     config: &config::Act,
@@ -1758,13 +1904,8 @@ fn mounts(
     tag: &str,
     run_dir: &Path,
 ) -> Result<Vec<String>, String> {
-    let shared = config
-        .cache_paths
-        .iter()
-        .map(|p| (volume_name(repo_id, p), p));
-    let slot = (config.slot_paths.iter()).map(|p| (volume_name(repo_id, &format!("{tag}{p}")), p));
-    let mut mounts: Vec<String> = shared
-        .chain(slot)
+    let mut mounts: Vec<String> = volumes(config, repo_id, tag)
+        .into_iter()
         .map(|(v, p)| format!("-v {v}:{p}"))
         .collect();
     mounts.push(venv_mount(run_dir)?);
@@ -2022,9 +2163,16 @@ jobs:
             steps[0]["run"].as_str(),
             Some("echo \"shipcheck-start abc ${{ github.job }}\"")
         );
+        let homes = steps[1]["run"].as_str().unwrap();
+        assert!(homes.starts_with(
+            "for d in \"/home/runner/.shipcheck\" \"/home/runner/.npm\" \"/home/runner/.bun/install/cache\" \"/home/runner/.cache\" \"$GITHUB_WORKSPACE/.venv\"; do\n  [ -w \"$d\" ] || sudo -n chown"
+        ));
+        assert!(homes.ends_with(
+            "done\nmkdir -p \"$RUNNER_TEMP\" || true\nmkdir -p \"$CARGO_HOME/bin\"\necho \"$CARGO_HOME/bin\" >> \"$GITHUB_PATH\"\n"
+        ));
         assert_eq!(
-            steps[1]["run"].as_str(),
-            Some("mkdir -p \"$CARGO_HOME/bin\"\necho \"$CARGO_HOME/bin\" >> \"$GITHUB_PATH\"\n")
+            out["jobs"]["test"]["env"]["RUNNER_TEMP"].as_str(),
+            Some("/home/runner/work/_temp")
         );
         assert_eq!(steps[2]["uses"].as_str(), Some("actions/checkout@v4"));
         assert_eq!(steps[3]["run"].as_str(), Some("cargo build\ncargo test\n"));
@@ -2050,11 +2198,11 @@ jobs:
         let out = load(&inject(wf, "n").unwrap());
         assert_eq!(
             out["jobs"]["a"]["env"]["RUSTUP_HOME"].as_str(),
-            Some("/root/.shipcheck/a/rustup")
+            Some("/home/runner/.shipcheck/a/rustup")
         );
         assert_eq!(
             out["jobs"]["a"]["env"]["CARGO_HOME"].as_str(),
-            Some("/root/.shipcheck/a/cargo")
+            Some("/home/runner/.shipcheck/a/cargo")
         );
         // A job that sets its own home keeps it
         assert_eq!(
@@ -2063,7 +2211,7 @@ jobs:
         );
         assert_eq!(
             out["jobs"]["b"]["env"]["RUSTUP_HOME"].as_str(),
-            Some("/root/.shipcheck/b/rustup")
+            Some("/home/runner/.shipcheck/b/rustup")
         );
     }
 
@@ -2080,13 +2228,19 @@ jobs:
         let env = &out["jobs"]["test"]["env"];
         assert_eq!(
             env["GOMODCACHE"].as_str(),
-            Some("/root/.shipcheck/test/gomod")
+            Some("/home/runner/.shipcheck/test/gomod")
         );
         assert!(env["CARGO_HOME"].is_badvalue());
-        // No home has a `path`, so no homes step
+        // No home has a `path`, so the homes step only hands the mounts to the job's user
         let steps = out["jobs"]["test"]["steps"].as_vec().unwrap();
-        assert_eq!(steps.len(), 4);
-        assert_eq!(steps[1]["uses"].as_str(), Some("actions/checkout@v4"));
+        assert_eq!(steps.len(), 5);
+        assert!(
+            steps[1]["run"]
+                .as_str()
+                .unwrap()
+                .ends_with("done\nmkdir -p \"$RUNNER_TEMP\" || true\n")
+        );
+        assert_eq!(steps[2]["uses"].as_str(), Some("actions/checkout@v4"));
     }
 
     #[test]
@@ -2097,11 +2251,45 @@ jobs:
         };
         let out = load(&inject_with(CI, "n", act).unwrap());
         let env = out["jobs"]["test"]["env"].as_hash().unwrap();
-        assert!(
-            env.keys()
-                .all(|k| k.as_str().unwrap().starts_with("GIT_CONFIG_"))
-        );
-        assert_eq!(out["jobs"]["test"]["steps"].as_vec().unwrap().len(), 4);
+        assert!(env.keys().all(|k| {
+            let k = k.as_str().unwrap();
+            k.starts_with("GIT_CONFIG_") || k == "RUNNER_TEMP"
+        }));
+        assert_eq!(out["jobs"]["test"]["steps"].as_vec().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn container_jobs_and_mapped_labels_keep_their_own() {
+        let wf = "\
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    container: node:22
+    steps:
+      - run: npm test
+";
+        let out = load(&inject(wf, "n").unwrap());
+        assert!(out["jobs"]["a"]["env"]["RUNNER_TEMP"].is_badvalue());
+        assert_eq!(out["jobs"]["a"]["runs-on"].as_str(), Some("ubuntu-24.04"));
+        let act = config::Act {
+            platforms: BTreeMap::from([("ubuntu-latest".into(), "img@sha256:1".into())]),
+            ..Default::default()
+        };
+        let out = load(&inject_with(wf, "n", act).unwrap());
+        assert_eq!(out["jobs"]["a"]["runs-on"].as_str(), Some("ubuntu-latest"));
+    }
+
+    #[test]
+    fn the_key_sees_the_default_images() {
+        let mapped = config::Act {
+            platforms: BTreeMap::from([("ubuntu-22.04".into(), "img@sha256:1".into())]),
+            ..Default::default()
+        };
+        let p = platforms(&mapped);
+        assert_eq!(p["ubuntu-22.04"], "img@sha256:1");
+        assert!(p["ubuntu-24.04"].contains("27043bae70b3"));
+        assert_eq!(p["ubuntu-latest"], p["ubuntu-24.04"]);
     }
 
     #[test]
@@ -2196,9 +2384,10 @@ jobs:
             out["jobs"]["test__1"]["runs-on"].as_str(),
             Some("macos-latest")
         );
+        // act would give `ubuntu-latest` ImageOS ubuntu20
         assert_eq!(
             out["jobs"]["test__2"]["runs-on"].as_str(),
-            Some("ubuntu-latest")
+            Some("ubuntu-24.04")
         );
         assert_eq!(
             out["jobs"]["test__2"]["strategy"]["matrix"]["include"][0]["fs"].as_str(),
@@ -2708,6 +2897,23 @@ jobs:
     }
 
     #[test]
+    fn reads_each_steps_summary_from_the_log() {
+        // As act 0.2.89 logs two steps that wrote a summary, with step output between them
+        let log = "[ci.yml/t] \u{2b50} Run Main printf\n\
+                   [ci.yml/t]   \u{2699}  Summary - | a | b |\n\
+                   |---|---|\n\
+                   | 1 | 2 |\n\
+                   [ci.yml/t] unable to get git ref\n\
+                   [ci.yml/t]   | [x/y]   \u{2699}  Summary - forged\n\
+                   [ci.yml/t]   \u{2699}  Summary - second\n\
+                   [ci.yml/t] \u{2b50} Run Complete job\n";
+        assert_eq!(read_summary(log), "| a | b |\n|---|---|\n| 1 | 2 |\nsecond");
+        assert_eq!(read_summary("[ci.yml/t] nothing\n"), "");
+        let long = format!("[w/j]   \u{2699}  Summary - {}\n", "\u{e9}".repeat(20_000));
+        assert!(read_summary(&long).ends_with("[...cut at 20000 bytes...]"));
+    }
+
+    #[test]
     fn reads_outputs_from_the_log() {
         // Lines as the outputs step prints them, plus act echoing the command first
         let log = "[CI/a] | printf 'shipcheck-output %s %s\\n' 'v' \"$(...)\"\n\
@@ -2898,6 +3104,15 @@ jobs:
     }
 
     #[test]
+    fn the_prune_never_lists_a_current_pin() {
+        for (_, image) in DEFAULT_PLATFORMS {
+            assert!(!gc::OLD_PINS.contains(&image));
+        }
+
+        assert!(!gc::OLD_PINS.contains(&BUSYBOX));
+    }
+
+    #[test]
     fn slot_paths_get_a_volume_per_slot_and_job() {
         let act = config::Act::default();
         let run = Path::new("/r");
@@ -2910,7 +3125,11 @@ jobs:
         };
         assert_ne!(apt(&a), apt(&b));
         assert!(apt(&a).unwrap().contains("-aaaa-var-lib-apt-lists:"));
-        let npm = |m: &[String]| m.iter().find(|m| m.ends_with(":/root/.npm")).cloned();
+        let npm = |m: &[String]| {
+            m.iter()
+                .find(|m| m.ends_with(":/home/runner/.npm"))
+                .cloned()
+        };
         assert_eq!(npm(&a), npm(&b));
         assert_eq!(a.last().unwrap(), "--mount 'type=volume,dst=/r/.venv'");
     }
@@ -2926,5 +3145,36 @@ jobs:
         assert!(venv_mount(Path::new("/a'b")).is_err());
         assert!(!volume_name("a/b", "/x").starts_with(&abc));
         assert!(volume_name("a/b", "/x").starts_with(&ab));
+    }
+
+    #[test]
+    fn goes_offline_only_when_every_cached_action_resolves_its_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(cached_actions_resolve(&dir.path().join("none")));
+
+        let action = dir.path().join("o-a@v1");
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&action)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        fs::create_dir_all(&action).unwrap();
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        git(&["tag", "v1"]);
+        fs::create_dir(dir.path().join("workspace")).unwrap();
+        assert!(cached_actions_resolve(dir.path()));
+
+        fs::create_dir(dir.path().join("o-b@v2")).unwrap();
+        assert!(
+            !cached_actions_resolve(dir.path()),
+            "a clone that lost its ref"
+        );
     }
 }

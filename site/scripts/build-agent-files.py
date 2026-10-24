@@ -69,7 +69,10 @@ def main():
     (PUBLIC / "SKILL.md").write_text(skill.read_text())
 
     intro = pages[0][3].split("\n\n")[0]
-    lines = [f"# {config['title']}", "", f"> {config['description']}", "", intro, "", "## Docs", ""]
+    quickstart = next(body for _, stem, _, body in pages if stem == "quickstart")
+    setup = convert(re.search(r"^## Setup\n\n(.*?)\n\n", quickstart, re.S | re.M).group(1), base)
+    lines = [f"# {config['title']}", "", f"> {config['description']}", "", intro, "", "## Setup", "", setup, ""]
+    lines += ["## Docs", ""]
 
     for _, stem, meta, _ in pages[1:]:
         lines.append(f"- [{meta['title']}]({page_url(base, stem + '.md')}): {meta.get('description', '')}".rstrip(": "))
@@ -88,6 +91,13 @@ def main():
 
     (PUBLIC / "llms.txt").write_text("\n".join(lines) + "\n")
     (PUBLIC / "llms-full.txt").write_text("\n".join(full))
+
+    # The markdown copies and agent files join Zola's sitemap, _headers names each copy's HTML page as canonical
+    extra = ["docs.md"] + [f"docs/{stem}.md" for _, stem, _, _ in pages[1:]]
+    extra += ["llms.txt", "llms-full.txt", "SKILL.md"]
+    sitemap = PUBLIC / "sitemap.xml"
+    urls = "".join(f"    <url>\n        <loc>{base}/{path}</loc>\n    </url>\n" for path in extra)
+    sitemap.write_text(sitemap.read_text().replace("</urlset>", urls + "</urlset>"))
     print(f"wrote {len(pages)} markdown copies, SKILL.md, llms.txt and llms-full.txt into {PUBLIC}")
 
 

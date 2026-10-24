@@ -10,6 +10,8 @@
   --page: 70rem;
   --gutter: clamp(1rem, 4vw, 3rem);
   --sans: "Bricolage Grotesque", system-ui, sans-serif;
+  /* Body text in a static face, Safari drew the variable Bricolage heavy at every weight */
+  --text: "IBM Plex Sans", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
@@ -25,9 +27,8 @@ body {
   margin: 0;
   background: var(--paper);
   color: var(--ink);
-  font-family: var(--sans);
+  font-family: var(--text);
   font-size: 1.0625rem;
-  font-variation-settings: "opsz" 14;
   line-height: 1.6;
 }
 
@@ -60,11 +61,13 @@ pre {
   border-radius: 4px;
 }
 
-pre {
+pre,
+pre.z-code {
   margin: 1.25rem 0;
   padding: 1rem 1.25rem;
   overflow-x: auto;
   background: var(--well);
+  color: var(--ink);
   border-radius: 8px;
   line-height: 1.55;
 }
@@ -73,7 +76,8 @@ h1,
 h2,
 h3 {
   font-family: var(--sans);
-  font-variation-settings: "opsz" 64;
+  /* Safari drops font-weight once variation settings are set, so the weight goes in them too */
+  font-variation-settings: "opsz" 64, "wght" 700;
   font-weight: 700;
   line-height: 1.08;
   letter-spacing: -0.02em;
@@ -106,7 +110,8 @@ h3 {
 }
 
 .wordmark {
-  font-variation-settings: "opsz" 64;
+  font-family: var(--sans);
+  font-variation-settings: "opsz" 64, "wght" 750;
   font-weight: 750;
   font-size: 1.3rem;
   letter-spacing: -0.02em;
@@ -149,6 +154,13 @@ h3 {
 .home section > h2 {
   max-width: var(--measure);
   margin-bottom: 1.5rem;
+}
+
+/* One-column sections sit in the middle, under the centered hero, text still left-aligned */
+.timing,
+.how {
+  max-width: var(--measure);
+  margin-inline: auto;
 }
 
 .home p,
@@ -397,10 +409,6 @@ h3 {
 
 .guarantees h3 {
   margin-bottom: 0.75rem;
-}
-
-.status p {
-  font-size: 1.15rem;
 }
 
 /* Docs */

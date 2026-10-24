@@ -14,6 +14,8 @@ concurrency:
 
 jobs:
   gitleaks:
+    # The private repository's minutes run out: there only pushes to main run, the public repository runs PRs free
+    if: github.repository == 'gabrielkoerich/shipcheck' || github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
       GITLEAKS_VERSION: 8.30.1
