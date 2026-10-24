@@ -505,11 +505,11 @@ impl Sender {
                         ("sha", sha),
                     ],
                 )?;
-                let source = res["source"].as_str().unwrap_or("events").to_string();
+                let source = res["source"].as_str().unwrap_or("activity").to_string();
                 Ok(res["login"].as_str().map(|l| (l.to_string(), source)))
             }
-            How::Key(app, cache) => Ok(crate::github::find_pusher(
-                &self.installation_token(app, cache)?,
+            How::Key(app, _) => Ok(crate::github::find_pusher(
+                &app.pusher_token(&self.repo)?,
                 &self.repo,
                 pr,
                 branch,

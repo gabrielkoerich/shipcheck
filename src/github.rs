@@ -59,6 +59,11 @@ impl App {
         self.token(repo, json!({"checks": "write", "pull_requests": "read"}))
     }
 
+    /// A token that reads a branch's activity, which GitHub lists under Contents
+    pub fn pusher_token(&self, repo: &str) -> Result<String, String> {
+        self.token(repo, json!({"contents": "read"}))
+    }
+
     /// A token that writes the PR comment, which GitHub refuses until the App has Pull requests write
     pub fn comment_token(&self, repo: &str) -> Result<String, String> {
         self.token(repo, json!({"pull_requests": "write"}))
@@ -255,123 +260,30 @@ pub fn parse_checks(runs: &Value) -> Checks {
     found
 }
 
-/**
- * Who pushed head `sha` of PR `pr`, and which source said so, None while none does. Exact sources
- * first: the PR timeline lists a force-push, such as a rebase "Update branch", at once, and a merge
- * "Update branch" is a commit GitHub signs with the clicker as author. A PR merged into the branch,
- * such as a stacked PR, names who merged it. The repository's events cover a plain push, and GitHub
- * lists them from 30 seconds to hours late
- **/
+/// Who moved `branch` to `sha`, from GitHub's activity log, which lists every change of a branch at once
 pub fn find_pusher(
     token: &str,
     repo: &str,
-    pr: u64,
+    _pr: u64,
     branch: &str,
     sha: &str,
 ) -> Result<Option<(String, &'static str)>, String> {
-    // ponytail: 10 pages of 100 timeline events, the latest force-push is on the last page
-    let timeline = pages(
-        &format!("{API}/repos/{repo}/issues/{pr}/timeline"),
+    // ponytail: the branch's last 100 changes, the newest first
+    let activity = get_query(
+        &format!("{API}/repos/{repo}/activity"),
         token,
-        10,
+        &[
+            ("ref", &format!("refs/heads/{branch}")),
+            ("per_page", "100"),
+        ],
     )?;
-
-    if let Some(login) = forced(&timeline, sha) {
-        return Ok(Some((login, "timeline")));
-    }
-
-    // GitHub lists at most 250 commits of a PR
-    let commits = pages(&format!("{API}/repos/{repo}/pulls/{pr}/commits"), token, 3)?;
-
-    if let Some(login) = web_merge(&commits, sha) {
-        return Ok(Some((login, "merge-commit")));
-    }
-
-    // ponytail: the 100 PRs into the branch closed last
-    let closed = get(
-        &format!(
-            "{API}/repos/{repo}/pulls?state=closed&base={branch}&sort=updated&direction=desc&per_page=100"
-        ),
-        token,
-    )?;
-
-    if let Some(number) = merged_into(&closed, branch, sha) {
-        let merged = get(&format!("{API}/repos/{repo}/pulls/{number}"), token)?;
-
-        if let Some(login) = merged["merged_by"]["login"].as_str() {
-            return Ok(Some((login.to_string(), "merged-pr")));
-        }
-    }
-
-    // ponytail: first 100 events
-    let events = get(&format!("{API}/repos/{repo}/events?per_page=100"), token)?;
-    Ok(pusher(&events, branch, sha).map(|login| (login, "events")))
+    Ok(moved_by(&activity, sha).map(|login| (login, "activity")))
 }
 
-/// Every item of a GitHub list, 100 a page, up to `cap` pages
-fn pages(url: &str, token: &str, cap: u32) -> Result<Vec<Value>, String> {
-    let mut all = Vec::new();
-
-    for page in 1..=cap {
-        let list = get(&format!("{url}?per_page=100&page={page}"), token)?;
-        let list = list.as_array().cloned().unwrap_or_default();
-        let last = list.len() < 100;
-        all.extend(list);
-
-        if last {
-            break;
-        }
-    }
-
-    Ok(all)
-}
-
-/// The actor of the latest force-push of the PR's head to `sha`, from its timeline
-pub fn forced(timeline: &[Value], sha: &str) -> Option<String> {
-    timeline.iter().rev().find_map(|e| {
-        let push = e["event"] == "head_ref_force_pushed" && e["commit_id"] == sha;
-        push.then(|| e["actor"]["login"].as_str().map(String::from))?
-    })
-}
-
-/**
- * The login that clicked a merge "Update branch" whose result is `sha`: GitHub commits it as
- * web-flow, signs it, and names the clicker as author. Its first parent is the PR's previous head
- * and its second comes from the base
- **/
-pub fn web_merge(commits: &[Value], sha: &str) -> Option<String> {
-    let c = commits.iter().find(|c| c["sha"] == sha)?;
-    let ours = |p: &Value| commits.iter().any(|c| c["sha"] == p["sha"]);
-    let parents = c["parents"].as_array()?;
-    let by_github = c["committer"]["login"] == "web-flow"
-        && c["commit"]["committer"]["email"] == "noreply@github.com"
-        && c["commit"]["verification"]["verified"] == true;
-
-    if !by_github || parents.len() != 2 || !ours(&parents[0]) || ours(&parents[1]) {
-        return None;
-    }
-
-    c["author"]["login"].as_str().map(String::from)
-}
-
-/// The number of the PR into `branch` whose merge made `sha`
-pub fn merged_into(pulls: &Value, branch: &str, sha: &str) -> Option<u64> {
-    pulls.as_array()?.iter().find_map(|p| {
-        let made =
-            p["merge_commit_sha"] == sha && p["base"]["ref"] == branch && !p["merged_at"].is_null();
-        made.then(|| p["number"].as_u64())?
-    })
-}
-
-/// The login of the push event that moved `branch` to `sha`
-pub fn pusher(events: &Value, branch: &str, sha: &str) -> Option<String> {
-    let full = format!("refs/heads/{branch}");
-    events.as_array()?.iter().find_map(|e| {
-        let push = e["type"] == "PushEvent"
-            && e["payload"]["ref"] == full.as_str()
-            && e["payload"]["head"] == sha;
-        push.then(|| e["actor"]["login"].as_str().map(String::from))?
-    })
+/// The actor of the newest change of the branch whose result is `sha`
+pub fn moved_by(activity: &Value, sha: &str) -> Option<String> {
+    let entry = activity.as_array()?.iter().find(|a| a["after"] == sha)?;
+    entry["actor"]["login"].as_str().map(String::from)
 }
 
 /// Creates a check run from a body built in `check`, and returns its id and page on GitHub
@@ -410,8 +322,17 @@ fn patch(url: &str, auth: &str, body: &Value) -> Result<Value, String> {
 }
 
 fn get(url: &str, auth: &str) -> Result<Value, String> {
-    ureq::get(url)
-        .header("Authorization", format!("Bearer {auth}"))
+    get_query(url, auth, &[])
+}
+
+fn get_query(url: &str, auth: &str, query: &[(&str, &str)]) -> Result<Value, String> {
+    let mut req = ureq::get(url);
+
+    for (k, v) in query {
+        req = req.query(*k, *v);
+    }
+
+    req.header("Authorization", format!("Bearer {auth}"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .header("User-Agent", "shipcheck")
@@ -440,99 +361,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finds_who_pushed_the_head() {
-        let events = json!([
-            {"type": "PushEvent", "actor": {"login": "bob"}, "payload": {"ref": "refs/heads/fix", "head": "b"}},
-            {"type": "PullRequestEvent", "actor": {"login": "eve"}, "payload": {}},
-            {"type": "PushEvent", "actor": {"login": "ann"}, "payload": {"ref": "refs/heads/fix", "head": "a"}},
-            {"type": "PushEvent", "actor": {"login": "eve"}, "payload": {"ref": "refs/heads/other", "head": "c"}},
-        ]);
-        assert_eq!(pusher(&events, "fix", "a").as_deref(), Some("ann"));
-        assert_eq!(pusher(&events, "fix", "b").as_deref(), Some("bob"));
+    fn the_pusher_is_the_newest_change_to_the_head() {
+        let entry = |kind: &str, after: &str, login: &str| json!({"activity_type": kind, "before": "o", "after": after, "actor": {"login": login}});
+        let pusher = |entries: Vec<Value>| moved_by(&Value::Array(entries), "h");
         assert_eq!(
-            pusher(&events, "fix", "c"),
-            None,
-            "a push of the same commit to another branch"
-        );
-        assert_eq!(pusher(&events, "fix", "d"), None, "not listed yet");
-    }
-
-    #[test]
-    fn finds_a_force_push_on_the_timeline() {
-        let timeline = vec![
-            json!({"event": "head_ref_force_pushed", "actor": {"login": "eve"}, "commit_id": "h"}),
-            json!({"event": "committed", "sha": "h"}),
-            json!({"event": "head_ref_force_pushed", "actor": {"login": "ann"}, "commit_id": "h"}),
-            json!({"event": "head_ref_force_pushed", "actor": {"login": "bob"}, "commit_id": "g"}),
-        ];
-        assert_eq!(
-            forced(&timeline, "h").as_deref(),
+            pusher(vec![entry("branch_creation", "h", "ann")]).as_deref(),
             Some("ann"),
-            "the latest push of h"
+            "the first head of a new branch"
         );
         assert_eq!(
-            forced(&timeline, "x"),
+            pusher(vec![
+                entry("pr_merge", "h", "dan"),
+                entry("push", "h", "bob")
+            ])
+            .as_deref(),
+            Some("dan")
+        );
+        assert_eq!(
+            pusher(vec![
+                entry("push", "o", "bob"),
+                entry("force_push", "h", "eve")
+            ])
+            .as_deref(),
+            Some("eve")
+        );
+        assert_eq!(
+            pusher(vec![entry("push", "o", "bob")]),
             None,
-            "a plain push is only a commit"
-        );
-    }
-
-    #[test]
-    fn finds_the_pr_whose_merge_made_the_head() {
-        let sha = "7f32acaf1e3db3e0192f492f9c7d3cf2ba0f432f";
-        let pulls = serde_json::json!([
-            {"number": 58, "merge_commit_sha": sha, "base": {"ref": "cloud-only"}, "merged_at": null},
-            {"number": 59, "merge_commit_sha": sha, "base": {"ref": "main"}, "merged_at": "2026-10-24T11:08:29Z"},
-            {"number": 57, "merge_commit_sha": sha, "base": {"ref": "cloud-only"}, "merged_at": "2026-10-24T11:08:29Z"}
-        ]);
-        assert_eq!(
-            merged_into(&pulls, "cloud-only", sha),
-            Some(57),
-            "a closed PR that never merged, or one into another branch, names no one"
-        );
-        assert_eq!(merged_into(&pulls, "cloud-only", &"0".repeat(40)), None);
-    }
-
-    #[test]
-    fn finds_who_clicked_a_merge_update_branch() {
-        let merge = |committer: &str, email: &str, verified: bool, second: &str| {
-            json!({
-                "sha": "m",
-                "author": {"login": "ann"},
-                "committer": {"login": committer},
-                "commit": {"committer": {"email": email}, "verification": {"verified": verified}},
-                "parents": [{"sha": "a"}, {"sha": second}],
-            })
-        };
-        let pr = |m: Value| vec![json!({"sha": "a", "parents": [{"sha": "base"}]}), m];
-        let gh = "noreply@github.com";
-        assert_eq!(
-            web_merge(&pr(merge("web-flow", gh, true, "main")), "m").as_deref(),
-            Some("ann")
+            "not listed yet"
         );
         assert_eq!(
-            web_merge(&pr(merge("ann", gh, true, "main")), "m"),
+            pusher(vec![
+                json!({"activity_type": "push", "after": "h", "actor": null})
+            ]),
             None,
-            "a merge made on a laptop"
-        );
-        assert_eq!(
-            web_merge(&pr(merge("web-flow", "ann@x", true, "main")), "m"),
-            None
-        );
-        assert_eq!(
-            web_merge(&pr(merge("web-flow", gh, false, "main")), "m"),
-            None,
-            "unsigned"
-        );
-        assert_eq!(
-            web_merge(&pr(merge("web-flow", gh, true, "a")), "m"),
-            None,
-            "both parents from the PR"
-        );
-        assert_eq!(
-            web_merge(&pr(merge("web-flow", gh, true, "main")), "a"),
-            None,
-            "not a merge"
+            "a deleted account names no one"
         );
     }
 }

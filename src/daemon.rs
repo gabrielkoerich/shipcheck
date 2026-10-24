@@ -260,7 +260,7 @@ type State<'a> = (
     &'a mut BTreeMap<(String, u64), String>,
 );
 
-/// The heads that waited for their push event and that a new head on the same PR replaced
+/// The heads that waited for their pusher and that a new head on the same PR replaced
 fn abandoned(
     waits: &BTreeMap<(String, u64), String>,
     repo: &str,
@@ -381,8 +381,8 @@ fn tainted(checkout: &Path, head: &str, refused: &BTreeMap<String, u64>) -> Opti
 #[derive(Debug, PartialEq)]
 enum Pushed {
     Run,
-    /// No source names the pusher yet. GitHub lists events from 30 seconds to hours late, so the
-    /// head waits and every poll asks again, never giving up on a PR
+    /// The branch's activity does not name the pusher yet, so the head waits and every poll asks
+    /// again, never giving up on a PR
     Wait,
     /// Another login pushed it, and main does not list them
     Other,
@@ -791,7 +791,7 @@ mod tests {
         assert_eq!(
             pushed("ann", None, "ann", &listed),
             Pushed::Wait,
-            "no push event yet"
+            "no pusher yet"
         );
         assert_eq!(pushed("", Some(""), "", &["".to_string()]), Pushed::Other);
     }
