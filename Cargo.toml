@@ -2,7 +2,7 @@
 name = "shipcheck"
 version = "0.1.0"
 edition = "2024"
-description = "Run GitHub Actions locally with act, cache the result by git tree, and post it as the PR's required check"
+description = "Run your CI checks locally, cache the result by git tree, and post it as the PR's required checks"
 license = "MIT"
 repository = "https://github.com/gabrielkoerich/shipcheck"
 homepage = "https://shipcheck.run"

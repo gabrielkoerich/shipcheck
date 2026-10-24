@@ -1,5 +1,5 @@
 class Shipcheck < Formula
-  desc "Run your GitHub Actions locally and post the result as the PR's required check"
+  desc "Run your CI checks locally and post the result as the PR's required checks"
   homepage "https://shipcheck.run"
   version "0.0.0"
   license "MIT"
@@ -48,8 +48,9 @@ class Shipcheck < Formula
 
   def caveats
     <<~EOS
-      shipcheck runs each job in a Docker container, so it needs a running
-      Docker engine: Docker Desktop, OrbStack or colima (brew install colima).
+      Host mode runs your checks natively in an OS sandbox. act mode runs
+      each job in a Docker container, so it needs a running Docker engine:
+      Docker Desktop, OrbStack or colima (brew install colima).
 
       In a repository: shipcheck init, then see https://shipcheck.run/docs/quickstart/
     EOS
