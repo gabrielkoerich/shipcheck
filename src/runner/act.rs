@@ -485,8 +485,12 @@ impl Runner for Act {
             gc::stamp(&home, "images", &image);
         }
 
+        // A job its `if:` skips prints nothing, so a dry run, which starts no container, says why
+        let skipped = exit == Some(0) && !log.contains("shipcheck-start ") && skipped_by_if(&cmd);
+
         Ok(Outcome {
             exit,
+            skipped,
             unsupported_jobs: unsupported_jobs(&log),
             outputs: read_outputs(&log),
             shards,
@@ -576,6 +580,36 @@ pub fn platforms(config: &config::Act) -> BTreeMap<String, String> {
         .map(|(l, i)| (l.to_string(), i.to_string()))
         .chain(config.platforms.clone())
         .collect()
+}
+
+/// Whether act, run again as `cmd` with `--dryrun --verbose`, says the job's `if:` skips it
+fn skipped_by_if(cmd: &Command) -> bool {
+    let mut dry = Command::new(cmd.get_program());
+    dry.args(cmd.get_args())
+        .args(["--dryrun", "--verbose"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+
+    for (k, v) in cmd.get_envs() {
+        if let Some(v) = v {
+            dry.env(k, v);
+        }
+    }
+
+    if let Some(dir) = cmd.get_current_dir() {
+        dry.current_dir(dir);
+    }
+
+    dry.output().is_ok_and(|out| {
+        out.status.success() && dry_run_skips(&String::from_utf8_lossy(&out.stdout))
+    })
+}
+
+/// act's verbose line for a job whose `if:` is false
+fn dry_run_skips(log: &str) -> bool {
+    log.lines()
+        .any(|l| l.contains("] [DEBUG] Skipping job '") && l.contains("' due to '"))
 }
 
 /// catthehacker's `runner-*` images, pinned by index digest for amd64 and arm64, unless
@@ -2531,6 +2565,15 @@ jobs:
         };
         let out = load(&inject_with(wf, "n", act).unwrap());
         assert_eq!(out["jobs"]["a"]["runs-on"].as_str(), Some("ubuntu-latest"));
+    }
+
+    #[test]
+    fn a_dry_run_says_when_an_if_skips_the_job() {
+        // act 0.2.89 with --dryrun --verbose, for `if: github.event_name == 'pull_request'`
+        let skipped = "*DRYRUN* [w.yml/x] [DEBUG] Skipping job 'x' due to 'github.event_name == 'pull_request''\n";
+        assert!(dry_run_skips(skipped));
+        let ran = "*DRYRUN* [w.yml/x] [DEBUG] evaluating expression 'success()'\n*DRYRUN* [w.yml/x] ⭐ Run Set up job\n";
+        assert!(!dry_run_skips(ran));
     }
 
     #[test]
