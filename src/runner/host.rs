@@ -494,7 +494,14 @@ impl Jail {
             }
         };
         let cache = |dir: &str| self.cache.join(dir);
-        let path = jail_path();
+        let shims = self.home.join(SHIMS);
+        let path = if shims.is_dir() {
+            let dirs = std::iter::once(shims)
+                .chain(std::env::split_paths(&jail_path()).collect::<Vec<_>>());
+            std::env::join_paths(dirs).unwrap_or_else(|_| jail_path())
+        } else {
+            jail_path()
+        };
         let rustup = Some(self.home.join(".rustup"))
             .filter(|r| r.is_dir())
             .unwrap_or_else(|| user_tool("RUSTUP_HOME", ".rustup"));
@@ -565,7 +572,38 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
     toolchains(&path, &crate::run::user_dir())?;
     rustup_home(&path, &user_tool("RUSTUP_HOME", ".rustup"))?;
     sbf_sdk(&path, &jail_path())?;
+
+    if cfg!(target_os = "macos") {
+        mktemp_shim(&path)?;
+    }
+
     Ok((dir, path))
+}
+
+/// Where the jail's own commands go, first on `PATH`
+const SHIMS: &str = ".shipcheck/bin";
+
+/**
+ * macOS `mktemp` with no template ignores `TMPDIR` for the per-user temp dir from `confstr`, which
+ * the jail denies, and no variable moves that dir. This one gives it `-p "$TMPDIR"` then, the
+ * jail's home. A template or `-p` of the caller's own runs as given
+ **/
+const MKTEMP: &str = r#"#!/bin/sh
+for a in "$@"; do
+  case $a in
+    *XXX* | -p* | --tmpdir*) exec /usr/bin/mktemp "$@" ;;
+  esac
+done
+exec /usr/bin/mktemp -p "${TMPDIR:-/tmp}" "$@"
+"#;
+
+fn mktemp_shim(home: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join(SHIMS);
+    fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
+    let file = bin.join("mktemp");
+    fs::write(&file, MKTEMP).map_err(|e| e.to_string())?;
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
 }
 
 /// Toolchains found only through `$HOME`, linked from the jail's home to the user's, readable as
@@ -1386,6 +1424,33 @@ mod tests {
             "--bind /j/clone /j/clone --bind /j/home /j/home --remount-ro {}",
             user.display()
         )));
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn mktemp_makes_its_files_in_the_jails_tmpdir() {
+        let (clone, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (_home, home) = temp_home().unwrap();
+        let cache = real_dir(cache.path()).unwrap();
+        let jail = Jail {
+            writable: vec![real_dir(clone.path()).unwrap(), home.clone(), cache.clone()],
+            readable: Vec::new(),
+            home,
+            cache,
+        };
+        let log = clone.path().join("log");
+        // As cli/cli's script/licenses does, then with a prefix, then with a template of its own
+        let cmd = "set -e; for d in \"$(mktemp -d)\" \"$(mktemp -d -t pre)\" \"$(mktemp)\"; do case $d in \"$TMPDIR\"/*) ;; *) exit 9 ;; esac; done; mktemp \"$PWD/own.XXXX\"";
+        let exit = run_command(cmd, clone.path(), &jail, &[], &log, Duration::from_secs(10));
+        let log = fs::read_to_string(&log).unwrap();
+        assert_eq!(exit.unwrap(), Some(0), "{log}");
+        assert!(
+            log.contains(&format!(
+                "{}/own.",
+                clone.path().canonicalize().unwrap().display()
+            )),
+            "{log}"
+        );
     }
 
     #[test]
