@@ -209,7 +209,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut rev = "HEAD".to_string();
     let mut fetch = true;
-    let mut base = run::default_base(&cwd);
+    let mut base = String::new();
     let mut base_set = false;
     let mut all = false;
     let mut explicit = false;
@@ -358,6 +358,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             "on-push"
         }
     };
+
+    if !base_set {
+        base = shipcheck::daemon::command_base(name, &cwd);
+    }
 
     // With --json, stdout holds only the result object
     let style = if json {

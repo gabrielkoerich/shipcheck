@@ -135,6 +135,13 @@ pub fn install(root: &Path) -> String {
     }
 }
 
+/// Adds the checkout to the daemon at the base the remote names. Offline it stores no guess
+fn register(file: &Path, checkout: &Path) -> Result<bool, String> {
+    let base = run::remote_base(checkout)
+        .ok_or("could not ask origin for its default branch, run init again when online")?;
+    DaemonConfig::add_to(file, &run::repo_id(checkout)?, checkout, &base)
+}
+
 fn try_install(root: &Path) -> Result<String, String> {
     if std::env::var_os("SHIPCHECK_NO_DAEMON").is_some_and(|v| v == "1") {
         return Ok("daemon not installed, SHIPCHECK_NO_DAEMON=1".into());
@@ -148,12 +155,7 @@ fn try_install(root: &Path) -> Result<String, String> {
         return Ok("daemon not installed, daemon = false on main".into());
     }
 
-    let checkout = main_checkout(root);
-    DaemonConfig::add(
-        &run::repo_id(&checkout)?,
-        &checkout,
-        &run::default_base(&checkout),
-    )?;
+    register(&DaemonConfig::path(), &main_checkout(root))?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // The service runs outside any sandbox for weeks, so it keeps only the PATH entries a jail would
     let path = crate::runner::host::jail_path()
@@ -235,6 +237,62 @@ pub fn uninstall() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(at: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(at)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    #[test]
+    fn an_unreachable_remote_registers_no_guessed_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, origin) = (dir.path().join("app"), dir.path().join("acme/app.git"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "master"]);
+        git(&repo, &["init", "-q", "-b", "master"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "a",
+            ],
+        );
+        git(&repo, &["push", "-q", "origin", "master"]);
+        let file = dir.path().join("daemon.toml");
+        fs::write(&file, "").unwrap();
+
+        assert_eq!(register(&file, &repo), Ok(true));
+        let before = fs::read_to_string(&file).unwrap();
+        assert!(before.contains("base = \"origin/master\""), "{before}");
+
+        let gone = dir.path().join("gone/app.git");
+        git(
+            &repo,
+            &["remote", "set-url", "origin", gone.to_str().unwrap()],
+        );
+        let e = register(&file, &repo).unwrap_err();
+        assert!(
+            e.contains("could not ask origin for its default branch"),
+            "{e}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
+    }
 
     #[test]
     fn only_the_default_home_installs_or_removes_the_service() {
