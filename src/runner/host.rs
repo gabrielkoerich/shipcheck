@@ -268,6 +268,7 @@ const TOOLCHAINS: &[&str] = &[
     ".local/bin",
     ".local/share/uv/python",
     ".local/share/mise/installs",
+    ".rubies",
     ".local/share/mise/shims",
     ".local/share/pnpm",
     "Library/pnpm",
@@ -514,13 +515,14 @@ impl Jail {
         let cache = |dir: &str| self.cache.join(dir);
         let base = self.path(jail_path());
         let shims = self.home.join(SHIMS);
-        let path = if shims.is_dir() {
-            let dirs =
-                std::iter::once(shims).chain(std::env::split_paths(&base).collect::<Vec<_>>());
-            std::env::join_paths(dirs).unwrap_or(base)
-        } else {
-            base
-        };
+        // `gem install` goes to the home each check gets new, and the commands it installs run from there
+        let gems = self.home.join(".gem");
+        let dirs = Some(shims)
+            .filter(|s| s.is_dir())
+            .into_iter()
+            .chain([gems.join("bin")])
+            .chain(std::env::split_paths(&base).collect::<Vec<_>>());
+        let path = std::env::join_paths(dirs).unwrap_or(base);
         let rustup = Some(self.home.join(".rustup"))
             .filter(|r| r.is_dir())
             .unwrap_or_else(|| user_tool("RUSTUP_HOME", ".rustup"));
@@ -536,6 +538,9 @@ impl Jail {
             .env("AVM_HOME", user_tool("AVM_HOME", ".avm"))
             .env("BUN_INSTALL_CACHE_DIR", cache("bun"))
             .env("CARGO_HOME", cache("cargo"))
+            // Bundler keeps a directory per Ruby version under it, and the system gem dir is read-only here
+            .env("BUNDLE_PATH", cache("bundle"))
+            .env("GEM_HOME", gems)
             .env("npm_config_cache", cache("npm"))
             .env("npm_config_prefix", self.home.join(NPM_PREFIX))
             .env("UV_CACHE_DIR", cache("uv"))
@@ -1074,6 +1079,27 @@ mod tests {
             home: real_dir(&dir.join("home")).unwrap(),
             cache: real_dir(&dir.join("cache")).unwrap(),
         }
+    }
+
+    #[test]
+    fn gems_install_into_the_jail_and_their_commands_are_on_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = jail(dir.path());
+        let cmd = jail.shell("true", dir.path(), &[]).unwrap();
+        let env = |name: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == name)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap()
+        };
+        assert_eq!(
+            env("BUNDLE_PATH"),
+            jail.cache.join("bundle").to_string_lossy()
+        );
+        assert_eq!(env("GEM_HOME"), jail.home.join(".gem").to_string_lossy());
+        let gem_bin = format!("{}:", jail.home.join(".gem/bin").display());
+        assert!(env("PATH").starts_with(&gem_bin), "{}", env("PATH"));
     }
 
     #[test]

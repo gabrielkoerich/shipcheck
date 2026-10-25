@@ -844,11 +844,18 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
         let source = fs::read_to_string(&path).map_err(|e| format!("{file}: {e}"))?;
         let jobs = crate::workflow::job_runs(&source);
         let covers = coverage(root, cfg, &file, &jobs);
-        let staying: Vec<&str> = kept
+        let mut staying: Vec<&str> = kept
             .iter()
             .filter(|k| k.file == file)
             .map(|k| k.job.as_str())
             .collect();
+
+        // No host check can run a job with no command, so it stays on GitHub and the rest is gated
+        for job in jobs.iter().filter(|_| cfg.runner == RunnerKind::Host) {
+            if setup::job_commands(job).is_empty() && !staying.contains(&job.id.as_str()) {
+                staying.push(&job.id);
+            }
+        }
 
         if !staying.is_empty() {
             offered = true;
@@ -978,9 +985,16 @@ fn gate(
     let stay = staying.join(", ");
 
     if gated.is_empty() {
-        plan.notes.push(format!(
-            "{file}: GitHub keeps running it on PRs, for {stay}, and no job of it runs only in shipcheck"
-        ));
+        plan.notes.push(if crate::workflow::runs_on_prs(source) {
+            format!(
+                "{file}: GitHub keeps running it on PRs, for {stay}, and no job of it runs only in shipcheck"
+            )
+        } else {
+            // Its branch pushes are no PR check, and no shipcheck check takes their place
+            format!(
+                "{file}: GitHub keeps running it on pushes to every branch, and no shipcheck check runs its jobs"
+            )
+        });
         return;
     }
 
@@ -1299,11 +1313,16 @@ mod tests {
         let plan = super::plan(dir.path(), App::NotPublic).unwrap();
         let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
         // Without Docker, e2e.yml's matrix stays on GitHub, which tests see on every machine
-        assert_eq!(files, ["ci.yml", "leaks.yml"]);
+        // leaks.yml's job has no command a check could run, so it stays on GitHub too
+        assert_eq!(files, ["ci.yml"]);
         assert!(
             plan.notes[0].starts_with("e2e.yml: GitHub keeps running it on PRs"),
             "{:?}",
             plan.notes
+        );
+        assert_eq!(
+            plan.notes[1],
+            "leaks.yml: GitHub keeps running it on PRs, for gitleaks, and no job of it runs only in shipcheck"
         );
         assert!(plan.workflows.iter().all(|w| !w.recommended));
         let warning = |i: usize| plan.workflows[i].warning.clone().unwrap_or_default();
@@ -1317,11 +1336,6 @@ mod tests {
             ),
             "{}",
             plan.workflows[0].yes
-        );
-        assert!(
-            warning(1).contains("job gitleaks (init found no command in it to compare)"),
-            "{}",
-            warning(1)
         );
     }
 
@@ -1515,6 +1529,24 @@ mod tests {
     }
 
     #[test]
+    fn a_job_with_no_command_stays_and_the_rest_is_gated() {
+        // rubocop's linting.yml, trimmed: yamllint is an action, so no host check can run it
+        let lint = "on:\n  push:\n    branches: [main]\n  pull_request:\njobs:\n  ruby:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  yaml:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: karancode/yamllint-github-action@v3.0.0\n";
+        let config = "runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n";
+        let dir = repo(&[
+            (".github/workflows/lint.yml", lint),
+            ("shipcheck.toml", config),
+        ]);
+        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let change = &plan.workflows[0];
+        assert!(change.recommended, "{:?}", change.warning);
+        assert_eq!(
+            Some(change.edited.clone()),
+            crate::workflow::gate_jobs(lint, &["ruby".to_string()], "main")
+        );
+    }
+
+    #[test]
     fn a_workflow_of_jobs_only_github_can_run_stays_as_it_is() {
         // orch's orch-review.yml, trimmed: on main its `if:` skips the job, so cutting it to main runs it nowhere
         let review = "on:\n  push:\njobs:\n  review-gate:\n    runs-on: ubuntu-latest\n    if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)\n    steps:\n      - run: ./scripts/lint-frontmatter.sh\n";
@@ -1527,9 +1559,8 @@ mod tests {
         let plan = super::plan(dir.path(), App::NotPublic).unwrap();
         assert_eq!(plan.workflows.len(), 1);
         assert!(
-            plan.notes
-                .iter()
-                .any(|n| n.starts_with("orch-review.yml: GitHub keeps running it on PRs")),
+            plan.notes.iter().any(|n| n
+                .starts_with("orch-review.yml: GitHub keeps running it on pushes to every branch")),
             "{:?}",
             plan.notes
         );

@@ -81,6 +81,9 @@ pub struct Machine {
     /// The rustup toolchains installed, such as `1.94.1` or `nightly`
     pub toolchains: Vec<String>,
     pub jdks: Vec<crate::java::Jdk>,
+    /// The CRuby version `ruby` runs, such as `4.0.9`
+    pub ruby: Option<String>,
+    pub rubies: Vec<crate::ruby::Ruby>,
 }
 
 impl Machine {
@@ -91,6 +94,8 @@ impl Machine {
             mac: cfg!(target_os = "macos"),
             toolchains: toolchains(),
             jdks: crate::java::installed(),
+            ruby: ruby(),
+            rubies: crate::ruby::installed(),
         }
     }
 
@@ -121,6 +126,18 @@ fn toolchains() -> Vec<String> {
         .filter_map(|l| l.split_whitespace().next())
         .map(|t| t.strip_suffix(&suffix).unwrap_or(t).to_string())
         .collect()
+}
+
+/// `RUBY_VERSION` when `ruby` is CRuby
+#[cfg(not(test))]
+fn ruby() -> Option<String> {
+    let out = Command::new("ruby")
+        .args(["-e", "print RUBY_VERSION if RUBY_ENGINE == 'ruby'"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !version.is_empty()).then_some(version)
 }
 
 impl Detected {
@@ -400,6 +417,7 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
  **/
 pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     let mut d = Detected::default();
+    let ruby_file = fs::read_to_string(root.join(".ruby-version")).ok();
     let mut files = Vec::new();
 
     for file in workflow_files(root).unwrap_or_default() {
@@ -503,7 +521,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
                     return (job.id.as_str(), None);
                 }
 
-                match job_check(job, machine) {
+                match job_check(job, machine, ruby_file.as_deref()) {
                     Ok((command, exports, notes)) => {
                         d.skipped
                             .extend(notes.iter().map(|n| format!("{file}, job {}: {n}", job.id)));
@@ -650,6 +668,8 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             } else if let Some(v) = word.strip_prefix("UV_PYTHON=") {
                 // uv downloads a missing one on first use, which then changes the key once
                 format!("uv python find {v} --show-version || echo missing")
+            } else if let Some(root) = word.strip_prefix("RUBY_ROOT=") {
+                format!("{root}/bin/ruby --version")
             } else if let Some(home) = word.strip_prefix("JAVA_HOME=") {
                 // It prints to stderr, and `versions` keep stdout
                 format!("{home}/bin/java -version 2>&1")
@@ -671,6 +691,19 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             && !c.command.contains("UV_PYTHON=")
     });
     let found = "uv python find --show-version".to_string();
+
+    if unpinned && !d.versions.contains(&found) {
+        d.versions.push(found);
+    }
+
+    // The Ruby on the `PATH`, which a check without `RUBY_ROOT` runs on
+    let unpinned = d.checks.iter().any(|c| {
+        c.command
+            .split_whitespace()
+            .any(|w| ["ruby", "bundle", "gem", "rake"].contains(&w))
+            && !c.command.contains("RUBY_ROOT=")
+    });
+    let found = "ruby --version".to_string();
 
     if unpinned && !d.versions.contains(&found) {
         d.versions.push(found);
@@ -1258,6 +1291,7 @@ fn rust_need(step: &crate::workflow::RunStep) -> Option<String> {
 fn job_check(
     job: &crate::workflow::Job,
     machine: &Machine,
+    ruby_file: Option<&str>,
 ) -> Result<(String, Vec<String>, Vec<String>), String> {
     let toolchains = &machine.toolchains;
     // A name becomes a TOML key, a directory and a check name
@@ -1314,6 +1348,16 @@ fn job_check(
         let home = jdk.home.display();
         exports.push(format!("JAVA_HOME={home}"));
         exports.push(format!("PATH={home}/bin:\"$PATH\""));
+    }
+
+    // As chruby leaves it, so `ruby`, `gem` and `bundle` are the workflow's Ruby
+    let ruby = crate::ruby::pick(job, ruby_file, machine.ruby.as_deref(), &machine.rubies)?;
+    notes.extend(ruby.note);
+
+    if let Some(ruby) = ruby.ruby {
+        let root = ruby.root.display();
+        exports.push(format!("RUBY_ROOT={root}"));
+        exports.push(format!("PATH={root}/bin:\"$PATH\""));
     }
 
     // As `setup-python` leaves it for uv. A version file or a matrix leaves uv to choose
@@ -2568,6 +2612,96 @@ jobs:
                 ("ruby", "bundle install && bundle exec rake"),
             ]
         );
+    }
+
+    #[test]
+    fn a_job_runs_on_the_workflows_ruby_or_stays_without_one() {
+        let ci = r#"
+on: pull_request
+jobs:
+  latest:
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ruby
+          bundler-cache: true
+      - run: bundle exec rake
+  same:
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+      - run: bundle exec rake a
+  old:
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 2.7
+      - run: bundle exec rake b
+  jruby:
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: jruby
+      - run: bundle exec rake c
+  file:
+    steps:
+      - uses: ruby/setup-ruby@v1
+      - run: bundle exec rake d
+"#;
+        let rubies = [crate::ruby::Ruby {
+            engine: "ruby".into(),
+            version: "2.7.8".into(),
+            root: "/rubies/2.7.8".into(),
+        }];
+        let d = detect_on(
+            repo(&[
+                (".github/workflows/ci.yml", ci),
+                (".ruby-version", "ruby-3.4.1\n"),
+            ])
+            .path(),
+            &Machine {
+                ruby: Some("4.0.9".into()),
+                rubies: rubies.to_vec(),
+                ..Machine::default()
+            },
+        );
+        let checks: Vec<(&str, &str)> = d
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.command.as_str()))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                ("latest", "bundle install && bundle exec rake"),
+                ("same", "bundle exec rake a"),
+                (
+                    "old",
+                    "export RUBY_ROOT=/rubies/2.7.8 PATH=/rubies/2.7.8/bin:\"$PATH\" && bundle exec rake b"
+                ),
+                ("file", "bundle exec rake d"),
+            ]
+        );
+        for line in [
+            "ci.yml, job jruby: needs jruby, which this machine does not have",
+            "ci.yml, job file: runs on Ruby 4.0.9, which differs from the Ruby 3.4.1 its workflow sets up",
+        ] {
+            assert!(
+                d.skipped.iter().any(|s| s == line),
+                "{line}: {:?}",
+                d.skipped
+            );
+        }
+
+        // Each Ruby a check runs on is in the key
+        for version in ["/rubies/2.7.8/bin/ruby --version", "ruby --version"] {
+            assert!(
+                d.versions.iter().any(|v| v == version),
+                "{version}: {:?}",
+                d.versions
+            );
+        }
     }
 
     /// What `init` finds in these files on a Linux machine with or without Docker
