@@ -810,9 +810,34 @@ fn toolchains(home: &Path, user: &Path) -> Result<(), String> {
  **/
 static GROUPS: [AtomicI32; 64] = [const { AtomicI32::new(0) }; 64];
 
-fn register(pgid: u32) -> Option<usize> {
+/// The write end of the pipe the stopper thread waits on, -1 before it runs
+static WAKE: AtomicI32 = AtomicI32::new(-1);
+
+/**
+ * Installs the handler, and a thread that does what a handler cannot: on a signal it reaps each
+ * running launchd check, boots out its job and removes its record, kills the groups, then dies of it
+ **/
+fn install() {
     static HANDLER: std::sync::Once = std::sync::Once::new();
     HANDLER.call_once(|| {
+        let mut fds = [0; 2];
+
+        // Safe: pipe writes two descriptors into `fds`
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+            let read = fds[0];
+            WAKE.store(fds[1], Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let mut sig = 0u8;
+
+                // Safe: one byte into `sig`, which outlives the call
+                if unsafe { libc::read(read, (&mut sig as *mut u8).cast(), 1) } == 1 {
+                    #[cfg(target_os = "macos")]
+                    job::stop_all();
+                    die(sig as libc::c_int);
+                }
+            });
+        }
+
         for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             // Safe: the handler calls only async-signal-safe functions
             unsafe {
@@ -820,6 +845,11 @@ fn register(pgid: u32) -> Option<usize> {
             }
         }
     });
+}
+
+// ponytail: 64 slots, a run with more checks at once leaves the extra ones to outlive a signal
+fn register(pgid: u32) -> Option<usize> {
+    install();
     GROUPS.iter().position(|g| {
         g.compare_exchange(0, pgid as i32, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -840,6 +870,18 @@ fn kill_registered(groups: &[AtomicI32]) {
 }
 
 extern "C" fn stop(sig: libc::c_int) {
+    let wake = WAKE.load(Ordering::SeqCst);
+    let byte = sig as u8;
+
+    // Safe: write is async-signal-safe, and the byte outlives the call
+    if wake >= 0 && unsafe { libc::write(wake, (&byte as *const u8).cast(), 1) } == 1 {
+        return;
+    }
+
+    die(sig);
+}
+
+fn die(sig: libc::c_int) {
     kill_registered(&GROUPS);
     // Safe: back to the default action, then die of the same signal
     unsafe {
@@ -862,6 +904,12 @@ pub fn reap_slot(slot: &Path) -> Result<(), String> {
         let _ = slot;
         Ok(())
     }
+}
+
+/// The live members of a coalition, for tests that check nothing outlived a run
+#[cfg(target_os = "macos")]
+pub fn coalition_members(coal: u64) -> Vec<libc::pid_t> {
+    job::members(coal)
 }
 
 /**
@@ -927,7 +975,7 @@ mod job {
         (n == size).then_some(info.pbsi_status)
     }
 
-    fn members(coal: u64) -> Vec<libc::pid_t> {
+    pub fn members(coal: u64) -> Vec<libc::pid_t> {
         // Safe: a null buffer only asks for the count
         let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) }.max(0) as usize;
         let mut pids: Vec<libc::pid_t> = vec![0; n + 256];
@@ -1024,6 +1072,28 @@ mod job {
         String::from_utf8_lossy(&buf[..len])
             .trim_end_matches('\0')
             .to_string()
+    }
+
+    /// Each job this process started and has not booted out, with its coalition and record once known
+    static RUNNING: std::sync::Mutex<BTreeMap<String, Option<(u64, PathBuf)>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    fn running() -> std::sync::MutexGuard<'static, BTreeMap<String, Option<(u64, PathBuf)>>> {
+        RUNNING.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What a signal does before shipcheck dies: reap every running check and boot out its job
+    pub fn stop_all() {
+        for (target, known) in std::mem::take(&mut *running()) {
+            // A record whose reap failed stays, so the slot's next run tries again
+            if let Some((coal, record)) = known
+                && reap(coal).is_ok()
+            {
+                let _ = fs::remove_file(record);
+            }
+
+            bootout(&target);
+        }
     }
 
     fn bootout(target: &str) {
@@ -1223,8 +1293,10 @@ mod job {
             return Ok((Some(2), Vec::new()));
         }
 
+        running().insert(target.clone(), None);
         let result = supervise(dir, &ctl, &go, &target, deadline);
         bootout(&target);
+        running().remove(&target);
         result
     }
 
@@ -1265,6 +1337,7 @@ mod job {
         fs::write(&new, text)
             .and_then(|_| fs::rename(&new, &record))
             .map_err(|e| format!("{}: {e}", record.display()))?;
+        running().insert(target.to_string(), Some((coal, record.clone())));
 
         let exit = release(go, deadline).and_then(|released| {
             if !released {
@@ -1388,6 +1461,7 @@ pub fn run_command(
     #[cfg(target_os = "macos")]
     if !in_a_jail() {
         drop(file);
+        install();
         return job::run(&jail.shell(command, dir, extra)?, dir, log, timeout);
     }
 
