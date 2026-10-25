@@ -25,7 +25,10 @@ fn main() -> ExitCode {
 
     // git, bwrap and act come only from where a check finds tools, never a fake on the caller's PATH.
     // `shipcheck commit` gives the user's own git hooks the caller's PATH
-    let _ = run::CALLER_PATH.set(std::env::var_os("PATH").unwrap_or_default());
+    if let Some(path) = std::env::var_os("PATH") {
+        let _ = run::CALLER_PATH.set(path);
+    }
+
     // Safe: no other thread exists yet
     unsafe { std::env::set_var("PATH", shipcheck::runner::host::jail_path()) };
 

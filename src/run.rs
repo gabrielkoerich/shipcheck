@@ -683,15 +683,15 @@ pub fn last_tested(repo: &Path) -> Option<Tested> {
     serde_json::from_str(&fs::read_to_string(tested_file(repo)).ok()?).ok()
 }
 
+/// The caller's `PATH`, saved before `main` keeps only the trusted entries for shipcheck's own processes
+pub static CALLER_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+
 /**
  * Commits exactly the tree the last run tested, through `git commit`, so hooks, signing and the
  * author work as usual. The commit uses a copy of the index built by the snapshot's rules, and
  * the tree is compared on that copy, so what is compared is what is committed. The copy becomes
  * the real index only after the commit. On any refusal the real index is untouched
  **/
-/// The caller's `PATH`, saved before `main` keeps only the trusted entries for shipcheck's own processes
-pub static CALLER_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
-
 pub fn commit(
     cwd: &Path,
     tested: &Tested,
@@ -1993,7 +1993,7 @@ fn run_workflow(
                                 &marks,
                                 allowed.contains(&job),
                             );
-                            let state = act_skip(state, pr_only.iter().any(|j| names_job(&job, j)));
+                            let state = act_skip(state, &job, &pr_only);
                             let allow = state.ends_with(ALLOWED);
 
                             if exit == Some(0) && run.exit != Some(0) && !allow {
@@ -2092,10 +2092,10 @@ fn job_state(
     }
 }
 
-/// act runs a PR's checks as `workflow_dispatch`, so its skip of a job whose `if:` reads the PR says
-/// nothing of whether GitHub would run it
-fn act_skip(state: String, pr_only: bool) -> String {
-    if pr_only && state == "skipped" {
+/// act runs a PR's checks as `workflow_dispatch`, so its skip of a job whose `if:` reads the PR, or
+/// of a matrix leg of one, says nothing of whether GitHub would run it
+fn act_skip(state: String, job: &str, pr_only: &BTreeSet<String>) -> String {
+    if state == "skipped" && pr_only.iter().any(|j| names_job(job, j)) {
         PR_SKIP.into()
     } else {
         state
@@ -3288,6 +3288,48 @@ mod tests {
     }
 
     #[test]
+    fn asks_the_remote_for_its_default_branch_once_per_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, repo) = (dir.path().join("origin.git"), dir.path().join("repo"));
+        sh(
+            dir.path(),
+            &["init", "-q", "--bare", "-b", "trunk", "origin.git"],
+        );
+        sh(dir.path(), &["init", "-q", "-b", "trunk", "repo"]);
+        sh(&repo, &["commit", "-q", "--allow-empty", "-m", "trunk"]);
+        sh(
+            &repo,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        sh(&repo, &["push", "-q", "origin", "trunk"]);
+        // Each ls-remote of a local remote starts its upload-pack, which counts itself
+        let count = dir.path().join("asked");
+        let pack = dir.path().join("upload-pack");
+        let script = format!(
+            "#!/bin/sh\necho >> {}\nexec git upload-pack \"$@\"\n",
+            count.display()
+        );
+        fs::write(&pack, script).unwrap();
+        fs::set_permissions(&pack, fs::Permissions::from_mode(0o755)).unwrap();
+        sh(
+            &repo,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                &pack.to_string_lossy(),
+            ],
+        );
+
+        for _ in 0..3 {
+            assert_eq!(remote_base(&repo).as_deref(), Some("origin/trunk"));
+        }
+
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+    }
+
+    #[test]
     fn commit_and_post_refuse_the_default_branch() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -3588,9 +3630,14 @@ mod tests {
         fs::create_dir_all(&tools).unwrap();
         fs::create_dir_all(&repo).unwrap();
         fs::write(tools.join("husky-tool"), "#!/bin/sh\ntouch \"$1\"\n").unwrap();
+        // A fake git on the caller's PATH, which the commit itself must never run
+        let faked = dir.path().join("fake-git-ran");
+        let fake = format!("#!/bin/sh\ntouch {}\nexit 1\n", faked.display());
+        fs::write(tools.join("git"), fake).unwrap();
         Command::new("chmod")
             .arg("+x")
             .arg(tools.join("husky-tool"))
+            .arg(tools.join("git"))
             .status()
             .unwrap();
         sh(&repo, &["init", "-q", "-b", "main"]);
@@ -3617,6 +3664,7 @@ mod tests {
 
         commit(&repo, &tested, &["-m".into(), "a".into()], false).unwrap();
         assert!(ran.exists(), "the hook found its tool on the caller's PATH");
+        assert!(!faked.exists(), "git came from the trusted PATH");
     }
 
     #[test]
@@ -4065,7 +4113,8 @@ mod tests {
         let state = |job: &str| {
             act_skip(
                 job_state(job, Some(0), true, false, &marks(&[]), false),
-                pr_only.iter().any(|j| names_job(job, j)),
+                job,
+                &pr_only,
             )
         };
         let states = BTreeMap::from([("label".to_string(), state("label"))]);
@@ -4076,7 +4125,7 @@ mod tests {
         assert_eq!(state("push"), "skipped");
         assert_eq!(state("release"), "skipped");
         assert_eq!(
-            act_skip("success".into(), true),
+            act_skip("success".into(), "label", &pr_only),
             "success",
             "a job act ran stands"
         );
