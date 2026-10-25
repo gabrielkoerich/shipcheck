@@ -65,6 +65,10 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     );
     let work = tmp.path().join("work");
     git(&work, &["checkout", "-q", "-b", "main"]);
+    // `shipcheck commit` runs plain `git commit`, which must not need the developer's signing key
+    git(&work, &["config", "user.name", "t"]);
+    git(&work, &["config", "user.email", "t@t"]);
+    git(&work, &["config", "commit.gpgsign", "false"]);
     let home = tmp.path().join(".local/state/shipcheck");
     fs::create_dir_all(&home).unwrap();
     let cow = git_cow::can_clone(&home, &home);
