@@ -23,19 +23,9 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var(key, value) };
     }
 
-    // git, bwrap and act come only from where a check finds tools, never a fake first on the caller's
-    // PATH. Own dir last, so the hooks a commit runs still find this binary
-    let own = std::env::current_exe()
-        .ok()
-        .and_then(|e| Some(e.parent()?.to_path_buf()));
-    let dirs = std::env::split_paths(&shipcheck::runner::host::jail_path())
-        .chain(own)
-        .collect::<Vec<_>>();
-
-    if let Ok(path) = std::env::join_paths(dirs) {
-        // Safe: no other thread exists yet
-        unsafe { std::env::set_var("PATH", path) };
-    }
+    // git, bwrap and act come only from where a check finds tools, never a fake on the caller's PATH
+    // Safe: no other thread exists yet
+    unsafe { std::env::set_var("PATH", shipcheck::runner::host::jail_path()) };
 
     run::migrate_home();
 

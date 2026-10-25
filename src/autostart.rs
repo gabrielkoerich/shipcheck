@@ -100,7 +100,7 @@ fn write(file: &Path, text: &str) -> Result<bool, String> {
 }
 
 /// The checkout the daemon fetches into: the main one, not a worktree that may go away
-fn main_checkout(root: &Path) -> PathBuf {
+pub(crate) fn main_checkout(root: &Path) -> PathBuf {
     Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(root)
