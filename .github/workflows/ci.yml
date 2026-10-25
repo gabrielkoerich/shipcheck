@@ -1,9 +1,9 @@
 name: ci
 
 on:
-  # shipcheck checks PRs locally, e2e needs Docker in the job, so it runs here after each merge
+  # shipcheck checks every PR locally, so Actions minutes go only to main, after each merge
   push:
-    branches: [main, "dependabot/**"]
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:
