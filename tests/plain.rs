@@ -51,3 +51,44 @@ fn output_is_plain_without_a_terminal() {
         }
     }
 }
+
+// A fake git first on the PATH could report another tree, and so another tree's result
+#[test]
+fn a_fake_git_first_on_the_path_is_never_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, bin) = (tmp.path().join("repo"), tmp.path().join("bin"));
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let ran = tmp.path().join("fake-ran");
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\ntouch {}\nexec /usr/bin/git \"$@\"\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        bin.join("git"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+        .args(["status"])
+        .current_dir(&repo)
+        .env("SHIPCHECK_HOME", tmp.path().join("home"))
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!ran.exists(), "shipcheck ran the fake git");
+}

@@ -116,6 +116,20 @@ fn command_base_in(file: &Path, command: &str, repo: &Path) -> String {
         .map_or_else(origin_main, |entry| entry.base)
 }
 
+/// Whether a result on `base` may be posted: only the daemon's base for the repository or the
+/// remote's default branch, never a ref the caller picked, whose shipcheck.toml could run anything
+pub fn posts_from(base: &str, repo: &Path) -> bool {
+    posts_from_in(&DaemonConfig::path(), base, repo)
+}
+
+fn posts_from_in(file: &Path, base: &str, repo: &Path) -> bool {
+    let registered = run::repo_id(repo)
+        .ok()
+        .and_then(|id| DaemonConfig::load_from(file).ok()?.repos.remove(&id));
+
+    registered.is_some_and(|entry| entry.base == base) || run::default_base(repo) == base
+}
+
 /**
  * Polls GitHub for open PR heads with no completed `shipcheck` check, posts a stored result at
  * once, and runs a same-repository head that has none. It reads `daemon.toml` again every cycle,
@@ -1006,11 +1020,21 @@ mod tests {
             assert_eq!(command_base_in(&file, hook, &repo), "origin/main");
         }
 
+        // Only the remote's default branch posts until the daemon names a base
+        assert!(posts_from_in(&file, "origin/master", &repo));
+        assert!(!posts_from_in(&file, "origin/main", &repo));
+        assert!(!posts_from_in(&file, "origin/dev", &repo));
+
         DaemonConfig::add_to(&file, "acme/app", &repo, "origin/dev").unwrap();
 
         for hook in ["on-commit", "on-push"] {
             assert_eq!(command_base_in(&file, hook, &repo), "origin/dev");
         }
+
+        assert!(posts_from_in(&file, "origin/dev", &repo));
+        assert!(posts_from_in(&file, "origin/master", &repo));
+        assert!(!posts_from_in(&file, "origin/evil", &repo));
+        assert!(!posts_from_in(&file, "evil", &repo));
     }
 
     #[test]

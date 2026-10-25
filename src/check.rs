@@ -547,6 +547,18 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_that_does_not_hold_fails_every_job_check() {
+        let mut e = entry(true);
+        crate::run::fail_closed(&mut e);
+        let bodies = job_bodies("abc", &Jobs::new(), &e, None, false);
+        assert!(!bodies.is_empty());
+
+        for b in &bodies {
+            assert_eq!(b["conclusion"], "failure", "{b}");
+        }
+    }
+
+    #[test]
     fn names_ci_changes_without_failing() {
         let mut e = entry(true);
         e.ci_changes = vec![".github/workflows/ci.yml: job test gets continue-on-error".into()];
