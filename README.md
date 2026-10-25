@@ -11,7 +11,7 @@ It has two modes:
 
 `runner` is the mode of every job, and a `[jobs]` table moves one job to the other mode in the same run, such as a `ci.yml/e2e` job that needs Docker under act beside the host checks.
 
-Measured on an Apple silicon Mac against GitHub's hosted runners, same commits: a small Rust crate in host mode 1.9 to 2.3 s against about 20 s, a large Rust app in act 105 s against 115 to 124 s warm, and a tree already tested 0.13 s. A first run that starts cold can take longer than GitHub. [Speed](https://shipcheck.run/docs/speed/) has the settings that make runs fast.
+Measured on an idle Apple silicon Mac against GitHub's hosted runners, same commits: a large Rust app in act took 105 s warm against 115 to 124 s, and a tree already tested answers in under a second. A first run that starts cold can take longer than GitHub: the same app took 238 s against 116 s. [Speed](https://shipcheck.run/docs/speed/) has the settings that make runs fast.
 
 Docs: https://shipcheck.run/docs/.
 
