@@ -1875,11 +1875,7 @@ fn run_workflow(
     }
 
     let allowed = workflow::allowed_failures(&body)?;
-    let pr_only: BTreeSet<String> = workflow::job_runs(&body)
-        .into_iter()
-        .filter(|j| j.pr_only)
-        .map(|j| j.id)
-        .collect();
+    let pr_only = workflow::pr_only_jobs(&body);
     let artifacts = ctx.slot.with_extension("artifacts").join(file);
     let _ = fs::remove_dir_all(&artifacts);
     fs::create_dir_all(&artifacts).map_err(|e| e.to_string())?;
@@ -1973,7 +1969,7 @@ fn run_workflow(
                                 &marks,
                                 allowed.contains(&job),
                             );
-                            let state = act_skip(state, pr_only.contains(&job));
+                            let state = act_skip(state, pr_only.iter().any(|j| names_job(&job, j)));
                             let allow = state.ends_with(ALLOWED);
 
                             if exit == Some(0) && run.exit != Some(0) && !allow {
@@ -3984,22 +3980,21 @@ mod tests {
 
     #[test]
     fn a_skip_of_a_job_whose_if_reads_the_pr_fails() {
-        let wf = "on: pull_request\njobs:\n  label:\n    if: contains(github.event.pull_request.labels.*.name, 'slow')\n    runs-on: ubuntu-latest\n    steps:\n      - run: make slow\n  push:\n    if: github.event_name == 'push'\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n";
-        let pr_only: BTreeSet<String> = workflow::job_runs(wf)
-            .into_iter()
-            .filter(|j| j.pr_only)
-            .map(|j| j.id)
-            .collect();
+        let wf = "on: pull_request\njobs:\n  label:\n    if: contains(github.event.pull_request.labels.*.name, 'slow')\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: make slow\n  push:\n    if: github.event_name == 'push'\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n  release:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n    runs-on: ubuntu-latest\n    steps:\n      - run: make release\n";
+        let pr_only = workflow::pr_only_jobs(wf);
         let state = |job: &str| {
             act_skip(
                 job_state(job, Some(0), true, false, &marks(&[]), false),
-                pr_only.contains(job),
+                pr_only.iter().any(|j| names_job(job, j)),
             )
         };
         let states = BTreeMap::from([("label".to_string(), state("label"))]);
         assert!(!workflow_passed(&states), "{states:?}");
-        // GitHub skips it on a PR too
+        // A matrix leg is the job it comes from
+        assert_eq!(state("label__2"), PR_SKIP);
+        // GitHub skips these on a PR too
         assert_eq!(state("push"), "skipped");
+        assert_eq!(state("release"), "skipped");
         assert_eq!(
             act_skip("success".into(), true),
             "success",
