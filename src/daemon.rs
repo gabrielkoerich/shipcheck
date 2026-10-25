@@ -1195,6 +1195,11 @@ mod tests {
 
     #[test]
     fn a_mixed_config_never_checks_a_forks_pr() {
+        // Its plan reads `act --version`, which own_home fakes, since GitHub's test job has no act
+        if !own_home("a_mixed_config_never_checks_a_forks_pr") {
+            return;
+        }
+
         // Act is the default runner here, still the host checks beside its job run natively
         let mixed = "[host]\nchecks = { lint = \"true\" }\n\n[jobs.\"ci.yml/test\"]\n";
         let (dir, sha) = checkout("https://github.com/acme/app.git", mixed);
