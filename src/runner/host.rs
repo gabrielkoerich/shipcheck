@@ -184,6 +184,8 @@ pub fn sandbox() -> Result<&'static str, String> {
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
+const LAUNCHCTL: &str = "/bin/launchctl";
+
 const NESTED: &str = "the host checks' sandbox cannot start inside another sandbox, such as an agent's, so nothing ran: run shipcheck outside it, for example by exempting the `shipcheck` command in the agent's sandbox settings. A push still gets its checks from the hook's run and the daemon, which run outside it";
 
 /**
@@ -350,26 +352,33 @@ pub struct Jail {
     pub cache: PathBuf,
 }
 
-/// The setuid binaries in the system's bin dirs, read once
+/// The setuid binaries of the system, read once
+// ponytail: by path only, a hard link to a setuid binary on the data volume gets past it, a setuid filter if Sandbox gets one
 fn setuid() -> &'static [PathBuf] {
     use std::os::unix::fs::PermissionsExt;
 
     static FOUND: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
     FOUND.get_or_init(|| {
-        let mut found: Vec<PathBuf> = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        let dirs = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/libexec"];
+        let mut found: Vec<PathBuf> = dirs
             .iter()
             .flat_map(|d| fs::read_dir(d).into_iter().flatten().flatten())
-            .filter(|e| {
-                e.metadata()
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o4000 != 0)
+            .map(|e| e.path())
+            .chain([PathBuf::from(ARD_AGENT)])
+            .filter(|p| {
+                fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o4000 != 0)
             })
-            .map(|e| resolved(e.path()))
+            .map(resolved)
             .collect();
         found.sort();
         found.dedup();
         found
     })
 }
+
+/// A setuid root binary outside the scanned dirs
+const ARD_AGENT: &str =
+    "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent";
 
 /// The path a symlink resolves to, which is what the sandbox matches, or the path when it is missing
 fn resolved(path: PathBuf) -> PathBuf {
@@ -418,8 +427,10 @@ impl Jail {
      * The `sandbox-exec` profile. Writes only to the jail. The user's home is unreadable but for the
      * toolchains and the jail. Unix sockets connect only in the jail and to the DNS resolver, so
      * Docker's or an agent's socket is out of reach. Mach services only from [`MACH_SERVICES`], and
-     * no Apple events, so no copy of `open`, `osascript` or `launchctl` reaches launchd, Launch
-     * Services or another app, which would start a process outside the sandbox. A pseudo-terminal
+     * no Apple events, so no copy of `open` or `osascript` reaches Launch Services or another app,
+     * which would start a process outside the sandbox. `launchctl` talks to launchd over the
+     * bootstrap port, which no sandbox rule here covers, so it may not run at all. Signals reach
+     * only the check's own processes, never the user's other ones or another check's. A pseudo-terminal
      * only when the check opened it, which the `com.apple.sandbox.pty` extension marks, to read as
      * to write, so the terminal shipcheck runs in is out of reach. Nothing in the temp dirs but the
      * jail's own paths
@@ -463,11 +474,9 @@ impl Jail {
             .iter()
             .map(|p| quote(p).map(|q| format!(" (literal {q})")))
             .collect::<Result<_, String>>()?;
-        let setuid = if setuid.is_empty() {
-            String::new()
-        } else {
-            format!("(deny process-exec*{setuid})\n")
-        };
+        // A copy of launchctl outside /bin is killed at exec, so the path is enough
+        // ponytail: a compiled program that speaks launchd's XPC protocol may still boot out the user's jobs
+        let exec = format!("(deny process-exec* (literal \"{LAUNCHCTL}\"){setuid})\n");
         Ok(format!(
             "(version 1)\n(allow default)\n\
              (deny file-write*)\n\
@@ -483,7 +492,9 @@ impl Jail {
              (deny appleevent-send)\n\
              (deny mach-lookup)\n\
              (allow mach-lookup{mach})\n\
-             {setuid}"
+             (deny signal)\n\
+             (allow signal (target same-sandbox))\n\
+             {exec}"
         ))
     }
 
@@ -832,7 +843,7 @@ fn install() {
                 // Safe: one byte into `sig`, which outlives the call
                 if unsafe { libc::read(read, (&mut sig as *mut u8).cast(), 1) } == 1 {
                     #[cfg(target_os = "macos")]
-                    job::stop_all();
+                    let _held = job::stop_all();
                     die(sig as libc::c_int);
                 }
             });
@@ -906,6 +917,16 @@ pub fn reap_slot(slot: &Path) -> Result<(), String> {
     }
 }
 
+/// Whether host checks can start as launchd jobs here, which they need to be stopped whole, for doctor
+#[cfg(target_os = "macos")]
+pub fn launchd() -> Result<String, String> {
+    if in_a_jail() {
+        return Ok("not used inside a host check's own jail".into());
+    }
+
+    job::probe()
+}
+
 /// The live members of a coalition, for tests that check nothing outlived a run
 #[cfg(target_os = "macos")]
 pub fn coalition_members(coal: u64) -> Vec<libc::pid_t> {
@@ -927,7 +948,8 @@ mod job {
     // Process states from sys/proc.h
     const SSTOP: u32 = 4;
     const SZOMB: u32 = 5;
-    const LAUNCHCTL: &str = "/bin/launchctl";
+    // How long launchd may take to run a job's script, which takes about 0.1 s
+    const START: Duration = Duration::from_secs(10);
     // Rounds of a scan 1 ms apart, so a member that forks for longer than about 2 s fails the check
     const ROUNDS: usize = 2000;
 
@@ -975,14 +997,30 @@ mod job {
         (n == size).then_some(info.pbsi_status)
     }
 
-    pub fn members(coal: u64) -> Vec<libc::pid_t> {
+    /// Every pid on the machine, in a buffer doubled until the list fits with room to spare
+    fn all_pids() -> Vec<libc::pid_t> {
         // Safe: a null buffer only asks for the count
-        let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) }.max(0) as usize;
-        let mut pids: Vec<libc::pid_t> = vec![0; n + 256];
-        let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
-        // Safe: the kernel writes at most `size` bytes into `pids`
-        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) }.max(0) as usize;
-        pids.truncate(n);
+        let mut cap =
+            unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) }.max(0) as usize + 256;
+
+        loop {
+            let mut pids: Vec<libc::pid_t> = vec![0; cap];
+            let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
+            // Safe: the kernel writes at most `size` bytes into `pids`
+            let n =
+                unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) }.max(0) as usize;
+
+            if n < cap {
+                pids.truncate(n);
+                return pids;
+            }
+
+            cap *= 2;
+        }
+    }
+
+    pub fn members(coal: u64) -> Vec<libc::pid_t> {
+        let mut pids = all_pids();
         pids.retain(|&p| p > 1 && coalition(p) == Some(coal));
         pids
     }
@@ -994,8 +1032,10 @@ mod job {
      **/
     pub fn reap(coal: u64) -> Result<Vec<libc::pid_t>, String> {
         // Safe: getpid cannot fail
-        if coal == 0 || coalition(unsafe { libc::getpid() }) == Some(coal) {
-            return Err("refused to reap shipcheck's own coalition".into());
+        if coal <= 1 || coalition(unsafe { libc::getpid() }) == Some(coal) {
+            return Err(format!(
+                "refused to reap coalition {coal}, which is not a check's own"
+            ));
         }
 
         let mut signaled = Vec::new();
@@ -1055,7 +1095,8 @@ mod job {
         })
     }
 
-    fn boot() -> String {
+    /// The boot session's id, None when the kernel does not say, so no record can match across a restart
+    fn boot() -> Option<String> {
         let mut buf = [0u8; 64];
         let mut len = buf.len();
         // Safe: the kernel writes at most `len` bytes into `buf`
@@ -1068,10 +1109,10 @@ mod job {
                 0,
             )
         } == 0;
-        let len = if ok { len } else { 0 };
-        String::from_utf8_lossy(&buf[..len])
+        let id = String::from_utf8_lossy(&buf[..if ok { len } else { 0 }])
             .trim_end_matches('\0')
-            .to_string()
+            .to_string();
+        (!id.is_empty() && !id.contains(' ')).then_some(id)
     }
 
     /// Each job this process started and has not booted out, with its coalition and record once known
@@ -1082,9 +1123,14 @@ mod job {
         RUNNING.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What a signal does before shipcheck dies: reap every running check and boot out its job
-    pub fn stop_all() {
-        for (target, known) in std::mem::take(&mut *running()) {
+    /**
+     * What a signal does before shipcheck dies: reap every running check and boot out its job.
+     * Returns the lock, which the caller holds until it dies, so no check starts meanwhile
+     **/
+    pub fn stop_all() -> std::sync::MutexGuard<'static, BTreeMap<String, Option<(u64, PathBuf)>>> {
+        let mut held = running();
+
+        for (target, known) in std::mem::take(&mut *held) {
             // A record whose reap failed stays, so the slot's next run tries again
             if let Some((coal, record)) = known
                 && reap(coal).is_ok()
@@ -1094,7 +1140,11 @@ mod job {
 
             bootout(&target);
         }
+
+        held
     }
+
+    const NO_BOOT: &str = "the kernel did not give its boot session id, so shipcheck cannot tell its checks' processes from another boot's";
 
     fn bootout(target: &str) {
         let _ = Command::new(LAUNCHCTL)
@@ -1114,7 +1164,12 @@ mod job {
 
     pub fn reap_slot(slot: &Path) -> Result<(), String> {
         let dir = crate::run::home().join("reap");
-        let boot = boot();
+
+        if fs::read_dir(&dir).map_or(true, |mut d| d.next().is_none()) {
+            return Ok(());
+        }
+
+        let boot = boot().ok_or(NO_BOOT)?;
 
         for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
             let text = fs::read_to_string(entry.path()).unwrap_or_default();
@@ -1216,6 +1271,55 @@ mod job {
         s
     }
 
+    /// Starts a job of `/usr/bin/true` and boots it out, the error naming why launchd refused it
+    pub fn probe() -> Result<String, String> {
+        let keep = tempfile::Builder::new()
+            .prefix("shipcheck-job-")
+            .tempdir()
+            .map_err(|e| format!("job dir: {e}"))?;
+        let name = keep
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("job dir: not UTF-8")?;
+        let label = format!(
+            "run.shipcheck.probe.{}",
+            name.trim_start_matches("shipcheck-job-")
+        );
+        let plist = keep.path().join("job.plist");
+        fs::write(
+            &plist,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                 <key>Label</key><string>{}</string>\
+                 <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\
+                 <key>RunAtLoad</key><true/><key>KeepAlive</key><false/>\
+                 </dict></plist>\n",
+                xml(&label)
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        let out = Command::new(LAUNCHCTL)
+            .args(["bootstrap", domain()])
+            .arg(&plist)
+            .output()
+            .map_err(|e| format!("launchctl: {e}"))?;
+        bootout(&format!("{}/{label}", domain()));
+
+        if !out.status.success() {
+            return Err(format!(
+                "launchctl bootstrap {} failed ({}), so every host check fails with exit 2: shipcheck runs each check as a launchd job to stop all it starts. Run shipcheck outside another app's sandbox, and from a login session rather than ssh alone",
+                domain(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        Ok(format!(
+            "{}: each host check runs as a launchd job, and every process it starts is stopped with it",
+            domain()
+        ))
+    }
+
     /// Runs the check as a launchd job, then reaps its coalition and removes the job. None on timeout
     pub fn run(
         cmd: &Command,
@@ -1273,6 +1377,8 @@ mod job {
         let plist_path = ctl.join("job.plist");
         fs::write(&plist_path, plist).map_err(|e| e.to_string())?;
         let target = format!("{}/{label}", domain());
+        // Before the bootstrap, so a signal right after it still boots the job out
+        running().insert(target.clone(), None);
         let started = Command::new(LAUNCHCTL)
             .args(["bootstrap", domain()])
             .arg(&plist_path)
@@ -1280,6 +1386,7 @@ mod job {
             .map_err(|e| format!("launchctl: {e}"))?;
 
         if !started.status.success() {
+            running().remove(&target);
             let why = format!(
                 "shipcheck could not start this check as a launchd job in {}, which it needs to stop every process the check starts: {}\n",
                 domain(),
@@ -1293,7 +1400,6 @@ mod job {
             return Ok((Some(2), Vec::new()));
         }
 
-        running().insert(target.clone(), None);
         let result = supervise(dir, &ctl, &go, &target, deadline);
         bootout(&target);
         running().remove(&target);
@@ -1307,6 +1413,7 @@ mod job {
         target: &str,
         deadline: Instant,
     ) -> Result<(Option<i32>, Vec<libc::pid_t>), String> {
+        let started = Instant::now();
         let pid = loop {
             if let Ok(pid) = fs::read_to_string(ctl.join("pid")) {
                 break pid
@@ -1320,18 +1427,32 @@ mod job {
                 return Ok((None, Vec::new()));
             }
 
+            if Instant::now() >= started + START {
+                return Err(format!(
+                    "launchd took over {}s to start the check's job",
+                    START.as_secs()
+                ));
+            }
+
             std::thread::sleep(Duration::from_millis(5));
         };
-        // Safe: getpid cannot fail
-        let own = coalition(unsafe { libc::getpid() });
-        let coal = coalition(pid)
-            .filter(|c| Some(*c) != own)
-            .ok_or("launchd did not give the check a coalition of its own")?;
+        // The script's `mv` of its pid file may not have exited yet
+        let coal = loop {
+            if let Some(c) = own_coalition(pid) {
+                break c;
+            }
+
+            if Instant::now() >= started + START {
+                return Err("launchd did not give the check a coalition of its own".into());
+            }
+
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let record = record(dir);
         let parent = record.parent().ok_or("no reap dir")?;
         fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         let new = record.with_extension("new");
-        let line = format!("{coal} {} {target} ", boot());
+        let line = format!("{coal} {} {target} ", boot().ok_or(NO_BOOT)?);
         let mut text = line.into_bytes();
         text.extend_from_slice(dir.as_os_str().as_bytes());
         fs::write(&new, text)
@@ -1365,6 +1486,13 @@ mod job {
         let signaled = reap(coal)?;
         fs::remove_file(&record).map_err(|e| format!("{}: {e}", record.display()))?;
         exit.map(|e| (e, signaled))
+    }
+
+    /// The coalition of a job's waiting script, None unless it is the only member, so never a shared one
+    pub fn own_coalition(pid: libc::pid_t) -> Option<u64> {
+        // Safe: getpid cannot fail
+        let own = coalition(unsafe { libc::getpid() });
+        coalition(pid).filter(|&c| c > 1 && Some(c) != own && members(c) == [pid])
     }
 
     /// Lets the job's script run the check, false when the deadline passed first
@@ -1531,6 +1659,8 @@ fn version(
         cache: home.clone(),
         home,
     };
+    // No launchd job, which costs 0.1 s a command on every plan: a leftover writes only this
+    // temp home, removed on return, and signals only its own sandbox
     jail.shell(command, dir, extra)
         .and_then(|cmd| wait_for_stdout(cmd, timeout))
         .map_err(fail)
@@ -1565,10 +1695,21 @@ fn wait_for_stdout(mut cmd: Command, timeout: Duration) -> Result<String, String
         return Err(format!("failed with {status}"));
     }
 
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take().ok_or("no stdout")?, &mut out)
-        .map_err(|e| e.to_string())?;
-    Ok(out)
+    // A process the command left in another group can hold the pipe open, so the read has a limit
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = tx.send(std::io::Read::read_to_string(&mut stdout, &mut out).map(|_| out));
+    });
+    let left = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(500));
+
+    match rx.recv_timeout(left) {
+        Ok(read) => read.map_err(|e| e.to_string()),
+        Err(_) => Err("exited, but a process it left kept its output open".into()),
+    }
 }
 
 impl Runner for Host {
@@ -2719,5 +2860,141 @@ mod tests {
         )
         .unwrap();
         assert_ne!(exit, Some(0), "{}", fs::read_to_string(&log).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_check_signals_only_its_own_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = jail(dir.path());
+        let log = dir.path().join("log");
+        let run = |cmd: &str| {
+            run_command(cmd, dir.path(), &jail, &[], &log, Duration::from_secs(10)).unwrap()
+        };
+        // This test's own processes: one outside any sandbox, one in a sandbox of its own
+        let mut outside = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut other = jail
+            .shell("exec sleep 30", dir.path(), &[])
+            .unwrap()
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        for (name, pid) in [("outside", outside.id()), ("another sandbox", other.id())] {
+            assert_ne!(run(&format!("kill -0 {pid}")), Some(0), "{name}");
+        }
+
+        let own = "sleep 30 & kill $! || exit 1; set -m; ( exec sleep 30 ) & kill $! || exit 1; \
+            /usr/bin/perl -e 'use POSIX; my $p = fork(); if (!$p) { POSIX::setsid(); sleep 30; exit 0 } select(undef, undef, undef, 0.2); exit(kill(\"KILL\", $p) ? 0 : 1)'";
+        assert_eq!(run(own), Some(0), "{}", fs::read_to_string(&log).unwrap());
+
+        for child in [&mut outside, &mut other] {
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_check_cannot_reach_launchd_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Safe: getuid cannot fail
+        let uid = unsafe { libc::getuid() };
+        let label = format!("run.shipcheck.probe.test-{}", std::process::id());
+        let target = format!("gui/{uid}/{label}");
+        let plist = dir.path().join("job.plist");
+        fs::write(
+            &plist,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sleep</string><string>60</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/></dict></plist>\n"
+            ),
+        )
+        .unwrap();
+        let launchctl = |args: &[&str]| Command::new(LAUNCHCTL).args(args).output().unwrap();
+        assert!(launchd().is_ok(), "{:?}", launchd());
+        assert!(
+            launchctl(&["bootstrap", &format!("gui/{uid}"), plist.to_str().unwrap()])
+                .status
+                .success()
+        );
+        let log = dir.path().join("log");
+        let jail = jail(dir.path());
+
+        for cmd in [
+            format!("{LAUNCHCTL} print {target}"),
+            format!("{LAUNCHCTL} kill SIGCONT {target}"),
+            format!("{LAUNCHCTL} bootout {target}"),
+            format!("cp {LAUNCHCTL} ./lc && ./lc bootout {target}"),
+        ] {
+            let exit = run_command(&cmd, dir.path(), &jail, &[], &log, Duration::from_secs(10));
+            assert_ne!(
+                exit.unwrap(),
+                Some(0),
+                "{cmd}: {}",
+                fs::read_to_string(&log).unwrap()
+            );
+        }
+
+        let loaded = launchctl(&["print", &target]).status.success();
+
+        // A bootout can fail while launchd still stops the job, so it tries until the job is gone
+        for _ in 0..50 {
+            if !launchctl(&["bootout", &target]).status.success()
+                && !launchctl(&["print", &target]).status.success()
+            {
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert!(loaded, "a check booted out the test's job");
+        assert!(
+            !launchctl(&["print", &target]).status.success(),
+            "{target} stayed loaded"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_reap_refuses_a_coalition_it_shares_or_the_kernels() {
+        assert!(job::reap(1).is_err());
+        // This process's coalition holds the test runner and its parents, so it is never a job's own
+        // Safe: getpid cannot fail
+        assert_eq!(job::own_coalition(unsafe { libc::getpid() }), None);
+        assert_eq!(job::own_coalition(1), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn setuid_binaries_outside_the_bin_dirs_are_denied_too() {
+        for path in [
+            "/usr/libexec/authopen",
+            "/usr/libexec/security_authtrampoline",
+            ARD_AGENT,
+        ] {
+            if Path::new(path).exists() {
+                assert!(setuid().contains(&PathBuf::from(path)), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_versions_command_that_leaves_its_output_open_fails_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let got = version(
+            "echo tool 1.0; set -m; ( exec sleep 30 ) &",
+            dir.path(),
+            &[],
+            Duration::from_secs(2),
+        );
+        assert!(got.is_err(), "{got:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

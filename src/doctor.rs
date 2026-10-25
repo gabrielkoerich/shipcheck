@@ -324,6 +324,8 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                 format!("{s}: host checks write only to their clone, a new home and the repository's tool caches")
             }),
         ));
+        #[cfg(target_os = "macos")]
+        found.push(check("launchd", runner::host::launchd()));
     }
 
     if let Ok(config) = &planned {
