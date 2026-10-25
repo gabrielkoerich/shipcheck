@@ -96,6 +96,8 @@ pub struct Plan {
     failed: Vec<(String, String, String)>,
     /// The file, job and GitHub's check names of each job that stays on GitHub for PRs
     github: Vec<(String, String, Option<Vec<String>>)>,
+    /// Where each job runs, for a shipcheck.toml of host checks init derived, which the person can change
+    pub detected: Option<setup::Detected>,
 }
 
 /// The person's choice for each step of a plan
@@ -137,6 +139,7 @@ fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan
         stop: None,
         failed: Vec::new(),
         github: Vec::new(),
+        detected: None,
     };
     let text = if path.exists() {
         fs::read_to_string(&path).map_err(|e| format!("shipcheck.toml: {e}"))?
@@ -205,6 +208,9 @@ fn tried(
     plan: &mut Plan,
 ) -> Result<Option<(String, String)>, String> {
     if RepoConfig::parse(&text)?.runner != RunnerKind::Host {
+        // Only act jobs and no check to try, still each job has a place the person may change
+        let d = setup::detect_on(root, machine);
+        plan.detected = d.act.is_none().then_some(d);
         return Ok(Some((text, said)));
     }
 
@@ -262,7 +268,26 @@ fn tried(
         return Ok(None);
     }
 
-    Ok(Some((setup::config_text(&d), setup::said_for(&d))))
+    let out = (setup::config_text(&d), setup::said_for(&d));
+    plan.detected = Some(d);
+    Ok(Some(out))
+}
+
+/**
+ * The plan again after the person moved jobs between host checks, act and GitHub: a new
+ * shipcheck.toml and the workflow edits and required checks that go with it. Nothing is written
+ **/
+pub fn replan(root: &Path, plan: &mut Plan, d: setup::Detected) -> Result<(), String> {
+    let text = setup::config_text(&d);
+    let cfg = RepoConfig::parse(&text)?;
+    plan.config = Some((text.clone(), setup::said_for(&d)));
+    plan.detected = Some(d);
+    plan.workflows.clear();
+    plan.notes.clear();
+    plan.github.clear();
+    workflows(root, &cfg, plan)?;
+    plan.ruleset = ruleset_plan(root, &text, &plan.app, &plan.github);
+    Ok(())
 }
 
 /// Each check's command once it passed, or why it failed
@@ -970,13 +995,6 @@ impl Report for Spinners {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Then {
-    Apply,
-    Change,
-    Quit,
-}
-
 /**
  * The terminal wizard: QuickStart or every step, a review that can reopen a step, then apply.
  * Nothing is written before apply, and Ctrl-C or quit leaves everything as it was
@@ -1022,48 +1040,11 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
         return Ok(Ok(false));
     }
 
-    let quick = cliclack::select("Setup")
-        .item(true, "QuickStart", "recommended choices, then a review")
-        .item(false, "Advanced", "every step, one by one")
-        .interact()?;
-    let mut a = plan.recommended();
-
-    if !quick {
-        for step in plan.steps() {
-            ask(&plan, step, &mut a, s)?;
-        }
-    }
-
-    loop {
-        cliclack::note(s.bold("Review"), plan.review(&a).join("\n"))?;
-        let then = cliclack::select("Apply these choices?")
-            .item(Then::Apply, "Apply", "")
-            .item(Then::Change, "Change a step", "")
-            .item(Then::Quit, "Quit without changes", "")
-            .interact()?;
-
-        match then {
-            Then::Apply => break,
-            Then::Quit => {
-                cliclack::outro_cancel("Quit, nothing changed")?;
-                return Ok(Ok(false));
-            }
-            Then::Change => {
-                let mut pick = cliclack::select("Which step?");
-
-                for (n, step) in plan.steps().into_iter().enumerate() {
-                    pick = pick.item(
-                        step,
-                        format!("{}  {}", n + 1, plan.title(step)),
-                        plan.effect(step, &a),
-                    );
-                }
-
-                let step = pick.interact()?;
-                ask(&plan, step, &mut a, s)?;
-            }
-        }
-    }
+    // Every choice is made in the tabs, and nothing is written before Apply on the Review tab
+    let Some((plan, a)) = crate::tabs::run(root, plan)? else {
+        cliclack::outro_cancel("Quit, nothing changed")?;
+        return Ok(Ok(false));
+    };
 
     let next = match apply(root, &plan, &a, finish, &mut report) {
         Ok(next) => next,
@@ -1079,31 +1060,6 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
         .collect();
     cliclack::outro_note(s.bold("Next"), next.join("\n"))?;
     Ok(Ok(true))
-}
-
-/// Shows a step and records its answer, the current one preselected
-fn ask(plan: &Plan, step: Step, a: &mut Answers, s: Style) -> std::io::Result<()> {
-    cliclack::note(s.bold(&plan.title(step)), plan.details(step, s).join("\n"))?;
-    let recommended = plan.default(step);
-    let label = |yes: bool| {
-        let mut a = a.clone();
-        plan.set(step, &mut a, yes);
-        plan.effect(step, &a)
-    };
-    let hint = |yes: bool| {
-        if yes == recommended {
-            "recommended"
-        } else {
-            ""
-        }
-    };
-    let yes = cliclack::select(plan.question(step))
-        .item(true, format!("Yes: {}", label(true)), hint(true))
-        .item(false, format!("No: {}", label(false)), hint(false))
-        .initial_value(plan.answer(step, a))
-        .interact()?;
-    plan.set(step, a, yes);
-    Ok(())
 }
 
 /// The base the daemon, the hooks and `shipcheck run` use, as a branch name. Offline it refuses to guess
@@ -1247,7 +1203,11 @@ fn coverage(
 /// The workflow edits for the jobs shipcheck checks, and notes for the workflows left alone
 fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), String> {
     let base = plan.base.clone();
-    let kept = kept(root, &plan.failed);
+    // What the person placed, else what this machine can run
+    let kept = match &plan.detected {
+        Some(d) => d.github.clone(),
+        None => kept(root, &plan.failed),
+    };
     // A job the config runs with act is shipcheck's, whatever this machine could run
     let on_act = crate::run::expected_jobs(cfg, |f| {
         fs::read_to_string(root.join(".github/workflows").join(f)).ok()

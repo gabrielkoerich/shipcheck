@@ -49,6 +49,7 @@ pub fn config_for(workflows: &[String]) -> String {
 }
 
 /// A host check `init` found, and where it came from
+#[derive(Clone)]
 pub struct Found {
     pub name: String,
     pub command: String,
@@ -56,6 +57,7 @@ pub struct Found {
 }
 
 /// A job that keeps running on GitHub for PRs, since shipcheck cannot run it here
+#[derive(Clone)]
 pub struct Kept {
     pub file: String,
     pub job: String,
@@ -66,7 +68,7 @@ pub struct Kept {
     pub act: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Detected {
     pub checks: Vec<Found>,
     pub versions: Vec<String>,
