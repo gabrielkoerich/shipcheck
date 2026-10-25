@@ -1051,6 +1051,15 @@ pub fn lookup(plan: &Plan) -> Option<Entry> {
     Some(entry)
 }
 
+/// Fails a result whose pass does not hold, every workflow too, so each job check fails beside `shipcheck`
+pub fn fail_closed(entry: &mut Entry) {
+    entry.passed = false;
+
+    for wf in &mut entry.workflows {
+        wf.passed = false;
+    }
+}
+
 /**
  * What a check shows of a stored result must hold before it is posted again, or the result does not
  * count and the commit runs: the plan's tree, a base on the plan's base, and each log hashing to its

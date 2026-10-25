@@ -117,6 +117,27 @@ fn command_base_in(file: &Path, command: &str, repo: &Path) -> String {
 }
 
 /**
+ * Whether a result on `base` may be posted: the daemon's base for this checkout, or the default
+ * branch the remote reports, never a ref the caller picked, whose shipcheck.toml could run anything.
+ * An entry counts only for the checkout it names, and a remote that does not answer allows nothing
+ **/
+pub fn posts_from(base: &str, repo: &Path) -> bool {
+    posts_from_in(&DaemonConfig::path(), base, repo)
+}
+
+fn posts_from_in(file: &Path, base: &str, repo: &Path) -> bool {
+    let checkout = |p: &Path| crate::autostart::main_checkout(p).canonicalize().ok();
+    let here = checkout(repo);
+    let registered = run::repo_id(repo)
+        .ok()
+        .and_then(|id| DaemonConfig::load_from(file).ok()?.repos.remove(&id))
+        .filter(|entry| here.is_some() && checkout(&entry.path) == here);
+
+    registered.is_some_and(|entry| entry.base == base)
+        || run::remote_base(repo).as_deref() == Some(base)
+}
+
+/**
  * Polls GitHub for open PR heads with no completed `shipcheck` check, posts a stored result at
  * once, and runs a same-repository head that has none. It reads `daemon.toml` again every cycle,
  * so a repository `shipcheck install` adds needs no restart, and waits while this machine cannot
@@ -1006,11 +1027,49 @@ mod tests {
             assert_eq!(command_base_in(&file, hook, &repo), "origin/main");
         }
 
+        // Only the remote's default branch posts until the daemon names a base
+        assert!(posts_from_in(&file, "origin/master", &repo));
+        assert!(!posts_from_in(&file, "origin/main", &repo));
+        assert!(!posts_from_in(&file, "origin/dev", &repo));
+
         DaemonConfig::add_to(&file, "acme/app", &repo, "origin/dev").unwrap();
 
         for hook in ["on-commit", "on-push"] {
             assert_eq!(command_base_in(&file, hook, &repo), "origin/dev");
         }
+
+        assert!(posts_from_in(&file, "origin/dev", &repo));
+        assert!(posts_from_in(&file, "origin/master", &repo));
+        assert!(!posts_from_in(&file, "origin/evil", &repo));
+        assert!(!posts_from_in(&file, "evil", &repo));
+
+        // Another clone of the same repository does not get the entry's base
+        let other = dir.path().join("other");
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        assert!(!posts_from_in(&file, "origin/dev", &other));
+        assert!(posts_from_in(&file, "origin/master", &other));
+
+        // Offline, nothing posts, not even the fallback origin/main
+        git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                dir.path().join("gone").to_str().unwrap(),
+            ],
+        );
+        DaemonConfig::add_to(&file, "acme/app", &other, "origin/dev").unwrap();
+        assert!(!posts_from_in(&file, "origin/master", &repo));
+        assert!(!posts_from_in(&file, "origin/main", &repo));
     }
 
     #[test]

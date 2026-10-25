@@ -51,3 +51,86 @@ fn output_is_plain_without_a_terminal() {
         }
     }
 }
+
+// A fake git first on the PATH could report another tree, and so another tree's result
+#[test]
+fn a_fake_git_first_on_the_path_is_never_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, bin) = (tmp.path().join("repo"), tmp.path().join("bin"));
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let ran = tmp.path().join("fake-ran");
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\n/usr/bin/touch {}\nexec /usr/bin/git \"$@\"\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        bin.join("git"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+        .args(["status"])
+        .current_dir(&repo)
+        .env("SHIPCHECK_HOME", tmp.path().join("home"))
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!ran.exists(), "shipcheck ran the fake git");
+}
+
+// Where shipcheck is installed can be a dir the user writes, such as ~/.cargo/bin, so it adds no dir to PATH
+#[test]
+fn a_fake_git_next_to_the_binary_is_never_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, bin) = (tmp.path().join("repo"), tmp.path().join("bin"));
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let ran = tmp.path().join("fake-ran");
+    fs::copy(env!("CARGO_BIN_EXE_shipcheck"), bin.join("shipcheck")).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\n/usr/bin/touch {}\nexec /usr/bin/git \"$@\"\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        bin.join("git"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // /sbin is trusted and holds no git, so only a dir shipcheck added could find one
+    let out = Command::new(bin.join("shipcheck"))
+        .args(["status"])
+        .current_dir(&repo)
+        .env("SHIPCHECK_HOME", tmp.path().join("home"))
+        .env("PATH", "/sbin")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!ran.exists(), "shipcheck ran the fake git: {out:?}");
+}

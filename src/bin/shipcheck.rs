@@ -23,6 +23,10 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var(key, value) };
     }
 
+    // git, bwrap and act come only from where a check finds tools, never a fake on the caller's PATH
+    // Safe: no other thread exists yet
+    unsafe { std::env::set_var("PATH", shipcheck::runner::host::jail_path()) };
+
     run::migrate_home();
 
     match cli(Cli::parse().command) {
@@ -393,6 +397,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 posts = None;
             }
 
+            if posts.is_some() && !shipcheck::daemon::posts_from(&base, &cwd) {
+                say(&format!(
+                    "{base} is not the base this repository posts from, so nothing is posted"
+                ));
+                posts = None;
+            }
+
             let started = std::time::Instant::now();
             let mut record = Record::new(
                 &std::env::var("SHIPCHECK_TRIGGER").unwrap_or_else(|_| "cli".into()),
@@ -632,6 +643,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         }
         "post" => {
             refuse_moved_home(home_ok)?;
+
+            if !shipcheck::daemon::posts_from(&base, &cwd) {
+                return Err(format!(
+                    "{base} is not the base this repository posts from: its default branch, or the daemon's base for it. A result from another base is a trial, never a check"
+                ));
+            }
+
             let plan = run::plan(&cwd, &rev, &base)?;
 
             if let Some(branch) = run::on_default_branch(&plan.repo, &base, Some(&plan.sha)) {
@@ -1024,7 +1042,7 @@ fn posting_run(
                         say(
                             "the run's tree, base or logs do not match its result, posting a failure",
                         );
-                        entry.passed = false;
+                        run::fail_closed(&mut entry);
                     }
 
                     Ok(entry)
