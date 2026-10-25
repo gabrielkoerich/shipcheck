@@ -62,11 +62,11 @@ The repository owner runs this once per repository, in a clone on `main`:
 shipcheck init
 ```
 
-1. It writes `shipcheck.toml` with a check for each workflow job it can run here, and prints what it left out and why. When every job has to stay on GitHub, it writes no file and stops.
+1. It writes `shipcheck.toml` with a check for each workflow job it can run here, and prints what it left out and why. In host mode it first runs each check once in the sandbox, as `shipcheck run` would. A check that fails is tried again without forced color, then with color off. A job whose check still fails stays on GitHub, and init prints the end of its log and the fix. When every job has to stay on GitHub, it writes no file and stops.
 2. On a terminal it walks the further steps: the [shipcheck App](https://github.com/apps/shipcheck-run) link, hosted Actions only on `main`, and a ruleset that requires each `shipcheck/<job>` check and PRs into the default branch. It changes nothing until the person applies the review. `--yes` applies the recommended choices with no questions, but opens no browser and creates no ruleset.
 3. It writes the agent instructions into `AGENTS.md` and the other files agents read, then does what `shipcheck install` does.
 
-Without a terminal it writes every check it finds and the instructions, installs the hooks and starts the daemon, and skips the App, workflow and ruleset steps. Read the checks it wrote, commit `shipcheck.toml` and `AGENTS.md`, and merge them to `main`. The owner installs the App on the repository once.
+Without a terminal it writes every check that passed and the instructions, installs the hooks and starts the daemon, and skips the App, workflow and ruleset steps. Read the checks it wrote, commit `shipcheck.toml` and `AGENTS.md`, and merge them to `main`. The owner installs the App on the repository once.
 
 ## Set up a machine: `shipcheck install`
 

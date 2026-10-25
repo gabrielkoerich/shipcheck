@@ -1345,6 +1345,72 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     Ok(entry)
 }
 
+/// One host check as `init` tried it
+pub struct Trial {
+    pub passed: bool,
+    pub log: String,
+    pub secs: u64,
+}
+
+/**
+ * Runs each host check of `config` once on HEAD, as `run` runs it: the same jail, a new clone, at
+ * most `max_parallel` at once. For `init`, which writes only checks that passed. Nothing is cached,
+ * posted or recorded, the logs are removed, and `versions` is not run, the caller tries each
+ **/
+pub fn trial(
+    repo: &Path,
+    mut config: RepoConfig,
+    say: &mut dyn FnMut(&str),
+) -> Result<BTreeMap<String, Trial>, String> {
+    let repo = PathBuf::from(git(repo, &["rev-parse", "--show-toplevel"])?);
+    let sha = git(&repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let tree = git(&repo, &["rev-parse", &format!("{sha}^{{tree}}")])?;
+    config.timeout_minutes = config.timeout_minutes.min(10);
+    config.retries = 0;
+    let names: Vec<String> = config.host.checks.keys().cloned().collect();
+    let plan = Plan {
+        key: format!("trial-{}", nonce(&tree)),
+        repo,
+        sha: sha.clone(),
+        tree,
+        base: sha,
+        config_text: Vec::new(),
+        config,
+        workflows: BTreeMap::new(),
+        ci_changes: Vec::new(),
+        defaults: false,
+        tools: String::new(),
+    };
+    let entry = execute(&plan, None, say);
+    let logs = log_dir(&plan.key);
+    let read = |name: &str| {
+        let log = fs::read(logs.join(HOST).join(format!("{name}.log"))).unwrap_or_default();
+        printable(&String::from_utf8_lossy(&log))
+    };
+    let result = entry.map(|entry| {
+        let host = entry.workflows.first();
+        names
+            .iter()
+            .map(|name| {
+                let passed = host.is_some_and(|h| h.jobs.get(name).is_some_and(|s| s == "success"));
+                let secs = host
+                    .and_then(|h| h.times.get(name))
+                    .map_or(0, |[start, end]| end.saturating_sub(*start));
+                (
+                    name.clone(),
+                    Trial {
+                        passed,
+                        log: read(name),
+                        secs,
+                    },
+                )
+            })
+            .collect()
+    });
+    let _ = fs::remove_dir_all(&logs);
+    result
+}
+
 /// Every required workflow at once, as on GitHub, with `max_parallel` shared by all their jobs
 fn run_workflows(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, String> {
     let plan = ctx.plan;
