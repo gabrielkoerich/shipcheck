@@ -117,6 +117,20 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     assert_eq!(same.key, plan.key);
     assert!(run::lookup(&same).unwrap().passed);
 
+    // A clone that is not the plan's tree fails every check, and that result is never kept
+    let mut wrong = run::plan(&work, "main", "origin/main").unwrap();
+    wrong.tree = same.tree.clone();
+    let entry = run::run(&wrong, &mut |l| eprintln!("{l}")).unwrap();
+    assert!(!entry.passed);
+    assert!(
+        entry.workflows[0]
+            .jobs
+            .values()
+            .all(|s| s == run::WRONG_TREE),
+        "{entry:?}"
+    );
+    assert!(run::cached(&wrong.key).is_none());
+
     // A failing check fails the run, and names only that check
     let plan = run::plan(&work, "main", "origin/main").unwrap();
     let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();

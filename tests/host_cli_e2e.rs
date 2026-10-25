@@ -175,6 +175,40 @@ fn status_logs_commit_and_post_refuse_before_any_run() {
 }
 
 #[test]
+fn history_never_asks_the_remote() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = Repo::new(MARKER);
+    // Each ls-remote of a local remote starts its upload-pack, which counts itself
+    let count = repo.home.join("asked");
+    let pack = repo.home.join("upload-pack");
+    let script = format!(
+        "#!/bin/sh\necho >> {}\nexec git upload-pack \"$@\"\n",
+        count.display()
+    );
+    fs::write(&pack, script).unwrap();
+    fs::set_permissions(&pack, fs::Permissions::from_mode(0o755)).unwrap();
+    repo.git(&[
+        "config",
+        "remote.origin.uploadpack",
+        &pack.to_string_lossy(),
+    ]);
+    let asked = || {
+        fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let (code, out) = repo.shipcheck(&["history"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(asked(), 0, "{out}");
+    // status reads the base, so the count works
+    repo.shipcheck(&["status", "--no-fetch"]);
+    assert_eq!(asked(), 1);
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 #[cfg_attr(
     jail,
