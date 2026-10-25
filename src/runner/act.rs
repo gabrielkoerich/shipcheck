@@ -467,6 +467,12 @@ impl Engine for Docker {
         let actions = actions_dir(Some(request.repo_id))
             .join(request.file)
             .join(request.job);
+        // act 0.2.89 copies an action into the job by the path as given and runs its post step by
+        // the cleaned one, so a `..` in SHIPCHECK_HOME failed every post step
+        fs::create_dir_all(&actions).map_err(|e| format!("{}: {e}", actions.display()))?;
+        let actions = actions
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", actions.display()))?;
 
         // Offline, act still clones a missing action but no longer fetches a cached one, which
         // would fail the run when GitHub does not answer. A damaged clone fails offline, so it fetches
