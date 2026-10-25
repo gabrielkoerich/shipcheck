@@ -2313,7 +2313,7 @@ jobs:
     fn the_checkout_step_needs_both_nonces() {
         let script = nonce_step("abc")["run"].as_str().unwrap().to_string();
         let run = |dir: &Path| {
-            let out = Command::new("sh")
+            let out = Command::new(crate::runner::posix_sh())
                 .args(["-e", "-c", &script])
                 .env("GITHUB_WORKSPACE", dir)
                 .output()
@@ -2572,7 +2572,7 @@ jobs:
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let mut reaper = Command::new("sh")
+            let mut reaper = Command::new(crate::runner::posix_sh())
                 .args(["-c", REAPER, "sh", "net-1", "/runs/0"])
                 .env("PATH", &path)
                 .stdin(Stdio::piped())
