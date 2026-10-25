@@ -69,7 +69,7 @@ jobs:
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true
       - run: docker version
       - run: act --version
-      - run: cargo test --test e2e --test retry_e2e --test shard_e2e --test mixed_e2e -- --ignored --nocapture
+      - run: cargo test --test e2e --test retry_e2e --test shard_e2e --test mixed_e2e --test post_step_e2e -- --ignored --nocapture
 
   gitleaks:
     runs-on: ubuntu-latest
