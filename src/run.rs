@@ -581,6 +581,57 @@ pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
 }
 
 /**
+ * The base of runs, status, post and doctor: the default branch the remote reports, as
+ * `origin/<branch>`, else `origin/main`. Never the local origin/HEAD, which anyone with the clone can
+ * repoint at a branch whose shipcheck.toml and workflows would then run
+ **/
+pub fn default_base(repo: &Path) -> String {
+    remote_base(repo).unwrap_or_else(|| "origin/main".into())
+}
+
+/// The remote's default branch as `origin/<branch>`, None when the remote did not answer
+pub fn remote_base(repo: &Path) -> Option<String> {
+    remote_default(repo).map(|b| format!("origin/{b}"))
+}
+
+/// `git ls-remote --symref origin HEAD`'s branch, None when the remote does not answer in 5s
+fn remote_default(repo: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().ok()? {
+            break status;
+        }
+
+        if started.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    status.success().then_some(())?;
+    out.lines().find_map(|l| {
+        let (branch, name) = l.strip_prefix("ref: refs/heads/")?.split_once('\t')?;
+        (name == "HEAD" && !branch.is_empty()).then(|| branch.to_string())
+    })
+}
+
+/**
  * The default branch, `base` without `origin/`, when `commit` (no `sha`) runs with HEAD on it, or
  * when `post` names its tip, locally or on `base`. Both refuse there, PRs carry the checks
  **/

@@ -75,7 +75,7 @@ impl DaemonConfig {
         Self::add_to(&Self::path(), repo, path, base)
     }
 
-    fn add_to(file: &Path, repo: &str, path: &Path, base: &str) -> Result<bool, String> {
+    pub(crate) fn add_to(file: &Path, repo: &str, path: &Path, base: &str) -> Result<bool, String> {
         let mut config = Self::load_from(file)?;
         let entry = RepoEntry {
             path: path.to_path_buf(),
@@ -95,6 +95,25 @@ impl DaemonConfig {
         std::fs::write(file, text).map_err(|e| format!("{}: {e}", file.display()))?;
         Ok(true)
     }
+}
+
+/**
+ * The base a command reads shipcheck.toml from. The hooks run in git's foreground, so they take the
+ * daemon's entry for the repository, else `origin/main`, and never ask the remote. The rest ask it
+ **/
+pub fn command_base(command: &str, repo: &Path) -> String {
+    command_base_in(&DaemonConfig::path(), command, repo)
+}
+
+fn command_base_in(file: &Path, command: &str, repo: &Path) -> String {
+    if !matches!(command, "on-commit" | "on-push") {
+        return run::default_base(repo);
+    }
+
+    run::repo_id(repo)
+        .ok()
+        .and_then(|id| DaemonConfig::load_from(file).ok()?.repos.remove(&id))
+        .map_or_else(origin_main, |entry| entry.base)
 }
 
 /**
@@ -937,6 +956,61 @@ mod tests {
             vec![(1, "old".to_string())]
         );
         assert!(abandoned(&waits, "acme/lib", &prs).is_empty());
+    }
+
+    #[test]
+    fn the_hooks_take_the_registered_base_and_never_ask_the_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, origin) = (dir.path().join("app"), dir.path().join("acme/app.git"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
+        let git = |at: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(at)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&origin, &["init", "-q", "--bare", "-b", "master"]);
+        git(&repo, &["init", "-q", "-b", "master"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "a",
+            ],
+        );
+        git(&repo, &["push", "-q", "origin", "master"]);
+        let file = dir.path().join("daemon.toml");
+
+        // The remote says master, so only a call to it gives master here
+        assert_eq!(command_base_in(&file, "run", &repo), "origin/master");
+
+        for hook in ["on-commit", "on-push"] {
+            assert_eq!(command_base_in(&file, hook, &repo), "origin/main");
+        }
+
+        DaemonConfig::add_to(&file, "acme/app", &repo, "origin/dev").unwrap();
+
+        for hook in ["on-commit", "on-push"] {
+            assert_eq!(command_base_in(&file, hook, &repo), "origin/dev");
+        }
     }
 
     #[test]

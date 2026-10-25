@@ -24,20 +24,26 @@ pub const BLOCK: &str = "<!-- shipcheck:start v3 -->
 
 <!-- shipcheck:end -->";
 
-/// `text` with the block in it: between the markers when they are there, else appended
-pub fn merge_block(text: Option<&str>) -> String {
+/**
+ * `text` with the block in it: between the markers when they are there, else appended. An error
+ * when the start marker has no end, since what follows it may be the person's own text
+ **/
+pub fn merge_block(text: Option<&str>) -> Result<String, String> {
     let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
-        return format!("{BLOCK}\n");
+        return Ok(format!("{BLOCK}\n"));
     };
 
-    if let Some(start) = text.find(START)
-        && let Some(len) = text[start..].find(END)
-    {
+    if let Some(start) = text.find(START) {
+        let Some(len) = text[start..].find(END) else {
+            return Err(format!(
+                "its shipcheck block has no `{END}`, add it where the block ends and run `shipcheck init` again"
+            ));
+        };
         let end = start + len + END.len();
-        return format!("{}{BLOCK}{}", &text[..start], &text[end..]);
+        return Ok(format!("{}{BLOCK}{}", &text[..start], &text[end..]));
     }
 
-    format!("{}\n\n{BLOCK}\n", text.trim_end())
+    Ok(format!("{}\n\n{BLOCK}\n", text.trim_end()))
 }
 
 /**
@@ -157,8 +163,10 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-pub fn imports_agents(text: &str) -> bool {
-    text.lines().any(|l| l.trim() == "@AGENTS.md")
+/// Whether the file at `name` imports the root AGENTS.md, an `@` path being relative to the file
+fn imports_agents(name: &str, text: &str) -> bool {
+    let import = format!("@{}AGENTS.md", "../".repeat(name.matches('/').count()));
+    text.lines().any(|l| l.trim() == import)
 }
 
 /// The instruction files besides AGENTS.md that get the block when they exist. A CLAUDE.md that
@@ -175,7 +183,8 @@ fn instruction_files(root: &Path) -> Vec<&'static str> {
     let mut files = vec!["AGENTS.md"];
 
     for name in OTHER_INSTRUCTIONS {
-        if fs::symlink_metadata(root.join(name)).is_ok() && !imports_agents(&read(&root.join(name)))
+        if fs::symlink_metadata(root.join(name)).is_ok()
+            && !imports_agents(name, &read(&root.join(name)))
         {
             files.push(name);
         }
@@ -191,7 +200,13 @@ pub fn instructions(root: &Path) -> Result<Vec<String>, String> {
     for name in instruction_files(root) {
         let path = root.join(name);
         let text = fs::read_to_string(&path).ok();
-        let merged = merge_block(text.as_deref());
+        let merged = match merge_block(text.as_deref()) {
+            Ok(merged) => merged,
+            Err(e) => {
+                done.push(format!("not writing {}: {e}", path.display()));
+                continue;
+            }
+        };
 
         if text.as_deref() == Some(merged.as_str()) {
             continue;
@@ -482,18 +497,18 @@ mod tests {
 
     #[test]
     fn block_goes_in_a_new_file_between_markers_and_after_other_text() {
-        assert_eq!(merge_block(None), format!("{BLOCK}\n"));
+        assert_eq!(merge_block(None).unwrap(), format!("{BLOCK}\n"));
 
         let old = "# Notes\n\n<!-- shipcheck:start v0 -->\nold\n<!-- shipcheck:end -->\n\nmore\n";
         assert_eq!(
-            merge_block(Some(old)),
+            merge_block(Some(old)).unwrap(),
             format!("# Notes\n\n{BLOCK}\n\nmore\n")
         );
 
         // A block from before the blank lines is rewritten, and doctor sees no drift in it
         let tight =
             "<!-- shipcheck:start v3 -->\n## Tests and commits\n\n- old\n<!-- shipcheck:end -->\n";
-        assert_eq!(merge_block(Some(tight)), format!("{BLOCK}\n"));
+        assert_eq!(merge_block(Some(tight)).unwrap(), format!("{BLOCK}\n"));
         assert!(BLOCK.starts_with("<!-- shipcheck:start v3 -->\n\n## "));
         assert!(BLOCK.ends_with(".txt\n\n<!-- shipcheck:end -->"));
         let dir = tempfile::tempdir().unwrap();
@@ -501,9 +516,13 @@ mod tests {
         assert!(notes(dir.path()).is_empty(), "{:?}", notes(dir.path()));
 
         let plain = "# Notes\nkeep this\n";
-        let merged = merge_block(Some(plain));
+        let merged = merge_block(Some(plain)).unwrap();
         assert_eq!(merged, format!("# Notes\nkeep this\n\n{BLOCK}\n"));
-        assert_eq!(merge_block(Some(&merged)), merged);
+        assert_eq!(merge_block(Some(&merged)).unwrap(), merged);
+
+        // A start with no end leaves the file alone, rather than add a second block or eat what follows
+        let open = "# Notes\n<!-- shipcheck:start v2 -->\nold\nmine\n";
+        assert!(merge_block(Some(open)).unwrap_err().contains(END));
     }
 
     #[test]
@@ -528,6 +547,11 @@ mod tests {
         assert_eq!(read(&root.join(".gemini/settings.json")), "{}");
         assert!(!root.join(".github").exists());
         assert!(notes(root).is_empty());
+
+        // `@AGENTS.md` in .claude/CLAUDE.md is .claude/AGENTS.md, not the root one
+        assert!(imports_agents("CLAUDE.md", "@AGENTS.md\n"));
+        assert!(!imports_agents(".claude/CLAUDE.md", "@AGENTS.md\n"));
+        assert!(imports_agents(".claude/CLAUDE.md", "@../AGENTS.md\n"));
         assert!(instructions(root).unwrap().is_empty());
     }
 
