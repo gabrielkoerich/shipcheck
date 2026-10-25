@@ -220,14 +220,20 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         plan.as_ref()
             .map(|p| {
                 let list = p.config.workflows.join(", ");
+                let checks: Vec<&str> = p.config.host.checks.keys().map(String::as_str).collect();
+                let host = format!("runs host checks {} on {base}, natively as this user in a sandbox", checks.join(", "));
 
-                if p.config.runner == RunnerKind::Host {
-                    let checks: Vec<&str> = p.config.host.checks.keys().map(String::as_str).collect();
-                    format!("runs host checks {} on {base}, natively as this user in a sandbox", checks.join(", "))
+                if p.config.acts() && p.config.hosts() {
+                    let acts = jobs_line(&p.config);
+                    format!("{host}, and {acts} with act")
+                } else if p.config.hosts() {
+                    host
                 } else if p.defaults {
                     format!(
                         "not on {base}, so runs use the workflows that run for branches: {list}. For the PR check, `shipcheck init` and merge shipcheck.toml to main"
                     )
+                } else if !p.config.jobs.is_empty() {
+                    format!("runs {} with act on {base}", jobs_line(&p.config))
                 } else {
                     format!("runs {list} on {base}")
                 }
@@ -242,7 +248,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             .iter()
             .filter(|(path, body)| {
                 let file = path.rsplit('/').next().unwrap_or(path);
-                p.config.workflows.iter().any(|w| w == file)
+                p.config.act_files().iter().any(|w| w == file)
                     && runner::shard::shardable(&String::from_utf8_lossy(body))
             })
             .map(|(path, _)| path.rsplit('/').next().unwrap_or(path).to_string())
@@ -293,8 +299,8 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 
     let planned: Result<RepoConfig, String> = plan.map(|p| p.config);
 
-    // Host mode runs no container
-    if planned.as_ref().is_ok_and(|c| c.runner == RunnerKind::Host) {
+    // Host checks run no container
+    if planned.as_ref().is_ok_and(|c| !c.acts()) {
         for c in found
             .iter_mut()
             .filter(|c| !c.ok && ["act", "docker"].contains(&c.name))
@@ -302,7 +308,9 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             c.ok = true;
             c.detail = format!("not needed, runner is host ({})", c.detail);
         }
+    }
 
+    if planned.as_ref().is_ok_and(|c| c.hosts()) {
         found.push(check(
             "sandbox",
             runner::host::sandbox().map(|s| {
@@ -316,7 +324,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             name: "network",
             ok: true,
             detail: match config.network {
-                _ if config.runner == RunnerKind::Host => "as this machine has it: host checks are sandboxed for files, not for the network, and `network` does not apply".into(),
+                _ if !config.acts() => "as this machine has it: host checks are sandboxed for files, not for the network, and `network` does not apply".into(),
                 Network::None => "none: jobs reach nothing. A job that downloads packages or tools fails, then the owner sets `network = \"internet\"` in shipcheck.toml".into(),
                 Network::Internet => "internet: jobs can download, and can still reach this machine and the local network".into(),
             },
@@ -387,6 +395,18 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 }
 
 /// The check names the base branch's rules require, read with the person's `gh`. None when gh cannot read them
+/// What act runs: each listed workflow whole, then each act `[jobs]` entry
+fn jobs_line(config: &RepoConfig) -> String {
+    let mut parts = config.workflows.clone();
+    parts.extend(
+        config
+            .jobs_on(RunnerKind::Act)
+            .into_iter()
+            .map(|j| format!("job {j}")),
+    );
+    parts.join(", ")
+}
+
 fn required_checks(cwd: &Path, base: &str) -> Option<Vec<String>> {
     let branch = base.strip_prefix("origin/").unwrap_or(base);
     let rules = output(
