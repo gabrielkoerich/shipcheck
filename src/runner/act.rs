@@ -518,8 +518,10 @@ impl Engine for Docker {
         let port = free_port()?;
         let home = crate::run::home();
 
-        for (name, _) in volumes(&act.config, request.repo_id, &tag) {
+        // Stamped first, so a parallel run's prune never takes it for an empty one no run used
+        for (name, path) in volumes(&act.config, request.repo_id, &tag) {
             gc::stamp(&home, "volumes", &name);
+            gc::create_volume(&name, &home, request.repo_id, path)?;
         }
 
         let volumes = mounts(&act.config, request.repo_id, &tag, run_dir)?;
@@ -751,13 +753,13 @@ impl Engine for Docker {
     }
 
     fn prune(&self) -> Vec<String> {
-        let now = std::time::SystemTime::now();
+        let (home, prefix, default, host) = here_parts();
         gc::prune(
             &gc::Docker,
-            &crate::run::home(),
-            &home_prefix(),
+            &here(&home, &prefix, &default, &host),
+            &run_tags(&home),
             gc::OLD_PINS,
-            now,
+            std::time::SystemTime::now(),
         )
     }
 
@@ -771,7 +773,9 @@ impl Engine for Docker {
         }
 
         let prefix = repo_id.map(volume_prefix).unwrap_or_else(home_prefix);
-        done.extend(gc::clean(&gc::Docker, &crate::run::home(), &prefix));
+        let (home, own, default, host) = here_parts();
+        let here = here(&home, &own, &default, &host);
+        done.extend(gc::clean(&gc::Docker, &here, &prefix, repo_id.is_none()));
         // Networks are per slot, not per repository, and Docker refuses to remove one in use
         let prefix = format!("{}net-", home_prefix());
         let Ok(listed) = Command::new("docker")
@@ -1955,10 +1959,15 @@ read -r state || state=
 [ "$state" = done ] && exit 0
 [ "$state" = exited ] || kill -s KILL -- "-$pgid" 2>/dev/null
 net=$1
-shift
+tag=$2
+shift 2
 cleanup() {
   for p in "$@"; do
     docker ps -aq --filter name=^act- --filter "volume=$p" | while read -r id; do docker rm -f -v "$id"; done
+  done
+  # act removes its volumes only when it ends by itself
+  docker volume ls -q --filter "name=-$tag-" | while read -r v; do
+    case $v in act-*-env) docker volume rm "$v" ;; esac
   done
   docker network rm "$net"
 }
@@ -1990,7 +1999,7 @@ fn reaper(run_dir: &Path, slot_lock: Option<std::os::fd::RawFd>) -> Option<std::
             .collect::<Vec<_>>()
             .join(" "),
     );
-    cmd.args(["-c", REAPER, "sh", &network_name(run_dir)])
+    cmd.args(["-c", REAPER, "sh", &network_name(run_dir), &run_tag(run_dir)])
         .args(mount_paths(run_dir))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2128,9 +2137,55 @@ fn volume_prefix(repo_id: &str) -> String {
 /// The start of every volume name under this `SHIPCHECK_HOME`, so `clean --all` of one home leaves
 /// the volumes of another, such as a test's, alone
 pub fn home_prefix() -> String {
-    let home = crate::run::home();
+    prefix_of(&crate::run::home())
+}
+
+fn prefix_of(home: &Path) -> String {
     let hash = cache::hex(&Sha256::digest(home.to_string_lossy().as_bytes())[..3]);
     format!("shipcheck-{hash}-")
+}
+
+/// The home, its prefix, the default home's prefix and the host name, which `here` borrows
+pub fn here_parts() -> (PathBuf, String, String, String) {
+    let home = crate::run::home();
+    let prefix = prefix_of(&home);
+    (
+        home,
+        prefix,
+        prefix_of(&crate::run::default_home()),
+        gc::hostname(),
+    )
+}
+
+pub fn here<'a>(home: &'a Path, prefix: &'a str, default: &'a str, host: &'a str) -> gc::Here<'a> {
+    gc::Here {
+        home,
+        prefix,
+        default_prefix: default,
+        host,
+    }
+}
+
+/// The run tags of every checkout dir under `runs/<owner>/<repo>/<slot>`, and of the slot itself,
+/// which was the checkout before one per job
+pub fn run_tags(home: &Path) -> Vec<String> {
+    let mut dirs = vec![home.join("runs")];
+    let mut tags = Vec::new();
+
+    for depth in 1..=5 {
+        dirs = dirs
+            .iter()
+            .flat_map(|d| fs::read_dir(d).into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+
+        if depth >= 3 {
+            tags.extend(dirs.iter().map(|d| run_tag(d)));
+        }
+    }
+
+    tags
 }
 
 /**
@@ -2762,9 +2817,9 @@ jobs:
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("docker.log");
         let docker = dir.path().join("docker");
-        // `ps` names one container, every call is logged
+        // `ps` names one container, `volume ls` an act volume and one that is not, every call is logged
         let fake = format!(
-            "#!/bin/sh\necho \"$*\" >> {}\n[ \"$1\" = ps ] && echo c1\nexit 0\n",
+            "#!/bin/sh\necho \"$*\" >> {}\n[ \"$1\" = ps ] && echo c1\n[ \"$1\" = volume ] && [ \"$2\" = ls ] && printf 'act-CI-t-13f69a23-0a-env\\nact-x-13f69a23-0a\\n'\nexit 0\n",
             log.display()
         );
         fs::write(&docker, fake).unwrap();
@@ -2786,7 +2841,7 @@ jobs:
             let held =
                 super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
             let mut reaper = cmd
-                .args(["-c", REAPER, "sh", "net-1", "/runs/0"])
+                .args(["-c", REAPER, "sh", "net-1", "13f69a23", "/runs/0"])
                 .env("PATH", &path)
                 .env("LOCK_FDS", held[0].to_string())
                 .stdin(Stdio::piped())
@@ -2802,7 +2857,7 @@ jobs:
             drop(stdin);
             assert!(reaper.wait().unwrap().success());
             let calls = fs::read_to_string(&log).unwrap_or_default();
-            let cleanup = "ps -aq --filter name=^act- --filter volume=/runs/0\nrm -f -v c1\nnetwork rm net-1\n";
+            let cleanup = "ps -aq --filter name=^act- --filter volume=/runs/0\nrm -f -v c1\nvolume ls -q --filter name=-13f69a23-\nvolume rm act-CI-t-13f69a23-0a-env\nnetwork rm net-1\n";
 
             match state {
                 "done" => assert_eq!(calls, ""),

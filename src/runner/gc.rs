@@ -14,10 +14,33 @@ const KEEP_OLD_PIN: Duration = Duration::from_secs(24 * 3600);
 /// a release stops pinning, so the image leaves machines that never stamped it
 pub const OLD_PINS: &[&str] = &[];
 
+/// An empty volume no run used this long goes, the wait keeps one a run just made for its mount
+const KEEP_EMPTY: Duration = Duration::from_secs(3600);
+
+/// A volume as `docker system df -v` lists it
+#[derive(Clone, Debug, Default)]
+pub struct Volume {
+    pub name: String,
+    /// The `shipcheck.home` and `shipcheck.host` labels, None on a volume from before labels
+    pub home: Option<String>,
+    pub host: Option<String>,
+    /// None when Docker gave no size it can read
+    pub bytes: Option<u64>,
+}
+
+/// Where this process runs, so the prune can tell its own volumes from another home's
+pub struct Here<'a> {
+    pub home: &'a Path,
+    pub prefix: &'a str,
+    /// The default home's prefix. Only that home removes its own volumes from before labels
+    pub default_prefix: &'a str,
+    pub host: &'a str,
+}
+
 /// The Docker calls the prune makes, so its decisions can be tested without Docker
 pub trait Engine {
-    /// Volume names that contain `part`, None when Docker cannot list them
-    fn volumes(&self, part: &str) -> Option<Vec<String>>;
+    /// Every volume on the machine, None when Docker cannot list them
+    fn volumes(&self) -> Option<Vec<Volume>>;
     /// Whether a container, running or stopped, matches the `docker ps` filter. True on any doubt
     fn used(&self, filter: &str) -> bool;
     /// The image's id, None when it is not on this machine
@@ -36,9 +59,10 @@ fn docker(args: &[&str]) -> Option<String> {
 }
 
 impl Engine for Docker {
-    fn volumes(&self, part: &str) -> Option<Vec<String>> {
-        let out = docker(&["volume", "ls", "-q", "--filter", &format!("name={part}")])?;
-        Some(out.split_whitespace().map(String::from).collect())
+    fn volumes(&self) -> Option<Vec<Volume>> {
+        let out = docker(&["system", "df", "-v", "--format", "{{json .Volumes}}"])?;
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&out).ok()?;
+        Some(listed.iter().map(parse_volume).collect())
     }
 
     fn used(&self, filter: &str) -> bool {
@@ -52,6 +76,58 @@ impl Engine for Docker {
     fn remove(&self, kind: &str, name: &str) -> bool {
         docker(&[kind, "rm", name]).is_some()
     }
+}
+
+/// Docker joins labels as `k=v,k=v`. A home with a comma never runs, `venv_mount` refuses it
+fn parse_volume(v: &serde_json::Value) -> Volume {
+    let labels = v["Labels"].as_str().unwrap_or_default();
+    let label = |key: &str| {
+        labels
+            .split(',')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .map(String::from)
+    };
+    Volume {
+        name: v["Name"].as_str().unwrap_or_default().to_string(),
+        home: label("shipcheck.home"),
+        host: label("shipcheck.host"),
+        bytes: v["Size"].as_str().and_then(size),
+    }
+}
+
+/// Creates the volume with labels that name its home, host, repository and path. Docker keeps the
+/// labels of a volume that exists already
+pub fn create_volume(name: &str, home: &Path, repo_id: &str, path: &str) -> Result<(), String> {
+    let out = Command::new("docker")
+        .args(["volume", "create"])
+        .arg("--label")
+        .arg(format!("shipcheck.home={}", home.display()))
+        .arg("--label")
+        .arg(format!("shipcheck.host={}", hostname()))
+        .arg("--label")
+        .arg(format!("shipcheck.repo={repo_id}"))
+        .arg("--label")
+        .arg(format!("shipcheck.path={path}"))
+        .arg(name)
+        .output()
+        .map_err(|e| format!("docker volume create: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "docker volume create {name}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer outlives the call, and one byte stays for the NUL a long name lacks
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) } == 0;
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+    String::from_utf8_lossy(if ok { &buf[..end] } else { &[] }).into_owned()
 }
 
 /// Volume names are file names already, image references hold `/`
@@ -93,13 +169,49 @@ fn stamps(home: &Path, kind: &str) -> Vec<String> {
         .collect()
 }
 
-fn ours(name: &str, prefix: &str) -> bool {
-    prefix.starts_with("shipcheck-") && name.starts_with(prefix)
+/// `shipcheck-` and the six hex digits of `home_prefix`, so a user's `shipcheck-review-cargo` never matches
+fn shipcheck_named(name: &str) -> bool {
+    name.strip_prefix("shipcheck-")
+        .and_then(|rest| rest.get(..7))
+        .is_some_and(|h| {
+            h.ends_with('-')
+                && h[..6]
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
 }
 
-/// A volume of this home goes when its stamp is old. One without a stamp gets one first
-fn volume_due(name: &str, prefix: &str, age: Option<Duration>) -> bool {
-    ours(name, prefix) && age.is_some_and(|a| a > KEEP)
+fn ours(name: &str, prefix: &str) -> bool {
+    shipcheck_named(prefix) && name.starts_with(prefix)
+}
+
+/**
+ * A volume of this home goes when no run used it for `KEEP`, when it is empty and no run used it
+ * for `KEEP_EMPTY`, or when it has no labels: the next run that needs it makes it again with them.
+ * One without a stamp starts its days now
+ **/
+fn volume_due(v: &Volume, prefix: &str, age: Option<Duration>) -> bool {
+    let Some(age) = age.filter(|_| ours(&v.name, prefix)) else {
+        return false;
+    };
+    age > KEEP || v.home.is_none() || (v.bytes == Some(0) && age > KEEP_EMPTY)
+}
+
+/// A volume of another home goes when that home is gone from this host, or when it has no labels
+/// and is not the default home's, which removes its own
+fn orphan(v: &Volume, here: &Here) -> bool {
+    if !shipcheck_named(&v.name) || v.name.starts_with(here.prefix) {
+        return false;
+    }
+
+    match (&v.home, &v.host) {
+        (Some(home), Some(host)) => {
+            host == here.host
+                && matches!(fs::symlink_metadata(home), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        }
+        (None, None) => !v.name.starts_with(here.default_prefix),
+        _ => false,
+    }
 }
 
 /// Only an image an older release pinned can go, a day after a config last named it. Any other
@@ -120,36 +232,52 @@ fn remove_image(engine: &dyn Engine, reference: &str) -> Option<bool> {
     Some(!used && engine.remove("image", reference))
 }
 
-/// Removes this home's volumes unused for `KEEP`, and every image of `old_pins` no config uses.
-/// Whatever a container references, running or stopped, stays
+/**
+ * Removes this home's volumes that `volume_due` picks, the volumes of other homes `orphan` picks,
+ * the act volumes of this home's run dirs as `tags` names them, and every image of `old_pins` no
+ * config uses. Whatever a container references, running or stopped, stays
+ **/
 pub fn prune(
     engine: &dyn Engine,
-    home: &Path,
-    prefix: &str,
+    here: &Here,
+    tags: &[String],
     old_pins: &[&str],
     now: SystemTime,
 ) -> Vec<String> {
+    let (home, prefix) = (here.home, here.prefix);
     let mut done = Vec::new();
 
-    if let Some(listed) = engine.volumes(prefix) {
-        for name in &listed {
-            let age = age(home, "volumes", name, now);
+    if let Some(listed) = engine.volumes() {
+        for v in &listed {
+            let age = age(home, "volumes", &v.name, now);
 
             // A volume from before stamps, or from a run that crashed before its stamp, starts its days now
-            if age.is_none() && ours(name, prefix) {
-                stamp(home, "volumes", name);
+            if age.is_none() && ours(&v.name, prefix) {
+                stamp(home, "volumes", &v.name);
             }
 
-            if volume_due(name, prefix, age) && remove_volume(engine, name) {
-                unstamp(home, "volumes", name);
-                done.push(format!("removed volume {name}"));
+            if volume_due(v, prefix, age) && remove_volume(engine, &v.name) {
+                unstamp(home, "volumes", &v.name);
+                done.push(format!("removed volume {}", v.name));
             }
         }
 
+        let names: BTreeSet<&str> = listed.iter().map(|v| v.name.as_str()).collect();
+
         for name in stamps(home, "volumes") {
-            if !listed.contains(&name) {
+            if !names.contains(name.as_str()) {
                 unstamp(home, "volumes", &name);
             }
+        }
+
+        done.extend(remove_orphans(engine, &listed, here));
+
+        for tag in tags {
+            done.extend(
+                env_volumes(&listed, tag)
+                    .filter(|n| remove_volume(engine, n))
+                    .map(|n| format!("removed volume {n}")),
+            );
         }
     }
 
@@ -171,29 +299,47 @@ pub fn prune(
     done
 }
 
-/// Removes the volumes that start with `prefix`. Whatever a container references stays
-pub fn clean(engine: &dyn Engine, home: &Path, prefix: &str) -> Vec<String> {
+fn remove_orphans(engine: &dyn Engine, listed: &[Volume], here: &Here) -> Vec<String> {
+    listed
+        .iter()
+        .filter(|v| orphan(v, here) && remove_volume(engine, &v.name))
+        .map(|v| format!("removed volume {} of another home", v.name))
+        .collect()
+}
+
+/// Removes the volumes that start with `prefix`, and with `orphans` also those `orphan` picks.
+/// Whatever a container references stays
+pub fn clean(engine: &dyn Engine, here: &Here, prefix: &str, orphans: bool) -> Vec<String> {
+    let listed = engine.volumes().unwrap_or_default();
     let mut done = Vec::new();
 
-    for name in engine.volumes(prefix).unwrap_or_default() {
-        if ours(&name, prefix) && remove_volume(engine, &name) {
-            unstamp(home, "volumes", &name);
-            done.push(format!("removed volume {name}"));
+    for v in &listed {
+        if ours(&v.name, prefix) && remove_volume(engine, &v.name) {
+            unstamp(here.home, "volumes", &v.name);
+            done.push(format!("removed volume {}", v.name));
         }
+    }
+
+    if orphans {
+        done.extend(remove_orphans(engine, &listed, here));
     }
 
     done
 }
 
-/// act's `act-<workflow>-<job>-<hash>-env` volumes of the jobs whose name carries this tag, which
-/// a killed act leaves behind
-pub fn remove_env_volumes(engine: &dyn Engine, tag: &str) {
+/// act's `act-<workflow>-<job>-<hash>-env` volumes of the jobs whose name carries this tag
+fn env_volumes<'a>(listed: &'a [Volume], tag: &str) -> impl Iterator<Item = &'a str> {
     let part = format!("-{tag}-");
+    listed
+        .iter()
+        .map(|v| v.name.as_str())
+        .filter(move |n| n.starts_with("act-") && n.ends_with("-env") && n.contains(&part))
+}
 
-    for name in engine.volumes(&part).unwrap_or_default() {
-        if name.starts_with("act-") && name.ends_with("-env") && name.contains(&part) {
-            remove_volume(engine, &name);
-        }
+/// The act volumes of a job, which a killed act leaves behind
+pub fn remove_env_volumes(engine: &dyn Engine, tag: &str) {
+    for name in env_volumes(&engine.volumes().unwrap_or_default(), tag) {
+        remove_volume(engine, name);
     }
 }
 
@@ -211,18 +357,22 @@ pub fn images_in_log(log: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Count and size of this home's volumes and stamped images. `docker system df -v` measures volumes
-pub fn usage(home: &Path, prefix: &str) -> Result<String, String> {
-    let out = docker(&["system", "df", "-v", "--format", "{{json .Volumes}}"])
-        .ok_or("docker system df failed")?;
-    let volumes: Vec<serde_json::Value> = serde_json::from_str(&out).map_err(|e| e.to_string())?;
-    let (count, bytes) = volumes
-        .iter()
-        .filter(|v| v["Name"].as_str().is_some_and(|n| n.starts_with(prefix)))
-        .fold((0, 0), |(n, b), v| {
-            (n + 1, b + v["Size"].as_str().map_or(0, size))
-        });
-
+/// Count and size of this home's volumes, of the volumes other live homes keep, of act's that no
+/// run dir of this home names, and of this home's stamped images
+pub fn usage(here: &Here, tags: &[String]) -> Result<String, String> {
+    let listed = Docker.volumes().ok_or("docker system df failed")?;
+    let tally = |keep: &dyn Fn(&Volume) -> bool| {
+        (listed.iter().filter(|v| keep(v)))
+            .fold((0, 0), |(n, b), v| (n + 1, b + v.bytes.unwrap_or(0)))
+    };
+    let (count, bytes) = tally(&|v| ours(&v.name, here.prefix));
+    let (others, other_bytes) =
+        tally(&|v| shipcheck_named(&v.name) && !ours(&v.name, here.prefix) && !orphan(v, here));
+    let (gone, gone_bytes) = tally(&|v| orphan(v, here));
+    let mine: BTreeSet<&str> = tags.iter().flat_map(|t| env_volumes(&listed, t)).collect();
+    let (act, act_bytes) =
+        tally(&|v| v.name.starts_with("act-") && !mine.contains(v.name.as_str()));
+    let home = here.home;
     let refs = stamps(home, "images");
     let mut images = BTreeSet::new();
     let mut image_bytes = 0;
@@ -245,16 +395,39 @@ pub fn usage(home: &Path, prefix: &str) -> Result<String, String> {
         }
     }
 
-    Ok(format!(
-        "Docker volumes of this home: {count}, {}, removed after a run once unused for 14 days, or now with `shipcheck clean`. Images its runs used: {}, {}, kept",
+    let mut text = format!(
+        "Docker volumes of this home: {count}, {}, removed after a run once unused for 14 days, empty ones after an hour, or now with `shipcheck clean`. Images its runs used: {}, {}, kept",
         gigabytes(bytes),
         images.len(),
         gigabytes(image_bytes)
-    ))
+    );
+
+    if gone > 0 {
+        text += &format!(
+            ". Volumes of gone homes: {gone}, {}, removed after the next run, or now with `shipcheck clean --all`",
+            gigabytes(gone_bytes)
+        );
+    }
+
+    if others > 0 {
+        text += &format!(
+            ". Volumes of other live homes or hosts: {others}, {}, kept",
+            gigabytes(other_bytes)
+        );
+    }
+
+    if act > 0 {
+        text += &format!(
+            ". {act} act volumes, {}, are not from a run of this home and stay",
+            gigabytes(act_bytes)
+        );
+    }
+
+    Ok(text)
 }
 
-/// Docker's sizes are decimal: `4.3GB`, `512kB`, `0B`
-fn size(text: &str) -> u64 {
+/// Docker's sizes are decimal: `4.3GB`, `512kB`, `0B`. None for `N/A` or anything else
+fn size(text: &str) -> Option<u64> {
     let split = text
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .unwrap_or(text.len());
@@ -265,9 +438,9 @@ fn size(text: &str) -> u64 {
         "MB" => 1e6,
         "GB" => 1e9,
         "TB" => 1e12,
-        _ => 0.0,
+        _ => return None,
     };
-    (n.parse::<f64>().unwrap_or(0.0) * scale) as u64
+    Some((n.parse::<f64>().ok()? * scale) as u64)
 }
 
 fn gigabytes(bytes: u64) -> String {
@@ -285,7 +458,7 @@ mod tests {
     /// Volumes and images on a fake machine, the filters of its containers, and what Docker refuses
     #[derive(Default)]
     struct Fake {
-        volumes: Vec<String>,
+        volumes: Vec<Volume>,
         images: Vec<String>,
         containers: Vec<String>,
         refuse: Vec<String>,
@@ -293,14 +466,8 @@ mod tests {
     }
 
     impl Engine for Fake {
-        fn volumes(&self, part: &str) -> Option<Vec<String>> {
-            Some(
-                self.volumes
-                    .iter()
-                    .filter(|v| v.contains(part))
-                    .cloned()
-                    .collect(),
-            )
+        fn volumes(&self) -> Option<Vec<Volume>> {
+            Some(self.volumes.clone())
         }
 
         fn used(&self, filter: &str) -> bool {
@@ -328,6 +495,33 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
 
+    /// A volume with the labels of `home` on host `h1`, 1 kB
+    fn labeled(name: &str, home: &Path) -> Volume {
+        Volume {
+            name: name.into(),
+            home: Some(home.display().to_string()),
+            host: Some("h1".into()),
+            bytes: Some(1000),
+        }
+    }
+
+    fn bare(name: &str) -> Volume {
+        Volume {
+            name: name.into(),
+            bytes: Some(1000),
+            ..Volume::default()
+        }
+    }
+
+    fn here(home: &Path) -> Here<'_> {
+        Here {
+            home,
+            prefix: P,
+            default_prefix: "shipcheck-def456-",
+            host: "h1",
+        }
+    }
+
     fn stamp_at(home: &Path, kind: &str, name: &str, ago: Duration) {
         stamp(home, kind, name);
         let file = fs::File::options()
@@ -339,13 +533,59 @@ mod tests {
 
     #[test]
     fn volumes_go_by_stamp_age_and_prefix() {
-        assert!(!volume_due(&format!("{P}x"), P, None));
-        assert!(volume_due(&format!("{P}x"), P, Some(15 * DAY)));
-        assert!(!volume_due(&format!("{P}x"), P, Some(13 * DAY)));
-        assert!(!volume_due("shipcheck-other-x", P, None));
+        let home = Path::new("/h");
+        let v = labeled(&format!("{P}x"), home);
+        assert!(!volume_due(&v, P, None));
+        assert!(volume_due(&v, P, Some(15 * DAY)));
+        assert!(!volume_due(&v, P, Some(13 * DAY)));
+        assert!(!volume_due(
+            &labeled("shipcheck-other-x", home),
+            P,
+            Some(15 * DAY)
+        ));
         // A prefix that is not shipcheck's never matches, even an empty one
-        assert!(!volume_due("pg-data", "", Some(15 * DAY)));
-        assert!(!volume_due("act-toolcache", "act-", Some(15 * DAY)));
+        assert!(!volume_due(&bare("pg-data"), "", Some(15 * DAY)));
+        assert!(!volume_due(&bare("act-toolcache"), "act-", Some(15 * DAY)));
+        // Empty goes after an hour, one from before labels on the first prune that stamped it
+        let empty = Volume {
+            bytes: Some(0),
+            ..v.clone()
+        };
+        assert!(!volume_due(&empty, P, Some(DAY / 48)));
+        assert!(volume_due(&empty, P, Some(DAY / 12)));
+        assert!(volume_due(&bare(&format!("{P}x")), P, Some(Duration::ZERO)));
+        assert!(!volume_due(&bare(&format!("{P}x")), P, None));
+    }
+
+    #[test]
+    fn only_volumes_of_gone_homes_and_unlabeled_strangers_are_orphans() {
+        let live = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (live, gone) = (live.path(), tmp.path().join("gone"));
+        let h = here(live);
+        assert!(orphan(&labeled("shipcheck-111111-a", &gone), &h));
+        assert!(!orphan(&labeled("shipcheck-111111-a", live), &h));
+        // Another host's home may exist there, so its volumes stay
+        let other_host = Volume {
+            host: Some("h2".into()),
+            ..labeled("shipcheck-111111-a", &gone)
+        };
+        assert!(!orphan(&other_host, &h));
+        assert!(orphan(&bare("shipcheck-111111-a"), &h));
+        // The default home removes its own, this home's go by `volume_due`
+        assert!(!orphan(&bare("shipcheck-def456-a"), &h));
+        assert!(!orphan(&bare(&format!("{P}a")), &h));
+        assert!(!orphan(&labeled(&format!("{P}a"), &gone), &h));
+        // Names that are not shipcheck's, even with shipcheck's labels
+        for name in [
+            "shipcheck-review-gaps-cargo",
+            "cvm_redis-data",
+            "act-ci-e2e-1",
+            "shipcheck-ABCDEF-a",
+        ] {
+            assert!(!orphan(&bare(name), &h), "{name}");
+            assert!(!orphan(&labeled(name, &gone), &h), "{name}");
+        }
     }
 
     #[test]
@@ -362,7 +602,8 @@ mod tests {
     fn prune_removes_only_unused_shipcheck_volumes() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
-        let (old, fresh, bare, stopped, refused) = (
+        let gone = home.join("gone");
+        let (old, fresh, bare_name, stopped, refused) = (
             format!("{P}old"),
             format!("{P}fresh"),
             format!("{P}bare"),
@@ -374,15 +615,28 @@ mod tests {
         stamp_at(home, "volumes", &stopped, 20 * DAY);
         stamp_at(home, "volumes", &format!("{P}gone"), DAY);
         let fake = Fake {
-            volumes: [&old, &fresh, &bare, &stopped, &refused]
-                .map(String::clone)
+            volumes: [&old, &fresh, &bare_name, &stopped, &refused]
+                .map(|n| labeled(n, home))
                 .into_iter()
-                .chain(strings(&[
-                    "act-toolcache",
-                    "sbpf-cargo-registry",
-                    "myapp-cargo",
-                    "compose_db",
-                ]))
+                .chain(
+                    [
+                        "act-toolcache",
+                        "sbpf-cargo-registry",
+                        "myapp-cargo",
+                        "compose_db",
+                        "cvm_cvm-data",
+                        "shipcheck-review-gaps-cargo",
+                        "shipcheck-def456-x",
+                        "act-ci-yml-a-85f7-env",
+                        "act-CI-test-ffffffff-0abc-env",
+                    ]
+                    .map(bare),
+                )
+                .chain([
+                    labeled("shipcheck-111111-x", &gone),
+                    bare("shipcheck-222222-x"),
+                ])
+                .chain([bare("act-CI-test-1-13f69a23-0abc-env")])
                 .collect(),
             // A stopped container still references it, as `docker ps -a` shows
             containers: vec![format!("volume={stopped}")],
@@ -390,17 +644,121 @@ mod tests {
             ..Fake::default()
         };
 
-        let done = prune(&fake, home, P, &[], SystemTime::now());
-        assert_eq!(*fake.removed.borrow(), std::slice::from_ref(&old));
-        assert_eq!(done.len(), 1);
+        let done = prune(
+            &fake,
+            &here(home),
+            &strings(&["13f69a23"]),
+            &[],
+            SystemTime::now(),
+        );
+        assert_eq!(
+            *fake.removed.borrow(),
+            [
+                old.as_str(),
+                "shipcheck-111111-x",
+                "shipcheck-222222-x",
+                "act-CI-test-1-13f69a23-0abc-env"
+            ]
+        );
+        assert_eq!(done.len(), 4);
         // An unstamped volume gets a stamp dated now, so it lasts 14 more days
-        let bare_age = age(home, "volumes", &bare, SystemTime::now()).unwrap();
+        let bare_age = age(home, "volumes", &bare_name, SystemTime::now()).unwrap();
         assert!(bare_age < DAY);
         assert!(!home.join("volumes").join(&old).exists());
         assert!(home.join("volumes").join(&fresh).exists());
         assert!(home.join("volumes").join(&stopped).exists());
         // The stamp of a volume Docker no longer has goes
         assert!(!home.join("volumes").join(format!("{P}gone")).exists());
+    }
+
+    #[test]
+    #[ignore = "needs Docker"]
+    fn docker_prune_removes_the_volumes_of_a_gone_home_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (live, gone) = (tmp.path().join("live"), tmp.path().join("gone"));
+        fs::create_dir(&live).unwrap();
+        let id = &crate::cache::hex(&rand_bytes())[..6];
+        let names = [
+            format!("shipcheck-{id}-gone"),
+            format!("shipcheck-{id}-bare"),
+            format!("shipcheck-{id}-live"),
+            format!("shipcheck-review-{id}"),
+        ];
+        create_volume(&names[0], &gone, "a/b", "/x").unwrap();
+        assert!(docker(&["volume", "create", &names[1]]).is_some());
+        create_volume(&names[2], &live, "a/b", "/x").unwrap();
+        assert!(docker(&["volume", "create", &names[3]]).is_some());
+        let host = hostname();
+        let here = Here {
+            home: &live,
+            prefix: "shipcheck-ffffff-",
+            default_prefix: "shipcheck-eeeeee-",
+            host: &host,
+        };
+
+        // Docker, but it lists only this test's volumes, so the prune never sees anyone else's
+        struct Only<'a>(&'a str);
+
+        impl Engine for Only<'_> {
+            fn volumes(&self) -> Option<Vec<Volume>> {
+                let all = Docker.volumes()?;
+                Some(
+                    all.into_iter()
+                        .filter(|v| v.name.contains(self.0))
+                        .collect(),
+                )
+            }
+
+            fn used(&self, filter: &str) -> bool {
+                Docker.used(filter)
+            }
+
+            fn image_id(&self, reference: &str) -> Option<String> {
+                Docker.image_id(reference)
+            }
+
+            fn remove(&self, kind: &str, name: &str) -> bool {
+                name.contains(self.0) && Docker.remove(kind, name)
+            }
+        }
+
+        prune(&Only(id), &here, &[], &[], SystemTime::now());
+        let left = Only(id).volumes().unwrap();
+        let has = |n: &str| left.iter().any(|v| v.name == n);
+        let kept = [
+            has(&names[0]),
+            has(&names[1]),
+            has(&names[2]),
+            has(&names[3]),
+        ];
+
+        for name in &names {
+            let _ = docker(&["volume", "rm", name]);
+        }
+
+        assert_eq!(kept, [false, false, true, true]);
+    }
+
+    fn rand_bytes() -> [u8; 8] {
+        let mut b = [0u8; 8];
+        fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+            .unwrap();
+        b
+    }
+
+    #[test]
+    fn parses_labels_from_docker_system_df() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"Name":"shipcheck-abc123-x","Labels":"shipcheck.repo=a/b,shipcheck.home=/Users/a/.local/state/shipcheck,shipcheck.host=mac","Size":"0B"}"#,
+        )
+        .unwrap();
+        let v = parse_volume(&v);
+        assert_eq!(v.home.as_deref(), Some("/Users/a/.local/state/shipcheck"));
+        assert_eq!(v.host.as_deref(), Some("mac"));
+        assert_eq!(v.bytes, Some(0));
+        let v = parse_volume(&serde_json::json!({"Name": "x", "Labels": "", "Size": "N/A"}));
+        assert_eq!((v.home, v.host, v.bytes), (None, None, None));
     }
 
     #[test]
@@ -423,7 +781,13 @@ mod tests {
             ..Fake::default()
         };
 
-        prune(&fake, home, P, &[old_pin, used_pin], SystemTime::now());
+        prune(
+            &fake,
+            &here(home),
+            &[],
+            &[old_pin, used_pin],
+            SystemTime::now(),
+        );
         assert_eq!(*fake.removed.borrow(), [old_pin]);
         assert!(home.join("images").join(encode("postgres:16")).exists());
     }
@@ -439,7 +803,7 @@ mod tests {
             ..Fake::default()
         };
 
-        assert!(prune(&fake, home, P, &["a/b:1"], SystemTime::now()).is_empty());
+        assert!(prune(&fake, &here(home), &[], &["a/b:1"], SystemTime::now()).is_empty());
         assert!(home.join("images").join(encode("a/b:1")).exists());
     }
 
@@ -449,23 +813,31 @@ mod tests {
         stamp(home.path(), "images", "a:1");
         let fake = Fake {
             images: strings(&["a:1"]),
-            volumes: strings(&[&format!("{P}x"), "pg-data"]),
+            volumes: vec![
+                labeled(&format!("{P}x"), home.path()),
+                bare("pg-data"),
+                bare("shipcheck-222222-x"),
+            ],
             ..Fake::default()
         };
 
-        clean(&fake, home.path(), P);
+        clean(&fake, &here(home.path()), P, false);
         assert_eq!(*fake.removed.borrow(), [format!("{P}x")]);
+        clean(&fake, &here(home.path()), P, true);
+        assert_eq!(fake.removed.borrow().last().unwrap(), "shipcheck-222222-x");
     }
 
     #[test]
     fn env_volumes_match_the_tag_only() {
         let fake = Fake {
-            volumes: strings(&[
+            volumes: [
                 "act-CI-test-1-13f69a23-0abc-env",
                 "act-CI-test-1-13f69a23-0abc",
                 "other-13f69a23-env",
                 "act-CI-test-ffffffff-0abc-env",
-            ]),
+            ]
+            .map(bare)
+            .to_vec(),
             ..Fake::default()
         };
         remove_env_volumes(&fake, "13f69a23");
@@ -501,9 +873,9 @@ mod tests {
 
     #[test]
     fn parses_docker_sizes() {
-        assert_eq!(size("4.3GB"), 4_300_000_000);
-        assert_eq!(size("512kB"), 512_000);
-        assert_eq!(size("0B"), 0);
-        assert_eq!(size("N/A"), 0);
+        assert_eq!(size("4.3GB"), Some(4_300_000_000));
+        assert_eq!(size("512kB"), Some(512_000));
+        assert_eq!(size("0B"), Some(0));
+        assert_eq!(size("N/A"), None);
     }
 }
