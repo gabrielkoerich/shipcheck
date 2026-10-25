@@ -175,6 +175,35 @@ fn status_logs_commit_and_post_refuse_before_any_run() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+#[cfg_attr(
+    jail,
+    ignore = "inside shipcheck's jail the outer sandbox is strict, so the checks run"
+)]
+fn inside_an_agents_sandbox_the_run_says_nothing_ran() {
+    let repo = Repo::new(MARKER);
+    repo.write("marker.txt", "x");
+    // An agent's sandbox, which allows more than the host checks' own and so cannot hold it
+    let out = Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", "(version 1)(allow default)"])
+        .arg(env!("CARGO_BIN_EXE_shipcheck"))
+        .args(["run", "--no-fetch"])
+        .current_dir(&repo.work)
+        .env("SHIPCHECK_HOME", &repo.home)
+        .env("SHIPCHECK_NO_DAEMON", "1")
+        .env_remove("SHIPCHECK_TOKEN")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("cannot start inside another sandbox"),
+        "{text}"
+    );
+    assert_eq!(repo.cached(), 0);
+}
+
+#[test]
 fn run_then_commit_exactly_the_working_copy() {
     let repo = Repo::new(MARKER);
     repo.write("marker.txt", "tested before the commit");

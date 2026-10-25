@@ -126,6 +126,27 @@ fn trusted_path_in(path: &std::ffi::OsStr, user: &Path, temp: &[PathBuf]) -> std
 /// The OS sandbox host checks run in, an error naming the fix when this machine has none
 pub fn sandbox() -> Result<&'static str, String> {
     if cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists() {
+        // macOS refuses a sandbox inside a sandbox, such as an agent's, unless that one is as strict
+        static STARTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let starts = *STARTS.get_or_init(|| {
+            in_a_jail()
+                || Command::new(SANDBOX_EXEC)
+                    // One real rule, since macOS starts a nested profile that restricts nothing
+                    .args([
+                        "-p",
+                        "(version 1)(allow default)(deny file-write* (literal \"/var/empty/shipcheck\"))",
+                        "/usr/bin/true",
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+        });
+
+        if !starts {
+            return Err(NESTED.into());
+        }
+
         return Ok("sandbox-exec");
     }
 
@@ -162,6 +183,8 @@ pub fn sandbox() -> Result<&'static str, String> {
 }
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+const NESTED: &str = "the host checks' sandbox cannot start inside another sandbox, such as an agent's, so nothing ran: run shipcheck outside it, for example by exempting the `shipcheck` command in the agent's sandbox settings. A push still gets its checks from the hook's run and the daemon, which run outside it";
 
 /**
  * Whether this process already runs in a jail as strict as a host check's, as shipcheck's own
