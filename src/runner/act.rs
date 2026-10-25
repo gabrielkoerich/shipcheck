@@ -146,6 +146,19 @@ impl Runner for Act {
         for (id, job) in jobs.iter_mut() {
             let base = id.as_str().map(|s| s.split("__").next().unwrap_or(s));
 
+            if let Yaml::Hash(job) = job
+                && let Some(rest) = job
+                    .get(&key("if"))
+                    .and_then(Yaml::as_str)
+                    .and_then(workflow::ungate)
+            {
+                if rest.is_empty() {
+                    job.remove(&key("if"));
+                } else {
+                    job.insert(key("if"), key(&rest));
+                }
+            }
+
             if let (Some(base), Yaml::Hash(job)) = (base, job)
                 && own_image.contains_key(base)
             {
@@ -2245,6 +2258,15 @@ jobs:
             !on.contains("nproc"),
             "the shard count must stay out of the key"
         );
+    }
+
+    #[test]
+    fn runs_the_jobs_init_gated_to_the_base_branch() {
+        let wf = "on:\n  push:\n    branches: [main, \"v[0-9]+\"]\n  pull_request:\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n  b:\n    runs-on: ubuntu-latest\n    if: always()\n    steps:\n      - run: make\n";
+        let gated = workflow::gate_jobs(wf, &["a".into(), "b".into()], "main").unwrap();
+        let out = load(&Act::default().prepare(&gated, "ci.yml").unwrap());
+        assert!(matches!(out["jobs"]["a"]["if"], Yaml::BadValue), "{out:?}");
+        assert_eq!(out["jobs"]["b"]["if"].as_str(), Some("always()"));
     }
 
     #[test]

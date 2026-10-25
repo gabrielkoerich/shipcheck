@@ -68,9 +68,6 @@ pub struct Change {
     pub no: String,
     short_yes: String,
     short_no: String,
-    /// Why yes is not the default, when it is not
-    pub warning: Option<String>,
-    pub recommended: bool,
 }
 
 /// The required checks init can turn on
@@ -519,7 +516,7 @@ impl Plan {
     pub fn recommended(&self) -> Answers {
         Answers {
             config: true,
-            workflows: self.workflows.iter().map(|w| w.recommended).collect(),
+            workflows: vec![true; self.workflows.len()],
             open_app: self.app == App::Hosted,
             ruleset: self.ruleset.is_some(),
         }
@@ -608,11 +605,6 @@ impl Plan {
             Step::Workflow(i) => {
                 let w = &self.workflows[i];
                 let mut out = vec![format!("{}: {}", w.file, w.yes)];
-
-                if let Some(warning) = &w.warning {
-                    out.push(format!("{} {}", s.warn(), s.yellow(warning)));
-                }
-
                 out.push(s.dim(&format!("Leave it as is and {}", w.no)));
                 out.extend(w.diff.lines().map(|l| format!("  {}", s.diff(l))));
                 out
@@ -1203,15 +1195,6 @@ fn coverage(
         .collect()
 }
 
-/// The jobs no check covers, for a warning
-fn uncovered(covers: &[&Cover]) -> String {
-    covers
-        .iter()
-        .map(|c| format!("job {} ({})", c.job, c.missing.join(", ")))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// The workflow edits for the jobs shipcheck checks, and notes for the workflows left alone
 fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), String> {
     let base = plan.base.clone();
@@ -1236,81 +1219,12 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
             }
         }
 
-        if !staying.is_empty() {
-            offered = true;
-            gate(&file, &source, &jobs, &covers, &staying, &base, plan);
+        if !crate::workflow::runs_for_branches(&source) {
             continue;
         }
 
-        let Some(edited) = crate::workflow::main_only(&source, &base) else {
-            if crate::workflow::runs_for_branches(&source) {
-                offered = true;
-                plan.notes.push(format!(
-                    "{file}: its `on:` has a form shipcheck does not edit, change it by hand"
-                ));
-            }
-
-            continue;
-        };
         offered = true;
-        let mut by: Vec<String> = Vec::new();
-
-        for c in &covers {
-            by.extend(
-                c.by.iter()
-                    .filter(|n| !by.contains(n))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            );
-        }
-
-        let on_prs = crate::workflow::runs_on_prs(&source);
-
-        // Its branch pushes are no PR check, and no shipcheck check takes their place
-        if by.is_empty() && !on_prs {
-            plan.notes.push(format!(
-                "{file}: GitHub keeps running it on pushes to every branch, and no shipcheck check runs its jobs"
-            ));
-            continue;
-        }
-
-        let missing: Vec<&Cover> = covers.iter().filter(|c| !c.missing.is_empty()).collect();
-        let runs = if by.is_empty() {
-            "nothing runs its jobs".to_string()
-        } else {
-            format!("shipcheck runs {}", by.join(", "))
-        };
-        plan.workflows.push(Change {
-            diff: diff(&file, &source, &edited),
-            yes: format!("on PRs {runs}, GitHub keeps running {file} on pushes to {base}"),
-            no: if on_prs {
-                format!("GitHub keeps running {file} on PRs and on pushes to {base}")
-            } else {
-                format!("GitHub keeps running {file} on pushes to every branch")
-            },
-            short_yes: format!(
-                "PRs: {}, {base}: GitHub",
-                if by.is_empty() {
-                    "nothing".into()
-                } else {
-                    by.join(", ")
-                }
-            ),
-            short_no: if on_prs {
-                format!("PRs and {base}: GitHub, as now")
-            } else {
-                "pushes: GitHub, as now".into()
-            },
-            warning: (!missing.is_empty()).then(|| {
-                format!(
-                    "no shipcheck check runs {}. Change it and PRs run that nowhere",
-                    uncovered(&missing)
-                )
-            }),
-            recommended: missing.is_empty(),
-            edited,
-            file,
-        });
+        gate(&file, &source, &jobs, &covers, &staying, &base, plan);
     }
 
     if !offered {
@@ -1322,9 +1236,10 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
 }
 
 /**
- * A workflow with jobs that stay on GitHub keeps its triggers, and the jobs shipcheck checks run
- * on GitHub only on the base branch. A job that a job left on GitHub needs is not gated, or GitHub
- * would skip that job too
+ * A workflow keeps its triggers, and the jobs shipcheck checks run on GitHub only on the base
+ * branch and for a fork's PR, which the daemon never runs. Cutting `on:` instead would leave a
+ * fork's PR with no check. A job that a job left on GitHub needs is not gated, or GitHub would skip
+ * that job too
  **/
 fn gate(
     file: &str,
@@ -1361,10 +1276,17 @@ fn gate(
         .map(|j| j.id.clone())
         .filter(|id| !ungated.contains(id))
         .collect();
-    let stay = staying.join(", ");
+    let stay = jobs
+        .iter()
+        .filter(|j| ungated.contains(&j.id) && !base_only.contains(&j.id))
+        .map(|j| j.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let on_prs = crate::workflow::runs_on_prs(source);
 
     if gated.is_empty() {
-        plan.notes.push(if crate::workflow::runs_on_prs(source) {
+        plan.notes.push(if on_prs {
             format!(
                 "{file}: GitHub keeps running it on PRs, for {stay}, and no job of it runs only in shipcheck"
             )
@@ -1379,8 +1301,9 @@ fn gate(
 
     let Some(edited) = crate::workflow::gate_jobs(source, &gated, base) else {
         plan.notes.push(format!(
-            "{file}: a job has a form shipcheck does not edit. To run {} on GitHub only on {base}, give each `if: github.ref == 'refs/heads/{base}' || github.actor == 'dependabot[bot]'` by hand",
-            gated.join(", ")
+            "{file}: a job has a form shipcheck does not edit. To run {} on GitHub only on {base} and for forks, give each `if: github.ref == 'refs/heads/{base}' || github.actor == 'dependabot[bot]' || {fork}` by hand",
+            gated.join(", "),
+            fork = crate::workflow::FORK
         ));
         return;
     };
@@ -1394,16 +1317,30 @@ fn gate(
     plan.workflows.push(Change {
         file: file.to_string(),
         diff: diff(file, source, &edited),
-        yes: format!(
-            "on PRs shipcheck runs {}, GitHub keeps running {stay} on PRs and all of {file} on pushes to {base}{}",
-            by.join(", "),
-            elsewhere(source, base)
-        ),
-        no: format!("GitHub keeps running all of {file} on PRs, beside shipcheck's checks"),
-        short_yes: format!("PRs: {}, GitHub {stay}, {base}: GitHub", by.join(", ")),
+        yes: if stay.is_empty() {
+            format!(
+                "on PRs shipcheck runs {}, GitHub keeps running {file} on pushes to {base}{}",
+                by.join(", "),
+                elsewhere(source, base)
+            )
+        } else {
+            format!(
+                "on PRs shipcheck runs {}, GitHub keeps running {stay} on PRs and all of {file} on pushes to {base}{}",
+                by.join(", "),
+                elsewhere(source, base)
+            )
+        },
+        no: if on_prs {
+            format!("GitHub keeps running all of {file} on PRs, beside shipcheck's checks")
+        } else {
+            format!("GitHub keeps running {file} on pushes to every branch")
+        },
+        short_yes: if stay.is_empty() {
+            format!("PRs: {}, {base} and forks: GitHub", by.join(", "))
+        } else {
+            format!("PRs: {}, GitHub {stay}, {base} and forks: GitHub", by.join(", "))
+        },
         short_no: format!("PRs and {base}: GitHub, as now"),
-        warning: None,
-        recommended: true,
         edited,
     });
 }
@@ -1421,10 +1358,7 @@ fn elsewhere(source: &str, base: &str) -> String {
         more.push("on PRs into other branches".to_string());
     }
 
-    if more.is_empty() {
-        return String::new();
-    }
-
+    more.push("on fork PRs".to_string());
     format!(", and {}", more.join(" and "))
 }
 
@@ -1722,12 +1656,13 @@ mod tests {
         ]);
         let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let ci = &plan.workflows[0];
-        assert!(ci.recommended, "{:?}", ci.warning);
         assert_eq!(
             ci.yes,
-            "on PRs shipcheck runs shipcheck/fmt, shipcheck/clippy, shipcheck/test, GitHub keeps running ci.yml on pushes to main"
+            "on PRs shipcheck runs shipcheck/clippy, shipcheck/fmt, shipcheck/test, GitHub keeps running ci.yml on pushes to main, and on PRs into other branches and on fork PRs"
         );
-        assert!(ci.diff.contains("-  pull_request:"), "{}", ci.diff);
+        // `on:` stays, so a fork's PR, which the daemon never runs, still gets the checks
+        assert!(!ci.diff.contains("-  pull_request:"), "{}", ci.diff);
+        assert!(ci.diff.contains("&& (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\""), "{}", ci.diff);
     }
 
     #[test]
@@ -1752,19 +1687,12 @@ mod tests {
             plan.notes[1],
             "leaks.yml: GitHub keeps running it on PRs, for gitleaks, and no job of it runs only in shipcheck"
         );
-        assert!(plan.workflows.iter().all(|w| !w.recommended));
-        let warning = |i: usize| plan.workflows[i].warning.clone().unwrap_or_default();
+        // A job no check runs stays on GitHub ungated, so a PR still runs it there
         assert_eq!(
-            warning(0),
-            "no shipcheck check runs job service (`bun run test` in service, `bun run test:worker` in service, `bunx tsc --noEmit` in service). Change it and PRs run that nowhere"
+            plan.workflows[0].yes,
+            "on PRs shipcheck runs shipcheck/clippy, shipcheck/fmt, shipcheck/test, GitHub keeps running service on PRs and all of ci.yml on pushes to main, and on PRs into other branches and on fork PRs"
         );
-        assert!(
-            plan.workflows[0].yes.starts_with(
-                "on PRs shipcheck runs shipcheck/fmt, shipcheck/clippy, shipcheck/test,"
-            ),
-            "{}",
-            plan.workflows[0].yes
-        );
+        assert!(plan.workflows[0].diff.contains("&& (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\""));
     }
 
     #[test]
@@ -1774,36 +1702,29 @@ mod tests {
             (".github/workflows/lint.yml", LINT),
             (
                 "shipcheck.toml",
-                "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n",
+                "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\nclippy = \"cargo clippy\"\n",
             ),
         ]);
         let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let mut a = plan.recommended();
-        // ci.yml is checked, so yes is its default. lint.yml is not
-        assert_eq!(a.workflows, [true, false]);
-        assert!(
-            plan.workflows[1]
-                .warning
-                .as_deref()
-                .unwrap()
-                .contains("job lint (`cargo clippy`)")
-        );
+        assert_eq!(a.workflows, [true, true]);
 
         // Changing step 2, lint.yml, and back again, as the review's "Change a step" does
-        plan.set(Step::Workflow(1), &mut a, true);
+        plan.set(Step::Workflow(1), &mut a, false);
         assert!(
-            plan.review(&a)[2].contains("PRs: nothing, main: GitHub"),
+            plan.review(&a)[2].contains("PRs and main: GitHub, as now"),
             "{:?}",
             plan.review(&a)
         );
+        plan.set(Step::Workflow(1), &mut a, true);
+        assert!(plan.review(&a)[2].contains("PRs: shipcheck/clippy, main and forks: GitHub"));
         plan.set(Step::Workflow(1), &mut a, false);
-        assert!(plan.review(&a)[2].contains("PRs and main: GitHub, as now"));
 
         let mut said = Said::default();
         let next = apply(dir.path(), &plan, &a, &mut finish_nothing, &mut said).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
-            "on:\n  push:\n    branches: [main, \"dependabot/**\"]\njobs:\n  test:\n    steps:\n      - run: cargo test\n"
+            CI.replace("  test:\n", "  test:\n    if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n")
         );
         assert_eq!(
             fs::read_to_string(dir.path().join(".github/workflows/lint.yml")).unwrap(),
@@ -1902,7 +1823,7 @@ mod tests {
             fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
             ci.replace(
                 "  test:\n",
-                "  test:\n    if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n"
+                "  test:\n    if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n"
             ),
         );
         assert!(
@@ -1933,12 +1854,12 @@ mod tests {
             fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
             ci.replace(
                 "  lint:\n",
-                "  lint:\n    if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n"
+                "  lint:\n    if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n"
             ),
         );
         assert_eq!(
             plan.workflows[0].yes,
-            "on PRs shipcheck runs shipcheck/lint, GitHub keeps running tests on PRs and all of ci.yml on pushes to main, and on PRs into other branches"
+            "on PRs shipcheck runs shipcheck/lint, GitHub keeps running tests on PRs and all of ci.yml on pushes to main, and on PRs into other branches and on fork PRs"
         );
 
         // The matrix needs lint, so lint stays on GitHub too and nothing is gated
@@ -1950,7 +1871,7 @@ mod tests {
         let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         assert!(plan.workflows.is_empty());
         assert!(
-            plan.notes[0].contains("ci.yml: GitHub keeps running it on PRs, for tests, lint"),
+            plan.notes[0].contains("ci.yml: GitHub keeps running it on PRs, for lint, tests"),
             "{:?}",
             plan.notes
         );
@@ -1965,9 +1886,9 @@ mod tests {
             (".github/workflows/lint.yml", lint),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let change = &plan.workflows[0];
-        assert!(change.recommended, "{:?}", change.warning);
+        assert_eq!(plan.recommended().workflows, [true]);
         assert_eq!(
             Some(change.edited.clone()),
             crate::workflow::gate_jobs(lint, &["ruby".to_string()], "main")
