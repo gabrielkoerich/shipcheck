@@ -584,7 +584,7 @@ fn handle(
 
     // The check reflects the owner's rules, so a repository with no shipcheck.toml on main gets none
     if plan.defaults {
-        return Ok(None);
+        return Ok(Some("not checked, no shipcheck.toml on main"));
     }
 
     if !plan.config.daemon {
@@ -737,6 +737,12 @@ fn handle(
         }
         Action::Queue => {
             background::mark(&send, &existing, sha, &names, false)?;
+
+            // It never runs here, so asking again every poll would only spend API calls until its head changes
+            if !same_repo {
+                return Ok(Some("queued, the daemon never runs a fork's PR"));
+            }
+
             Ok(None)
         }
     }
@@ -1260,7 +1266,11 @@ mod tests {
         let fork = open_pr(5, &sha, "main", "eve/app");
         let fake = Fake::by("ann");
         let (got, started) = run_handle(&fake, "acme/app", dir.path(), &fork);
-        assert_eq!(got, Ok(None));
+        assert_eq!(
+            got,
+            Ok(Some("queued, the daemon never runs a fork's PR")),
+            "a fork's PR would be polled again every cycle"
+        );
         assert!(started.is_empty(), "a fork's PR started a run");
         assert!(!fake.statuses().is_empty());
         assert!(
@@ -1285,6 +1295,30 @@ mod tests {
         if run::secret_values("acme/app").is_ok() {
             assert!(tail(&fake), "a same-repo PR's check holds its log tail");
         }
+    }
+
+    #[test]
+    fn a_repository_with_no_config_on_main_is_not_polled_again() {
+        if !own_home("a_repository_with_no_config_on_main_is_not_polled_again") {
+            return;
+        }
+
+        let (dir, _) = checkout("https://github.com/acme/app.git", ACT);
+        run_git(dir.path(), &["rm", "-q", "shipcheck.toml"]);
+        run_git(dir.path(), &["commit", "-q", "-m", "no config"]);
+        run_git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        std::fs::write(dir.path().join("more.txt"), "y").unwrap();
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "-q", "-m", "head"]);
+        let sha = run_git(dir.path(), &["rev-parse", "HEAD"]);
+        let fake = Fake::by("ann");
+        let pr = open_pr(5, &sha, "main", "acme/app");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
+        assert_eq!(got, Ok(Some("not checked, no shipcheck.toml on main")));
+        assert!(fake.bodies().is_empty() && started.is_empty());
     }
 
     #[test]
