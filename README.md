@@ -72,7 +72,7 @@ What a green check proves and what a job can reach: [proof](https://shipcheck.ru
 |---|---|
 | `src/` | The `shipcheck` CLI and daemon |
 | `tests/` | Integration and end-to-end tests |
-| `Formula/` | The Homebrew formula template, filled in by the release workflow |
+| `Formula/` | The Homebrew formula template, filled in by the `release` job of `ci.yml` |
 
 ## License
 

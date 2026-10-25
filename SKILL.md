@@ -7,7 +7,15 @@ description: Run a repository's CI checks locally with shipcheck and read the re
 
 shipcheck runs the checks that `shipcheck.toml` names on this machine, for your working copy or a commit, and keeps the result for that git tree. The PR's required checks, one per job such as `shipcheck/test`, come from that result, so a passing local run is what lets the PR merge.
 
-There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the listed GitHub workflows, and each job runs in its own container. `runner` is the default for every job: a `[jobs."ci.yml/e2e"]` table with `runner = "act"` runs that one job, and the jobs it needs, with act beside the host checks, in the same run and under the same `shipcheck` check. A workflow listed in `workflows` still runs whole under act, also with `runner = "host"`. `runner = "host"` in a `[jobs]` table takes that job out of a listed workflow, and the `[host.checks]` entry of the same id runs in its place. `shipcheck run --job <name>` picks the host check when a host check and an act job share the name, `--job ci.yml/e2e` picks one workflow's job. `engine = "colima"` in a `[jobs]` table runs that act job on a Colima VM of its own, with its own Docker and kernel, for a job that runs Docker or needs a Linux kernel feature. The VM reaches this machine's loopback and the internet, so use it only for code you trust.
+There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the jobs of the workflows listed in `workflows`, each in its own container. A listed workflow runs under act in both modes.
+
+`runner` sets the mode of every job. A `[jobs."<file>/<job>"]` table changes it for one job, in the same run and under the same `shipcheck` check:
+
+- `runner = "act"` runs that job, and the jobs it needs, under act beside the host checks.
+- `runner = "host"` takes that job out of a listed workflow, and the `[host.checks]` entry of the same id runs in its place.
+- `engine = "colima"` runs that act job on a Colima VM of its own, with its own Docker and kernel, for a job that runs Docker or needs a Linux kernel feature. The VM reaches this machine's loopback and the internet, so use it only for code you trust.
+
+`shipcheck run --job <name>` picks the host check when a host check and an act job share the name. `--job ci.yml/e2e` picks the job of one workflow.
 
 Docs: https://shipcheck.run/llms.txt
 

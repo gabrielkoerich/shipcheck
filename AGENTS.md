@@ -23,7 +23,7 @@ Every change must keep these.
 - Opinionated defaults. Setup is: install the binary, `shipcheck init`, merge `shipcheck.toml`, install the App. Every option has a default that works, and none is required. A change that adds a step, a question or a required option to that path needs a reason in its PR. Otherwise it gets a default.
 - Rust, one crate with one binary, `shipcheck`. The daemon is `shipcheck daemon`.
 - `SKILL.md` at the root tells agents how to use shipcheck. Keep it true to the CLI. https://shipcheck.run serves it.
-- `Formula/shipcheck.rb` is the Homebrew template. The release workflow fills in versions and checksums and pushes it to `gabrielkoerich/homebrew-tap`.
+- `Formula/shipcheck.rb` is the Homebrew template. Each merge to `main` is a release: the `release` job of `ci.yml` fills in versions and checksums and pushes the formula to `gabrielkoerich/homebrew-tap`.
 - Call `act` and `git` as processes. Do not embed or reimplement them.
 - The cache key needs a test with fixed inputs and a fixed expected digest.
 - Test `act` behaviour against a real workflow before claiming it works.
