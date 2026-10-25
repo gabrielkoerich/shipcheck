@@ -139,8 +139,9 @@ pub fn install(root: &Path) -> String {
 
 /// Adds the checkout to the daemon at the base the remote names. Offline it stores no guess
 fn register(file: &Path, checkout: &Path) -> Result<bool, String> {
-    let base = run::remote_base(checkout)
-        .ok_or("could not ask origin for its default branch, run init again when online")?;
+    let base = run::remote_base(checkout).ok_or(
+        "could not ask origin for its default branch, run `shipcheck install` again when online",
+    )?;
     DaemonConfig::add_to(file, &run::repo_id(checkout)?, checkout, &base)
 }
 

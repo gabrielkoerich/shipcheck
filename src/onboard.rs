@@ -200,13 +200,7 @@ fn tried(
     let (results, versions) = try_checks(root, &text, r)?;
     let mut d = setup::detect_on(root, machine);
     let mut failed = Vec::new();
-
-    for v in d.versions.iter().filter(|v| !versions.contains(v)) {
-        d.skipped.push(format!(
-            "versions `{v}`: it does not run here, so init left it out"
-        ));
-    }
-
+    // try_checks already said which versions it left out
     d.versions = versions;
     d.checks.retain_mut(|c| match results.get(&c.name) {
         Some(Ok(command)) => {

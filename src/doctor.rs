@@ -206,7 +206,10 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         if has_base {
             Ok(format!("{base} found"))
         } else {
-            Err(format!("{base} is missing: `git fetch origin main`"))
+            Err(format!(
+                "{base} is missing: `git fetch origin {}`",
+                base.strip_prefix("origin/").unwrap_or(base)
+            ))
         },
     ));
 

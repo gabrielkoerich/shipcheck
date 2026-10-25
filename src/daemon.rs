@@ -193,6 +193,8 @@ pub fn serve(home_ok: bool) -> ! {
     let mut heads: BTreeMap<(String, u64), String> = BTreeMap::new();
     // The head each PR had while it waited for GitHub to list its push
     let mut waits: BTreeMap<(String, u64), String> = BTreeMap::new();
+    // The heads checked while the base had no shipcheck.toml, with the base's tip then
+    let mut unconfigured: HashMap<(String, String), String> = HashMap::new();
 
     loop {
         let config = match DaemonConfig::load() {
@@ -226,7 +228,13 @@ pub fn serve(home_ok: bool) -> ! {
                 }
             }
 
-            let state = (&mut done, &mut waiting, &mut heads, &mut waits);
+            let state = (
+                &mut done,
+                &mut waiting,
+                &mut heads,
+                &mut waits,
+                &mut unconfigured,
+            );
 
             if let Err(e) = cycle(&config, repo, entry, &senders[repo], state) {
                 eprintln!("{repo}: {e}");
@@ -253,7 +261,7 @@ fn cycle(
     repo: &str,
     entry: &RepoEntry,
     sender: &Sender,
-    (done, waiting, heads, waits): State,
+    (done, waiting, heads, waits, unconfigured): State,
 ) -> Result<(), String> {
     let base_branch = entry.base.strip_prefix("origin/").unwrap_or(&entry.base);
     let open = sender.open_prs()?;
@@ -286,9 +294,11 @@ fn cycle(
         waits.remove(&(repo.to_string(), number));
     }
 
+    // ponytail: a head waiting for a shipcheck.toml on the base costs a fetch each cycle
+    let id = |pr: &OpenPr| (repo.to_string(), pr.sha.clone());
     if prs
         .iter()
-        .all(|pr| done.contains(&(repo.to_string(), pr.sha.clone())))
+        .all(|pr| done.contains(&id(pr)) && !unconfigured.contains_key(&id(pr)))
     {
         return Ok(());
     }
@@ -298,6 +308,9 @@ fn cycle(
             "could not fetch {base_branch}, so its config cannot be trusted"
         ));
     }
+
+    let tip = base_tip(entry);
+    recheck(unconfigured, done, repo, &tip);
 
     for pr in prs {
         let id = (repo.to_string(), pr.sha.clone());
@@ -326,6 +339,11 @@ fn cycle(
                 println!("{repo}#{}: {verdict} on {}", pr.number, &pr.sha[..12]);
                 heads.insert((repo.to_string(), pr.number), pr.sha.clone());
                 waiting.remove(&id);
+
+                if verdict == NO_CONFIG {
+                    unconfigured.insert(id.clone(), tip.clone());
+                }
+
                 done.insert(id);
             }
             Ok(None) => {
@@ -353,7 +371,46 @@ type State<'a> = (
     &'a mut HashMap<(String, String), Instant>,
     &'a mut BTreeMap<(String, u64), String>,
     &'a mut BTreeMap<(String, u64), String>,
+    &'a mut HashMap<(String, String), String>,
 );
+
+const NO_CONFIG: &str = "not checked, no shipcheck.toml on main";
+
+/// The commit the fetched base is at, empty when git cannot say
+fn base_tip(entry: &RepoEntry) -> String {
+    Command::new("git")
+        .arg("-C")
+        .arg(&entry.path)
+        .args([
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("{}^{{commit}}", entry.base),
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Checks again the heads of `repo` marked with no config once the base moved, as a merge of shipcheck.toml does
+fn recheck(
+    unconfigured: &mut HashMap<(String, String), String>,
+    done: &mut HashSet<(String, String)>,
+    repo: &str,
+    tip: &str,
+) {
+    unconfigured.retain(|id, at| {
+        let moved = id.0 == repo && at != tip;
+
+        if moved {
+            done.remove(id);
+        }
+
+        !moved
+    });
+}
 
 /// The heads that waited for their push event and that a new head on the same PR replaced
 fn abandoned(
@@ -664,7 +721,7 @@ fn handle(
 
     // The check reflects the owner's rules, so a repository with no shipcheck.toml on main gets none
     if plan.defaults {
-        return Ok(Some("not checked, no shipcheck.toml on main"));
+        return Ok(Some(NO_CONFIG));
     }
 
     if !plan.config.daemon {
@@ -996,6 +1053,21 @@ mod tests {
         assert!(mark);
         assert!(refusal(&Pushed::Wait).is_none());
         assert!(refusal(&Pushed::Run).is_none());
+    }
+
+    #[test]
+    fn a_head_with_no_config_is_checked_again_when_the_base_moves() {
+        let id = |repo: &str, sha: &str| (repo.to_string(), sha.to_string());
+        let mut done = HashSet::from([id("acme/app", "a"), id("acme/lib", "b")]);
+        let mut unconfigured = HashMap::from([
+            (id("acme/app", "a"), "tip1".to_string()),
+            (id("acme/lib", "b"), "tip1".to_string()),
+        ]);
+        recheck(&mut unconfigured, &mut done, "acme/app", "tip1");
+        assert_eq!(done.len(), 2, "the base did not move");
+        recheck(&mut unconfigured, &mut done, "acme/app", "tip2");
+        assert_eq!(done, HashSet::from([id("acme/lib", "b")]));
+        assert_eq!(unconfigured.len(), 1, "another repository's head stays");
     }
 
     #[test]
