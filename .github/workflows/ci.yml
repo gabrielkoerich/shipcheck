@@ -314,8 +314,11 @@ jobs:
           PY
           grep -m1 '^version' Cargo.toml
 
-      # Publish first: a tag without a crate is worse than a crate without a tag, and a rerun then tags it.
-      # Permanent: a version can be yanked, never deleted, and it publishes the source
+      # A crate crates.io would refuse fails here, before the tag
+      - name: Check the crate publishes
+        run: |
+          cargo publish --dry-run --locked --allow-dirty
+
       # Before crates.io, so a refused tag leaves nothing published
       - name: Create tag
         env:
@@ -326,6 +329,7 @@ jobs:
           git tag -a "$VERSION" -m "$VERSION"
           git push origin "$VERSION"
 
+      # Permanent: a version can be yanked, never deleted, and it publishes the source
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

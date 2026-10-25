@@ -71,6 +71,14 @@ fn error_state(e: &str) -> &'static str {
 }
 
 impl Entry {
+    /// A job's clone was not the tested tree, a fault of shipcheck's own that another run may not repeat
+    fn wrong_tree(&self) -> bool {
+        self.workflows
+            .iter()
+            .flat_map(|w| w.jobs.values())
+            .any(|s| s.starts_with(WRONG_TREE))
+    }
+
     /// It failed only because shipcheck could not start jobs, so the code never ran
     pub fn could_not_run(&self) -> bool {
         let states = || self.workflows.iter().flat_map(|w| w.jobs.values());
@@ -1289,8 +1297,8 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
 pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     let entry = execute(plan, None, say)?;
 
-    // Docker or the sandbox failed before the code ran, so there is no verdict to keep
-    if entry.could_not_run() {
+    // Docker or the sandbox failed before the code ran, or a clone was wrong, so there is no verdict to keep
+    if entry.could_not_run() || entry.wrong_tree() {
         return Ok(entry);
     }
 
@@ -2513,7 +2521,7 @@ fn verify_checkout(dir: &Path, tree: &str) -> Result<(), String> {
 
     if on_disk != tree {
         return Err(format!(
-            "{WRONG_TREE}: {} is tree {on_disk}, not {tree}. Run again from a clean worktree",
+            "{WRONG_TREE}: shipcheck's clone {} is tree {on_disk}, not {tree}. Run again, and report it at https://github.com/gabrielkoerich/shipcheck/issues if it repeats",
             dir.display()
         ));
     }
@@ -3262,6 +3270,21 @@ mod tests {
         // A wrong tree is the check's failure, exit 1, never "could not run"
         let e = verify_checkout(&repo, &other).unwrap_err();
         assert_eq!(error_state(&e), WRONG_TREE, "{e}");
+    }
+
+    #[test]
+    fn a_wrong_tree_fails_the_check_and_is_never_kept() {
+        let entry: Entry = serde_json::from_value(serde_json::json!({
+            "key": "k", "sha": "s", "tree": "t", "base": "origin/main", "passed": false,
+            "finished_unix": 0,
+            "workflows": [{
+                "file": HOST, "exit": 1, "attempts": 1, "log_sha256": "", "passed": false,
+                "jobs": {"test": WRONG_TREE, "fmt": "success"},
+            }],
+        }))
+        .unwrap();
+        assert!(entry.wrong_tree() && !entry.could_not_run());
+        assert_eq!(exit_code(&entry), 1);
     }
 
     #[test]

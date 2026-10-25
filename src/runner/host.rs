@@ -456,9 +456,9 @@ impl Jail {
     }
 
     /**
-     * `bwrap` arguments. The root read-only, then new empty `/tmp`, `/run` and user home, so no
-     * Unix socket of the host is in reach by path, then the toolchains read-only and the jail
-     * writable. The host's network, and a pid namespace and session that die with the check
+     * `bwrap` arguments. The root read-only, then new empty `/tmp`, `/var/tmp`, `/run` and user
+     * home, so no Unix socket of the host is in reach by path, then the toolchains read-only and the
+     * jail writable. The host's network, and a pid namespace and session that die with the check
      **/
     fn bwrap_args(&self) -> Result<Vec<std::ffi::OsString>, String> {
         let user = Self::user()?;
@@ -481,8 +481,11 @@ impl Jail {
         .map(Into::into)
         .to_vec();
 
-        if fs::symlink_metadata("/var/run").is_ok_and(|m| m.is_dir()) {
-            args.extend(["--tmpfs".into(), "/var/run".into()]);
+        // As on macOS, a check reads nothing another process left in the host's temp dirs
+        for dir in ["/var/run", "/var/tmp"] {
+            if fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+                args.extend(["--tmpfs".into(), dir.into()]);
+            }
         }
 
         args.extend(["--tmpfs".into(), user.clone().into()]);
@@ -1621,6 +1624,10 @@ mod tests {
             "--tmpfs /run",
         ] {
             assert!(all.contains(flag), "{flag}");
+        }
+
+        if Path::new("/var/tmp").is_dir() && !Path::new("/var/tmp").is_symlink() {
+            assert!(all.contains("--tmpfs /var/tmp"), "{all}");
         }
 
         let user = resolved(crate::run::user_dir());
