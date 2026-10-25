@@ -107,6 +107,8 @@ pub struct Job {
 pub enum Engine {
     #[default]
     Docker,
+    /// A Colima VM per job, which reaches this machine's loopback, for trusted repositories only
+    Colima,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone, Copy, Default)]
@@ -429,6 +431,15 @@ impl RepoConfig {
         }
 
         files
+    }
+
+    /// The engine each act `[jobs]` entry sets, by `"<file>/<job>"`
+    pub fn engines(&self) -> BTreeMap<String, Engine> {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| self.job_runner(job) == RunnerKind::Act)
+            .filter_map(|(name, job)| Some((name.clone(), job.engine?)))
+            .collect()
     }
 
     /// Some job runs under act
@@ -846,6 +857,13 @@ mod tests {
         assert_eq!(cfg.act_files(), ["ci.yml"]);
         assert_eq!(cfg.jobs_on(RunnerKind::Act), ["ci.yml/e2e"]);
         assert_eq!(cfg.jobs["ci.yml/e2e"].engine, Some(Engine::Docker));
+        let vm =
+            RepoConfig::parse("[jobs.\"ci.yml/e2e\"]\nengine = \"colima\"\n[jobs.\"ci.yml/b\"]")
+                .unwrap();
+        assert_eq!(
+            vm.engines(),
+            BTreeMap::from([("ci.yml/e2e".to_string(), Engine::Colima)])
+        );
 
         // Without [jobs], one runner, as before
         let host = RepoConfig::parse("runner = \"host\"\n[host.checks]\nt = \"x\"").unwrap();

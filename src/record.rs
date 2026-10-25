@@ -151,7 +151,7 @@ pub fn event(repo: &str, name: &str, mut fields: Value) -> Value {
 /// act's identity is one line, a host check's version output can be several, so only mixed splits
 fn run_tools(kind: &str, identity: &str) -> Vec<String> {
     match identity.split_once('\n') {
-        Some((act, host)) if kind == "mixed" => [vec![act.to_string()], tools(host)].concat(),
+        Some((act, host)) if kind == "mixed" => [tools(act), tools(host)].concat(),
         _ => tools(identity),
     }
 }
@@ -323,6 +323,10 @@ mod tests {
             run_tools("act", "act version 0.2.89"),
             ["act version 0.2.89"]
         );
+        let colima = "act version 0.2.89\0colima\0colima version 0.10.3";
+        let both = ["act version 0.2.89", "colima: colima version 0.10.3"];
+        assert_eq!(run_tools("act", colima), both);
+        assert_eq!(run_tools("mixed", &format!("{colima}\nhost"))[..2], both);
     }
 
     fn plan() -> Plan {

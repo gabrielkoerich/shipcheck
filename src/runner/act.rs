@@ -24,6 +24,8 @@ pub struct Act {
     config: config::Act,
     network: config::Network,
     shards: config::ShardTests,
+    /// The engine of each `[jobs]` entry that sets one, by `"<file>/<job>"`
+    engines: BTreeMap<String, config::Engine>,
 }
 
 impl Act {
@@ -32,7 +34,29 @@ impl Act {
             config,
             network: config::Network::None,
             shards: config::ShardTests::default(),
+            engines: BTreeMap::new(),
         }
+    }
+
+    pub fn with_engines(self, engines: BTreeMap<String, config::Engine>) -> Self {
+        Act { engines, ..self }
+    }
+
+    /// The labels this host has an image for, the default ones and each `[act.jobs]` job's own
+    pub(super) fn labels(&self, file: &str) -> Vec<String> {
+        platforms(&self.config)
+            .into_keys()
+            .chain(
+                self.config
+                    .job_images(file)
+                    .into_keys()
+                    .map(|j| job_label(&j)),
+            )
+            .collect()
+    }
+
+    fn uses_colima(&self) -> bool {
+        self.engines.values().any(|e| *e == config::Engine::Colima)
     }
 
     pub fn with_network(self, network: config::Network) -> Self {
@@ -54,6 +78,13 @@ pub fn job_label(job: &str) -> String {
  * act's and the same on every engine, an engine starts act for one job and cleans up after it
  **/
 pub trait Engine: Sync {
+    fn name(&self) -> &'static str;
+
+    /// What the cache key holds of the engine. Docker's is none, so keys from before it stay
+    fn identity(&self) -> Result<String, String> {
+        Ok(String::new())
+    }
+
     /// Refuses a host whose isolation is known to be broken
     fn preflight(&self) -> Result<(), String>;
 
@@ -74,14 +105,25 @@ pub trait Engine: Sync {
 pub struct Docker;
 
 impl Act {
-    fn engine(&self, _file: &str, _job: &str) -> &dyn Engine {
-        &Docker
+    /// The engine of a job, or of the matrix job a leg `<job>__<n>` came from
+    fn engine(&self, file: &str, job: &str) -> &dyn Engine {
+        let base = job.split("__").next().unwrap_or(job);
+
+        match self.engines.get(&format!("{file}/{base}")) {
+            Some(config::Engine::Colima) => &super::colima::Colima,
+            _ => &Docker,
+        }
     }
 }
 
 impl Runner for Act {
     fn preflight(&self) -> Result<(), String> {
+        // A job that a colima job needs runs on Docker, so Docker is checked either way
         Docker.preflight()?;
+
+        if self.uses_colima() {
+            super::colima::Colima.preflight()?;
+        }
 
         // act before 0.2.86 served its cache on every interface and honoured ::set-env (CVE-2026-34041, -34042)
         let act = self.identity()?;
@@ -110,6 +152,15 @@ impl Runner for Act {
             ));
         }
 
+        if self.uses_colima() {
+            let colima = &super::colima::Colima;
+            return Ok(format!(
+                "{version}\0{}\0{}",
+                colima.name(),
+                colima.identity()?
+            ));
+        }
+
         Ok(version)
     }
 
@@ -124,6 +175,10 @@ impl Runner for Act {
 
     fn reclaim(&self, run_dir: &Path) {
         Docker.reclaim(run_dir);
+
+        if self.uses_colima() {
+            super::colima::Colima.reclaim(run_dir);
+        }
     }
 
     fn prune(&self) -> Vec<String> {
@@ -299,6 +354,10 @@ impl Act {
 }
 
 impl Engine for Docker {
+    fn name(&self) -> &'static str {
+        "docker"
+    }
+
     fn preflight(&self) -> Result<(), String> {
         let out = Command::new("docker")
             .args([
@@ -323,35 +382,9 @@ impl Engine for Docker {
         let run_dir = request.run_dir;
         let began = Instant::now();
         let (file, job) = (request.file, request.job);
-
-        // act reads these from the checkout, so a commit could change how its own run behaves
-        for dotfile in [".actrc", ".env", ".secrets", ".vars", ".input"] {
-            let _ = fs::remove_file(run_dir.join(dotfile));
-        }
-
         let wf_path = request.workflow;
-        let prepared = fs::read_to_string(wf_path).map_err(|e| e.to_string())?;
         let tag = run_tag(run_dir);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let nonce = cache::hex(
-            &Sha256::digest(format!(
-                "{}{}{}",
-                run_dir.display(),
-                now.as_nanos(),
-                std::process::id()
-            ))[..16],
-        );
-        write_nonces(run_dir, &nonce).map_err(|e| e.to_string())?;
-        let isolated = isolate(
-            &prepared,
-            request.file,
-            request.job,
-            request.needs,
-            &tag,
-            &nonce,
-        )?;
+        let isolated = isolated(request, &tag, true)?;
         let shards = (request.shard && isolated.contains(shard::MARK))
             .then(|| shard::count(act.shards, engine_resources()));
 
@@ -677,7 +710,7 @@ fn skipped_by_if(cmd: &Command) -> bool {
 }
 
 /// act's verbose line for a job whose `if:` is false
-fn dry_run_skips(log: &str) -> bool {
+pub(super) fn dry_run_skips(log: &str) -> bool {
     log.lines()
         .any(|l| l.contains("] [DEBUG] Skipping job '") && l.contains("' due to '"))
 }
@@ -1070,7 +1103,7 @@ fn outputs_step(job: &Hash) -> Option<Yaml> {
 }
 
 /// The outputs a job printed with its outputs step, the last value of each name
-fn read_outputs(log: &str) -> BTreeMap<String, String> {
+pub(super) fn read_outputs(log: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
 
     for line in log.lines() {
@@ -1108,7 +1141,7 @@ fn read_outputs(log: &str) -> BTreeMap<String, String> {
  * `[<workflow>/<job>]   ⚙  Summary - <first line>`, the other lines bare. A step's own output
  * has `|` after the prefix, so it cannot pass for one. The summary ends at the next prefixed line
  **/
-fn read_summary(log: &str) -> String {
+pub(super) fn read_summary(log: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut open: Option<&str> = None;
 
@@ -1261,6 +1294,45 @@ fn reads_needs(y: &Yaml, is_if: bool) -> Option<String> {
 }
 
 /**
+ * The prepared workflow cut down to the request's job, with a new nonce written into its checkout.
+ * act reads its dotfiles from the checkout, so a commit could change how its own run behaves, and
+ * they go first
+ **/
+pub(super) fn isolated(request: &RunRequest, tag: &str, shared: bool) -> Result<String, String> {
+    let run_dir = request.run_dir;
+
+    for dotfile in [".actrc", ".env", ".secrets", ".vars", ".input"] {
+        let _ = fs::remove_file(run_dir.join(dotfile));
+    }
+
+    let prepared = fs::read_to_string(request.workflow).map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let nonce = cache::hex(
+        &Sha256::digest(format!(
+            "{}{}{}",
+            run_dir.display(),
+            now.as_nanos(),
+            std::process::id()
+        ))[..16],
+    );
+    // A new VM has no file sharing to show stale files, so only a shared checkout gets the nonce
+    if shared {
+        write_nonces(run_dir, &nonce).map_err(|e| e.to_string())?;
+    }
+
+    isolate(
+        &prepared,
+        request.file,
+        request.job,
+        request.needs,
+        tag,
+        shared.then_some(nonce.as_str()),
+    )
+}
+
+/**
  * act runs a job's `needs` along with it, so each job's copy holds only that job, without `needs`,
  * and the outputs and results of its needs become literals. The workflow name gets the checkout's
  * tag, since act names containers after workflow and job and removes an older one of that name
@@ -1332,7 +1404,7 @@ fn isolate(
     job: &str,
     needs: &BTreeMap<String, BTreeMap<String, String>>,
     tag: &str,
-    nonce: &str,
+    nonce: Option<&str>,
 ) -> Result<String, String> {
     let mut root = workflow::load(source)?;
     let jobs = workflow::jobs_mut(&mut root)?;
@@ -1419,7 +1491,7 @@ fn isolate(
         };
         h.insert(key("name"), key(&format!("{name} {tag}")));
 
-        if let Some(Yaml::Array(steps)) = h.get_mut(&key("steps")) {
+        if let (Some(nonce), Some(Yaml::Array(steps))) = (nonce, h.get_mut(&key("steps"))) {
             steps.insert(0, nonce_step(nonce));
         }
     }
@@ -1727,7 +1799,7 @@ fn runs_here(workflow: &str, job: &str, labels: &BTreeSet<String>) -> bool {
 }
 
 /// Jobs act skipped because no platform maps their `runs-on`, named as act prints them
-fn unsupported_jobs(log: &str) -> Vec<String> {
+pub(super) fn unsupported_jobs(log: &str) -> Vec<String> {
     log.lines()
         .filter(|l| l.contains("Skipping unsupported platform"))
         .filter_map(|l| {
@@ -1780,7 +1852,7 @@ fn reaper(run_dir: &Path) -> Option<std::process::Child> {
 }
 
 /// What separates a run's act process from another's: its containers, apt volume and network
-fn run_tag(run_dir: &Path) -> String {
+pub(super) fn run_tag(run_dir: &Path) -> String {
     cache::hex(&Sha256::digest(run_dir.to_string_lossy().as_bytes())[..4])
 }
 
@@ -2463,6 +2535,19 @@ jobs:
         assert!(status.success());
         assert!(fs::create_dir(home.join(".bun/install/bin")).is_ok());
         assert!(fs::create_dir(home.join(".bun/bin")).is_ok());
+    }
+
+    #[test]
+    fn a_jobs_entry_picks_the_engine_of_its_job_and_legs() {
+        let act = Act::default().with_engines(BTreeMap::from([(
+            "ci.yml/e2e".to_string(),
+            config::Engine::Colima,
+        )]));
+        assert_eq!(act.engine("ci.yml", "e2e").name(), "colima");
+        assert_eq!(act.engine("ci.yml", "e2e__2").name(), "colima");
+        assert_eq!(act.engine("ci.yml", "test").name(), "docker");
+        assert_eq!(act.engine("other.yml", "e2e").name(), "docker");
+        assert!(act.uses_colima() && !Act::default().uses_colima());
     }
 
     #[test]
@@ -3436,7 +3521,7 @@ jobs:
       - run: echo ${{ needs.build.outputs.tag }} ${{ needs.test.outputs.os }} ${{ needs.build.outputs.none }}
 ";
         let needs = outputs(&[("test__1", &[("os", "it's")]), ("build", &[("tag", "v1")])]);
-        let out = load(&isolate(wf, "ci.yml", "deploy", &needs, "abcd", "5eed").unwrap());
+        let out = load(&isolate(wf, "ci.yml", "deploy", &needs, "abcd", Some("5eed")).unwrap());
         assert_eq!(out["name"].as_str(), Some("CI"), "github.workflow stays");
         assert_eq!(out["jobs"]["deploy"]["name"].as_str(), Some("deploy abcd"));
         let jobs = out["jobs"].as_hash().unwrap();
@@ -3475,7 +3560,7 @@ jobs:
 ";
         let value = "x' }} ${{ secrets.S }} ${{ '\n- run: evil\nkey: [a, {b: \"c\n#";
         let needs = outputs(&[("a", &[("v", value)])]);
-        let out = load(&isolate(wf, "ci.yml", "b", &needs, "t", "n").unwrap());
+        let out = load(&isolate(wf, "ci.yml", "b", &needs, "t", Some("n")).unwrap());
         let literal = literal(value);
         // Nothing of the value can end the expression or start one, wherever act scans for them
         let inner = &literal["fromJSON('".len()..literal.len() - "')".len()];
@@ -3530,18 +3615,18 @@ jobs:
                 "{run: echo, env: [x]}",
             ),
         ] {
-            let err = isolate(&wf, "ci.yml", "b", &needs, "t", "n").unwrap_err();
+            let err = isolate(&wf, "ci.yml", "b", &needs, "t", Some("n")).unwrap_err();
             assert!(err.contains("not a mapping"), "{wf}: {err}");
         }
 
         // An env with nothing from needs is left as it is
         let plain = with("    env: ${{ fromJSON(x) }}\n", "{run: echo, env: [x]}");
-        assert!(isolate(&plain, "ci.yml", "b", &needs, "t", "n").is_ok());
+        assert!(isolate(&plain, "ci.yml", "b", &needs, "t", Some("n")).is_ok());
         let empty = with(
             "    env: {E: '${{ needs.a.outputs.v }}'}\n",
             "{run: echo, env: }",
         );
-        let out = load(&isolate(&empty, "ci.yml", "b", &needs, "t", "n").unwrap());
+        let out = load(&isolate(&empty, "ci.yml", "b", &needs, "t", Some("n")).unwrap());
         assert!(out["jobs"]["b"]["steps"][1]["env"]["E"].as_str().is_some());
     }
 
@@ -3560,15 +3645,15 @@ jobs:
       - run: echo '${{ toJSON(needs) }}'
 ";
         let needs = outputs(&[("a", &[])]);
-        let err = isolate(wf, "ci.yml", "b", &needs, "t", "n").unwrap_err();
+        let err = isolate(wf, "ci.yml", "b", &needs, "t", Some("n")).unwrap_err();
         assert!(err.contains("toJSON(needs)"), "{err}");
         // Words that only contain `needs`, and `needs` in a script, are fine
         let ok = wf.replace(
             "toJSON(needs)",
             "steps.needs_x.outputs.y }} needs.a.result ${{ inputs.needs",
         );
-        assert!(isolate(&ok, "ci.yml", "b", &needs, "t", "n").is_ok());
-        assert!(isolate(wf, "ci.yml", "missing", &needs, "t", "n").is_err());
+        assert!(isolate(&ok, "ci.yml", "b", &needs, "t", Some("n")).is_ok());
+        assert!(isolate(wf, "ci.yml", "missing", &needs, "t", Some("n")).is_err());
     }
 
     #[test]
