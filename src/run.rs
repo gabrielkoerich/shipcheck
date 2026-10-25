@@ -681,6 +681,9 @@ pub fn last_tested(repo: &Path) -> Option<Tested> {
  * the tree is compared on that copy, so what is compared is what is committed. The copy becomes
  * the real index only after the commit. On any refusal the real index is untouched
  **/
+/// The caller's `PATH`, saved before `main` keeps only the trusted entries for shipcheck's own processes
+pub static CALLER_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+
 pub fn commit(
     cwd: &Path,
     tested: &Tested,
@@ -701,8 +704,21 @@ pub fn commit(
             return Err("files changed since the run, run `shipcheck run` again".to_string());
         }
 
+        // git comes from the trusted PATH, but its hooks are the user's own and get the caller's PATH,
+        // such as ~/.nvm's node for husky, which the trusted one drops for sitting under a .git
+        let trusted = std::env::var_os("PATH").unwrap_or_default();
+        let bin = std::env::split_paths(&trusted)
+            .map(|d| d.join("git"))
+            .find(|g| g.is_file())
+            .unwrap_or_else(|| "git".into());
+        let mut git_commit = Command::new(bin);
+
+        if let Some(path) = CALLER_PATH.get() {
+            git_commit.env("PATH", path);
+        }
+
         // From the caller's directory, so a relative `-F` file is found
-        let status = Command::new("git")
+        let status = git_commit
             .current_dir(cwd)
             .arg("commit")
             .args(git_args)
@@ -3537,6 +3553,47 @@ mod tests {
         copy_index(&index, &temp).unwrap();
         assert_eq!(fs::read(&temp).unwrap(), b"entries");
         assert_eq!(fs::metadata(&temp).unwrap().modified().unwrap(), written);
+    }
+
+    #[test]
+    fn commit_runs_the_users_hooks_with_the_callers_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        // A tool in a git checkout, as ~/.nvm is, which the trusted PATH drops
+        let tools = dir.path().join("nvm/bin");
+        fs::create_dir_all(dir.path().join("nvm/.git")).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(tools.join("husky-tool"), "#!/bin/sh\ntouch \"$1\"\n").unwrap();
+        Command::new("chmod")
+            .arg("+x")
+            .arg(tools.join("husky-tool"))
+            .status()
+            .unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "user.email", "t@t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        sh(&repo, &["commit", "-q", "--allow-empty", "-m", "main"]);
+        let hook = repo.join(".git/hooks/pre-commit");
+        let ran = dir.path().join("tool-ran");
+        fs::write(&hook, format!("#!/bin/sh\nhusky-tool {}\n", ran.display())).unwrap();
+        Command::new("chmod").arg("+x").arg(&hook).status().unwrap();
+        fs::write(repo.join("a.txt"), "a").unwrap();
+        let wc = snapshot(&repo, false).unwrap().unwrap();
+        let tested = Tested {
+            tree: sh(&repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
+            staged: false,
+            passed: true,
+        };
+        let path = std::env::join_paths(
+            std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        CALLER_PATH.set(path).unwrap();
+
+        commit(&repo, &tested, &["-m".into(), "a".into()], false).unwrap();
+        assert!(ran.exists(), "the hook found its tool on the caller's PATH");
     }
 
     #[test]
