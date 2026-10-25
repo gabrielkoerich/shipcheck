@@ -1640,6 +1640,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn a_check_sees_none_of_the_hosts_var_tmp() {
+        let clone = tempfile::tempdir().unwrap();
+        let (_home, home) = temp_home().unwrap();
+        let jail = Jail {
+            writable: vec![real_dir(clone.path()).unwrap(), home.clone()],
+            readable: Vec::new(),
+            home: home.clone(),
+            cache: home,
+        };
+        let left = tempfile::NamedTempFile::new_in("/var/tmp").unwrap();
+        let log = clone.path().join("log");
+        let cmd = format!("test ! -e '{}'", left.path().display());
+        let exit = run_command(
+            &cmd,
+            clone.path(),
+            &jail,
+            &[],
+            &log,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            exit.unwrap(),
+            Some(0),
+            "{}",
+            fs::read_to_string(&log).unwrap()
+        );
+    }
+
+    #[test]
     #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn mktemp_makes_its_files_in_the_jails_tmpdir() {
         let (clone, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
