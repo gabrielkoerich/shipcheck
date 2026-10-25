@@ -17,6 +17,8 @@ pub struct Host {
     config: config::Host,
     /// Where `versions` run, so a toolchain file in the repository picks the version
     repo: PathBuf,
+    /// This run's copy of the base's cache, which its checks of another tree write
+    copy: std::sync::OnceLock<Result<tempfile::TempDir, String>>,
 }
 
 impl Host {
@@ -24,8 +26,101 @@ impl Host {
         Host {
             config,
             repo: repo.to_path_buf(),
+            copy: std::sync::OnceLock::new(),
         }
     }
+
+    /**
+     * The cache a check of a tree other than the base's writes: a copy-on-write copy of the base's,
+     * made once per run and removed with it, so no branch leaves a file another branch's run reads.
+     * A shared cache let one branch plant registry sources that cargo trusts once extracted
+     **/
+    fn run_cache(&self, repo_id: &str) -> Result<PathBuf, String> {
+        let copy = self.copy.get_or_init(|| {
+            let dir = cache_dir(Some(repo_id));
+            // The cache every branch once shared, which a branch may have written
+            let _ = fs::remove_dir_all(dir.join("branches"));
+            let base = real_dir(&dir.join("base"))?;
+            let runs = real_dir(&dir.join("runs"))?;
+            // Copies a run that died left, none of them still in use after a day
+            let day = std::time::SystemTime::now() - Duration::from_secs(86_400);
+
+            for old in fs::read_dir(&runs).into_iter().flatten().flatten() {
+                if old
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t < day)
+                {
+                    remove_tree(&old.path());
+                }
+            }
+
+            let copy = tempfile::Builder::new()
+                .prefix("run-")
+                .tempdir_in(runs)
+                .map_err(|e| format!("run cache: {e}"))?;
+            clone_dir(&base, copy.path())?;
+            Ok(copy)
+        });
+
+        match copy {
+            Ok(copy) => real_dir(copy.path()),
+            Err(e) => Err(e.clone()),
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Some(Ok(copy)) = self.copy.take() {
+            remove_tree(&copy.keep());
+        }
+    }
+}
+
+/// Removes a cache tree, read-only directories included, as Go's module cache makes them
+fn remove_tree(dir: &Path) {
+    let _ = Command::new("chmod").arg("-R").arg("u+w").arg(dir).status();
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Replaces the empty `dst` with a copy of `src` that shares its blocks where the file system can
+fn clone_dir(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::remove_dir(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+
+    // One clonefile call copies the whole tree on APFS
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let from = std::ffi::CString::new(src.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let to = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+
+        // Safe: both strings outlive the call, which only reads them
+        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+    }
+
+    let copied = Command::new("cp")
+        .args(if cfg!(target_os = "linux") {
+            &["-a", "--reflink=auto"][..]
+        } else {
+            &["-pR"][..]
+        })
+        .arg(src)
+        .arg(dst)
+        .status()
+        .map_err(|e| format!("cp: {e}"))?;
+
+    if !copied.success() {
+        return Err(format!(
+            "could not copy {} to {}",
+            src.display(),
+            dst.display()
+        ));
+    }
+
+    Ok(())
 }
 
 /// What every check gets from the user's environment, besides the names `[host] env` adds.
@@ -651,8 +746,8 @@ impl Jail {
 }
 
 /**
- * The tool caches host checks share, per repository, written only by checks. Runs of the base's
- * tree get one and every other tree another, so a branch cannot plant a file a run of main reads
+ * The tool caches of host checks, per repository, written only by checks. Runs of the base's tree
+ * write `base`, and every other run writes a copy of it of its own, under `runs`
  **/
 fn cache_dir(repo_id: Option<&str>) -> PathBuf {
     let dir = crate::run::home().join("hostcache");
@@ -1766,11 +1861,11 @@ impl Runner for Host {
             .get(request.job)
             .ok_or_else(|| format!("no host check {}", request.job))?;
         let (_dir, home) = temp_home()?;
-        let cache = real_dir(&cache_dir(Some(request.repo_id)).join(if request.on_base {
-            "base"
+        let cache = if request.on_base {
+            real_dir(&cache_dir(Some(request.repo_id)).join("base"))?
         } else {
-            "branches"
-        }))?;
+            self.run_cache(request.repo_id)?
+        };
         let jail = Jail {
             writable: vec![real_dir(request.run_dir)?, home.clone(), cache.clone()],
             readable: Vec::new(),
@@ -2663,6 +2758,63 @@ mod tests {
         assert!(userns_fix(Some("1"), true).contains("is not loaded"));
         assert!(userns_fix(None, false).contains("max_user_namespaces"));
         assert!(userns_fix(Some("0"), false).contains("max_user_namespaces"));
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_branch_run_never_sees_what_another_branch_run_left_in_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let checks = BTreeMap::from([
+            (
+                "base".into(),
+                "mkdir -p \"$CARGO_HOME\" && touch \"$CARGO_HOME/from-base\"".into(),
+            ),
+            (
+                "branch".into(),
+                "mkdir -p \"$CARGO_HOME\" && touch \"$CARGO_HOME/from-branch\"".into(),
+            ),
+            (
+                "other".into(),
+                "test -e \"$CARGO_HOME/from-base\" && test ! -e \"$CARGO_HOME/from-branch\"".into(),
+            ),
+        ]);
+        // Each call is a run of its own, as each run makes its own runners
+        let run = |job: &str, on_base: bool| {
+            let host = Host::new(
+                config::Host {
+                    checks: checks.clone(),
+                    ..Default::default()
+                },
+                dir.path(),
+            );
+            let clone = tempfile::tempdir().unwrap();
+            let log = dir.path().join(format!("{job}.log"));
+            let (needs, artifacts) = (BTreeMap::new(), dir.path().join("artifacts"));
+            let request = RunRequest {
+                run_dir: clone.path(),
+                file: HOST,
+                workflow: Path::new("/dev/null"),
+                job,
+                needs: &needs,
+                artifacts: &artifacts,
+                repo_id: &repo_id,
+                timeout: Duration::from_secs(30),
+                shard: false,
+                on_base,
+            };
+            let exit = host.run(&request, &log).unwrap().exit;
+            (exit, fs::read_to_string(&log).unwrap())
+        };
+        assert_eq!(run("base", true).0, Some(0));
+        assert_eq!(run("branch", false).0, Some(0));
+        let (exit, log) = run("other", false);
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(
+            exit,
+            Some(0),
+            "saw the other branch's file or missed the base's: {log}"
+        );
     }
 
     #[test]
