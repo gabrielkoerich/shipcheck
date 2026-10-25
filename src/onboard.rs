@@ -1811,7 +1811,7 @@ mod tests {
             (".github/workflows/ci.yml", PUSH),
             (".github/workflows/setup.yml", SETUP),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
         assert_eq!(files, ["ci.yml"]);
         assert_eq!(
