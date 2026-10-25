@@ -294,7 +294,6 @@ fn cycle(
         waits.remove(&(repo.to_string(), number));
     }
 
-    // ponytail: a head waiting for a shipcheck.toml on the base costs a fetch each cycle
     let id = |pr: &OpenPr| (repo.to_string(), pr.sha.clone());
     if prs
         .iter()

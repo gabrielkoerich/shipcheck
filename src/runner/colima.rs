@@ -20,7 +20,6 @@ use crate::cache;
 pub struct Colima;
 
 /// The VM's packages, act pinned as ci.yml pins it, and GitHub's `/home/runner`. Part of the key.
-/// ponytail: apt's packages are whatever Ubuntu serves that day, a prepared image pins them
 const SETUP: &str = r#"set -eu
 apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
 sudo DEBIAN_FRONTEND=noninteractive apt-get $apt -qq update
@@ -227,7 +226,6 @@ impl Engine for Colima {
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         let dry = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         let status = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        // ponytail: one VM at a time on this machine, a VM count in `max_parallel` if jobs queue here
         let home = crate::run::home().join("locks");
         fs::create_dir_all(&home).map_err(|e| e.to_string())?;
         let one_vm = fs::File::create(home.join("colima.lock")).map_err(|e| e.to_string())?;

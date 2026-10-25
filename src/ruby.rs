@@ -31,7 +31,6 @@ pub fn installed() -> Vec<Ruby> {
     ])
 }
 
-// ponytail: a path with a space or a quote is left out, so it can be written into a check as is
 fn from_dirs(dirs: &[PathBuf]) -> Vec<Ruby> {
     let mut found: Vec<Ruby> = Vec::new();
 

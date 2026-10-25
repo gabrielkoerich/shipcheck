@@ -42,7 +42,6 @@ pub fn installed() -> Vec<Jdk> {
     from_homes(&homes, &crate::run::user_dir())
 }
 
-// ponytail: a home with a space or a quote is left out, so its path can be written into a check as is
 fn from_homes(homes: &[PathBuf], user: &Path) -> Vec<Jdk> {
     let mut found: Vec<Jdk> = Vec::new();
 
@@ -160,7 +159,6 @@ fn needs(job: &Job) -> Result<Vec<Need>, String> {
  * which is the one `setup-java` leaves in `JAVA_HOME`. None for a job that sets up no JDK, an error
  * naming a JDK this machine does not have. A version matches by its parts, so `21` takes `21.0.5`
  **/
-// ponytail: `distribution` other than graalvm is not matched, a vendor check if a build needs one
 pub fn pick<'a>(job: &Job, jdks: &'a [Jdk]) -> Result<Option<&'a Jdk>, String> {
     let mut last = None;
 
