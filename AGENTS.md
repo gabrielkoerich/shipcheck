@@ -9,7 +9,7 @@ Every change must keep these.
 - A result comes only from a run shipcheck started. Nothing accepts a result, a log or a verdict from a caller.
 - `shipcheck.toml` and `.github/workflows/` are read from the remote's default branch, as `git ls-remote --symref origin HEAD` reports it, else `main`. Never from the PR tree, the working copy or a local ref such as `origin/HEAD`.
 - Every job gets a new copy-on-write clone checked out at the SHA, at its slot's fixed path for that job. Jobs never share a checkout, and never run in the agent's worktree.
-- A job never reaches the host: no Docker socket, no host token or environment, a `.git` of its own, no network unless `network = "internet"` on main, never `-self-hosted`. The isolation case of the end-to-end test proves it, and must keep passing.
+- A job never reaches the host: no Docker socket, no host token or environment, a `.git` of its own, no network unless `network = "internet"` on main, `-self-hosted` only inside a VM shipcheck created for that job. The isolation case of the end-to-end test proves it, and must keep passing. The `colima` engine's VM still reaches the host's loopback and the internet, so it is for trusted repositories only, and doctor says so.
 - A workflow passes only on exit code 0 from an `act` process shipcheck started, with every started job ending in `success`. A host check passes only on exit code 0 from its command, which shipcheck started. The cache is written only from such a run.
 - The cache key holds the tree, the config from `main`, the workflows as they run, the act and shipcheck versions and the images. Never key by commit SHA.
 - A `paths` skip is never cached, and any doubt about the changed files means run.

@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::config::RepoConfig;
 
 pub mod act;
+pub mod colima;
 pub mod gc;
 pub mod host;
 pub mod shard;
@@ -106,7 +107,8 @@ impl Runners {
                 Box::new(
                     act::Act::new(config.act.clone())
                         .with_network(config.network)
-                        .with_shards(config.shard_tests),
+                        .with_shards(config.shard_tests)
+                        .with_engines(config.engines()),
                 ) as Box<dyn Runner>
             }),
             host: config

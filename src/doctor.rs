@@ -331,6 +331,27 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         });
     }
 
+    if let Ok(config) = &planned {
+        let on_vm: Vec<String> = config
+            .engines()
+            .into_iter()
+            .filter(|(_, e)| *e == crate::config::Engine::Colima)
+            .map(|(job, _)| job)
+            .collect();
+
+        if !on_vm.is_empty() {
+            found.push(check(
+                "colima",
+                runner::colima::version().map(|v| {
+                    format!(
+                        "{v}, a VM of its own for each of {}. For trusted repositories only: the VM reaches this machine's 127.0.0.1 through 192.168.5.2 and the internet whatever `network` says, and act runs beside the job's code",
+                        on_vm.join(", ")
+                    )
+                }),
+            ));
+        }
+    }
+
     let hook = Path::new(&top).join(".git/hooks/pre-push");
     let hooked = fs::read_to_string(&hook).is_ok_and(|h| h.contains("shipcheck on-push"));
     found.push(Check {
@@ -398,11 +419,15 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 /// What act runs: each listed workflow whole, then each act `[jobs]` entry
 fn jobs_line(config: &RepoConfig) -> String {
     let mut parts = config.workflows.clone();
+    let engines = config.engines();
     parts.extend(
         config
             .jobs_on(RunnerKind::Act)
             .into_iter()
-            .map(|j| format!("job {j}")),
+            .map(|j| match engines.get(&j) {
+                Some(crate::config::Engine::Colima) => format!("job {j} on colima"),
+                _ => format!("job {j}"),
+            }),
     );
     parts.join(", ")
 }
