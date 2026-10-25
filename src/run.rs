@@ -12,7 +12,7 @@ use crate::cache::{self, KeyInputs};
 use crate::config::{RepoConfig, RunnerKind};
 use crate::runner::host::{self as host_runner, HOST};
 use crate::runner::shard::{self, Rejected, ShardRun};
-use crate::runner::{self, RunRequest, Runner};
+use crate::runner::{RunRequest, Runner, Runners};
 use crate::workflow;
 
 pub(crate) const WORKFLOWS: &str = ".github/workflows";
@@ -104,7 +104,7 @@ pub struct Plan {
     pub ci_changes: Vec<String>,
     /// The base has no shipcheck.toml, so the plan runs the defaults, and its result is never posted
     pub defaults: bool,
-    /// The runner's identity in the key: act's version, or host mode's tool versions
+    /// The runners' identity in the key: act's version, then the host checks' tool versions
     pub tools: String,
 }
 
@@ -373,6 +373,17 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
     let mut config = RepoConfig::parse(&String::from_utf8_lossy(&config_text))?;
     let files: BTreeSet<String> = workflows.keys().map(|p| file_name(p)).collect();
     config.validate(&files)?;
+
+    // Where each job runs needs the workflows, so a wrong entry fails here, before anything runs
+    if !config.jobs.is_empty() {
+        expected_jobs(&config, |file| {
+            workflows
+                .iter()
+                .find(|(path, _)| file_name(path) == file)
+                .map(|(_, body)| String::from_utf8_lossy(body).into_owned())
+        })?;
+    }
+
     let tree_files = git_raw(&repo, &["ls-tree", "-r", "-z", "--name-only", &tree])?;
     config.act.for_tree(
         String::from_utf8_lossy(&tree_files)
@@ -381,26 +392,31 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
     );
 
     // Hash required workflows as they run, so a change to the injection changes the key too
-    let runner = runner::from_config(&config, &repo);
-    let host = config.runner == RunnerKind::Host;
+    let runners = Runners::new(&config, &repo);
+    let act_files = config.act_files();
     let mut as_run = BTreeMap::new();
 
-    // Host mode runs no workflow, so a change to one does not change its result
-    for (path, body) in workflows.iter().filter(|_| !host) {
-        let body = if config.workflows.contains(&file_name(path)) {
-            as_run_body(runner.as_ref(), body, &file_name(path), "nonce")?
+    // Host checks run no workflow, so with no act job a change to one does not change the result
+    for (path, body) in workflows.iter().filter(|_| config.acts()) {
+        let body = if act_files.contains(&file_name(path)) {
+            as_run_body(
+                runners.for_file(&file_name(path))?,
+                body,
+                &file_name(path),
+                "nonce",
+            )?
         } else {
             body.clone()
         };
         as_run.insert(path.clone(), body);
     }
 
-    let tools = runner.identity()?;
+    let tools = runners.identity()?;
     let key = cache::key(&KeyInputs {
         tree: &tree,
         config: &config_text,
         workflows: &as_run,
-        runner_kind: if host { "host" } else { "act" },
+        runner_kind: runners.kind(),
         checks: &config.host.checks,
         runner_version: &tools,
         shipcheck_version: env!("CARGO_PKG_VERSION"),
@@ -782,22 +798,87 @@ pub fn expected_jobs(
     config: &RepoConfig,
     source: impl Fn(&str) -> Option<String>,
 ) -> Result<crate::check::Jobs, String> {
-    if config.runner == RunnerKind::Host {
-        return Ok(BTreeMap::from([(
-            HOST.to_string(),
-            config.host.checks.keys().cloned().collect(),
-        )]));
+    let mut graphs = BTreeMap::new();
+
+    for file in config.act_files() {
+        let body = source(&file).ok_or_else(|| format!("{file} is not on the base"))?;
+        graphs.insert(file, workflow::job_needs(&body)?);
     }
 
-    let mut jobs = BTreeMap::new();
+    let mut jobs = act_jobs(config, &graphs)?;
 
-    for file in &config.workflows {
-        let body = source(file).ok_or_else(|| format!("{file} is not on the base"))?;
-        let ids = workflow::job_needs(&body)?.into_iter().map(|(id, _)| id);
-        jobs.insert(file.clone(), ids.collect());
+    if config.hosts() {
+        jobs.insert(
+            HOST.to_string(),
+            config.host.checks.keys().cloned().collect(),
+        );
     }
 
     Ok(jobs)
+}
+
+/**
+ * The act jobs of `config` per workflow file: each listed workflow whole, each act `[jobs]` entry,
+ * and every job they need, less the jobs host entries take out. A host entry must name a job of its
+ * file and a host check of that id, so no job is dropped without a check in its place
+ **/
+fn act_jobs(config: &RepoConfig, graphs: &Graphs) -> Result<crate::check::Jobs, String> {
+    let mut chosen = select(graphs, &config.jobs_on(RunnerKind::Act), &config.workflows)?;
+    let moved = config.jobs_on(RunnerKind::Host);
+
+    // Every host entry first, so a moved job may need another moved job
+    for name in &moved {
+        let (file, job) = name.split_once('/').unwrap_or((name, ""));
+        let real = graphs
+            .get(file)
+            .is_some_and(|graph| graph.iter().any(|(id, _)| names_job(id, job)));
+
+        if !real {
+            return Err(format!("jobs entry {name:?} names no job of {file}"));
+        }
+
+        if !config.host.checks.contains_key(job) {
+            return Err(format!(
+                "jobs entry {name:?} is on the host runner, but [host.checks] has no check {job:?} to run in its place"
+            ));
+        }
+
+        if let Some(picked) = chosen.get_mut(file) {
+            picked.retain(|id| !names_job(id, job));
+        }
+    }
+
+    for (file, picked) in &chosen {
+        if picked.is_empty() && moved.iter().any(|m| m.starts_with(&format!("{file}/"))) {
+            return Err(format!(
+                "every job of {file} is on the host runner, so act would run nothing. Remove it from workflows"
+            ));
+        }
+
+        let graph = graphs.get(file).into_iter().flatten();
+
+        for (id, needs) in graph.filter(|(id, _)| picked.contains(id)) {
+            if let Some(need) = needs.iter().find(|n| !picked.contains(*n)) {
+                return Err(format!(
+                    "act job {file}/{id} needs {need}, which a jobs entry puts on the host runner"
+                ));
+            }
+        }
+    }
+
+    Ok(chosen)
+}
+
+/// A workflow file's jobs, each with the ids of the jobs it needs
+type Graphs = BTreeMap<String, Vec<(String, Vec<String>)>>;
+
+/// Whether `job` names job `id`, itself or as one leg `<job>__<n>` of its matrix
+fn names_job(id: &str, job: &str) -> bool {
+    let leg = id
+        .strip_prefix(job)
+        .and_then(|rest| rest.strip_prefix("__"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    id == job || leg
 }
 
 /// The jobs a run of this plan reports, from the base's workflows
@@ -1138,9 +1219,9 @@ pub fn run_partial(
 }
 
 /// The jobs to run per workflow file: every job of each named workflow, each job whose id or
-/// matrix leg matches a name, and every job they need
+/// matrix leg matches a name, or `<file>/<job>` for one file's, and every job they need
 pub fn select(
-    graphs: &BTreeMap<String, Vec<(String, Vec<String>)>>,
+    graphs: &Graphs,
     jobs: &[String],
     workflows: &[String],
 ) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
@@ -1163,15 +1244,17 @@ pub fn select(
     for job in jobs {
         let mut found = false;
 
-        for (file, graph) in graphs {
-            for (id, _) in graph {
-                // A matrix job runs as legs `<id>__<n>`, its id names all of them
-                let leg = id
-                    .strip_prefix(job.as_str())
-                    .and_then(|rest| rest.strip_prefix("__"))
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let (in_file, name) = match job.split_once('/') {
+            Some((file, name)) => (Some(file), name),
+            None => (None, job.as_str()),
+        };
 
-                if id == job || leg {
+        for (file, graph) in graphs
+            .iter()
+            .filter(|(f, _)| in_file.is_none_or(|i| i == *f))
+        {
+            for (id, _) in graph {
+                if names_job(id, name) {
                     chosen.entry(file.clone()).or_default().insert(id.clone());
                     found = true;
                 }
@@ -1246,13 +1329,17 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     let slots = home.join("runs").join(&id);
     fs::create_dir_all(&slots).map_err(|e| e.to_string())?;
     let (slot, _slot) = claim_slot(&slots)?;
-    let runner = runner::from_config(&plan.config, &plan.repo);
-    runner.preflight()?;
+    let runners = Runners::new(&plan.config, &plan.repo);
+
+    for runner in runners.all() {
+        runner.preflight()?;
+    }
+
     prune(&home, SystemTime::now());
     crate::templates::prune(&home, SystemTime::now(), &slot.with_extension("lock"));
     {
         let _git = git_lock(&id)?;
-        remove_checkouts(plan, runner.as_ref(), &slot);
+        remove_checkouts(plan, &runners, &slot);
     }
 
     // Before one checkout per job, the template was a single clone at this path
@@ -1261,31 +1348,49 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     }
 
     let nonce = nonce(&plan.key);
+    let act_files = plan.config.act_files();
     let mut bodies = BTreeMap::new();
 
     for (path, body) in &plan.workflows {
         let file = file_name(path);
-        let body = if plan.config.workflows.contains(&file) {
-            as_run_body(runner.as_ref(), body, &file, &nonce)?
+        let body = if act_files.contains(&file) {
+            as_run_body(runners.for_file(&file)?, body, &file, &nonce)?
         } else {
             body.clone()
         };
         bodies.insert(file, body);
     }
 
-    let only = match only {
-        Some((jobs, workflows)) if plan.config.runner == RunnerKind::Host => {
-            Some(select_host(&plan.config.host.checks, jobs, workflows)?)
-        }
-        Some((jobs, workflows)) => {
-            let mut graphs = BTreeMap::new();
+    let mut graphs = Graphs::new();
 
-            for file in &plan.config.workflows {
-                let body = String::from_utf8_lossy(&bodies[file]).into_owned();
-                graphs.insert(file.clone(), workflow::job_needs(&body)?);
+    for file in &act_files {
+        let body = String::from_utf8_lossy(&bodies[file]).into_owned();
+        graphs.insert(file.clone(), workflow::job_needs(&body)?);
+    }
+
+    let acts = act_jobs(&plan.config, &graphs)?;
+
+    // A partial run picks among the jobs a full run would run
+    for (file, graph) in &mut graphs {
+        graph.retain(|(id, _)| acts.get(file).is_some_and(|picked| picked.contains(id)));
+    }
+
+    let checks = &plan.config.host.checks;
+    let only = match only {
+        Some((jobs, workflows)) if !plan.config.acts() => {
+            Some(select_host(checks, jobs, workflows)?)
+        }
+        Some((jobs, workflows)) if !plan.config.hosts() => Some(select(&graphs, jobs, workflows)?),
+        Some((jobs, workflows)) => {
+            let (on_host, on_act): (Vec<String>, Vec<String>) =
+                jobs.iter().cloned().partition(|j| checks.contains_key(j));
+            let mut picked = select(&graphs, &on_act, workflows)?;
+
+            if !on_host.is_empty() {
+                picked.extend(select_host(checks, &on_host, &[])?);
             }
 
-            Some(select(&graphs, jobs, workflows)?)
+            Some(picked)
         }
         None => None,
     };
@@ -1302,7 +1407,8 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     );
     let ctx = Ctx {
         plan,
-        runner: runner.as_ref(),
+        runners: &runners,
+        acts: &acts,
         repo_id: &id,
         slot: &slot,
         templates: &templates,
@@ -1313,18 +1419,14 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
         only: only.as_ref(),
     };
 
-    let results = if plan.config.runner == RunnerKind::Host {
-        vec![run_host(&ctx, say)?]
-    } else {
-        run_workflows(&ctx, say)?
-    };
+    let results = run_all(&ctx, say)?;
 
     {
         let _git = git_lock(&id)?;
         let _ = git(&plan.repo, &["worktree", "prune"]);
     }
 
-    for line in runner.prune() {
+    for line in runners.all().flat_map(|r| r.prune()) {
         say(&line);
     }
 
@@ -1411,24 +1513,40 @@ pub fn trial(
     result
 }
 
-/// Every required workflow at once, as on GitHub, with `max_parallel` shared by all their jobs
-fn run_workflows(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, String> {
+/**
+ * The host checks, as one result, and every required workflow at once, as on GitHub, with
+ * `max_parallel` shared by all their jobs
+ **/
+fn run_all(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, String> {
     let plan = ctx.plan;
+    let host = ctx.runners.host.is_some() && ctx.only.is_none_or(|o| o.contains_key(HOST));
     std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<String>();
-        let handles: Vec<_> = plan
-            .config
-            .workflows
-            .iter()
-            .filter(|f| ctx.only.is_none_or(|o| o.contains_key(*f)))
-            .map(|file| {
-                let tx = tx.clone();
-                s.spawn(move || {
-                    run_workflow(ctx, file, &mut |line: &str| {
-                        let _ = tx.send(line.to_string());
-                    })
+        let host = host.then(|| {
+            let tx = tx.clone();
+            s.spawn(move || {
+                run_host(ctx, &mut |line: &str| {
+                    let _ = tx.send(line.to_string());
                 })
             })
+        });
+        let handles: Vec<_> = host
+            .into_iter()
+            .chain(
+                plan.config
+                    .act_files()
+                    .into_iter()
+                    .filter(|f| ctx.acts.contains_key(f))
+                    .filter(|f| ctx.only.is_none_or(|o| o.contains_key(f)))
+                    .map(|file| {
+                        let tx = tx.clone();
+                        s.spawn(move || {
+                            run_workflow(ctx, &file, &mut |line: &str| {
+                                let _ = tx.send(line.to_string());
+                            })
+                        })
+                    }),
+            )
             .collect();
         drop(tx);
 
@@ -1552,7 +1670,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
 }
 
 /// Removes the checkouts and containers a crashed run left in this slot
-fn remove_checkouts(plan: &Plan, runner: &dyn Runner, slot: &Path) {
+fn remove_checkouts(plan: &Plan, runners: &Runners, slot: &Path) {
     if !slot.exists() {
         return;
     }
@@ -1571,7 +1689,10 @@ fn remove_checkouts(plan: &Plan, runner: &dyn Runner, slot: &Path) {
     }
 
     for dir in dirs {
-        runner.reclaim(&dir);
+        for runner in runners.all() {
+            runner.reclaim(&dir);
+        }
+
         mark_ended(&ended_stamp(slot, &dir));
         let _ = git(
             &plan.repo,
@@ -1625,7 +1746,9 @@ impl Drop for SlotGuard<'_> {
 struct Ctx<'a> {
     slots: &'a Slots,
     plan: &'a Plan,
-    runner: &'a dyn Runner,
+    runners: &'a Runners,
+    /// The jobs act runs per workflow file, for every job of the run
+    acts: &'a crate::check::Jobs,
     repo_id: &'a str,
     slot: &'a Path,
     templates: &'a Path,
@@ -1660,6 +1783,11 @@ fn run_workflow(
 ) -> Result<WorkflowResult, String> {
     let body = String::from_utf8_lossy(&ctx.bodies[file]).into_owned();
     let mut graph = workflow::job_needs(&body)?;
+    graph.retain(|(job, _)| {
+        ctx.acts
+            .get(file)
+            .is_some_and(|picked| picked.contains(job))
+    });
 
     if let Some(picked) = ctx.only.and_then(|o| o.get(file)) {
         graph.retain(|(job, _)| picked.contains(job));
@@ -1916,7 +2044,7 @@ fn run_job(
             let _git = git_lock(ctx.repo_id)?;
             timing(file, job, "git lock wait", at);
             let at = Instant::now();
-            checkout(ctx, &template, &dir, &say)?;
+            checkout(ctx, file == HOST, &template, &dir, &say)?;
             timing(file, job, "git-cow clone", at);
         }
 
@@ -1941,7 +2069,8 @@ fn run_job(
             shard,
             on_base,
         };
-        let host = ctx.plan.config.runner == RunnerKind::Host;
+        let host = file == HOST;
+        let runner = ctx.runners.for_file(file)?;
         let at = Instant::now();
         let written = if host {
             Ok(())
@@ -1958,13 +2087,13 @@ fn run_job(
         }
 
         let at = Instant::now();
-        let outcome = written.and_then(|_| ctx.runner.run(&request, &log_path));
+        let outcome = written.and_then(|_| runner.run(&request, &log_path));
         timing(file, job, "runner", at);
 
         // A container left running, after a timeout or otherwise, could rewrite the checkout's `.git`
         // while shipcheck warms from it, so none may outlive the job
         let at = Instant::now();
-        ctx.runner.reclaim(&dir);
+        runner.reclaim(&dir);
         timing(file, job, "reclaim", at);
         mark_ended(&ended_stamp(ctx.slot, &dir));
         // Only now, with no container left that could swap them, are the job's reports read
@@ -2138,7 +2267,13 @@ fn finish_job(dir: &Path, template: &Path, link: Option<&str>, say: &dyn Fn(Stri
     }
 }
 
-fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Result<(), String> {
+fn checkout(
+    ctx: &Ctx,
+    host: bool,
+    template: &Path,
+    dir: &Path,
+    say: &dyn Fn(String),
+) -> Result<(), String> {
     if dir.exists() {
         empty_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let _ = git(&ctx.plan.repo, &["worktree", "prune"]);
@@ -2148,7 +2283,7 @@ fn checkout(ctx: &Ctx, template: &Path, dir: &Path, say: &dyn Fn(String)) -> Res
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     // Host checks build as the developer does, so git-cow warms their template from the
     // developer's checkout, with the repository's `cow.share` and `cow.warmInterval`
-    let opts = if ctx.plan.config.runner == RunnerKind::Host {
+    let opts = if host {
         git_cow::Options::from_repo(&ctx.plan.repo)
     } else {
         // Host builds in the developer's checkout break in a Linux container, so git-cow never warms from it
@@ -2469,7 +2604,7 @@ pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
         }
     }
 
-    done.extend(runner::act::Act::default().clean(id.as_deref()));
+    done.extend(crate::runner::act::Act::default().clean(id.as_deref()));
     let mut dirs = vec![runs];
 
     match &id {
@@ -2767,6 +2902,122 @@ mod tests {
         assert!(select(&graphs, &s(&["nope"]), &[]).is_err());
         assert!(select(&graphs, &s(&["test__"]), &[]).is_err());
         assert!(select(&graphs, &[], &s(&["release.yml"])).is_err());
+
+        // `<file>/<job>` names one file's job only
+        let both = BTreeMap::from([
+            ("ci.yml".to_string(), g(&[("test", &[])])),
+            (
+                "e2e.yml".to_string(),
+                g(&[("build", &[]), ("test", &["build"])]),
+            ),
+        ]);
+        let picked = select(&both, &s(&["e2e.yml/test"]), &[]).unwrap();
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked["e2e.yml"], set(&["build", "test"]));
+        assert_eq!(select(&both, &s(&["test"]), &[]).unwrap().len(), 2);
+        assert!(select(&both, &s(&["docs.yml/test"]), &[]).is_err());
+        assert!(select(&both, &s(&["ci.yml/build"]), &[]).is_err());
+    }
+
+    #[test]
+    fn a_config_places_each_job_on_one_runner() {
+        let g = |jobs: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
+            jobs.iter()
+                .map(|(j, n)| (j.to_string(), n.iter().map(|s| s.to_string()).collect()))
+                .collect()
+        };
+        let ci = "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  e2e:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
+        let set = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<BTreeSet<_>>();
+        let jobs = |text: &str| {
+            let cfg = RepoConfig::parse(text).unwrap();
+            expected_jobs(&cfg, |f| (f == "ci.yml").then(|| ci.to_string()))
+        };
+
+        // An act job beside host checks brings the jobs it needs, and no other
+        let mixed = jobs("runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n[jobs.\"ci.yml/e2e\"]\nrunner = \"act\"").unwrap();
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[HOST], set(&["lint"]));
+        assert_eq!(mixed["ci.yml"], set(&["build", "e2e"]));
+        let names: Vec<String> = crate::check::job_names(&mixed)
+            .into_iter()
+            .map(|n| n.2)
+            .collect();
+        assert_eq!(
+            names,
+            ["shipcheck/build", "shipcheck/e2e", "shipcheck/lint"]
+        );
+
+        // Without [jobs], every job of a listed workflow, or only the host checks, as before
+        let act = jobs("workflows = [\"ci.yml\"]").unwrap();
+        assert_eq!(act.len(), 1);
+        assert_eq!(act["ci.yml"], set(&["build", "e2e", "lint"]));
+        let host = jobs("runner = \"host\"\n[host.checks]\nlint = \"make lint\"").unwrap();
+        assert_eq!(host.len(), 1);
+        assert_eq!(host[HOST], set(&["lint"]));
+
+        // A host entry takes a job out of a listed workflow, and a host check of that name stands in
+        let out = jobs("workflows = [\"ci.yml\"]\n[host.checks]\nlint = \"make lint\"\n[jobs.\"ci.yml/lint\"]\nrunner = \"host\"").unwrap();
+        assert_eq!(out["ci.yml"], set(&["build", "e2e"]));
+        let names: Vec<String> = crate::check::job_names(&out)
+            .into_iter()
+            .map(|n| n.2)
+            .collect();
+        assert_eq!(
+            names,
+            ["shipcheck/build", "shipcheck/e2e", "shipcheck/lint"]
+        );
+        let listed = "workflows = [\"ci.yml\"]\n";
+        let entry = |id: &str| format!("[jobs.\"ci.yml/{id}\"]\nrunner = \"host\"\n");
+        let checks = |names: &[&str]| {
+            let lines: Vec<String> = names.iter().map(|n| format!("{n} = \"x\"\n")).collect();
+            format!("[host.checks]\n{}", lines.concat())
+        };
+        let err = |text: String| jobs(&text).unwrap_err();
+
+        assert!(
+            err(format!("{listed}{}{}", checks(&["build"]), entry("build")))
+                .contains("act job ci.yml/e2e needs build")
+        );
+        assert!(
+            err(format!("{listed}{}{}", checks(&["lnit"]), entry("lnit")))
+                .contains("\"ci.yml/lnit\" names no job of ci.yml")
+        );
+        assert!(err(format!("{listed}{}", entry("lint"))).contains("no check \"lint\""));
+        assert!(
+            err(format!("{listed}{}{}", checks(&["test"]), entry("lint")))
+                .contains("no check \"lint\"")
+        );
+        // Both moved at once, whatever order the entries come in
+        let both = jobs(&format!(
+            "{listed}{}{}{}",
+            checks(&["build", "e2e"]),
+            entry("e2e"),
+            entry("build")
+        ))
+        .unwrap();
+        assert_eq!(both["ci.yml"], set(&["lint"]));
+        assert_eq!(both[HOST], set(&["build", "e2e"]));
+        let all = format!(
+            "{listed}{}{}{}{}",
+            checks(&["build", "e2e", "lint"]),
+            entry("build"),
+            entry("e2e"),
+            entry("lint")
+        );
+        assert!(err(all).contains("every job of ci.yml is on the host runner"));
+        assert!(jobs("runner = \"host\"\n[host.checks]\nt = \"x\"\n[jobs.\"ci.yml/nope\"]\nrunner = \"act\"").is_err());
+
+        let graphs = BTreeMap::from([(
+            "ci.yml".to_string(),
+            g(&[("lint__1", &[]), ("lint__2", &[]), ("test", &[])]),
+        )]);
+        let cfg =
+            RepoConfig::parse(&format!("{listed}{}{}", checks(&["lint"]), entry("lint"))).unwrap();
+        assert_eq!(
+            act_jobs(&cfg, &graphs).unwrap()["ci.yml"],
+            set(&["test"]),
+            "a host entry takes every leg"
+        );
     }
 
     #[test]

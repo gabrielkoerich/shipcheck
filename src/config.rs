@@ -35,6 +35,9 @@ pub struct RepoConfig {
     pub act: Act,
     #[serde(default)]
     pub host: Host,
+    /// One job's runner and engine, as `"<workflow file>/<job id>"`, when it differs from `runner`
+    #[serde(default)]
+    pub jobs: BTreeMap<String, Job>,
     /// Whether the daemon reruns and posts this repository's PRs that changed on GitHub
     #[serde(default = "yes")]
     pub daemon: bool,
@@ -88,6 +91,22 @@ pub enum RunnerKind {
     #[default]
     Act,
     Host,
+}
+
+/// A `[jobs]` entry. `runner` unset is the repository's `runner`
+#[derive(Debug, Deserialize, PartialEq, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Job {
+    pub runner: Option<RunnerKind>,
+    /// What an act job runs on, Docker unless set
+    pub engine: Option<Engine>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    #[default]
+    Docker,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone, Copy, Default)]
@@ -384,6 +403,81 @@ fn default_parallel(host: usize, engine: Option<(u32, u64)>) -> usize {
 }
 
 impl RepoConfig {
+    fn job_runner(&self, job: &Job) -> RunnerKind {
+        job.runner.unwrap_or(self.runner)
+    }
+
+    /// The `[jobs]` entries that run under `kind`, as `"<file>/<job>"`
+    pub fn jobs_on(&self, kind: RunnerKind) -> Vec<String> {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| self.job_runner(job) == kind)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// The workflow files act runs jobs of: each of `workflows`, then each file of an act `[jobs]` entry
+    pub fn act_files(&self) -> Vec<String> {
+        let mut files = self.workflows.clone();
+
+        for name in self.jobs_on(RunnerKind::Act) {
+            let file = name.split_once('/').map_or(name.as_str(), |(f, _)| f);
+
+            if !files.iter().any(|f| f == file) {
+                files.push(file.to_string());
+            }
+        }
+
+        files
+    }
+
+    /// Some job runs under act
+    pub fn acts(&self) -> bool {
+        !self.act_files().is_empty()
+    }
+
+    /// Some `[host]` check runs natively on this machine
+    pub fn hosts(&self) -> bool {
+        !self.host.checks.is_empty()
+    }
+
+    fn jobs_problems(&self, workflows: &BTreeSet<String>) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        if !self.acts() && !self.hosts() {
+            problems.push("no workflow, job or host check is set, so nothing would run".into());
+        }
+
+        for (name, job) in &self.jobs {
+            let kind = self.job_runner(job);
+            let file = name
+                .split_once('/')
+                .filter(|(f, id)| workflows.contains(*f) && !id.is_empty() && !id.contains('/'))
+                .map(|(f, _)| f);
+
+            match file {
+                None => problems.push(format!(
+                    "jobs entry {name:?} must be \"<a workflow file>/<job id>\""
+                )),
+                // Only a listed workflow runs a job that a host entry could take out of it
+                Some(f) if kind == RunnerKind::Host && !self.workflows.iter().any(|w| w == f) => {
+                    problems.push(format!(
+                        "jobs entry {name:?} is on the host runner, but workflows does not list {f}, so it changes nothing"
+                    ))
+                }
+                Some(_) => {}
+            }
+
+            if kind == RunnerKind::Host && job.engine.is_some() {
+                problems.push(format!(
+                    "jobs entry {name:?} sets engine, which applies to act jobs only"
+                ));
+            }
+        }
+
+        problems
+    }
+
     fn host_problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
 
@@ -396,6 +490,13 @@ impl RepoConfig {
         if self.host.checks.is_empty() {
             problems.push("runner is host, but [host] has no checks, so nothing would run".into());
         }
+
+        problems.extend(self.check_problems());
+        problems
+    }
+
+    fn check_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
 
         // A name becomes a directory and a check named as GitHub names a job, so its grammar
         for (name, command) in &self.host.checks {
@@ -437,7 +538,7 @@ impl RepoConfig {
         let config: Self = toml::from_str(text).map_err(|e| format!("shipcheck.toml: {e}"))?;
 
         // Defaults hide whether these were set, so the raw table says
-        if config.runner == RunnerKind::Host {
+        if !config.acts() {
             let table: toml::Table =
                 toml::from_str(text).map_err(|e| format!("shipcheck.toml: {e}"))?;
             let set: Vec<&str> = ["shard_tests", "network", "act"]
@@ -488,6 +589,11 @@ impl RepoConfig {
         let mut problems = Vec::new();
 
         match self.runner {
+            // A config with `[jobs]` mixes runners on purpose
+            _ if !self.jobs.is_empty() => {
+                problems.extend(self.jobs_problems(workflows));
+                problems.extend(self.check_problems());
+            }
             RunnerKind::Act if self.workflows.is_empty() => {
                 problems.push("workflows is empty, so nothing would run".to_string());
             }
@@ -547,7 +653,7 @@ impl RepoConfig {
         for name in self.act.jobs.keys() {
             let ok = name
                 .split_once('/')
-                .is_some_and(|(f, job)| self.workflows.contains(&f.to_string()) && !job.is_empty());
+                .is_some_and(|(f, job)| self.act_files().iter().any(|a| a == f) && !job.is_empty());
 
             if !ok {
                 problems.push(format!(
@@ -718,6 +824,62 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    #[test]
+    fn parses_a_runner_per_job() {
+        let wf = workflows(&["ci.yml", "lint.yml"]);
+        let cfg = RepoConfig::parse(
+            r#"
+            runner = "host"
+            network = "internet"
+            [host.checks]
+            test = "cargo test"
+            [jobs."ci.yml/e2e"]
+            runner = "act"
+            engine = "docker"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.validate(&wf), Ok(()));
+        assert!(cfg.acts() && cfg.hosts());
+        assert_eq!(cfg.act_files(), ["ci.yml"]);
+        assert_eq!(cfg.jobs_on(RunnerKind::Act), ["ci.yml/e2e"]);
+        assert_eq!(cfg.jobs["ci.yml/e2e"].engine, Some(Engine::Docker));
+
+        // Without [jobs], one runner, as before
+        let host = RepoConfig::parse("runner = \"host\"\n[host.checks]\nt = \"x\"").unwrap();
+        assert!(!host.acts() && host.hosts());
+        let act = RepoConfig::parse("workflows = [\"ci.yml\"]").unwrap();
+        assert!(act.acts() && !act.hosts());
+        assert_eq!(act.act_files(), ["ci.yml"]);
+
+        assert!(RepoConfig::parse("[jobs.\"ci.yml/e2e\"]\nengine = \"podman\"").is_err());
+        assert!(RepoConfig::parse("[jobs.\"ci.yml/e2e\"]\nimage = \"x\"").is_err());
+        let err = |text: &str| RepoConfig::parse(text).unwrap().validate(&wf).unwrap_err();
+        let host = "runner = \"host\"\n[host.checks]\nt = \"x\"\n";
+
+        for bad in ["gone.yml/e2e", "ci.yml", "ci.yml/", "ci.yml/a/b"] {
+            let text = format!("{host}[jobs.\"{bad}\"]\nrunner = \"act\"");
+            assert!(err(&text).contains(&format!("{bad:?} must be")), "{bad}");
+        }
+
+        assert!(
+            err(&format!("{host}[jobs.\"ci.yml/e2e\"]\nengine = \"docker\""))
+                .contains("applies to act jobs only")
+        );
+        assert!(
+            err("workflows = [\"lint.yml\"]\n[jobs.\"ci.yml/test\"]\nrunner = \"host\"")
+                .contains("does not list ci.yml")
+        );
+        assert!(err("[jobs.\"ci.yml/test\"]\nrunner = \"host\"").contains("nothing would run"));
+        // A host entry takes a job out of a listed workflow, the host check of its name stands in for it
+        let out = "workflows = [\"ci.yml\"]\n[host.checks]\ntest = \"cargo test\"\n[jobs.\"ci.yml/test\"]\nrunner = \"host\"";
+        let cfg = RepoConfig::parse(out).unwrap();
+        assert_eq!(cfg.validate(&wf), Ok(()));
+        assert_eq!(cfg.jobs_on(RunnerKind::Host), ["ci.yml/test"]);
+        // act's settings stay host-only errors only when no job runs under act
+        assert!(RepoConfig::parse(&format!("network = \"internet\"\n{host}")).is_err());
     }
 
     #[test]
