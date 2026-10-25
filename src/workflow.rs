@@ -126,9 +126,6 @@ fn push_runs(filter: &Yaml) -> bool {
     }
 }
 
-/// Dependabot's branches, which GitHub's runners test, since no person pushes them from a machine with shipcheck
-pub const DEPENDABOT: &str = "\"dependabot/**\"";
-
 // GitHub's glob rules, where `*` stops at `/`, against an ordinary branch name. `*`, `**` and `**/*`
 // match it, `main`, `main*`, `feature/*`, `release/**` and Dependabot's branches do not
 fn branch_patterns_match(patterns: &Yaml) -> bool {
@@ -645,22 +642,77 @@ pub fn job_runs(source: &str) -> Vec<Job> {
 }
 
 /**
- * A job's `if:` without the gate `gate_jobs` adds, empty when the gate was all of it. None when it
- * has no gate. act runs a PR's checks on a branch of its own, where the gate would skip every job
+ * A job's `if:` without the gates `gate_jobs` adds, empty when a gate was all of it. None when it
+ * has no gate. act runs a PR's checks on a branch of its own, where a gate would skip every job.
+ * A job that two inits gated has two, so each is stripped
  **/
-// ponytail: matches the gate's closing fork clause as text, as base_only reads conditions
+// ponytail: matches the gate's text, as base_only reads conditions
 pub fn ungate(cond: &str) -> Option<String> {
-    let c = cond.trim();
+    let mut c = cond.trim().to_string();
+    let mut found = false;
 
-    if !c.ends_with(&format!(" || {FORK})")) {
-        return None;
+    loop {
+        if is_gate(&c) {
+            return Some(String::new());
+        }
+
+        let Some(at) = c
+            .rfind(") && (")
+            .filter(|&at| one_group(&c[..=at]) && is_gate(&c[at + 5..]))
+        else {
+            return found.then_some(c);
+        };
+        c = c[1..at].trim().to_string();
+        found = true;
+    }
+}
+
+/// The jobs whose `if:` holds a gate an init wrote
+pub fn gated_jobs(source: &str) -> Vec<String> {
+    let Ok(root) = load(source) else {
+        return Vec::new();
+    };
+    let Some(Yaml::Hash(jobs)) = root.get(&key("jobs")) else {
+        return Vec::new();
+    };
+    jobs.iter()
+        .filter(|(_, j)| j["if"].as_str().and_then(ungate).is_some())
+        .filter_map(|(id, _)| id.as_str().map(str::to_string))
+        .collect()
+}
+
+/**
+ * Whether a condition is a whole gate init wrote: this version's, which ends with the fork clause,
+ * or v0.1.4 to v0.1.7's base branch or Dependabot. The bare `github.ref == 'refs/heads/main'` of
+ * v0.1.1 to v0.1.3 is left alone, since a release job's own `if:` reads the same and act must not
+ * run that
+ **/
+fn is_gate(c: &str) -> bool {
+    let old = c
+        .strip_prefix("(github.ref == 'refs/heads/")
+        .and_then(|r| r.strip_suffix("' || github.actor == 'dependabot[bot]')"))
+        .is_some_and(|b| !b.contains(['\'', '(', ')']));
+    old || one_group(c) && c.ends_with(&format!(" || {FORK})"))
+}
+
+/// Whether `c` is one parenthesised group, its first `(` closed by its last `)`, quotes skipped
+fn one_group(c: &str) -> bool {
+    let (mut depth, mut quoted) = (0, false);
+
+    for (i, ch) in c.char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            _ => {}
+        }
+
+        if depth == 0 && !quoted {
+            return i == c.len() - 1 && i > 0;
+        }
     }
 
-    match c.rfind(") && (") {
-        Some(at) if c.starts_with('(') => Some(c[1..at].to_string()),
-        Some(_) => None,
-        None => Some(String::new()),
-    }
+    false
 }
 
 /**
@@ -709,19 +761,39 @@ pub fn other_branches(source: &str, base: &str) -> (Vec<String>, bool) {
     (pushes, prs)
 }
 
-/// The `if:` condition that is true where GitHub still runs a gated job, before the Dependabot clause
-fn on_branches(source: &str, base: &str) -> String {
-    let quote = |s: &str| s.replace('\'', "''");
+fn quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/**
+ * A condition true on a push to a branch the pattern matches, and maybe on a few more, never fewer.
+ * GitHub's expressions have no glob, so the text before the first glob character and after the
+ * last one pin it. None when neither pins anything, as for `[ab]*`, which would be true everywhere
+ **/
+pub fn push_condition(pattern: &str) -> Option<String> {
+    let globs = ['*', '?', '[', ']', '+'];
+    let Some(first) = pattern.find(globs) else {
+        return Some(format!("github.ref == 'refs/heads/{}'", quote(pattern)));
+    };
+    let last = pattern.rfind(globs).unwrap_or(first);
+    let (head, tail) = (&pattern[..first], &pattern[last + 1..]);
+    let starts = format!("startsWith(github.ref, 'refs/heads/{}')", quote(head));
+    let ends = format!("endsWith(github.ref, '{}')", quote(tail));
+
+    match (head.is_empty(), tail.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(starts),
+        (true, false) => Some(ends),
+        (false, false) => Some(format!("({starts} && {ends})")),
+    }
+}
+
+/// The condition `gate_jobs` writes: true where GitHub still runs a gated job
+pub fn gate_condition(source: &str, base: &str) -> String {
     let (pushes, prs) = other_branches(source, base);
     let mut refs = vec![format!("github.ref == 'refs/heads/{}'", quote(base))];
 
-    for p in pushes {
-        let cond = match p.find(['*', '?', '[', '+']) {
-            None => format!("github.ref == 'refs/heads/{}'", quote(&p)),
-            // A prefix match runs it on more branches than the pattern, never fewer
-            Some(at) => format!("startsWith(github.ref, 'refs/heads/{}')", quote(&p[..at])),
-        };
-
+    for cond in pushes.iter().filter_map(|p| push_condition(p)) {
         if !refs.contains(&cond) {
             refs.push(cond);
         }
@@ -734,15 +806,19 @@ fn on_branches(source: &str, base: &str) -> String {
         ));
     }
 
-    refs.join(" || ")
+    format!(
+        "({} || github.actor == 'dependabot[bot]' || {FORK})",
+        refs.join(" || ")
+    )
 }
 
 /**
  * The workflow with `if: github.ref == 'refs/heads/<base>'` on each of `jobs`, and-ed with an
  * `if:` a job has, so on a feature branch GitHub runs only the others. Pushes to the other branches
  * the workflow names and PRs into them keep the jobs, since shipcheck runs only PRs into `base`.
- * A fork's PR keeps them too, since the daemon never runs one. Triggers stay as they are. None when a job's form is one this does not edit, or the result would
- * parse otherwise
+ * A fork's PR keeps them too, since the daemon never runs one. Triggers stay as they are. A job
+ * an earlier init gated keeps its `if:`, so a second init adds no second gate. None when a job's
+ * form is one this does not edit, or the result would parse otherwise
  **/
 pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
     let plain = |s: &str| {
@@ -755,10 +831,7 @@ pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
         return None;
     }
 
-    let gate = format!(
-        "({} || github.actor == 'dependabot[bot]' || {FORK})",
-        on_branches(source, base)
-    );
+    let gate = gate_condition(source, base);
     let root = load(source).ok()?;
     let parsed = Yaml::Hash(root.clone());
     let lines: Vec<&str> = source.lines().collect();
@@ -789,6 +862,11 @@ pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
             Yaml::Boolean(b) => Some(b.to_string()),
             _ => return None,
         };
+
+        if old.as_deref().and_then(ungate).is_some() {
+            continue;
+        }
+
         let at = start + 1 + s + 1;
 
         match (old, keys.iter().find(|(k, _, _)| k == "if")) {
@@ -1258,6 +1336,24 @@ mod tests {
         assert_eq!(ungate("github.ref == 'refs/heads/main'"), None);
         assert_eq!(ungate("always()"), None);
 
+        // Two inits' gates, from before gate_jobs left a gated job alone, both go
+        assert_eq!(ungate(&format!("({gate}) && {gate}")).as_deref(), Some(""));
+        assert_eq!(
+            ungate(&format!("((always()) && {gate}) && {gate}")).as_deref(),
+            Some("always()")
+        );
+        // Only a whole gate after the last `&&` counts
+        assert_eq!(ungate(&format!("(a) || (b) && {gate}")), None);
+        assert_eq!(ungate(&format!("(a) && {gate} && (b)")), None);
+
+        // v0.1.4 to v0.1.7 wrote the base branch or Dependabot, without the fork clause
+        let old = "(github.ref == 'refs/heads/master' || github.actor == 'dependabot[bot]')";
+        assert_eq!(ungate(old).as_deref(), Some(""));
+        assert_eq!(
+            ungate(&format!("(always()) && {old}")).as_deref(),
+            Some("always()")
+        );
+
         // vite's form, with other branches and PRs into them, round trips through gate_jobs
         let vite = "on:\n  push:\n    branches: [main, \"v[0-9]+\"]\n  pull_request:\njobs:\n  a:\n    steps:\n      - run: make\n  b:\n    if: always()\n    steps:\n      - run: make\n";
         let gated = gate_jobs(vite, &["a".into(), "b".into()], "main").unwrap();
@@ -1270,6 +1366,54 @@ mod tests {
         assert!(
             jobs.iter().all(|j| !j.pr_only),
             "the gate runs them on the base branch"
+        );
+    }
+
+    #[test]
+    fn a_second_gate_leaves_a_gated_job_as_it_is() {
+        let ci = "on: [push, pull_request]\njobs:\n  a:\n    steps:\n      - run: make\n  b:\n    if: always()\n    steps:\n      - run: make\n  c:\n    steps:\n      - run: make\n";
+        let once = gate_jobs(ci, &["a".into(), "b".into()], "main").unwrap();
+        assert_eq!(gated_jobs(&once), ["a", "b"]);
+        assert_eq!(
+            gate_jobs(&once, &["a".into(), "b".into()], "main").as_deref(),
+            Some(once.as_str())
+        );
+        let twice = gate_jobs(&once, &["a".into(), "b".into(), "c".into()], "main").unwrap();
+        assert_eq!(
+            twice,
+            gate_jobs(ci, &["a".into(), "b".into(), "c".into()], "main").unwrap()
+        );
+        assert!(job_runs(&twice).iter().all(|j| !j.pr_only));
+
+        // A job two inits gated is no PR-only job, and act runs it with no `if:`
+        let gate = gate_condition(ci, "main");
+        let stacked = format!(
+            "on: push\njobs:\n  a:\n    if: \"({gate}) && {gate}\"\n    steps:\n      - run: make\n"
+        );
+        assert!(!job_runs(&stacked)[0].pr_only);
+        assert_eq!(gated_jobs(&stacked), ["a"]);
+    }
+
+    #[test]
+    fn a_push_pattern_becomes_a_condition_that_never_runs_fewer() {
+        // curl's '*/ci', which a prefix would turn into every branch
+        assert_eq!(
+            push_condition("*/ci").as_deref(),
+            Some("endsWith(github.ref, '/ci')")
+        );
+        assert_eq!(
+            push_condition("release/*").as_deref(),
+            Some("startsWith(github.ref, 'refs/heads/release/')")
+        );
+        assert_eq!(
+            push_condition("v*.x").as_deref(),
+            Some("(startsWith(github.ref, 'refs/heads/v') && endsWith(github.ref, '.x'))")
+        );
+        assert_eq!(push_condition("[ab]*"), None);
+        let curl = "on:\n  push:\n    branches: [master, '*/ci', '[ab]*']\njobs:\n  a:\n    steps:\n      - run: make\n";
+        assert_eq!(
+            gate_condition(curl, "master"),
+            "(github.ref == 'refs/heads/master' || endsWith(github.ref, '/ci') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)"
         );
     }
 
