@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -95,6 +95,8 @@ pub struct Plan {
     pub ruleset: Option<Ruleset>,
     /// Why init has nothing to set up, which ends it
     pub stop: Option<String>,
+    /// The file, job and reason of each job whose check failed when init tried it
+    failed: Vec<(String, String, String)>,
 }
 
 /// The person's choice for each step of a plan
@@ -115,8 +117,11 @@ pub enum Step {
     Ruleset,
 }
 
-/// Builds the plan. Reads only, so quitting before apply leaves everything as it was
-pub fn plan(root: &Path, app: App) -> Result<Plan, String> {
+/**
+ * Builds the plan, and tries each host check it would write. Writes nothing in the repository, so
+ * quitting before apply leaves everything as it was
+ **/
+pub fn plan(root: &Path, app: App, r: &mut dyn Report) -> Result<Plan, String> {
     let path = root.join("shipcheck.toml");
     let mut plan = Plan {
         base: base_branch(root),
@@ -127,12 +132,18 @@ pub fn plan(root: &Path, app: App) -> Result<Plan, String> {
         app,
         ruleset: None,
         stop: None,
+        failed: Vec::new(),
     };
     let text = if path.exists() {
         fs::read_to_string(&path).map_err(|e| format!("shipcheck.toml: {e}"))?
     } else {
-        match setup::propose(root, &setup::Machine::this())? {
+        let machine = setup::Machine::this();
+
+        match setup::propose(root, &machine)? {
             (Some(text), said) => {
+                let Some((text, said)) = tried(root, &machine, text, said, r, &mut plan)? else {
+                    return Ok(plan);
+                };
                 plan.config = Some((text.clone(), said));
                 text
             }
@@ -160,8 +171,347 @@ pub fn plan(root: &Path, app: App) -> Result<Plan, String> {
     }
 
     workflows(root, &cfg, &mut plan)?;
-    plan.ruleset = ruleset_plan(root, &text, &plan.app);
+    plan.ruleset = ruleset_plan(root, &text, &plan.app, &plan.failed);
     Ok(plan)
+}
+
+/**
+ * Keeps the host checks of a proposed shipcheck.toml that pass when init tries them, some with
+ * color turned off. A job whose check fails stays on GitHub with the end of its log as the reason.
+ * None, with the plan stopped, when no check passes
+ **/
+fn tried(
+    root: &Path,
+    machine: &setup::Machine,
+    text: String,
+    said: String,
+    r: &mut dyn Report,
+    plan: &mut Plan,
+) -> Result<Option<(String, String)>, String> {
+    // ponytail: act mode writes its workflows untried, trying them needs Docker and act's own runs
+    if RepoConfig::parse(&text)?.runner != RunnerKind::Host {
+        return Ok(Some((text, said)));
+    }
+
+    let (results, versions) = try_checks(root, &text, r)?;
+    let mut d = setup::detect_on(root, machine);
+    let mut failed = Vec::new();
+    d.versions = versions;
+    d.checks.retain_mut(|c| match results.get(&c.name) {
+        Some(Ok(command)) => {
+            c.command = command.clone();
+            true
+        }
+        other => {
+            let why = other.and_then(|t| t.as_ref().err()).cloned();
+            failed.push((
+                c.from.clone(),
+                why.unwrap_or_else(|| "init did not try it".into()),
+            ));
+            false
+        }
+    });
+
+    for (from, why) in failed {
+        // A check from project files has no job, so nothing stays on GitHub for it
+        let Some((file, job)) = from.split_once(", job ") else {
+            d.skipped.push(format!("{from}: {why}"));
+            continue;
+        };
+        let job = job.split(", after job ").next().unwrap_or(job);
+        plan.failed.push((file.into(), job.into(), why.clone()));
+        d.github.push(setup::Kept {
+            file: file.into(),
+            job: job.into(),
+            why,
+            checks: None,
+        });
+    }
+
+    if d.checks.is_empty() {
+        plan.stop = Some(format!(
+            "no check passed when init tried it, so init wrote no shipcheck.toml and set nothing up:\n{}",
+            d.explain()
+        ));
+        return Ok(None);
+    }
+
+    Ok(Some((
+        setup::host_config(&d.checks, &d.versions),
+        format!("these host checks:\n{}", d.explain()),
+    )))
+}
+
+/// Each check's command once it passed, or why it failed
+type Tried = BTreeMap<String, Result<String, String>>;
+
+/**
+ * Tries each `versions` command, then each check, then each safe variant of a check that failed.
+ * A version that fails would fail every run, so it is left out, and only the checks that start
+ * its tool fail with it. Returns the results and the versions that answered
+ **/
+fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec<String>), String> {
+    let cfg = RepoConfig::parse(text)?;
+    let mut tried = Tried::new();
+    let mut versions = Vec::new();
+
+    for version in &cfg.host.versions {
+        let Err(e) = probe(root, &cfg.host, version) else {
+            versions.push(version.clone());
+            continue;
+        };
+        let tool = version.split_whitespace().next().unwrap_or_default();
+
+        for (name, command) in &cfg.host.checks {
+            let starts = command
+                .split(|c: char| c.is_whitespace() || "();|&".contains(c))
+                .any(|w| w == tool);
+
+            if starts && !tried.contains_key(name) {
+                r.done(
+                    false,
+                    &format!("{name} ... failed, `{version}` does not run"),
+                );
+                tried.insert(
+                    name.clone(),
+                    Err(format!(
+                        "failed when init tried it: {e}\n    fix: install {tool}"
+                    )),
+                );
+            }
+        }
+    }
+
+    let mut todo: Vec<(String, Vec<String>)> = cfg
+        .host
+        .checks
+        .iter()
+        .filter(|(name, _)| !tried.contains_key(*name))
+        .map(|(name, command)| {
+            let mut commands = vec![command.clone()];
+            commands.extend(variants(command));
+            (name.clone(), commands)
+        })
+        .collect();
+    let mut first = true;
+
+    while !todo.is_empty() {
+        let what = if first {
+            "trying"
+        } else {
+            "trying again, with color off,"
+        };
+        r.start(&format!(
+            "{what} {} in the sandbox, as `shipcheck run` would",
+            plural(todo.len(), "check")
+        ));
+        first = false;
+        let mut round = RepoConfig::parse(text)?;
+        round.host.versions = versions.clone();
+        round.host.checks = todo
+            .iter()
+            .map(|(n, c)| (n.clone(), c[0].clone()))
+            .collect();
+        let results = run_trial(root, round)?;
+        let mut next = Vec::new();
+
+        for (name, mut commands) in todo {
+            let command = commands.remove(0);
+            let t = results
+                .get(&name)
+                .ok_or("a check init tried has no result")?;
+
+            if t.passed {
+                let how = if command == cfg.host.checks[&name] {
+                    ""
+                } else {
+                    ", with color off"
+                };
+                r.done(true, &format!("{name} ... passed {}s{how}", t.secs));
+                tried.insert(name, Ok(command));
+            } else if commands.is_empty() || deterministic(&t.log) {
+                r.done(false, &format!("{name} ... failed {}s", t.secs));
+                tried.insert(name, Err(reason(&t.log)));
+            } else {
+                next.push((name, commands));
+            }
+        }
+
+        todo = next;
+    }
+
+    Ok((tried, versions))
+}
+
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(not(test))]
+fn run_trial(root: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, crate::run::Trial>, String> {
+    crate::run::trial(root, cfg, &mut |_| {})
+}
+
+// Unit tests start no jail, every check passes. tests/init_tries.rs runs the real ones
+#[cfg(test)]
+fn run_trial(_: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, crate::run::Trial>, String> {
+    Ok(cfg
+        .host
+        .checks
+        .into_keys()
+        .map(|name| {
+            let t = crate::run::Trial {
+                passed: true,
+                log: String::new(),
+                secs: 0,
+            };
+            (name, t)
+        })
+        .collect())
+}
+
+/// Whether one `versions` command answers in the sandbox, as every plan runs it
+#[cfg(not(test))]
+fn probe(root: &Path, host: &crate::config::Host, version: &str) -> Result<(), String> {
+    use crate::runner::Runner;
+    let host = crate::config::Host {
+        versions: vec![version.to_string()],
+        ..host.clone()
+    };
+    crate::runner::host::Host::new(host, root)
+        .identity()
+        .map(|_| ())
+}
+
+#[cfg(test)]
+fn probe(_: &Path, _: &crate::config::Host, _: &str) -> Result<(), String> {
+    Ok(())
+}
+
+/// Turns color off for tools that read these, so a check that fails on color codes can pass
+const NO_COLOR: &str = "NO_COLOR=1 FORCE_COLOR=0 PY_COLORS=0 TERM=dumb";
+
+/// Flags that force color, which some tools refuse without a terminal
+const COLOR_FLAGS: &[&str] = &[
+    "--color=always",
+    "--color=yes",
+    "--color always",
+    "-c always",
+];
+
+/// The safe variants of a check, in the order init tries them: without forced color, then with color off too
+fn variants(command: &str) -> Vec<String> {
+    let plain = without_color(command);
+    let mut out = Vec::new();
+
+    if plain != command {
+        out.push(plain.clone());
+    }
+
+    out.push(format!("export {NO_COLOR} && {plain}"));
+    out
+}
+
+fn without_color(command: &str) -> String {
+    COLOR_FLAGS
+        .iter()
+        .fold(command.to_string(), |c, flag| without(&c, flag))
+}
+
+/// The command with each ` <flag>` that ends a word removed
+fn without(command: &str, flag: &str) -> String {
+    let needle = format!(" {flag}");
+    let mut out = String::new();
+    let mut rest = command;
+
+    while let Some(at) = rest.find(&needle) {
+        let after = &rest[at + needle.len()..];
+        let ends = after
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || ";&|)".contains(c));
+        out.push_str(&rest[..at]);
+
+        if !ends {
+            out.push_str(&needle);
+        }
+
+        rest = after;
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// A failure no variant changes: a missing command or a refused permission
+fn deterministic(log: &str) -> bool {
+    [
+        "command not found",
+        ": not found",
+        "not installed",
+        "Operation not permitted",
+        "EPERM",
+    ]
+    .iter()
+    .any(|w| log.contains(w))
+}
+
+/// The command a failure names as missing, as bash, zsh and dash print it
+fn missing_tool(log: &str) -> Option<String> {
+    log.lines()
+        .find_map(|line| {
+            let line = line.trim();
+
+            if let Some((_, tool)) = line.split_once("command not found: ") {
+                return tool.split_whitespace().next();
+            }
+
+            let before = line
+                .strip_suffix(": command not found")
+                .or_else(|| line.strip_suffix(": not found"))?;
+            before.rsplit(": ").next()
+        })
+        .filter(|t| {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._+-/".contains(c))
+        })
+        .map(str::to_string)
+}
+
+/// Why a job stays on GitHub after its check failed: the end of the log, and the fix when the log names one
+fn reason(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(6)..]
+        .iter()
+        .map(|l| format!("\n      {}", l.trim_end()))
+        .collect::<String>();
+    let fix = missing_tool(log)
+        .map(|t| format!("\n    fix: install {t}"))
+        .unwrap_or_default();
+    format!("failed when init tried it:{tail}{fix}")
+}
+
+/// The jobs that stay on GitHub for PRs: the ones shipcheck cannot run here, and the ones whose check failed when init tried it
+fn kept(root: &Path, failed: &[(String, String, String)]) -> Vec<setup::Kept> {
+    let mut kept = setup::detect(root).github;
+
+    for (file, job, why) in failed {
+        let source =
+            fs::read_to_string(root.join(".github/workflows").join(file)).unwrap_or_default();
+        let checks = crate::workflow::job_runs(&source)
+            .into_iter()
+            .find(|j| j.id == *job)
+            .and_then(|j| j.check_names);
+        kept.push(setup::Kept {
+            file: file.clone(),
+            job: job.clone(),
+            why: why.clone(),
+            checks,
+        });
+    }
+
+    kept
 }
 
 impl Plan {
@@ -486,8 +836,8 @@ impl Report for Lines<'_> {
 /// `init --yes`: no questions, the plan in plain text and the recommended choices applied
 pub fn plain(root: &Path, app: App, out: &mut dyn Write, finish: Finish) -> Result<bool, String> {
     let s = Style::stdout();
-    let plan = plan(root, app)?;
     let _ = writeln!(out, "{}", s.bold("shipcheck init"));
+    let plan = plan(root, app, &mut Lines { out, style: s })?;
 
     if let Some(why) = &plan.stop {
         let _ = writeln!(out, "\n{why}");
@@ -530,6 +880,26 @@ pub fn plain(root: &Path, app: App, out: &mut dyn Write, finish: Finish) -> Resu
     Ok(true)
 }
 
+/// `init` for an agent or a script: shipcheck.toml alone, with only the checks that passed when init tried them
+pub fn config_only(root: &Path, out: &mut dyn Write) -> Result<Option<String>, String> {
+    if root.join("shipcheck.toml").exists() {
+        return Ok(None);
+    }
+
+    let style = Style::stdout();
+    let plan = plan(root, App::NotPublic, &mut Lines { out, style })?;
+
+    if let Some(why) = plan.stop {
+        return Ok(Some(why));
+    }
+
+    let Some((text, said)) = plan.config else {
+        return Ok(None);
+    };
+    crate::agents::write_in_repo(root, &root.join("shipcheck.toml"), &text)?;
+    Ok(Some(format!("wrote shipcheck.toml with {said}")))
+}
+
 fn next_steps(out: &mut dyn Write, s: Style, next: &[String]) {
     let _ = writeln!(out, "\n{}", s.bold("Next"));
 
@@ -546,6 +916,10 @@ struct Spinners {
 
 impl Report for Spinners {
     fn start(&mut self, what: &str) {
+        if let Some(old) = self.spinner.take() {
+            old.clear();
+        }
+
         let spinner = cliclack::spinner();
         spinner.start(what);
         self.spinner = Some(spinner);
@@ -593,16 +967,24 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
     cliclack::log::remark(s.dim(
         "Sets this repository up so its PRs get their checks from this machine. Nothing changes until you apply",
     ))?;
-    let spinner = cliclack::spinner();
-    spinner.start("Reading the workflows");
-    let plan = match plan(root, find()) {
-        Ok(plan) => plan,
-        Err(e) => {
-            spinner.error(&e);
-            return Ok(Err(e));
-        }
+    let mut report = Spinners {
+        spinner: None,
+        style: s,
     };
-    spinner.stop("Read the workflows");
+    report.start("Reading the workflows");
+    let plan = plan(root, find(), &mut report);
+
+    if let Some(spinner) = report.spinner.take() {
+        match &plan {
+            Ok(_) => spinner.stop("Read the workflows"),
+            Err(e) => spinner.error(e),
+        }
+    }
+
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(e) => return Ok(Err(e)),
+    };
 
     if let Some(why) = &plan.stop {
         cliclack::outro(why)?;
@@ -652,10 +1034,6 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
         }
     }
 
-    let mut report = Spinners {
-        spinner: None,
-        style: s,
-    };
     let next = match apply(root, &plan, &a, finish, &mut report) {
         Ok(next) => next,
         Err(e) => {
@@ -797,7 +1175,8 @@ fn coverage(
                 let hits: Vec<&String> = checks
                     .iter()
                     .filter(|(_, whole, parts)| {
-                        parts.contains(&command)
+                        // init drops a forced color flag when only that makes the check pass
+                        (parts.contains(&command) || parts.contains(&without_color(&command)))
                             && dir
                                 .as_ref()
                                 .is_none_or(|d| whole.contains(&format!("cd {d}")))
@@ -836,7 +1215,7 @@ fn uncovered(covers: &[&Cover]) -> String {
 /// The workflow edits for the jobs shipcheck checks, and notes for the workflows left alone
 fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), String> {
     let base = plan.base.clone();
-    let kept = setup::detect(root).github;
+    let kept = kept(root, &plan.failed);
     let mut offered = false;
 
     for file in setup::workflow_files(root).unwrap_or_default() {
@@ -960,7 +1339,7 @@ fn gate(
     let mut ungated: BTreeSet<String> = jobs
         .iter()
         .map(|j| j.id.clone())
-        .filter(|id| !local(id))
+        .filter(|id| !local(id) || staying.contains(&id.as_str()))
         .collect();
 
     // A gated job still runs on the base branch, so a job that runs only there may need it
@@ -1117,13 +1496,18 @@ pub fn job_checks(root: &Path, text: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn ruleset_plan(root: &Path, text: &str, app: &App) -> Option<Ruleset> {
+fn ruleset_plan(
+    root: &Path,
+    text: &str,
+    app: &App,
+    failed: &[(String, String, String)],
+) -> Option<Ruleset> {
     let app = app.id().filter(|a| a.parse::<u64>().is_ok())?;
     let names = job_checks(root, text).ok().filter(|n| !n.is_empty())?;
     let mut github = Vec::new();
     let mut notes = Vec::new();
 
-    for kept in setup::detect(root).github {
+    for kept in kept(root, failed) {
         match kept.checks {
             Some(checks) => github.extend(checks),
             None => notes.push(format!(
@@ -1285,6 +1669,50 @@ mod tests {
     const OWN_LEAKS: &str = include_str!("../tests/fixtures/own/leaks.yml");
 
     #[test]
+    fn variants_drop_forced_color_then_turn_color_off() {
+        assert_eq!(
+            variants("cargo test --color=always && npx jest --color always"),
+            [
+                "cargo test && npx jest",
+                "export NO_COLOR=1 FORCE_COLOR=0 PY_COLORS=0 TERM=dumb && cargo test && npx jest",
+            ]
+        );
+        assert_eq!(
+            variants("pytest -c always.ini"),
+            ["export NO_COLOR=1 FORCE_COLOR=0 PY_COLORS=0 TERM=dumb && pytest -c always.ini"]
+        );
+        assert_eq!(variants("ls --color=yes; make -c always")[0], "ls; make");
+    }
+
+    #[test]
+    fn a_missing_command_is_no_flake_and_names_its_fix() {
+        for (log, tool) in [
+            (
+                "$ x\nbash: line 1: autoreconf: command not found\n",
+                "autoreconf",
+            ),
+            ("zsh: command not found: pnpm", "pnpm"),
+            ("sh: 1: pmccabe: not found", "pmccabe"),
+        ] {
+            assert!(deterministic(log), "{log}");
+            assert_eq!(missing_tool(log).as_deref(), Some(tool), "{log}");
+            assert!(
+                reason(log).ends_with(&format!("fix: install {tool}")),
+                "{log}"
+            );
+        }
+
+        assert!(deterministic("open /dev/ptmx: Operation not permitted"));
+        assert!(!deterministic("error: 2 tests failed"));
+        assert_eq!(missing_tool("error: 2 tests failed"), None);
+        let log = (1..=20).map(|n| format!("line {n}\n")).collect::<String>();
+        let why = reason(&log);
+        assert!(why.starts_with("failed when init tried it:"), "{why}");
+        assert!(why.contains("line 15") && why.contains("line 20") && !why.contains("line 14"));
+        assert!(!why.contains("fix:"));
+    }
+
+    #[test]
     fn coverage_compares_commands_not_names() {
         // ci.yml's test job, without its service job: fmt, clippy and test run its three commands
         let ci = OWN_CI.split("\n  service:").next().unwrap();
@@ -1292,7 +1720,7 @@ mod tests {
             (".github/workflows/ci.yml", ci),
             ("shipcheck.toml", SHIPCHECK_TOML),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let ci = &plan.workflows[0];
         assert!(ci.recommended, "{:?}", ci.warning);
         assert_eq!(
@@ -1310,7 +1738,7 @@ mod tests {
             (".github/workflows/leaks.yml", OWN_LEAKS),
             ("shipcheck.toml", SHIPCHECK_TOML),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
         // Without Docker, e2e.yml's matrix stays on GitHub, which tests see on every machine
         // leaks.yml's job has no command a check could run, so it stays on GitHub too
@@ -1349,7 +1777,7 @@ mod tests {
                 "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n",
             ),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let mut a = plan.recommended();
         // ci.yml is checked, so yes is its default. lint.yml is not
         assert_eq!(a.workflows, [true, false]);
@@ -1397,7 +1825,7 @@ mod tests {
             (".github/workflows/ci.yml", PUSH),
             (".github/workflows/setup.yml", SETUP),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
         assert_eq!(files, ["ci.yml"]);
         assert_eq!(
@@ -1414,7 +1842,7 @@ mod tests {
     #[test]
     fn plan_writes_nothing_and_a_declined_config_sets_nothing_up() {
         let dir = repo(&[(".github/workflows/ci.yml", CI)]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         assert!(!dir.path().join("shipcheck.toml").exists());
         assert_eq!(plan.steps()[0], Step::Config);
         assert_eq!(plan.recommended().workflows, [true]);
@@ -1459,7 +1887,7 @@ mod tests {
         let ci = crate::setup::tests::CI_WITH_RELEASE;
         let config = "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let mut said = Said::default();
         apply(
             dir.path(),
@@ -1491,7 +1919,7 @@ mod tests {
         let ci = "on:\n  pull_request:\n  push:\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  tests:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        python: [\"3.12\", \"3.13\"]\n    steps:\n      - run: make test\n";
         let config = "runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         let mut said = Said::default();
         apply(
             dir.path(),
@@ -1519,7 +1947,7 @@ mod tests {
             (".github/workflows/ci.yml", &needs),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         assert!(plan.workflows.is_empty());
         assert!(
             plan.notes[0].contains("ci.yml: GitHub keeps running it on PRs, for tests, lint"),
@@ -1556,7 +1984,7 @@ mod tests {
             (".github/workflows/orch-review.yml", review),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         assert_eq!(plan.workflows.len(), 1);
         assert!(
             plan.notes.iter().any(|n| n
@@ -1571,7 +1999,7 @@ mod tests {
         // git-cow's ci.yml, trimmed: its only test job is a matrix with a macOS entry
         let ci = "on: [push, pull_request]\njobs:\n  test:\n    strategy:\n      matrix:\n        include:\n          - {os: macos-latest}\n          - {os: ubuntu-latest}\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci)]);
-        let plan = super::plan(dir.path(), App::NotPublic).unwrap();
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         assert!(plan.stop.as_deref().unwrap().contains(setup::NOTHING_LOCAL));
         assert!(!dir.path().join("shipcheck.toml").exists());
     }
