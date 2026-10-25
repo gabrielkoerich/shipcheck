@@ -310,22 +310,49 @@ pub const FORK: &str = "github.event.pull_request.head.repo.fork";
 
 /// Whether a job's `if:` depends on the PR or the default branch, so only GitHub can tell if it runs
 fn pr_only(job: &Yaml) -> bool {
-    let cond = match &job["if"] {
+    match &job["if"] {
         // init's gate runs the job on the base branch, so only the condition it and-ed with counts
-        Yaml::String(c) => ungate(c).unwrap_or_else(|| c.clone()),
-        _ => return false,
-    };
+        Yaml::String(c) => reads_pr(&ungate(c).unwrap_or_else(|| c.clone())),
+        _ => false,
+    }
+}
 
-    [
-        "default_branch",
-        "pull_request",
-        "head_ref",
-        "base_ref",
-        "github.ref !=",
-        "github.ref_name !=",
-    ]
-    .iter()
-    .any(|p| cond.contains(p))
+/**
+ * Whether a condition reads the PR or the default branch, so only GitHub can tell if it holds on a
+ * PR. One that and-s a push or branch term is false on every PR, as act's skip says, so it does not
+ **/
+// ponytail: reads the condition as text, a parser of GitHub expressions if a real workflow fools it
+pub fn reads_pr(cond: &str) -> bool {
+    let false_on_pr = !cond.contains("||")
+        && !cond.contains("!(")
+        && [
+            "github.ref ==",
+            "github.ref_name ==",
+            "github.event_name == 'push'",
+        ]
+        .iter()
+        .any(|p| cond.contains(p));
+
+    !false_on_pr
+        && [
+            "default_branch",
+            "pull_request",
+            "head_ref",
+            "base_ref",
+            "github.ref !=",
+            "github.ref_name !=",
+        ]
+        .iter()
+        .any(|p| cond.contains(p))
+}
+
+/// The ids of the jobs whose `if:` reads the PR, see `reads_pr`
+pub fn pr_only_jobs(source: &str) -> BTreeSet<String> {
+    job_runs(source)
+        .into_iter()
+        .filter(|j| j.pr_only)
+        .map(|j| j.id)
+        .collect()
 }
 
 /**
@@ -1227,6 +1254,29 @@ pub fn read_marks(log: &str, nonce: &str) -> BTreeMap<String, JobMarks> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_condition_false_on_every_pr_does_not_read_the_pr() {
+        for cond in [
+            "github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+            "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+            "github.ref_name == github.event.repository.default_branch",
+            "github.event_name == 'push' && github.head_ref == ''",
+        ] {
+            assert!(!reads_pr(cond), "{cond}");
+        }
+
+        for cond in [
+            "contains(github.event.pull_request.labels.*.name, 'slow')",
+            "github.ref != format('refs/heads/{0}', github.event.repository.default_branch)",
+            "github.event_name == 'push' || github.event_name == 'pull_request'",
+            "!(github.ref == 'refs/heads/main') && github.head_ref != ''",
+        ] {
+            assert!(reads_pr(cond), "{cond}");
+        }
+
+        assert!(!reads_pr("always()"));
+    }
 
     #[test]
     fn reads_base_only_jobs_docker_steps_and_a_sha_pins_name() {
