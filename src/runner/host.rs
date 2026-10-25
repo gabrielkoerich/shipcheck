@@ -661,7 +661,7 @@ const NPM_PREFIX: &str = ".npm-global";
 /// part of `TOOLCHAINS`. Never all of `~/.docker`, whose config can name a credential store
 const HOME_LINKS: &[&str] = &[".docker/cli-plugins", ".cache/solana"];
 
-pub(crate) fn jail_path() -> std::ffi::OsString {
+pub fn jail_path() -> std::ffi::OsString {
     trusted_path(
         &std::env::var_os("PATH").unwrap_or_default(),
         &crate::run::user_dir(),
