@@ -67,7 +67,7 @@ exit "$code"
 /// Kills the job's process group and deletes its VM, unless shipcheck said `done` first
 const REAPER: &str = r#"read -r pgid || pgid=
 read -r done && exit 0
-[ -n "$pgid" ] && kill -KILL -- "-$pgid" 2>/dev/null
+[ -n "$pgid" ] && kill -s KILL -- "-$pgid" 2>/dev/null
 colima delete --force --data --profile "$1" >/dev/null 2>&1
 "#;
 
