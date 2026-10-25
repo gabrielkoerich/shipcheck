@@ -135,7 +135,6 @@ fn same_repo_prs(prs: &Value, repo: &str, sha: &str, base: &str) -> Vec<u64> {
 }
 
 /// This App's comment on a PR that holds `marker`, as its id and body
-// ponytail: first 100 comments, follow the Link header if a PR has more
 pub fn find_comment(
     token: &str,
     repo: &str,
@@ -184,7 +183,6 @@ pub fn put_comment(
     Ok(res["html_url"].as_str().unwrap_or_default().to_string())
 }
 
-// ponytail: first 100 open PRs only, follow the Link header if a repository has more
 pub fn open_prs(token: &str, repo: &str) -> Result<Vec<OpenPr>, String> {
     let prs = get(
         &format!("{API}/repos/{repo}/pulls?state=open&per_page=100"),
@@ -227,7 +225,6 @@ pub struct Check {
 pub type Checks = BTreeMap<String, Check>;
 
 /// This App's latest check run per name on a commit, in one call
-// ponytail: first 100 check runs, follow the Link header if a commit has more jobs
 pub fn find_checks(token: &str, repo: &str, sha: &str, app_id: &str) -> Result<Checks, String> {
     let runs = get(
         &format!(
@@ -274,7 +271,6 @@ pub fn find_pusher(
     branch: &str,
     sha: &str,
 ) -> Result<Option<(String, &'static str)>, String> {
-    // ponytail: 10 pages of 100 timeline events, the latest force-push is on the last page
     let timeline = pages(
         &format!("{API}/repos/{repo}/issues/{pr}/timeline"),
         token,
@@ -292,7 +288,6 @@ pub fn find_pusher(
         return Ok(Some((login, "merge-commit")));
     }
 
-    // ponytail: the 100 PRs into the branch closed last
     let closed = get(
         &format!(
             "{API}/repos/{repo}/pulls?state=closed&base={branch}&sort=updated&direction=desc&per_page=100"
@@ -308,7 +303,6 @@ pub fn find_pusher(
         }
     }
 
-    // ponytail: first 100 events
     let events = get(&format!("{API}/repos/{repo}/events?per_page=100"), token)?;
     Ok(pusher(&events, branch, sha).map(|login| (login, "events")))
 }
