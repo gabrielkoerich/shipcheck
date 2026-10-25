@@ -308,10 +308,14 @@ fn fill(y: &Yaml, leg: &[(String, String)]) -> Yaml {
     }
 }
 
+/// The clause of init's gate that keeps a fork's PR on GitHub, since the daemon never runs one
+pub const FORK: &str = "github.event.pull_request.head.repo.fork";
+
 /// Whether a job's `if:` depends on the PR or the default branch, so only GitHub can tell if it runs
 fn pr_only(job: &Yaml) -> bool {
     let cond = match &job["if"] {
-        Yaml::String(c) => c,
+        // init's gate runs the job on the base branch, so only the condition it and-ed with counts
+        Yaml::String(c) => ungate(c).unwrap_or_else(|| c.clone()),
         _ => return false,
     };
 
@@ -641,86 +645,22 @@ pub fn job_runs(source: &str) -> Vec<Job> {
 }
 
 /**
- * The workflow with `on:` cut to pushes to `base`: `pull_request` removed, `push` limited to
- * `branches: [base]`, other events kept. Edits only those lines, so comments and layout elsewhere
- * stay. None when GitHub already runs it only off feature branches, or its `on:` has a form this
- * does not edit
+ * A job's `if:` without the gate `gate_jobs` adds, empty when the gate was all of it. None when it
+ * has no gate. act runs a PR's checks on a branch of its own, where the gate would skip every job
  **/
-pub fn main_only(source: &str, base: &str) -> Option<String> {
-    let plain = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
-    };
+// ponytail: matches the gate's closing fork clause as text, as base_only reads conditions
+pub fn ungate(cond: &str) -> Option<String> {
+    let c = cond.trim();
 
-    if !runs_for_branches(source) || !plain(base) {
+    if !c.ends_with(&format!(" || {FORK})")) {
         return None;
     }
 
-    let lines: Vec<&str> = source.lines().collect();
-    let start = lines.iter().position(|l| {
-        ["on:", "\"on\":", "'on':"].iter().any(|k| {
-            l.strip_prefix(k)
-                .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
-        })
-    })?;
-    let end = (start + 1..lines.len())
-        .find(|&i| {
-            let l = lines[i];
-            !l.trim().is_empty() && !l.starts_with([' ', '\t', '#'])
-        })
-        .unwrap_or(lines.len());
-    let inline = value_of(lines[start]);
-    let body = &lines[start + 1..end];
-    let first = body.iter().find(|l| !blank(l));
-
-    let block = if inline.is_empty() && first.is_some_and(|l| !l.trim_start().starts_with('-')) {
-        // A push already kept off feature branches, such as `[main, stable]`, stays as it is
-        let keep_push = load(source)
-            .ok()
-            .and_then(|r| r.get(&key("on")).map(|on| on["push"].clone()))
-            .is_some_and(|push| !matches!(push, Yaml::BadValue) && !push_runs(&push));
-        edit_events(body, base, keep_push)
-    } else if inline.starts_with('{') {
-        return None;
-    } else {
-        // `on: push`, `on: [push, pull_request]` or a list, which name events and nothing else
-        let root = load(source).ok()?;
-        let events: Vec<String> = match root.get(&key("on"))? {
-            Yaml::String(e) => vec![e.clone()],
-            Yaml::Array(list) => list
-                .iter()
-                .filter_map(|e| e.as_str().map(str::to_string))
-                .collect(),
-            _ => return None,
-        };
-        let mut block = vec![
-            "  push:".to_string(),
-            format!("    branches: [{base}, {DEPENDABOT}]"),
-        ];
-        block.extend(
-            events
-                .iter()
-                .filter(|e| *e != "push" && *e != "pull_request")
-                .map(|e| format!("  {e}:")),
-        );
-        // What followed the list in the old block, such as a comment before `jobs:`
-        let last = body.iter().rposition(|l| !blank(l)).map_or(0, |i| i + 1);
-        block.extend(body[last..].iter().map(|l| l.to_string()));
-        block
-    };
-
-    let mut out: Vec<String> = lines[..start].iter().map(|l| l.to_string()).collect();
-    out.push(lines[start].split_once(':').map(|(k, _)| format!("{k}:"))?);
-    out.extend(block);
-    out.extend(lines[end..].iter().map(|l| l.to_string()));
-    let mut text = out.join("\n");
-
-    if source.ends_with('\n') {
-        text.push('\n');
+    match c.rfind(") && (") {
+        Some(at) if c.starts_with('(') => Some(c[1..at].to_string()),
+        Some(_) => None,
+        None => Some(String::new()),
     }
-
-    (text != source && load(&text).is_ok() && !runs_for_branches(&text)).then_some(text)
 }
 
 /**
@@ -801,7 +741,7 @@ fn on_branches(source: &str, base: &str) -> String {
  * The workflow with `if: github.ref == 'refs/heads/<base>'` on each of `jobs`, and-ed with an
  * `if:` a job has, so on a feature branch GitHub runs only the others. Pushes to the other branches
  * the workflow names and PRs into them keep the jobs, since shipcheck runs only PRs into `base`.
- * Triggers stay as they are. None when a job's form is one this does not edit, or the result would
+ * A fork's PR keeps them too, since the daemon never runs one. Triggers stay as they are. None when a job's form is one this does not edit, or the result would
  * parse otherwise
  **/
 pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
@@ -816,7 +756,7 @@ pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
     }
 
     let gate = format!(
-        "({} || github.actor == 'dependabot[bot]')",
+        "({} || github.actor == 'dependabot[bot]' || {FORK})",
         on_branches(source, base)
     );
     let root = load(source).ok()?;
@@ -949,58 +889,6 @@ fn entries(lines: &[&str]) -> (String, Vec<(String, usize, usize)>) {
         })
         .collect();
     (indent, entries)
-}
-
-/// The lines of a block `on:` mapping, with `pull_request` cut and `push` limited to `base`
-fn edit_events(body: &[&str], base: &str, keep_push: bool) -> Vec<String> {
-    let (indent, events) = entries(body);
-    let push = events.iter().find(|(k, _, _)| k == "push");
-    let mut new_push = vec![format!("{indent}push:")];
-
-    match push {
-        Some(&(_, s, e)) if keep_push => {
-            new_push = body[s..e].iter().map(|l| l.to_string()).collect();
-        }
-        Some(&(_, s, e)) if value_of(body[s]).is_empty() && e > s + 1 => {
-            let (sub, filters) = entries(&body[s + 1..e]);
-            new_push.push(format!("{sub}branches: [{base}, {DEPENDABOT}]"));
-            let mut at = s + 1;
-
-            for (k, fs, fe) in filters {
-                if k == "branches" || k == "branches-ignore" {
-                    new_push.extend(body[at..s + 1 + fs].iter().map(|l| l.to_string()));
-                    at = s + 1 + fe;
-                }
-            }
-
-            new_push.extend(body[at..e].iter().map(|l| l.to_string()));
-        }
-        _ => new_push.push(format!("{indent}  branches: [{base}, {DEPENDABOT}]")),
-    }
-
-    let mut out = Vec::new();
-    let mut at = 0;
-
-    if push.is_none() {
-        let first = events.first().map_or(0, |&(_, s, _)| s);
-        out.extend(body[..first].iter().map(|l| l.to_string()));
-        out.extend(new_push.clone());
-        at = first;
-    }
-
-    for (k, s, e) in &events {
-        if k == "pull_request" || k == "push" {
-            out.extend(body[at..*s].iter().map(|l| l.to_string()));
-            at = *e;
-
-            if k == "push" {
-                out.extend(new_push.clone());
-            }
-        }
-    }
-
-    out.extend(body[at..].iter().map(|l| l.to_string()));
-    out
 }
 
 /// Each job id with the ids in its `needs`, in file order
@@ -1264,11 +1152,19 @@ mod tests {
 
     #[test]
     fn reads_base_only_jobs_docker_steps_and_a_sha_pins_name() {
-        let ci = "on: push\njobs:\n  a:\n    if: github.ref == 'refs/heads/main'\n    steps:\n      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable\n      - run: echo\n  b:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n    steps:\n      - run: docker version\n  c:\n    steps:\n      - run: act --version\n  d:\n    steps:\n      - uses: docker/setup-buildx-action@v3\n  e:\n    steps:\n      - uses: actions/checkout@v4 # v4\n      - run: hadolint Dockerfile && echo docker-ish exact\n";
+        let ci = "on: push\njobs:\n  a:\n    if: github.ref == 'refs/heads/main'\n    steps:\n      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable\n      - run: echo\n  b:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n    steps:\n      - run: docker version\n  c:\n    steps:\n      - run: act --version\n  d:\n    steps:\n      - uses: docker/setup-buildx-action@v3\n  e:\n    steps:\n      - uses: actions/checkout@v4 # v4\n      - run: hadolint Dockerfile && echo docker-ish exact\n";
         let jobs = job_runs(ci);
         let job = |id: &str| jobs.iter().find(|j| j.id == id).unwrap();
         assert!(job("a").base_only);
         assert!(!job("b").base_only, "an || can run it off the base branch");
+        assert!(
+            !job("b").pr_only,
+            "init's fork clause is false on a push to the base branch"
+        );
+        let pr = job_runs(
+            "on: pull_request\njobs:\n  p:\n    if: github.event.pull_request.draft == false\n    steps:\n      - run: echo\n",
+        );
+        assert!(pr[0].pr_only);
         assert_eq!(job("a").steps[0].ref_name.as_deref(), Some("stable"));
         assert_eq!(
             job("e").steps[0].ref_name,
@@ -1281,88 +1177,6 @@ mod tests {
             !job("e").runs_docker,
             "a word that only contains docker is not Docker"
         );
-    }
-
-    #[test]
-    fn main_only_edits_on_and_keeps_the_rest() {
-        let block = r#"name: ci
-
-on:
-  push:
-    branches: ["**"] # every branch
-    paths-ignore: ["docs/**"]
-  # PRs too
-  pull_request:
-    paths-ignore: ["docs/**"]
-  workflow_dispatch:
-
-# Read only
-permissions:
-  contents: read
-jobs: {}
-"#;
-        let want = r#"name: ci
-
-on:
-  push:
-    branches: [main, "dependabot/**"]
-    paths-ignore: ["docs/**"]
-  # PRs too
-  workflow_dispatch:
-
-# Read only
-permissions:
-  contents: read
-jobs: {}
-"#;
-        assert_eq!(main_only(block, "main").as_deref(), Some(want));
-
-        let cases = [
-            (
-                "on: [push, pull_request, workflow_dispatch] # all\n\njobs: {}\n",
-                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\n  workflow_dispatch:\n\njobs: {}\n",
-            ),
-            (
-                "on: pull_request\njobs: {}\n",
-                "on:\n  push:\n    branches: [trunk, \"dependabot/**\"]\njobs: {}\n",
-            ),
-            (
-                "on:\n  - push\n  - merge_group\njobs: {}\n",
-                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\n  merge_group:\njobs: {}\n",
-            ),
-            (
-                "on:\n  pull_request:\n    types: [opened]\n  schedule:\n    - cron: \"0 0 * * *\"\njobs: {}\n",
-                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\n  schedule:\n    - cron: \"0 0 * * *\"\njobs: {}\n",
-            ),
-            (
-                "\"on\":\n    push:\n        branches-ignore:\n            - main\n        tags: [\"v*\"]\njobs: {}\n",
-                "\"on\":\n    push:\n        branches: [main, \"dependabot/**\"]\n        tags: [\"v*\"]\njobs: {}\n",
-            ),
-            (
-                "on:\n  push:\n  pull_request:\njobs: {}",
-                "on:\n  push:\n    branches: [main, \"dependabot/**\"]\njobs: {}",
-            ),
-        ];
-
-        for (source, want) in cases {
-            let base = if source.contains("on: pull_request") {
-                "trunk"
-            } else {
-                "main"
-            };
-            assert_eq!(main_only(source, base).as_deref(), Some(want), "{source}");
-        }
-
-        // Already off feature branches, a form it does not edit, or a base it will not write
-        for source in [
-            "on:\n  push:\n    branches: [main]\njobs: {}\n",
-            "on: {pull_request: {}}\njobs: {}\n",
-            "on: workflow_dispatch\njobs: {}\n",
-        ] {
-            assert_eq!(main_only(source, "main"), None, "{source}");
-        }
-
-        assert_eq!(main_only("on: push\njobs: {}\n", "a b"), None);
     }
 
     #[test]
@@ -1380,7 +1194,7 @@ jobs: {}
         let flask = "name: Tests\non:\n  pull_request:\n    paths-ignore: ['docs/**', 'README.md']\n  push:\n    branches: [main, stable]\njobs:\n  tests:\n    name: ${{ matrix.name || matrix.python }}\n    strategy:\n      matrix:\n        include:\n          - {python: '3.14'}\n    steps:\n      - run: uv run tox run\n  typing:\n    runs-on: ubuntu-latest\n    steps:\n      - run: uv run tox run -e typing\n";
         let want = flask.replace(
             "  typing:\n",
-            "  typing:\n    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/stable' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n",
+            "  typing:\n    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/stable' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n",
         );
         assert_eq!(
             gate_jobs(flask, &["typing".into()], "main").as_deref(),
@@ -1391,10 +1205,10 @@ jobs: {}
         let ripgrep = "on:\n  pull_request:\n  push:\n    branches:\n    - master\njobs:\n  test:\n    name: test\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        include:\n        - os: windows-latest\n    steps:\n    - run: cargo test\n  rustfmt:\n    runs-on: ubuntu-latest\n    if: (!cancelled() && !failure()) # after the rest\n    steps:\n    - run: cargo fmt --all --check\n  docs:\n    if: ${{ github.event_name != 'schedule' }}\n    runs-on: ubuntu-latest\n    steps:\n    - run: cargo doc\n";
         let gated = gate_jobs(ripgrep, &["rustfmt".into(), "docs".into()], "master").unwrap();
         assert!(gated.contains(
-            "    if: \"((!cancelled() && !failure())) && (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.base_ref != 'master') || github.actor == 'dependabot[bot]')\"\n"
+            "    if: \"((!cancelled() && !failure())) && (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.base_ref != 'master') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\"\n"
         ));
         assert!(gated.contains(
-            "    if: \"(github.event_name != 'schedule') && (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.base_ref != 'master') || github.actor == 'dependabot[bot]')\"\n"
+            "    if: \"(github.event_name != 'schedule') && (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.base_ref != 'master') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\"\n"
         ));
         assert!(gated.starts_with("on:\n  pull_request:\n  push:\n    branches:\n    - master\n"));
         assert_eq!(gated.lines().count(), ripgrep.lines().count());
@@ -1403,20 +1217,20 @@ jobs: {}
         let push_only = "on:\n  push:\n\njobs:\n  checks:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bun test\n  tests:\n    strategy:\n      matrix:\n        os: [ubuntu-latest, macos-latest]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test\n";
         let gated = gate_jobs(push_only, &["checks".into()], "main").unwrap();
         assert!(gated.starts_with(
-            "on:\n  push:\n\njobs:\n  checks:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n    runs-on"
+            "on:\n  push:\n\njobs:\n  checks:\n    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n    runs-on"
         ));
 
         // vite's ci.yml, trimmed: pushes to maintenance branches and PRs into them keep lint
         let vite = "on:\n  push:\n    branches:\n      - main\n      - release/*\n      - \"v[0-9]+\"\n      - \"v[0-9]+.[0-9]+\"\n      - hotfix\n      - \"**\"\n      - \"!wip\"\n  pull_request:\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: pnpm run lint\n";
         let gated = gate_jobs(vite, &["lint".into()], "main").unwrap();
         assert!(gated.contains(
-            "    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/hotfix' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]')\n"
+            "    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/hotfix' || (github.event_name == 'pull_request' && github.base_ref != 'main') || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n"
         ), "{gated}");
 
         // PRs only into the base need no clause for other branches
         let into_main = "on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\njobs:\n  lint:\n    steps:\n      - run: make lint\n";
         assert!(gate_jobs(into_main, &["lint".into()], "main").unwrap().contains(
-            "    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]')\n"
+            "    if: (github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)\n"
         ));
         assert_eq!(
             other_branches(
@@ -1434,22 +1248,28 @@ jobs: {}
     }
 
     #[test]
-    fn main_only_keeps_a_push_already_off_feature_branches() {
-        // ripgrep's ci.yml: list items at the key's own indentation
-        let ripgrep = "on:\n  pull_request:\n  push:\n    branches:\n    - master\n  schedule:\n  - cron: '00 01 * * *'\n\npermissions:\n  contents: read\njobs: {}\n";
+    fn ungate_removes_only_the_gate() {
+        let gate = "(github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)";
+        assert_eq!(ungate(gate).as_deref(), Some(""));
         assert_eq!(
-            main_only(ripgrep, "master").as_deref(),
-            Some(
-                "on:\n  push:\n    branches:\n    - master\n  schedule:\n  - cron: '00 01 * * *'\n\npermissions:\n  contents: read\njobs: {}\n"
-            )
+            ungate(&format!("((a) && (b)) && {gate}")).as_deref(),
+            Some("(a) && (b)")
         );
-        // flask's tests.yaml: `stable` keeps its hosted runs
-        let flask = "on:\n  pull_request:\n    paths-ignore: ['docs/**', 'README.md']\n  push:\n    branches: [main, stable]\n    paths-ignore: ['docs/**', 'README.md']\npermissions: {}\njobs: {}\n";
-        assert_eq!(
-            main_only(flask, "main").as_deref(),
-            Some(
-                "on:\n  push:\n    branches: [main, stable]\n    paths-ignore: ['docs/**', 'README.md']\npermissions: {}\njobs: {}\n"
-            )
+        assert_eq!(ungate("github.ref == 'refs/heads/main'"), None);
+        assert_eq!(ungate("always()"), None);
+
+        // vite's form, with other branches and PRs into them, round trips through gate_jobs
+        let vite = "on:\n  push:\n    branches: [main, \"v[0-9]+\"]\n  pull_request:\njobs:\n  a:\n    steps:\n      - run: make\n  b:\n    if: always()\n    steps:\n      - run: make\n";
+        let gated = gate_jobs(vite, &["a".into(), "b".into()], "main").unwrap();
+        let jobs = job_runs(&gated);
+        let root = Yaml::Hash(load(&gated).unwrap());
+        let cond = |id: &str| root["jobs"][id]["if"].as_str().unwrap().to_string();
+        assert!(cond("a").contains("startsWith(github.ref, 'refs/heads/v')"));
+        assert_eq!(ungate(&cond("a")).as_deref(), Some(""));
+        assert_eq!(ungate(&cond("b")).as_deref(), Some("always()"));
+        assert!(
+            jobs.iter().all(|j| !j.pr_only),
+            "the gate runs them on the base branch"
         );
     }
 
@@ -1458,7 +1278,6 @@ jobs: {}
         // fastapi's create-draft-release.yml
         let closed = "on:\n  pull_request:\n    types:\n      - closed\njobs: {}\n";
         assert!(!runs_for_branches(closed));
-        assert_eq!(main_only(closed, "master"), None);
         assert!(runs_for_branches(
             "on:\n  pull_request:\n    types: [opened, synchronize, labeled]\njobs: {}\n"
         ));
