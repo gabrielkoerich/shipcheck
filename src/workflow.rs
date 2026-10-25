@@ -321,7 +321,6 @@ fn pr_only(job: &Yaml) -> bool {
  * Whether a condition reads the PR or the default branch, so only GitHub can tell if it holds on a
  * PR. One that and-s a push or branch term is false on every PR, as act's skip says, so it does not
  **/
-// ponytail: reads the condition as text, a parser of GitHub expressions if a real workflow fools it
 pub fn reads_pr(cond: &str) -> bool {
     let false_on_pr = !cond.contains("||")
         && !cond.contains("!(")
@@ -359,7 +358,6 @@ pub fn pr_only_jobs(source: &str) -> BTreeSet<String> {
  * Whether a job's `if:` requires the ref to be one branch, so it runs only there. An `||` can let it
  * run elsewhere, as init's own gate for Dependabot does, so a condition with one never counts
  **/
-// ponytail: reads the condition as text, a parser of GitHub expressions if a real workflow fools it
 fn base_only(job: &Yaml) -> bool {
     job["if"].as_str().is_some_and(|c| {
         !c.contains("||")
@@ -673,7 +671,6 @@ pub fn job_runs(source: &str) -> Vec<Job> {
  * has no gate. act runs a PR's checks on a branch of its own, where a gate would skip every job.
  * A job that two inits gated has two, so each is stripped
  **/
-// ponytail: matches the gate's text, as base_only reads conditions
 pub fn ungate(cond: &str) -> Option<String> {
     let mut c = cond.trim().to_string();
     let mut found = false;

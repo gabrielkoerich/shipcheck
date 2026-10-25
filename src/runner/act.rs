@@ -1956,7 +1956,6 @@ fn artifact_addr(network: Option<&Network>) -> String {
     }
 }
 
-// ponytail: another process can take the port between this check and act binding it, retry the run if so
 fn free_port() -> Result<u16, String> {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())

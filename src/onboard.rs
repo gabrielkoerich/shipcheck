@@ -192,7 +192,6 @@ fn tried(
     r: &mut dyn Report,
     plan: &mut Plan,
 ) -> Result<Option<(String, String)>, String> {
-    // ponytail: act mode writes its workflows untried, trying them needs Docker and act's own runs
     if RepoConfig::parse(&text)?.runner != RunnerKind::Host {
         return Ok(Some((text, said)));
     }
