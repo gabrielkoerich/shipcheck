@@ -57,6 +57,19 @@ pub struct WorkflowResult {
 /// The state of a job shipcheck could not start, such as when Docker failed to create its network
 pub const COULD_NOT_RUN: &str = "failure, shipcheck could not run it";
 
+/// The state of a job whose checkout was not the tested tree, a failed proof and so the check's failure
+pub const WRONG_TREE: &str = "failure, the checkout is not the tested tree";
+
+/// The state of a job that ended in error `e`: a wrong tree fails the code's check, anything else
+/// means shipcheck could not run it
+fn error_state(e: &str) -> &'static str {
+    if e.starts_with(WRONG_TREE) {
+        WRONG_TREE
+    } else {
+        COULD_NOT_RUN
+    }
+}
+
 impl Entry {
     /// It failed only because shipcheck could not start jobs, so the code never ran
     pub fn could_not_run(&self) -> bool {
@@ -144,11 +157,14 @@ pub fn home() -> PathBuf {
     let absolute =
         |dir: std::ffi::OsString| std::path::absolute(&dir).unwrap_or_else(|_| dir.into());
 
-    if let Some(dir) = std::env::var_os("SHIPCHECK_HOME") {
+    // An empty value is unset, as XDG says, not the current directory
+    let set = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+
+    if let Some(dir) = set("SHIPCHECK_HOME") {
         return absolute(dir);
     }
 
-    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+    if let Some(state) = set("XDG_STATE_HOME") {
         return absolute(state).join("shipcheck");
     }
 
@@ -1477,6 +1493,7 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
         logs,
         slots: &slots,
         only: only.as_ref(),
+        base_tree: std::sync::OnceLock::new(),
     };
 
     let results = run_all(&ctx, say)?;
@@ -1702,7 +1719,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
             Err(e) => {
                 exit = exit.and(Some(1));
                 say(&format!("{HOST}/{name}: {e}"));
-                COULD_NOT_RUN
+                error_state(&e)
             }
         };
         say(&format!("{HOST}/{name}: {state}"));
@@ -1817,6 +1834,8 @@ struct Ctx<'a> {
     logs: PathBuf,
     /// The jobs a partial run picked per workflow, `None` for every job
     only: Option<&'a BTreeMap<String, BTreeSet<String>>>,
+    /// The tree of the remote's default branch, asked once by the first host check
+    base_tree: std::sync::OnceLock<Option<String>>,
 }
 
 enum Msg {
@@ -1979,7 +1998,7 @@ fn run_workflow(
                             // The state goes into the check, which may be public, so the error with
                             // its host paths stays on this machine
                             say(&format!("{file}/{job}: {e}"));
-                            COULD_NOT_RUN.to_string()
+                            error_state(&e).to_string()
                         }
                     };
                     say(&format!("{file}/{job}: {state}"));
@@ -2131,11 +2150,21 @@ fn run_job(
         let at = Instant::now();
         let link = standalone_git(&dir, &ctx.plan.sha)?;
         timing(file, job, "standalone_git", at);
-        // The remote's default branch, never `--base`, which a caller picks and could point at a branch
-        let on_base = ["origin/HEAD^{tree}", "origin/main^{tree}"]
-            .iter()
-            .find_map(|r| git(&ctx.plan.repo, &["rev-parse", "--verify", "-q", r]).ok())
-            .is_some_and(|t| t == ctx.plan.tree);
+        // The default branch the remote reports, never `--base` or the local origin/HEAD, which a
+        // caller can point at a branch. Only host checks keep a cache per base
+        let on_base = file == HOST
+            && ctx
+                .base_tree
+                .get_or_init(|| {
+                    let base = remote_base(&ctx.plan.repo)?;
+                    git(
+                        &ctx.plan.repo,
+                        &["rev-parse", "--verify", "-q", &format!("{base}^{{tree}}")],
+                    )
+                    .ok()
+                })
+                .as_ref()
+                .is_some_and(|t| *t == ctx.plan.tree);
         let workflow = dir.with_extension("workflows").join(file);
         let request = RunRequest {
             run_dir: &dir,
@@ -2470,7 +2499,7 @@ fn verify_checkout(dir: &Path, tree: &str) -> Result<(), String> {
 
     if on_disk != tree {
         return Err(format!(
-            "the checkout in {} is tree {on_disk}, not the tested tree {tree}",
+            "{WRONG_TREE}: {} is tree {on_disk}, not {tree}. Run again from a clean worktree",
             dir.display()
         ));
     }
@@ -2844,6 +2873,31 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_home_variable_counts_as_unset() {
+        if std::env::var_os("SHIPCHECK_HOME_CHILD").is_some() {
+            assert_eq!(home(), PathBuf::from("/tmp/fake/.local/state/shipcheck"));
+            return;
+        }
+
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run::tests::an_empty_home_variable_counts_as_unset",
+            ])
+            .env("SHIPCHECK_HOME_CHILD", "1")
+            .env("HOME", "/tmp/fake")
+            .env("SHIPCHECK_HOME", "")
+            .env("XDG_STATE_HOME", "")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
     fn default_home_ignores_the_environment() {
         if std::env::var_os("SHIPCHECK_HOME_CHILD").is_some() {
             assert!(
@@ -3191,10 +3245,9 @@ mod tests {
         }
 
         let other = sh(&repo, &["rev-parse", "HEAD^{tree}"]).replace(char::is_alphanumeric, "0");
-        assert!(
-            verify_checkout(&repo, &other).is_err(),
-            "another tree must fail"
-        );
+        // A wrong tree is the check's failure, exit 1, never "could not run"
+        let e = verify_checkout(&repo, &other).unwrap_err();
+        assert_eq!(error_state(&e), WRONG_TREE, "{e}");
     }
 
     #[test]
