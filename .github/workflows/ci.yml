@@ -57,6 +57,15 @@ jobs:
           echo "$ACT_SHA256  act.tar.gz" | sha256sum -c -
           tar -xzf act.tar.gz -C "$RUNNER_TEMP" act
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # mixed_e2e runs host checks, which need bubblewrap as in the test job
+      - timeout-minutes: 5
+        run: |
+          apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
+          sudo apt-get $apt update -q && sudo apt-get $apt install -y bubblewrap apparmor-profiles
+          sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true
       - run: docker version
       - run: act --version
       - run: cargo test --test e2e --test retry_e2e --test shard_e2e --test mixed_e2e -- --ignored --nocapture
