@@ -68,39 +68,79 @@ pub fn signal_group(pgid: u32, signal: libc::c_int) {
     }
 }
 
-/// Whether a child ended, without reaping it, so its pid and group id stay its own until `wait`
-pub fn has_exited(pid: u32) -> bool {
-    // Safe: waitid with WNOWAIT only reads the child's state into a zeroed struct
-    unsafe {
-        let mut info: libc::siginfo_t = std::mem::zeroed();
-        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+/**
+ * Whether a child ended, without reaping it, so its pid and group id stay its own until `wait`. A
+ * child already reaped counts as ended, any other error is an error, so no caller takes it for an
+ * end it can then wait on
+ **/
+pub fn has_exited(pid: u32) -> Result<bool, String> {
+    loop {
+        // Safe: waitid with WNOWAIT only reads the child's state into a zeroed struct
+        let (ret, info) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+            (
+                libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags),
+                info,
+            )
+        };
 
-        // An error, such as a child already reaped, counts as ended, so no caller waits forever
-        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) != 0 || info.si_pid() != 0
+        if ret == 0 {
+            // Safe: waitid filled info, or left it zeroed when the child is still running
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+
+        let err = std::io::Error::last_os_error();
+
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ECHILD) => return Ok(true),
+            _ => return Err(format!("waitid {pid}: {err}")),
+        }
     }
 }
 
 /**
- * Lets the child keep these descriptors open across exec, so a lock on them lasts as long as it
- * does. The parent's own copies keep their close-on-exec flag, only the child's are cleared
+ * Gives the child these descriptors across exec as 9, 8 and down, so a lock on them lasts as long
+ * as it does, and returns those numbers. A shell redirects only single-digit descriptors, so a
+ * reaper can close them for what it starts. Each goes to 10 or higher first, so no move overwrites
+ * one still to be moved. The parent's own descriptors stay as they are
  **/
-pub fn inherit(cmd: &mut std::process::Command, fds: Vec<std::os::fd::RawFd>) {
+pub fn inherit(
+    cmd: &mut std::process::Command,
+    fds: Vec<std::os::fd::RawFd>,
+) -> Vec<std::os::fd::RawFd> {
     use std::os::unix::process::CommandExt;
 
-    // Safe: fcntl is async-signal-safe and touches only the child's descriptor table
+    assert!(fds.len() <= 7, "only descriptors 3 to 9 are free for locks");
+    let targets: Vec<_> = (0..fds.len() as i32).map(|i| 9 - i).collect();
+    let to = targets.clone();
+
+    // Safe: fcntl and dup2 are async-signal-safe and touch only the child's descriptor table
     unsafe {
         cmd.pre_exec(move || {
-            for &fd in &fds {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
+            let mut high = [0; 7];
 
-                if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            for (h, &fd) in high.iter_mut().zip(&fds) {
+                *h = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
+
+                if *h < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+
+            // dup2 clears close-on-exec on the copy, the high ones still close on exec
+            for (&h, &t) in high.iter().zip(&to) {
+                if libc::dup2(h, t) < 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
             }
 
             Ok(())
         });
     }
+
+    targets
 }
 
 pub struct Outcome {
@@ -208,12 +248,22 @@ pub(crate) fn posix_sh() -> &'static str {
 mod tests {
     use super::*;
 
+    /// The file at a descriptor of 10 or higher, which a shell cannot redirect, as a lock can be
+    pub(crate) fn high(file: std::fs::File) -> std::fs::File {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        // Safe: F_DUPFD_CLOEXEC returns a new descriptor this File then owns alone
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+        assert!(fd >= 10);
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    }
+
     #[test]
     fn an_ended_child_is_seen_before_it_is_reaped() {
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let started = std::time::Instant::now();
 
-        while !has_exited(child.id()) {
+        while !has_exited(child.id()).unwrap() {
             assert!(started.elapsed() < std::time::Duration::from_secs(5));
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -224,7 +274,7 @@ mod tests {
             .arg("5")
             .spawn()
             .unwrap();
-        assert!(!has_exited(running.id()));
+        assert!(!has_exited(running.id()).unwrap());
         let _ = running.kill();
         let _ = running.wait();
     }

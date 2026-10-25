@@ -561,7 +561,9 @@ impl Engine for Docker {
             }
 
             // The reaper hears before the child is reaped, while no other process can have its id
-            if super::has_exited(child.id()) {
+            let ended = super::has_exited(child.id());
+
+            if matches!(ended, Ok(true)) {
                 crate::run::timing(file, job, "act total", spawned);
 
                 // act ended by itself and removed its containers, so the reaper has nothing to do
@@ -572,11 +574,12 @@ impl Engine for Docker {
                 break child.wait().map_err(|e| e.to_string())?.code();
             }
 
-            if Instant::now() > deadline {
+            // A child shipcheck cannot see end is stopped as on a timeout, never taken as done
+            if ended.is_err() || Instant::now() > deadline {
                 // The group, act's docker commands too, while its id is still act's
                 super::signal_group(child.id(), libc::SIGKILL);
 
-                while !super::has_exited(child.id()) {
+                while !super::has_exited(child.id()).unwrap_or(true) {
                     std::thread::sleep(Duration::from_millis(20));
                 }
 
@@ -1879,10 +1882,13 @@ exit 0
  **/
 fn reaper(run_dir: &Path, slot_lock: Option<std::os::fd::RawFd>) -> Option<std::process::Child> {
     let mut cmd = Command::new("sh");
-    super::inherit(&mut cmd, slot_lock.into_iter().collect());
+    let held = super::inherit(&mut cmd, slot_lock.into_iter().collect());
     cmd.env(
         "LOCK_FDS",
-        slot_lock.map(|f| f.to_string()).unwrap_or_default(),
+        held.iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
     );
     cmd.args(["-c", REAPER, "sh", &network_name(run_dir)])
         .args(mount_paths(run_dir))
@@ -2606,6 +2612,9 @@ jobs:
         fs::write(&docker, fake).unwrap();
         fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
+        // A slot lock at 10 or higher, which a shell cannot redirect, so it must come in lower
+        let lock =
+            crate::runner::tests::high(fs::File::create(dir.path().join("slot.lock")).unwrap());
 
         // Ended by itself, killed at the timeout, or shipcheck died
         for state in ["done", "exited", ""] {
@@ -2615,9 +2624,13 @@ jobs:
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let mut reaper = Command::new(crate::runner::posix_sh())
+            let mut cmd = Command::new(crate::runner::posix_sh());
+            let held =
+                super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
+            let mut reaper = cmd
                 .args(["-c", REAPER, "sh", "net-1", "/runs/0"])
                 .env("PATH", &path)
+                .env("LOCK_FDS", held[0].to_string())
                 .stdin(Stdio::piped())
                 .spawn()
                 .unwrap();

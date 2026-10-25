@@ -94,10 +94,11 @@ d=$!
 n=0
 limit=${DELETE_SECS:-120}
 while kill -0 "$d" 2>/dev/null && [ "$n" -lt "$limit" ]; do sleep 1; n=$((n + 1)); done
-if [ "$n" -lt "$limit" ]; then
+if ! kill -0 "$d" 2>/dev/null; then
   wait "$d" && rm -f "$2"
 else
-  kill -s KILL "$d" 2>/dev/null
+  # Its own group, which shipcheck started it in, so colima's limactl goes too, and this reaper last
+  kill -s KILL 0
 fi
 "#;
 
@@ -211,9 +212,17 @@ fn leftovers() -> Vec<String> {
         .append(true)
         .open(crate::run::home().join("locks").join("colima.lock"));
 
-    if lock.as_ref().map_or(true, |l| l.try_lock().is_err()) {
+    let Ok(mut lock) = lock else {
+        return Vec::new();
+    };
+
+    if lock.try_lock().is_err() {
         return Vec::new();
     }
+
+    // A run waiting on the lock names who holds it
+    let _ = lock.set_len(0);
+    let _ = write!(lock, "{}", std::process::id());
 
     let listed = profiles();
     let mut done = Vec::new();
@@ -378,14 +387,14 @@ impl Engine for Colima {
             .into_iter()
             .chain([std::os::fd::AsRawFd::as_raw_fd(&one_vm)])
             .collect();
-        super::inherit(&mut reaper, fds.clone());
+        let held = super::inherit(&mut reaper, fds);
         let record = records().join(&profile);
         fs::create_dir_all(records()).map_err(|e| e.to_string())?;
         fs::write(&record, "").map_err(|e| e.to_string())?;
         let mut reaper = clean_env(&mut reaper)
             .env(
                 "LOCK_FDS",
-                fds.iter()
+                held.iter()
                     .map(|f| f.to_string())
                     .collect::<Vec<_>>()
                     .join(" "),
@@ -427,16 +436,19 @@ impl Engine for Colima {
             };
 
             loop {
-                if super::has_exited(child.id()) {
+                let ended = super::has_exited(child.id());
+
+                if matches!(ended, Ok(true)) {
                     exited();
                     break Ok(child.wait().map_err(|e| e.to_string())?.code());
                 }
 
-                if Instant::now() > deadline {
+                // A child shipcheck cannot see end is stopped as on a timeout
+                if ended.is_err() || Instant::now() > deadline {
                     // The group, so `colima ssh` and act's side go too
                     super::signal_group(child.id(), libc::SIGKILL);
 
-                    while !super::has_exited(child.id()) {
+                    while !super::has_exited(child.id()).unwrap_or(true) {
                         std::thread::sleep(Duration::from_millis(20));
                     }
 
@@ -643,46 +655,68 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("colima.log");
-        let lock = fs::File::create(dir.path().join("x.lock")).unwrap();
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&lock);
+        let child = dir.path().join("child.pid");
+        // A lock at 10 or higher, which a shell cannot redirect
+        let lock = crate::runner::tests::high(fs::File::create(dir.path().join("x.lock")).unwrap());
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
 
         for (hang, kept) in [(false, false), (true, true)] {
             let record = dir.path().join("sc-abc");
             fs::write(&record, "").unwrap();
             let _ = fs::remove_file(&log);
-            // It says whether it got the lock's descriptor, and hangs when asked
+            let mut cmd = Command::new(crate::runner::posix_sh());
+            let held =
+                super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
+            assert_eq!(held, [9]);
+            // It says its arguments and whether it got the lock, and when asked hangs in a child as limactl does
             let fake = format!(
-                "#!/bin/sh\nif [ -e /dev/fd/{fd} ]; then echo open >> {log}; else echo closed >> {log}; fi\n{}",
-                if hang { "sleep 30\n" } else { "" },
+                "#!/bin/sh\nif [ -e /dev/fd/9 ]; then echo \"open $*\" >> {log}; else echo \"closed $*\" >> {log}; fi\n{}",
+                if hang {
+                    format!("sleep 30 &\necho $! > {}\nwait\n", child.display())
+                } else {
+                    String::new()
+                },
                 log = log.display()
             );
             fs::write(dir.path().join("colima"), fake).unwrap();
             fs::set_permissions(dir.path().join("colima"), fs::Permissions::from_mode(0o755))
                 .unwrap();
-            let mut cmd = Command::new(crate::runner::posix_sh());
-            super::super::inherit(&mut cmd, vec![fd]);
+            // Its own group, as shipcheck starts it, since on a hung delete it kills its group
             let mut reaper = cmd
                 .args(["-c", REAPER, "sh", "sc-abc"])
                 .arg(&record)
                 .env("PATH", &path)
-                .env("LOCK_FDS", fd.to_string())
+                .env("LOCK_FDS", "9")
                 .env("DELETE_SECS", "2")
                 .stdin(Stdio::null())
+                .process_group(0)
                 .spawn()
                 .unwrap();
             let started = Instant::now();
-            assert!(reaper.wait().unwrap().success());
+            let status = reaper.wait().unwrap();
+            assert_eq!(status.success(), !hang, "hang {hang}: {status}");
             assert!(
                 started.elapsed() < Duration::from_secs(10),
                 "a hung delete held the reaper"
             );
             assert_eq!(
                 fs::read_to_string(&log).unwrap(),
-                "closed\n",
-                "colima got the lock"
+                "closed delete --force --data --profile sc-abc\n",
+                "colima got the lock or another argument"
             );
             assert_eq!(record.exists(), kept, "hang {hang}");
+
+            if hang {
+                let pid: i32 = fs::read_to_string(&child).unwrap().trim().parse().unwrap();
+                let gone = || unsafe { libc::kill(pid, 0) } != 0;
+                let deadline = Instant::now() + Duration::from_secs(5);
+
+                while !gone() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+
+                assert!(gone(), "the hung delete's child outlived the reaper");
+            }
         }
     }
 
