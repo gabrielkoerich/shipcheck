@@ -12,6 +12,7 @@ pub mod java;
 pub mod onboard;
 pub mod record;
 pub mod report;
+pub mod ruby;
 pub mod run;
 pub mod runner;
 pub mod secret;
