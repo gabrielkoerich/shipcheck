@@ -1505,9 +1505,24 @@ mod tests {
             cache,
         };
         let log = clone.path().join("log");
-        // As cli/cli's script/licenses does, then with a prefix, then with a template of its own
-        let cmd = "set -e; for d in \"$(mktemp -d)\" \"$(mktemp -d -t pre)\" \"$(mktemp)\"; do case $d in \"$TMPDIR\"/*) ;; *) exit 9 ;; esac; done; mktemp \"$PWD/own.XXXX\"";
-        let exit = run_command(cmd, clone.path(), &jail, &[], &log, Duration::from_secs(10));
+        // As cli/cli's script/licenses does, then with a prefix, then with a template of its own.
+        // A bare `-t pre` is BSD's form, the one the macOS shim handles, GNU wants X's in it
+        let prefix = if cfg!(target_os = "macos") {
+            "pre"
+        } else {
+            "preXXXXXX"
+        };
+        let cmd = format!(
+            "set -e; for d in \"$(mktemp -d)\" \"$(mktemp -d -t {prefix})\" \"$(mktemp)\"; do case $d in \"$TMPDIR\"/*) ;; *) exit 9 ;; esac; done; mktemp \"$PWD/own.XXXX\""
+        );
+        let exit = run_command(
+            &cmd,
+            clone.path(),
+            &jail,
+            &[],
+            &log,
+            Duration::from_secs(10),
+        );
         let log = fs::read_to_string(&log).unwrap();
         assert_eq!(exit.unwrap(), Some(0), "{log}");
         assert!(
