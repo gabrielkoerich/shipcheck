@@ -175,7 +175,12 @@ fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan
         let acts = cfg.jobs_on(RunnerKind::Act);
 
         if !acts.is_empty() {
-            existing.push_str(&format!(", and with act jobs {}", acts.join(", ")));
+            let jobs = format!("act jobs {}", acts.join(", "));
+            existing = if cfg.host.checks.is_empty() && cfg.workflows.is_empty() {
+                jobs
+            } else {
+                format!("{existing}, and {jobs}")
+            };
         }
 
         plan.existing = Some(existing);
@@ -223,7 +228,7 @@ fn tried(
         }
     });
 
-    let before = d.github.len();
+    let mut ids = Vec::new();
 
     for (from, why) in failed {
         // A check from project files has no job, so nothing stays on GitHub for it
@@ -232,19 +237,22 @@ fn tried(
             continue;
         };
         let job = job.split(", after job ").next().unwrap_or(job);
+        ids.push((file.to_string(), job.to_string()));
         d.github.push(setup::Kept {
             file: file.into(),
             job: job.into(),
             why,
             checks: None,
+            act: None,
         });
     }
 
-    // A job whose check failed here can still run with act, and the jobs kept before stay kept
+    // A job whose check failed here can still run with act
     setup::place(root, machine, &mut d);
     plan.failed.extend(
-        d.github[before..]
+        d.github
             .iter()
+            .filter(|k| ids.contains(&(k.file.clone(), k.job.clone())))
             .map(|k| (k.file.clone(), k.job.clone(), k.why.clone())),
     );
 
@@ -379,10 +387,10 @@ fn run_trial(_: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, crate::run::T
     Ok(cfg
         .host
         .checks
-        .into_keys()
-        .map(|name| {
+        .into_iter()
+        .map(|(name, command)| {
             let t = crate::run::Trial {
-                passed: true,
+                passed: !command.contains("fails-in-trial"),
                 log: String::new(),
                 secs: 0,
             };
@@ -534,6 +542,7 @@ fn kept(root: &Path, failed: &[(String, String, String)]) -> Vec<setup::Kept> {
             job: job.clone(),
             why: why.clone(),
             checks,
+            act: None,
         });
     }
 
@@ -1794,6 +1803,39 @@ mod tests {
             ci.diff
         );
         assert!(plan.github.is_empty(), "{:?}", plan.github);
+    }
+
+    #[test]
+    fn a_job_whose_check_fails_its_trial_runs_with_act() {
+        let ci = "on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  broken:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make fails-in-trial\n";
+        let dir = repo(&[(".github/workflows/ci.yml", ci)]);
+        let machine = setup::Machine {
+            docker: true,
+            ..setup::Machine::default()
+        };
+        let (text, said) = setup::propose(dir.path(), &machine).unwrap();
+        let mut plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        plan.failed.clear();
+        let (text, said) = super::tried(
+            dir.path(),
+            &machine,
+            text.unwrap(),
+            said,
+            &mut Said::default(),
+            &mut plan,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            text.contains("[jobs.\"ci.yml/broken\"]\nrunner = \"act\""),
+            "{text}"
+        );
+        assert!(text.contains("lint = \"make lint\""), "{text}");
+        assert!(plan.failed.is_empty(), "{:?}", plan.failed);
+        assert!(
+            said.contains("ci.yml, job broken: failed when init tried it"),
+            "{said}"
+        );
     }
 
     #[test]

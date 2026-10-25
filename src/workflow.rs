@@ -699,6 +699,48 @@ pub fn ungate(cond: &str) -> Option<String> {
     }
 }
 
+/// What act, which runs a job as `workflow_dispatch` on a branch of its own, gives other values than a PR
+const CONTEXT_ACT_LACKS: &[&str] = &[
+    "github.event",
+    "github.base_ref",
+    "github.head_ref",
+    "github.repository_owner",
+    "github.actor",
+    "github.triggering_actor",
+    "default_branch",
+];
+
+/**
+ * Why act cannot tell what a job does on a PR: a job `if:` of its own, beside init's gate, which act
+ * may skip and a skip passes, or a value anywhere in the job that reads the PR or who opened it,
+ * which act leaves empty, so a step such as a changed-files lint checks nothing. None when it reads none
+ **/
+pub fn act_lacks_context(source: &str, id: &str) -> Option<String> {
+    let root = load(source).ok()?;
+    let mut job = root.get(&key("jobs"))?.as_hash()?.get(&key(id))?.clone();
+
+    if let Yaml::Hash(h) = &mut job
+        && let Some(cond) = h.get(&key("if")).and_then(Yaml::as_str).map(str::to_string)
+    {
+        let own = ungate(&cond).unwrap_or(cond);
+
+        if !own.trim().is_empty() {
+            return Some(format!(
+                "its `if: {}` can run otherwise under act, which runs it as workflow_dispatch",
+                own.trim()
+            ));
+        }
+
+        h.remove(&key("if"));
+    }
+
+    let text = emit(Hash::from_iter([(key(id), job)])).ok()?;
+    CONTEXT_ACT_LACKS
+        .iter()
+        .find(|c| text.contains(*c))
+        .map(|c| format!("it reads `{c}`, which act leaves empty or sets otherwise"))
+}
+
 /// The jobs whose `if:` holds a gate an init wrote
 pub fn gated_jobs(source: &str) -> Vec<String> {
     let Ok(root) = load(source) else {

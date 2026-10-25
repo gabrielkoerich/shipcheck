@@ -62,6 +62,8 @@ pub struct Kept {
     pub why: String,
     /// GitHub's names for its check runs, None when `init` cannot tell them
     pub checks: Option<Vec<String>>,
+    /// Why act cannot run it here either, on a machine with Docker
+    pub act: Option<String>,
 }
 
 #[derive(Default)]
@@ -203,11 +205,13 @@ impl Detected {
 
         if !self.github.is_empty() {
             out.push("stay on GitHub for PRs, and use Actions minutes:".into());
-            out.extend(
-                self.github
-                    .iter()
-                    .map(|k| format!("  {}, job {}: {}", k.file, k.job, k.why)),
-            );
+            out.extend(self.github.iter().map(|k| match &k.act {
+                Some(act) => format!(
+                    "  {}, job {}: {}, and act cannot run it either: {act}",
+                    k.file, k.job, k.why
+                ),
+                None => format!("  {}, job {}: {}", k.file, k.job, k.why),
+            }));
             out.push(REQUIRE.into());
         }
 
@@ -394,82 +398,229 @@ pub fn config_text(d: &Detected) -> String {
 /// Marks a note of `job_check` that the check runs with another version than the workflow's
 const WARNING: &str = "warning: ";
 
-/**
- * The engine act would run a job on here, or None when it cannot: on a machine without Docker,
- * for a job a PR decides or one off Linux, or one that runs Docker on a machine without colima
- **/
-fn act_engine(job: &crate::workflow::Job, machine: &Machine) -> Option<Engine> {
-    let os = job.os;
+/// Actions that report to GitHub or publish, which only GitHub's run of the job may do
+const REPORTERS: &[&str] = &[
+    "github/codeql-action/",
+    "actions/dependency-review-action",
+    "actions/upload-pages-artifact",
+    "actions/deploy-pages",
+    "actions/attest",
+    "codecov/",
+    "coverallsapp/",
+    "peaceiris/actions-gh-pages",
+    "jamesives/github-pages-deploy-action",
+    "softprops/action-gh-release",
+];
 
-    // act checks Docker before any job, a colima job's too
-    if job.pr_only || os.mac || os.windows || !os.linux || !machine.docker {
-        return None;
-    }
+/// Commands that run containers, whose daemon a job gets only on a VM of its own
+const CONTAINERS: &[&str] = &[
+    "act",
+    "buildah",
+    "docker",
+    "docker-compose",
+    "kind",
+    "minikube",
+    "nerdctl",
+    "podman",
+];
 
-    if job.runs_docker || needs_kernel(job) {
-        return machine.colima.then_some(Engine::Colima);
-    }
-
-    Some(Engine::Docker)
-}
-
-/// Commands that change the kernel's settings or namespaces, which a container never may
+/// Commands that change the kernel, its namespaces or the machine's services, which a container never may
 const KERNEL: &[&str] = &[
     "apparmor_parser",
     "bwrap",
+    "chroot",
     "insmod",
+    "iptables",
     "losetup",
     "modprobe",
     "mount",
+    "nsenter",
+    "service",
+    "setcap",
     "sysctl",
+    "systemctl",
     "unshare",
 ];
 
-/// A step runs a command a container cannot, such as loading an AppArmor profile, so only a VM runs the job
-fn needs_kernel(job: &crate::workflow::Job) -> bool {
-    job.steps.iter().any(|s| {
-        s.run
-            .split(|c: char| c.is_whitespace() || "();|&".contains(c))
-            .any(|w| KERNEL.contains(&w.rsplit('/').next().unwrap_or(w)))
-            || s.run.contains("/proc/sys/")
-    })
+/// The words of each command a `run` starts, `sudo` and leading `VAR=value` taken off
+fn started(run: &str) -> Vec<Vec<String>> {
+    run.replace("&&", "\n")
+        .replace("||", "\n")
+        .split(['\n', ';', '|', '&', '(', ')', '`'])
+        .map(|part| {
+            let words = words(part);
+            let mut sudo = false;
+            words
+                .into_iter()
+                .skip_while(|w| {
+                    let skip = w == "sudo"
+                        || sudo && w.starts_with('-')
+                        || w.contains('=') && !w.starts_with('-');
+                    sudo |= w == "sudo";
+                    skip
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// What a job runs that only a VM gives it: a container runtime, or a change to the kernel
+fn needs_vm(job: &crate::workflow::Job) -> Option<String> {
+    if job.runs_docker {
+        return Some("docker".into());
+    }
+
+    for step in &job.steps {
+        if step.uses.as_deref().is_some_and(|u| {
+            u.to_lowercase()
+                .starts_with("crazy-max/ghaction-setup-docker")
+        }) {
+            return Some("crazy-max/ghaction-setup-docker".into());
+        }
+
+        for words in started(&step.run) {
+            let name = words[0].rsplit('/').next().unwrap_or(&words[0]).to_string();
+            let netns = name == "ip" && words.get(1).is_some_and(|w| w == "netns");
+
+            if CONTAINERS.contains(&name.as_str()) || KERNEL.contains(&name.as_str()) || netns {
+                return Some(if netns { "ip netns".into() } else { name });
+            }
+        }
+
+        if ["/proc/sys/", "/sys/fs/cgroup", "/dev/kvm"]
+            .iter()
+            .any(|p| step.run.contains(p))
+        {
+            return Some("the kernel's /proc/sys, cgroups or KVM".into());
+        }
+    }
+
+    None
 }
 
 /**
- * Moves each job kept on GitHub that act can run here, with every job it needs, to `acts`. act
- * runs the jobs it needs too, on Docker unless they have an entry of their own
+ * Why act cannot run a job here as GitHub does, or the engine it would use. A job off Linux, on a
+ * label act has no image for, one whose `if:` or values read the PR, one that reports to GitHub, or
+ * one that needs a VM, since colima reaches this machine's loopback and is for its owner to choose
+ **/
+fn act_engine(
+    job: &crate::workflow::Job,
+    machine: &Machine,
+    source: &str,
+) -> Result<Engine, String> {
+    // act checks Docker before any job, a colima job's too
+    if !machine.docker {
+        return Err("Docker is not running".into());
+    }
+
+    let labels = crate::runner::act::platforms(&crate::config::Act::default());
+
+    if job.runs_on.is_empty() || job.runs_on.iter().any(|l| l.contains("${{")) {
+        return Err("its runs-on is not a label act has an image for".into());
+    }
+
+    if let Some(l) = job.runs_on.iter().find(|l| !labels.contains_key(*l)) {
+        return Err(format!("act has no image for its label {l}"));
+    }
+
+    if let Some(why) = crate::workflow::act_lacks_context(source, &job.id) {
+        return Err(why);
+    }
+
+    let reports = job
+        .steps
+        .iter()
+        .filter_map(|s| s.uses.as_deref())
+        .find(|u| {
+            let lower = u.to_lowercase();
+            REPORTERS.iter().any(|r| lower.starts_with(r))
+                || ships(u.split('@').next().unwrap_or(u), &['-', '_', '/'])
+        });
+
+    if let Some(u) = reports {
+        return Err(format!("it reports to GitHub or publishes with {u}"));
+    }
+
+    if let Some(what) = needs_vm(job) {
+        let vm = if machine.colima {
+            "colima could run it, but colima reaches this machine's loopback, so it is opt-in"
+        } else {
+            "only a VM runs it"
+        };
+        return Err(format!("it runs {what}, and {vm}"));
+    }
+
+    Ok(Engine::Docker)
+}
+
+/**
+ * Moves each job kept on GitHub that act can run here as GitHub does, with every job it needs, to
+ * `acts`. act runs the jobs it needs too. A job kept because a job left on GitHub needs it moves
+ * only with that job. A job act cannot run keeps its reason, with why act cannot either
  **/
 pub fn place(root: &Path, machine: &Machine, d: &mut Detected) {
-    let mut files: BTreeMap<String, Vec<crate::workflow::Job>> = BTreeMap::new();
+    let mut files: BTreeMap<String, (String, Vec<crate::workflow::Job>)> = BTreeMap::new();
 
     for k in &d.github {
         files.entry(k.file.clone()).or_insert_with(|| {
-            let source = fs::read_to_string(root.join(".github/workflows").join(&k.file));
-            crate::workflow::job_runs(&source.unwrap_or_default())
+            let source = fs::read_to_string(root.join(".github/workflows").join(&k.file))
+                .unwrap_or_default();
+            let jobs = crate::workflow::job_runs(&source);
+            (source, jobs)
         });
     }
 
-    let engine = |k: &Kept| {
-        let jobs = files.get(&k.file)?;
-        let job = jobs.iter().find(|j| j.id == k.job)?;
+    let engine = |k: &Kept| -> Result<Engine, String> {
+        let (source, jobs) = files.get(&k.file).ok_or("no workflow")?;
+        let job = jobs.iter().find(|j| j.id == k.job).ok_or("no job")?;
         let mut before = Vec::new();
         needed(jobs, &job.needs, &mut before, &mut vec![job.id.clone()]);
-        let needs_run = before.iter().all(|n| {
-            jobs.iter()
-                .find(|j| j.id == *n)
-                .and_then(|j| act_engine(j, machine))
-                .is_some()
-        });
-        act_engine(job, machine).filter(|_| needs_run)
+
+        for n in &before {
+            let need = jobs.iter().find(|j| j.id == *n).ok_or("no job")?;
+            act_engine(need, machine, source).map_err(|why| format!("job {n} it needs: {why}"))?;
+        }
+
+        act_engine(job, machine, source)
     };
     let kept = std::mem::take(&mut d.github);
+    let (needs, own): (Vec<Kept>, Vec<Kept>) =
+        kept.into_iter().partition(|k| needed_by(k).is_some());
 
-    for k in kept {
+    for k in own {
         match engine(&k) {
-            Some(e) => d.acts.push((k, e)),
-            None => d.github.push(k),
+            Ok(e) => d.acts.push((k, e)),
+            // Docker not running changes nothing, what stays says why as before
+            Err(why) if !machine.docker => {
+                let _ = why;
+                d.github.push(k);
+            }
+            // A reason that already names act needs no second one
+            Err(_) if k.why.contains("act cannot run") => d.github.push(k),
+            Err(why) => d.github.push(Kept {
+                act: Some(why),
+                ..k
+            }),
         }
     }
+
+    for k in needs {
+        let moved = needed_by(&k)
+            .is_some_and(|by| d.acts.iter().any(|(a, _)| a.file == k.file && a.job == by));
+
+        match engine(&k) {
+            Ok(e) if moved => d.acts.push((k, e)),
+            _ => d.github.push(k),
+        }
+    }
+}
+
+/// The job a job was kept on GitHub for, since that job stays there and needs it
+fn needed_by(k: &Kept) -> Option<&str> {
+    k.why
+        .strip_prefix("job ")?
+        .strip_suffix(" stays on GitHub and needs it")
 }
 
 /// The workflow files, sorted, or None without `.github/workflows`
@@ -537,6 +688,12 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
 
     if job.runs_docker {
         return Some(DOCKER.into());
+    }
+
+    if let Some(what) = needs_vm(job) {
+        return Some(format!(
+            "runs {what}, which only a VM of its own gives a job"
+        ));
     }
 
     // Host mode runs on this machine, not in the job's image
@@ -687,15 +844,10 @@ fn xcode(job: &crate::workflow::Job) -> Option<Result<String, String>> {
             .find(|(k, _)| k == "DEVELOPER_DIR")
             .and_then(|(_, v)| v.as_deref().map_or_else(expression, pick))
     };
-
-    if let Some(x) = from_env(&job.env) {
-        return Some(x);
-    }
+    let mut picks: Vec<Result<String, String>> = from_env(&job.env).into_iter().collect();
 
     for step in &job.steps {
-        if let Some(x) = from_env(&step.env) {
-            return Some(x);
-        }
+        picks.extend(from_env(&step.env));
 
         for line in step.run.lines() {
             let words = words(line);
@@ -704,14 +856,11 @@ fn xcode(job: &crate::workflow::Job) -> Option<Result<String, String>> {
                 .iter()
                 .filter_map(|w| w.strip_prefix("DEVELOPER_DIR="))
                 .chain(xcode_select(&words));
-
-            if let Some(x) = set.filter_map(pick).next() {
-                return Some(x);
-            }
+            picks.extend(set.filter_map(pick).next());
         }
 
         if sets_up_xcode(step) {
-            return Some(match input(step, "xcode-version") {
+            picks.push(match input(step, "xcode-version") {
                 Some(v) if v.starts_with("latest") => Ok(String::new()),
                 Some(v) if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') => {
                     Ok(format!("/Applications/Xcode_{v}.app"))
@@ -721,7 +870,14 @@ fn xcode(job: &crate::workflow::Job) -> Option<Result<String, String>> {
         }
     }
 
-    None
+    // One check has one DEVELOPER_DIR, so a job that switches Xcode between steps stays whole
+    let first = picks.first()?.clone();
+
+    if first.is_ok() && picks.iter().any(|p| *p != first) {
+        return Some(Err("picks more than one Xcode".into()));
+    }
+
+    Some(first)
 }
 
 /// A `run` whose every line only picks an Xcode, `|| true` or not, or hands `DEVELOPER_DIR` to later steps
@@ -826,6 +982,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
                     job: j.id.escape_debug().to_string(),
                     why: PR_ONLY.into(),
                     checks: j.check_names.clone(),
+                    act: None,
                 });
             }
         }
@@ -872,6 +1029,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
                     .iter()
                     .find(|j| j.id == *id)
                     .and_then(|j| j.check_names.clone()),
+                act: None,
             });
         }
 
@@ -901,6 +1059,17 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
                         }
 
                         (job.id.as_str(), Some((command, exports)))
+                    }
+                    // A toolchain or target this machine lacks, act sets up as GitHub does
+                    Err(why) if machine.docker && why.starts_with("needs ") => {
+                        d.github.push(Kept {
+                            file: file.clone(),
+                            job: job.id.escape_debug().to_string(),
+                            why,
+                            checks: job.check_names.clone(),
+                            act: None,
+                        });
+                        (job.id.as_str(), None)
                     }
                     Err(why) => {
                         d.skipped
@@ -3396,43 +3565,107 @@ jobs:
 
     /// What `init` finds in these files on a Linux machine with or without Docker
     #[test]
-    fn a_job_no_host_check_runs_as_github_does_goes_to_act_or_a_vm() {
-        let ci = "on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  heredoc:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat <<EOF > a\n          x\n          EOF\n          make test\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker build .\n  userns:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sudo apparmor_parser -r /etc/apparmor.d/bwrap\n      - run: make test\n  mac:\n    runs-on: macos-latest\n    steps:\n      - uses: some/action@v1\n  after:\n    needs: mac\n    runs-on: ubuntu-latest\n    steps:\n      - uses: some/action@v1\n";
+    fn a_job_no_host_check_runs_as_github_does_goes_to_act_unless_act_differs() {
+        let job = |id: &str, extra: &str, steps: &str| {
+            format!("  {id}:\n    runs-on: ubuntu-latest\n{extra}    steps:\n{steps}")
+        };
+        let heredoc = "      - run: |\n          cat <<EOF > a\n          x\n          EOF\n          make test\n";
+        let ci = [
+            "on: pull_request\njobs:\n".to_string(),
+            job("lint", "", "      - run: make lint\n"),
+            job("heredoc", "", heredoc),
+            job("e2e", "", "      - run: docker build .\n"),
+            job("podman", "", "      - run: sudo podman build .\n"),
+            job("userns", "", "      - run: sudo apparmor_parser -r /etc/apparmor.d/bwrap\n      - run: make test\n"),
+            job("words", "", "      - run: echo mount the disk && make check\n      - uses: some/action@v1\n"),
+            job("wasm", "", "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          targets: wasm32-wasip1\n      - run: cargo check\n"),
+            job("pr", "    if: github.event_name == 'pull_request'\n", heredoc),
+            job("owner", "    if: github.repository_owner == 'acme'\n", heredoc),
+            job("changed", "", "      - uses: some/lint@v1\n        with:\n          base: ${{ github.event.pull_request.base.sha }}\n"),
+            job("codeql", "", "      - uses: github/codeql-action/analyze@v4\n"),
+            job("newer", "", heredoc).replace("ubuntu-latest", "ubuntu-26.04-arm"),
+            job("matrix", "", heredoc).replace("ubuntu-latest", "${{ matrix.os }}"),
+            "  mac:\n    runs-on: macos-latest\n    steps:\n      - uses: some/action@v1\n".into(),
+            "  after:\n    needs: mac\n    runs-on: ubuntu-latest\n    steps:\n      - uses: some/action@v1\n".into(),
+        ]
+        .concat();
         let place = |docker: bool, colima: bool| {
-            let found = detect_on(
-                repo(&[(".github/workflows/ci.yml", ci)]).path(),
+            detect_on(
+                repo(&[(".github/workflows/ci.yml", &ci)]).path(),
                 &Machine {
                     docker,
                     colima,
                     ..Machine::default()
                 },
-            );
-            let ids = |ks: Vec<&Kept>| ks.iter().map(|k| k.job.clone()).collect::<Vec<_>>();
-            let acts: Vec<(String, Engine)> = found
-                .acts
+            )
+        };
+        let why = |d: &Detected, id: &str| {
+            d.github
                 .iter()
-                .map(|(k, e)| (k.job.clone(), *e))
-                .collect();
-            (ids(found.github.iter().collect()), acts, found)
+                .find(|k| k.job == id)
+                .and_then(|k| k.act.clone())
+                .unwrap_or_default()
         };
 
-        // Without Docker nothing changes: what no host check runs stays on GitHub
-        let (github, acts, found) = place(false, false);
-        assert_eq!(github, ["heredoc", "e2e", "userns", "mac", "after"]);
-        assert!(acts.is_empty());
+        // Without Docker nothing changes: what no host check runs stays on GitHub, as it said before
+        let found = place(false, false);
+        assert!(found.acts.is_empty());
+        assert!(found.github.iter().all(|k| k.act.is_none()));
         assert_eq!(found.checks[0].name, "lint");
 
-        let (github, acts, found) = place(true, false);
-        assert_eq!(acts, [("heredoc".to_string(), Engine::Docker)]);
-        // Docker in the job needs a VM, macOS needs GitHub, and so does a job that needs a macOS job
-        assert_eq!(github, ["e2e", "userns", "mac", "after"]);
+        let found = place(true, true);
+        let acts: Vec<(&str, Engine)> = found
+            .acts
+            .iter()
+            .map(|(k, e)| (k.job.as_str(), *e))
+            .collect();
+        assert_eq!(
+            acts,
+            // A target this machine lacks is no host check, act sets it up as GitHub does
+            [
+                ("heredoc", Engine::Docker),
+                ("words", Engine::Docker),
+                ("wasm", Engine::Docker)
+            ]
+        );
+        for (id, reason) in [
+            (
+                "e2e",
+                "it runs docker, and colima could run it, but colima reaches this machine's loopback, so it is opt-in",
+            ),
+            ("podman", "it runs podman, and colima could run it"),
+            ("userns", "it runs apparmor_parser"),
+            (
+                "pr",
+                "its `if: github.event_name == 'pull_request'` can run otherwise under act",
+            ),
+            ("owner", "its `if: github.repository_owner == 'acme'`"),
+            ("changed", "it reads `github.event`"),
+            (
+                "codeql",
+                "it reports to GitHub or publishes with github/codeql-action/analyze@v4",
+            ),
+            ("newer", "act has no image for its label ubuntu-26.04-arm"),
+            ("matrix", "its runs-on is not a label act has an image for"),
+            ("after", "job mac it needs:"),
+        ] {
+            assert!(
+                why(&found, id).contains(reason),
+                "{id}: {}",
+                why(&found, id)
+            );
+        }
+
+        // Without colima a VM job says only a VM runs it, and init never writes colima unasked
+        assert!(why(&place(true, false), "e2e").ends_with("only a VM runs it"));
         let text = config_text(&found);
-        // Before any table, so it is the config's own `network`
-        assert!(text.contains("network = \"internet\"\n\n[host]"), "{text}");
         assert!(
             text.contains("\n[jobs.\"ci.yml/heredoc\"]\nrunner = \"act\"\n"),
             "{text}"
         );
+        assert!(!text.contains("colima"), "{text}");
+        // Before any table, so it is the config's own `network`
+        assert!(text.contains("network = \"internet\"\n\n[host]"), "{text}");
         assert!(
             found
                 .explain()
@@ -3440,27 +3673,10 @@ jobs:
             "{}",
             found.explain()
         );
-
-        let (github, acts, found) = place(true, true);
-        assert_eq!(
-            acts,
-            [
-                ("heredoc".to_string(), Engine::Docker),
-                ("e2e".to_string(), Engine::Colima),
-                ("userns".to_string(), Engine::Colima)
-            ]
-        );
-        assert_eq!(github, ["mac", "after"]);
-        let text = config_text(&found);
-        assert!(
-            text.contains("[jobs.\"ci.yml/e2e\"]\nrunner = \"act\"\n# A VM of its own"),
-            "{text}"
-        );
-        assert!(text.contains("engine = \"colima\""));
         assert!(
             found
                 .explain()
-                .contains("job e2e on a colima VM of its own: runs Docker"),
+                .contains(", and act cannot run it either: it runs docker"),
             "{}",
             found.explain()
         );
@@ -3468,20 +3684,24 @@ jobs:
         // What init writes runs those jobs with act, beside the host check
         let cfg = crate::config::RepoConfig::parse(&text).unwrap();
         cfg.validate(&["ci.yml".to_string()].into()).unwrap();
-        let jobs = crate::run::expected_jobs(&cfg, |_| Some(ci.to_string())).unwrap();
+        let jobs = crate::run::expected_jobs(&cfg, |_| Some(ci.clone())).unwrap();
         assert_eq!(
             jobs["ci.yml"],
-            ["e2e", "heredoc", "userns"].map(String::from).into()
+            ["heredoc", "wasm", "words"].map(String::from).into()
         );
         assert_eq!(
             jobs[crate::runner::host::HOST],
             ["lint"].map(String::from).into()
         );
 
-        // A machine without colima but a config that never needed it stays as before
-        let (_, acts, found) = place(false, true);
-        assert!(acts.is_empty(), "act needs Docker on this machine");
-        assert!(!config_text(&found).contains("[jobs."));
+        // A colima job the owner chose needs no network line, which covers Docker's jobs only
+        let mut vm = place(true, true);
+        vm.acts = vec![(vm.acts.remove(0).0, Engine::Colima)];
+        let text = config_text(&vm);
+        assert!(
+            text.contains("engine = \"colima\"") && !text.contains("network"),
+            "{text}"
+        );
     }
 
     /// The jobs no host check runs, on GitHub or on act, in that order
@@ -3894,7 +4114,7 @@ jobs:
             ]
         );
         for line in [
-            "ci.yml, job test: a check would leave out its step `Create XFS reflink volume`, a step that needs root, with `sudo`, `mount`, `mkfs` or `apt`",
+            "ci.yml, job test: runs mount, which only a VM of its own gives a job",
             "ci.yml, job vars: left out variable TMPDIR, which the sandbox sets",
             "ci.yml, job vars: left out variable HOME, which the sandbox sets",
         ] {
@@ -4200,9 +4420,17 @@ jobs:
                     "cached",
                     "a check would leave out its step `./.github/actions/cache`, a step that uses an action no command stands for"
                 ),
-                ("old", "runs in container debian:stretch-slim"),
                 ("boxed", "runs in container alpine:3.24"),
+                ("old", "runs in container debian:stretch-slim"),
             ]
+        );
+        // Only `old` names a runner act has an image for, the rest stay on GitHub and say why
+        let acts: Vec<&str> = found.acts.iter().map(|(k, _)| k.job.as_str()).collect();
+        assert_eq!(acts, ["old"]);
+        assert!(
+            found.github.iter().all(
+                |k| k.act.as_deref() == Some("its runs-on is not a label act has an image for")
+            )
         );
     }
 
@@ -4487,6 +4715,24 @@ jobs:
             .iter()
             .map(|c| (c.name.as_str(), c.command.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn a_job_that_picks_two_xcodes_stays_whole() {
+        let ci = "on: pull_request\njobs:\n  two:\n    runs-on: macos-latest\n    steps:\n      - run: sudo xcode-select -s /Applications/Xcode_26.6.app\n      - run: swift build\n      - run: sudo xcode-select -s /Applications/Xcode_16.4.app\n      - run: swift test\n";
+        let found = detect_on(
+            repo(&[(".github/workflows/ci.yml", ci)]).path(),
+            &Machine {
+                mac: true,
+                xcodes: vec![
+                    "/Applications/Xcode_26.6.app".into(),
+                    "/Applications/Xcode_16.4.app".into(),
+                ],
+                ..Machine::default()
+            },
+        );
+        assert!(found.checks.is_empty(), "{}", found.explain());
+        assert_eq!(found.github[0].why, "picks more than one Xcode");
     }
 
     #[test]
