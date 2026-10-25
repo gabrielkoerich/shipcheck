@@ -18,7 +18,7 @@ pub struct Host {
     /// Where `versions` run, so a toolchain file in the repository picks the version
     repo: PathBuf,
     /// This run's copy of the base's cache, which its checks of another tree write
-    copy: std::sync::OnceLock<Result<tempfile::TempDir, String>>,
+    copy: std::sync::OnceLock<Result<RunCopy, String>>,
 }
 
 impl Host {
@@ -33,7 +33,8 @@ impl Host {
     /**
      * The cache a check of a tree other than the base's writes: a copy-on-write copy of the base's,
      * made once per run and removed with it, so no branch leaves a file another branch's run reads.
-     * A shared cache let one branch plant registry sources that cargo trusts once extracted
+     * A shared cache let one branch plant registry sources that cargo trusts once extracted. On
+     * APFS, btrfs or XFS the copy shares the base's blocks, on ext4 it is a full copy each run
      **/
     fn run_cache(&self, repo_id: &str) -> Result<PathBuf, String> {
         let copy = self.copy.get_or_init(|| {
@@ -42,40 +43,75 @@ impl Host {
             let _ = fs::remove_dir_all(dir.join("branches"));
             let base = real_dir(&dir.join("base"))?;
             let runs = real_dir(&dir.join("runs"))?;
-            // Copies a run that died left, none of them still in use after a day
-            let day = std::time::SystemTime::now() - Duration::from_secs(86_400);
-
-            for old in fs::read_dir(&runs).into_iter().flatten().flatten() {
-                if old
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|t| t < day)
-                {
-                    remove_tree(&old.path());
-                }
-            }
-
-            let copy = tempfile::Builder::new()
-                .prefix("run-")
-                .tempdir_in(runs)
-                .map_err(|e| format!("run cache: {e}"))?;
-            clone_dir(&base, copy.path())?;
+            RunCopy::remove_unused(&runs);
+            let copy = RunCopy::new(&runs)?;
+            clone_dir(&base, &copy.dir)?;
             Ok(copy)
         });
 
         match copy {
-            Ok(copy) => real_dir(copy.path()),
+            Ok(copy) => real_dir(&copy.dir),
             Err(e) => Err(e.clone()),
         }
     }
 }
 
-impl Drop for Host {
-    fn drop(&mut self) {
-        if let Some(Ok(copy)) = self.copy.take() {
-            remove_tree(&copy.keep());
+/**
+ * One run's copy of the base cache, `runs/run-X`, beside `runs/run-X.lock`, which the run holds
+ * locked while it lives. A copy whose lock another run can take is unused, as when its run died
+ **/
+struct RunCopy {
+    dir: PathBuf,
+    // Unlinked and then closed on drop, which releases the lock
+    _lock: tempfile::NamedTempFile,
+}
+
+impl RunCopy {
+    fn new(runs: &Path) -> Result<Self, String> {
+        let lock = tempfile::Builder::new()
+            .prefix("run-")
+            .suffix(".lock")
+            .tempfile_in(runs)
+            .map_err(|e| format!("run cache: {e}"))?;
+
+        if !locked(lock.as_file()) {
+            return Err(format!("{}: could not lock", lock.path().display()));
+        }
+
+        Ok(RunCopy {
+            dir: lock.path().with_extension(""),
+            _lock: lock,
+        })
+    }
+
+    fn remove_unused(runs: &Path) {
+        for entry in fs::read_dir(runs).into_iter().flatten().flatten() {
+            let path = entry.path();
+
+            if path.extension().is_none_or(|e| e != "lock") {
+                continue;
+            }
+
+            if fs::File::open(&path).is_ok_and(|f| locked(&f)) {
+                remove_tree(&path.with_extension(""));
+                let _ = fs::remove_file(&path);
+            }
         }
     }
+}
+
+impl Drop for RunCopy {
+    fn drop(&mut self) {
+        remove_tree(&self.dir);
+    }
+}
+
+/// Takes an exclusive lock on `file` without waiting, held until the file is closed
+fn locked(file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    // Safe: flock only takes a lock on a descriptor this file owns
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
 /// Removes a cache tree, read-only directories included, as Go's module cache makes them
@@ -84,10 +120,8 @@ fn remove_tree(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Replaces the empty `dst` with a copy of `src` that shares its blocks where the file system can
+/// Copies `src` to the new path `dst`, sharing blocks where the file system can
 fn clone_dir(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::remove_dir(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-
     // One clonefile call copies the whole tree on APFS
     #[cfg(target_os = "macos")]
     {
@@ -2815,6 +2849,46 @@ mod tests {
             Some(0),
             "saw the other branch's file or missed the base's: {log}"
         );
+    }
+
+    #[test]
+    fn a_run_leaves_the_copy_of_a_run_going_alone_and_removes_a_dead_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let base = cache_dir(Some(&repo_id)).join("base");
+        fs::create_dir_all(base.join("cargo")).unwrap();
+        // A copy keeps the base's times, and an old base once made a live copy look abandoned
+        assert!(
+            Command::new("touch")
+                .args(["-t", "200001010000"])
+                .arg(&base)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let host = || Host::new(config::Host::default(), dir.path());
+        let runs = cache_dir(Some(&repo_id)).join("runs");
+        let dead = runs.join("run-dead");
+        fs::create_dir_all(dead.join("cargo")).unwrap();
+        fs::write(runs.join("run-dead.lock"), "").unwrap();
+
+        let (first, second) = (host(), host());
+        let one = first.run_cache(&repo_id).unwrap();
+        let two = second.run_cache(&repo_id).unwrap();
+        assert_ne!(one, two);
+        assert!(
+            one.join("cargo").is_dir(),
+            "the second run removed the first's copy"
+        );
+        assert!(!dead.exists(), "a copy no run holds stays");
+        drop((first, second));
+        let left: Vec<_> = fs::read_dir(&runs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
