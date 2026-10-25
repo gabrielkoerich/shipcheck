@@ -17,14 +17,42 @@ fn output_is_plain_without_a_terminal() {
         "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n",
     )
     .unwrap();
-    assert!(
-        Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(&repo)
-            .status()
-            .unwrap()
-            .success()
-    );
+    // init asks the remote for its default branch, so it needs one that answers
+    let origin = tmp.path().join("origin.git");
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&[
+        "init",
+        "-q",
+        "--bare",
+        "-b",
+        "main",
+        origin.to_str().unwrap(),
+    ]);
+    git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "a",
+    ]);
+    git(&["push", "-q", "origin", "main"]);
 
     for args in [&["init", "--yes"][..], &["doctor"], &["nope"]] {
         let out = Command::new(env!("CARGO_BIN_EXE_shipcheck"))

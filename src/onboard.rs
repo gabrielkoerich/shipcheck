@@ -121,9 +121,13 @@ pub enum Step {
  * quitting before apply leaves everything as it was
  **/
 pub fn plan(root: &Path, app: App, r: &mut dyn Report) -> Result<Plan, String> {
+    plan_at(root, &base_branch(root)?, app, r)
+}
+
+fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan, String> {
     let path = root.join("shipcheck.toml");
     let mut plan = Plan {
-        base: base_branch(root),
+        base: base.to_string(),
         config: None,
         existing: None,
         workflows: Vec::new(),
@@ -1089,10 +1093,12 @@ fn ask(plan: &Plan, step: Step, a: &mut Answers, s: Style) -> std::io::Result<()
     Ok(())
 }
 
-/// The base the daemon, the hooks and `shipcheck run` use, as a branch name
-fn base_branch(root: &Path) -> String {
-    let base = crate::run::default_base(root);
-    base.strip_prefix("origin/").unwrap_or(&base).to_string()
+/// The base the daemon, the hooks and `shipcheck run` use, as a branch name. Offline it refuses to guess
+fn base_branch(root: &Path) -> Result<String, String> {
+    let base = crate::daemon::known_base(root).ok_or(
+        "origin did not say its default branch, so init cannot tell which branch to gate. Run `shipcheck init` again when online",
+    )?;
+    Ok(base.strip_prefix("origin/").unwrap_or(&base).to_string())
 }
 
 /// One job of a workflow: the shipcheck checks that run its commands, and the commands none runs
@@ -1690,7 +1696,8 @@ mod tests {
             (".github/workflows/ci.yml", ci),
             ("shipcheck.toml", SHIPCHECK_TOML),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let ci = &plan.workflows[0];
         assert_eq!(
             ci.yes,
@@ -1709,7 +1716,8 @@ mod tests {
             (".github/workflows/leaks.yml", OWN_LEAKS),
             ("shipcheck.toml", SHIPCHECK_TOML),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
         // Without Docker, e2e.yml's matrix stays on GitHub, which tests see on every machine
         // leaks.yml's job has no command a check could run, so it stays on GitHub too
@@ -1741,7 +1749,8 @@ mod tests {
                 "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\nclippy = \"cargo clippy\"\n",
             ),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let mut a = plan.recommended();
         assert_eq!(a.workflows, [true, true]);
 
@@ -1782,7 +1791,8 @@ mod tests {
             (".github/workflows/ci.yml", PUSH),
             (".github/workflows/setup.yml", SETUP),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let files: Vec<&str> = plan.workflows.iter().map(|w| w.file.as_str()).collect();
         assert_eq!(files, ["ci.yml"]);
         assert_eq!(
@@ -1799,7 +1809,8 @@ mod tests {
     #[test]
     fn plan_writes_nothing_and_a_declined_config_sets_nothing_up() {
         let dir = repo(&[(".github/workflows/ci.yml", CI)]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         assert!(!dir.path().join("shipcheck.toml").exists());
         assert_eq!(plan.steps()[0], Step::Config);
         assert_eq!(plan.recommended().workflows, [true]);
@@ -1844,7 +1855,8 @@ mod tests {
         let ci = crate::setup::tests::CI_WITH_RELEASE;
         let config = "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let mut said = Said::default();
         apply(
             dir.path(),
@@ -1876,7 +1888,8 @@ mod tests {
         let ci = "on:\n  pull_request:\n  push:\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  tests:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        python: [\"3.12\", \"3.13\"]\n    steps:\n      - run: make test\n";
         let config = "runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let mut said = Said::default();
         apply(
             dir.path(),
@@ -1904,7 +1917,8 @@ mod tests {
             (".github/workflows/ci.yml", &needs),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         assert!(plan.workflows.is_empty());
         assert!(
             plan.notes[0].contains("ci.yml: GitHub keeps running it on PRs, for lint, tests"),
@@ -1922,7 +1936,13 @@ mod tests {
             (".github/workflows/lint.yml", lint),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::Own("1".into()), &mut Said::default()).unwrap();
+        let plan = super::plan_at(
+            dir.path(),
+            "main",
+            App::Own("1".into()),
+            &mut Said::default(),
+        )
+        .unwrap();
         let change = &plan.workflows[0];
         assert_eq!(
             Some(change.edited.clone()),
@@ -1939,7 +1959,13 @@ mod tests {
         let ci = "on: [push, pull_request]\njobs:\n  lint:\n    steps:\n      - run: make lint\n  test:\n    steps:\n      - run: make test\n  release:\n    if: github.ref == 'refs/heads/main'\n    steps:\n      - run: make release\n";
         let config = "runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
-        let plan = super::plan(dir.path(), App::Own("1".into()), &mut Said::default()).unwrap();
+        let plan = super::plan_at(
+            dir.path(),
+            "main",
+            App::Own("1".into()),
+            &mut Said::default(),
+        )
+        .unwrap();
         let rule = plan.ruleset.unwrap();
         assert_eq!(rule.names, ["shipcheck/lint"]);
         assert_eq!(rule.github, ["test"]);
@@ -1954,7 +1980,8 @@ mod tests {
             (".github/workflows/lint.yml", LINT),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let mut a = plan.recommended();
         a.workflows = vec![true, false];
         apply(
@@ -1968,7 +1995,8 @@ mod tests {
         let gated = fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap();
 
         // lint.yml, declined the first time, is offered again, ci.yml is not touched
-        let again = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let again =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let files: Vec<&str> = again.workflows.iter().map(|w| w.file.as_str()).collect();
         assert_eq!(files, ["lint.yml"]);
         assert!(
@@ -2001,7 +2029,8 @@ mod tests {
             (".github/workflows/ci.yml", flow),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let gate = crate::workflow::gate_condition(flow, "main");
         let note = plan.notes.iter().find(|n| n.contains("by hand")).unwrap();
         assert!(note.contains(&format!("`if: {gate}`")), "{note}");
@@ -2074,14 +2103,22 @@ mod tests {
                 "refs/remotes/origin/evil",
             ],
         );
-        assert_eq!(crate::run::default_base(dir.path()), "origin/master");
+        assert_eq!(
+            crate::run::remote_base(dir.path()).as_deref(),
+            Some("origin/master")
+        );
         let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         assert_eq!(plan.base, "master");
         assert!(plan.workflows[0].edited.contains("refs/heads/master"));
 
-        // A remote that does not answer means main, never the local origin/HEAD
+        // A remote that does not answer gives no base, never the local origin/HEAD, and init refuses
         git(dir.path(), &["remote", "set-url", "origin", "/nonexistent"]);
-        assert_eq!(crate::run::default_base(dir.path()), "origin/main");
+        assert_eq!(crate::run::remote_base(dir.path()), None);
+        assert!(
+            base_branch(dir.path())
+                .unwrap_err()
+                .contains("again when online")
+        );
     }
 
     #[test]
@@ -2094,7 +2131,8 @@ mod tests {
             (".github/workflows/orch-review.yml", review),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         assert_eq!(plan.workflows.len(), 1);
         assert!(
             plan.notes.iter().any(|n| n
@@ -2109,7 +2147,8 @@ mod tests {
         // git-cow's ci.yml, trimmed: its only test job is a matrix with a macOS entry
         let ci = "on: [push, pull_request]\njobs:\n  test:\n    strategy:\n      matrix:\n        include:\n          - {os: macos-latest}\n          - {os: ubuntu-latest}\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci)]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         assert!(plan.stop.as_deref().unwrap().contains(setup::NOTHING_LOCAL));
         assert!(!dir.path().join("shipcheck.toml").exists());
     }

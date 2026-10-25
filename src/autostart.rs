@@ -114,11 +114,13 @@ pub(crate) fn main_checkout(root: &Path) -> PathBuf {
 
 /// Whether `shipcheck.toml` on the base branch leaves the daemon on, which it does when there is none yet
 fn wanted_on_main(root: &Path) -> bool {
+    // Offline there is no base to read, and `register` then says why nothing was installed
+    let Some(base) = crate::daemon::known_base(root) else {
+        return true;
+    };
+
     Command::new("git")
-        .args([
-            "show",
-            &format!("{}:shipcheck.toml", run::default_base(root)),
-        ])
+        .args(["show", &format!("{base}:shipcheck.toml")])
         .current_dir(root)
         .output()
         .ok()
