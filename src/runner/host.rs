@@ -353,7 +353,6 @@ pub struct Jail {
 }
 
 /// The setuid binaries of the system, read once
-// ponytail: by path only, a hard link to a setuid binary on the data volume gets past it, a setuid filter if Sandbox gets one
 fn setuid() -> &'static [PathBuf] {
     use std::os::unix::fs::PermissionsExt;
 
@@ -475,7 +474,6 @@ impl Jail {
             .map(|p| quote(p).map(|q| format!(" (literal {q})")))
             .collect::<Result<_, String>>()?;
         // A copy of launchctl outside /bin is killed at exec, so the path is enough
-        // ponytail: assumes no allowed mach service reaches launchd for the check, launch_msg and XPC need a denied lookup
         let exec = format!("(deny process-exec* (literal \"{LAUNCHCTL}\"){setuid})\n");
         Ok(format!(
             "(version 1)\n(allow default)\n\
@@ -858,7 +856,6 @@ fn install() {
     });
 }
 
-// ponytail: 64 slots, a run with more checks at once leaves the extra ones to outlive a signal
 fn register(pgid: u32) -> Option<usize> {
     install();
     GROUPS.iter().position(|g| {
@@ -1058,7 +1055,6 @@ mod job {
                     continue;
                 }
 
-                // ponytail: a pid reused between the check and the kill needs a full pid wrap, no pidfd on macOS
                 // Safe: kill only sends a signal
                 if unsafe { libc::kill(pid, sig) } == -1
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
