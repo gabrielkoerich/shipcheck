@@ -324,6 +324,8 @@ const MACH_SERVICES: &[&str] = &[
     "com.apple.SystemConfiguration.DNSConfiguration",
     "com.apple.trustd",
     "com.apple.trustd.agent",
+    // Process lists for pgrep and pkill, since ps is setuid and denied
+    "com.apple.sysmond",
 ];
 
 /// Credentials in the user's home, hidden again in case a toolchain path above reaches one
@@ -679,7 +681,7 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
     sbf_sdk(&path, &jail_path())?;
 
     if cfg!(target_os = "macos") {
-        mktemp_shim(&path)?;
+        shims(&path)?;
     }
 
     Ok((dir, path))
@@ -702,13 +704,24 @@ done
 exec /usr/bin/mktemp -p "${TMPDIR:-/tmp}" "$@"
 "#;
 
-fn mktemp_shim(home: &Path) -> Result<(), String> {
+/// The jail's `mktemp`, and a command for each setuid binary that says why the jail denies it
+fn shims(home: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let bin = home.join(SHIMS);
     fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
-    let file = bin.join("mktemp");
-    fs::write(&file, MKTEMP).map_err(|e| e.to_string())?;
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
+    let mut files = vec![("mktemp".to_string(), MKTEMP.to_string())];
+    files.extend(setuid().iter().filter_map(|p| {
+        let name = p.file_name()?.to_str()?;
+        Some((name.to_string(), format!("#!/bin/sh\necho \"shipcheck: {name} is setuid root, which a macOS host check cannot run, since shipcheck could not stop it once it outlived the check. Use pgrep to find processes, or run this job under act\" >&2\nexit 126\n")))
+    }));
+
+    for (name, text) in files {
+        let file = bin.join(name);
+        fs::write(&file, text).map_err(|e| e.to_string())?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 /// The prefix of `npm install -g` in the jail's home, since node's own is read-only here
@@ -2846,16 +2859,23 @@ mod tests {
         assert!(setuid().contains(&PathBuf::from("/bin/ps")));
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let exit = run_command(
-            "/bin/ps -p $$",
-            dir.path(),
-            &jail(dir.path()),
-            &[],
-            &log,
-            Duration::from_secs(10),
-        )
-        .unwrap();
-        assert_ne!(exit, Some(0), "{}", fs::read_to_string(&log).unwrap());
+        let jail = jail(dir.path());
+        shims(&jail.home).unwrap();
+        let run = |cmd: &str| {
+            let exit = run_command(cmd, dir.path(), &jail, &[], &log, Duration::from_secs(10));
+            (exit.unwrap(), fs::read_to_string(&log).unwrap())
+        };
+        let (exit, _) = run("/bin/ps -p $$");
+        assert_ne!(exit, Some(0));
+        // By name, as test suites and build scripts call it, the error names the cause
+        let (exit, text) = run("ps -p $$");
+        assert_eq!(exit, Some(126), "{text}");
+        assert!(
+            text.contains("ps is setuid root") && text.contains("pgrep"),
+            "{text}"
+        );
+        let (exit, text) = run("pgrep -x launchd >/dev/null; test $? -le 1");
+        assert_eq!(exit, Some(0), "{text}");
     }
 
     #[test]
