@@ -58,29 +58,51 @@ impl Host {
 
 /**
  * One run's copy of the base cache, `runs/run-X`, beside `runs/run-X.lock`, which the run holds
- * locked while it lives. A copy whose lock another run can take is unused, as when its run died
+ * locked while it lives. A copy whose lock another run can take is unused, as when its run died.
+ * The lock is taken under a name cleanup skips, and only then linked to its `.lock` name
  **/
 struct RunCopy {
     dir: PathBuf,
-    // Unlinked and then closed on drop, which releases the lock
-    _lock: tempfile::NamedTempFile,
+    lock: PathBuf,
+    // Closed after `drop` removes both paths, which releases the lock
+    _file: fs::File,
 }
 
 impl RunCopy {
     fn new(runs: &Path) -> Result<Self, String> {
-        let lock = tempfile::Builder::new()
-            .prefix("run-")
-            .suffix(".lock")
+        let fail = |e: std::io::Error| format!("run cache in {}: {e}", runs.display());
+        let new = tempfile::Builder::new()
+            .prefix(".new-")
             .tempfile_in(runs)
-            .map_err(|e| format!("run cache: {e}"))?;
+            .map_err(fail)?;
 
-        if !locked(lock.as_file()) {
-            return Err(format!("{}: could not lock", lock.path().display()));
+        if !locked(new.as_file()) {
+            return Err(format!("{}: could not lock", new.path().display()));
         }
 
+        // A hard link keeps the locked inode and, unlike a rename, never replaces another's lock
+        let lock = loop {
+            let mut bytes = [0u8; 8];
+            std::io::Read::read_exact(
+                &mut fs::File::open("/dev/urandom").map_err(fail)?,
+                &mut bytes,
+            )
+            .map_err(fail)?;
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let lock = runs.join(format!("run-{hex}.lock"));
+
+            match fs::hard_link(new.path(), &lock) {
+                Ok(()) => break lock,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(fail(e)),
+            }
+        };
+        let (file, temp) = new.keep().map_err(|e| fail(e.error))?;
+        let _ = fs::remove_file(temp);
         Ok(RunCopy {
-            dir: lock.path().with_extension(""),
-            _lock: lock,
+            dir: lock.with_extension(""),
+            lock,
+            _file: file,
         })
     }
 
@@ -92,10 +114,17 @@ impl RunCopy {
                 continue;
             }
 
-            if fs::File::open(&path).is_ok_and(|f| locked(&f)) {
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+
+            // The lock must still be the one at that path, not one another cleanup removed meanwhile
+            if locked(&file) && same_file(&file, &path) {
                 remove_tree(&path.with_extension(""));
                 let _ = fs::remove_file(&path);
             }
+
+            drop(file);
         }
     }
 }
@@ -103,6 +132,17 @@ impl RunCopy {
 impl Drop for RunCopy {
     fn drop(&mut self) {
         remove_tree(&self.dir);
+        let _ = fs::remove_file(&self.lock);
+    }
+}
+
+/// Whether `path` still names the inode `file` has open
+fn same_file(file: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
@@ -116,7 +156,12 @@ fn locked(file: &fs::File) -> bool {
 
 /// Removes a cache tree, read-only directories included, as Go's module cache makes them
 fn remove_tree(dir: &Path) {
-    let _ = Command::new("chmod").arg("-R").arg("u+w").arg(dir).status();
+    let _ = Command::new("chmod")
+        .arg("-R")
+        .arg("u+w")
+        .arg(dir)
+        .stderr(Stdio::null())
+        .status();
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -2888,6 +2933,53 @@ mod tests {
             .map(|e| e.path())
             .collect();
         Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn runs_racing_on_one_cache_never_remove_each_others_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        fs::create_dir_all(cache_dir(Some(&repo_id)).join("base/cargo")).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let host = || Host::new(config::Host::default(), dir.path());
+        // Recorded, not asserted, so a failing thread never leaves the others at a barrier
+        let removed = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    barrier.wait();
+                    let mine = host();
+                    let copy = mine.run_cache(&repo_id);
+                    barrier.wait();
+
+                    // Each cleanup runs while every other copy is in use
+                    for _ in 0..5 {
+                        let _ = host().run_cache(&repo_id);
+                    }
+
+                    barrier.wait();
+
+                    if !copy.as_ref().is_ok_and(|c| c.join("cargo").is_dir()) {
+                        removed.lock().unwrap().push(copy);
+                    }
+                });
+            }
+        });
+
+        let runs = cache_dir(Some(&repo_id)).join("runs");
+        let left: Vec<_> = fs::read_dir(&runs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        host().clean(Some(&repo_id));
+        assert!(
+            removed.lock().unwrap().is_empty(),
+            "{:?}",
+            removed.lock().unwrap()
+        );
         assert!(left.is_empty(), "{left:?}");
     }
 
