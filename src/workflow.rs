@@ -708,7 +708,16 @@ const CONTEXT_ACT_LACKS: &[&str] = &[
     "github.actor",
     "github.triggering_actor",
     "default_branch",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_EVENT_PATH",
+    "GITHUB_BASE_REF",
+    "GITHUB_HEAD_REF",
+    "GITHUB_ACTOR",
+    "GITHUB_REPOSITORY_OWNER",
 ];
+
+/// What a step's `if:` may read that act gives otherwise: the ref, and secrets and variables it has none of
+const IF_ACT_LACKS: &[&str] = &["github.ref", "secrets.", "vars.", "env."];
 
 /**
  * Why act cannot tell what a job does on a PR: a job `if:` of its own, beside init's gate, which act
@@ -732,6 +741,17 @@ pub fn act_lacks_context(source: &str, id: &str) -> Option<String> {
         }
 
         h.remove(&key("if"));
+    }
+
+    let steps = job["steps"].as_vec().into_iter().flatten();
+    let step_if = steps
+        .filter_map(|s| s["if"].as_str())
+        .find_map(|c| IF_ACT_LACKS.iter().find(|w| c.contains(*w)).map(|w| (c, w)));
+
+    if let Some((cond, what)) = step_if {
+        return Some(format!(
+            "a step's `if: {cond}` reads `{what}`, which act sets otherwise or lacks"
+        ));
     }
 
     let text = emit(Hash::from_iter([(key(id), job)])).ok()?;

@@ -412,6 +412,14 @@ const REPORTERS: &[&str] = &[
     "softprops/action-gh-release",
 ];
 
+/// Actions that read the PR, such as its changed files, which act's run has none of
+const PR_AWARE: &[&str] = &[
+    "tj-actions/changed-files",
+    "dorny/paths-filter",
+    "reviewdog/",
+    "danger/",
+];
+
 /// Commands that run containers, whose daemon a job gets only on a VM of its own
 const CONTAINERS: &[&str] = &[
     "act",
@@ -442,27 +450,75 @@ const KERNEL: &[&str] = &[
     "unshare",
 ];
 
-/// The words of each command a `run` starts, `sudo` and leading `VAR=value` taken off
+/// Commands that start the command after them, with flags of their own
+const WRAPPERS: &[&str] = &["sudo", "env", "time", "exec", "nohup"];
+
+/**
+ * The words of each command a `run` starts, wrappers such as `sudo -u x`, `env` and `time` and
+ * leading `VAR=value` taken off, and the commands a `bash -c` or `sh -c` string starts
+ **/
 fn started(run: &str) -> Vec<Vec<String>> {
-    run.replace("&&", "\n")
+    let mut out = Vec::new();
+
+    for part in run
+        .replace("&&", "\n")
         .replace("||", "\n")
         .split(['\n', ';', '|', '&', '(', ')', '`'])
-        .map(|part| {
-            let words = words(part);
-            let mut sudo = false;
-            words
-                .into_iter()
-                .skip_while(|w| {
-                    let skip = w == "sudo"
-                        || sudo && w.starts_with('-')
-                        || w.contains('=') && !w.starts_with('-');
-                    sudo |= w == "sudo";
-                    skip
-                })
-                .collect::<Vec<_>>()
-        })
-        .filter(|w| !w.is_empty())
-        .collect()
+    {
+        let words = words(part);
+        let mut at = 0;
+
+        while let Some(w) = words.get(at) {
+            if WRAPPERS.contains(&w.as_str()) {
+                at += 1;
+
+                while let Some(flag) = words.get(at).filter(|f| f.starts_with('-')) {
+                    // `sudo -u <user>` and `-g <group>` take the word after them
+                    at += if ["-u", "-g"].contains(&flag.as_str()) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+            } else if w.contains('=') && !w.starts_with('-') {
+                at += 1;
+            } else {
+                break;
+            }
+        }
+
+        let words = words[at.min(words.len())..].to_vec();
+
+        if words.is_empty() {
+            continue;
+        }
+
+        let shell = ["sh", "bash", "zsh", "dash"].contains(&words[0].as_str());
+
+        match words.iter().position(|w| w == "-c").filter(|_| shell) {
+            Some(c) => out.extend(words.get(c + 1).map(|s| started(s)).unwrap_or_default()),
+            None => out.push(words),
+        }
+    }
+
+    out
+}
+
+/// A command's name for the lists above: a bare name, or the basename of one in a system directory
+fn command_word(word: &str) -> Option<&str> {
+    let system = [
+        "/bin/",
+        "/sbin/",
+        "/usr/bin/",
+        "/usr/sbin/",
+        "/usr/local/bin/",
+    ];
+
+    match word.rsplit_once('/') {
+        None => Some(word),
+        Some((dir, name)) if system.contains(&format!("{dir}/").as_str()) => Some(name),
+        Some(_) => None,
+    }
 }
 
 /// What a job runs that only a VM gives it: a container runtime, or a change to the kernel
@@ -480,7 +536,9 @@ fn needs_vm(job: &crate::workflow::Job) -> Option<String> {
         }
 
         for words in started(&step.run) {
-            let name = words[0].rsplit('/').next().unwrap_or(&words[0]).to_string();
+            let Some(name) = command_word(&words[0]).map(str::to_string) else {
+                continue;
+            };
             let netns = name == "ip" && words.get(1).is_some_and(|w| w == "netns");
 
             if CONTAINERS.contains(&name.as_str()) || KERNEL.contains(&name.as_str()) || netns {
@@ -540,6 +598,22 @@ fn act_engine(
 
     if let Some(u) = reports {
         return Err(format!("it reports to GitHub or publishes with {u}"));
+    }
+
+    let pr_aware = job.steps.iter().find(|s| {
+        let lower = s.uses.as_deref().unwrap_or_default().to_lowercase();
+        let only_new = lower.starts_with("golangci/golangci-lint-action")
+            && s.with
+                .iter()
+                .any(|(k, v)| k == "only-new-issues" && v.as_deref() != Some("false"));
+        PR_AWARE.iter().any(|p| lower.starts_with(p)) || only_new
+    });
+
+    if let Some(s) = pr_aware {
+        return Err(format!(
+            "{} reads the PR, which act's run has none of",
+            s.uses.as_deref().unwrap_or_default()
+        ));
     }
 
     if let Some(what) = needs_vm(job) {
@@ -3587,6 +3661,20 @@ jobs:
             job("matrix", "", heredoc).replace("ubuntu-latest", "${{ matrix.os }}"),
             "  mac:\n    runs-on: macos-latest\n    steps:\n      - uses: some/action@v1\n".into(),
             "  after:\n    needs: mac\n    runs-on: ubuntu-latest\n    steps:\n      - uses: some/action@v1\n".into(),
+            // A host check of its own, kept on GitHub only because a macOS job needs it
+            "  prep:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make prep\n".into(),
+            "  mac2:\n    needs: prep\n    runs-on: macos-latest\n    steps:\n      - run: make mac\n".into(),
+            job("evname", "", "      - run: if [ \"$GITHUB_EVENT_NAME\" = pull_request ]; then make lint-changed; fi\n"),
+            job("baseref", "", "      - run: git diff origin/$GITHUB_BASE_REF\n      - uses: some/action@v1\n"),
+            job("evpath", "", "      - run: jq .pull_request \"$GITHUB_EVENT_PATH\"\n      - uses: some/action@v1\n"),
+            job("secret", "", "      - if: secrets.TOKEN != ''\n        run: make upload\n      - uses: some/action@v1\n"),
+            job("var", "", "      - if: vars.RUN_SLOW == 'true'\n        run: make slow\n      - uses: some/action@v1\n"),
+            job("ref", "", "      - if: github.ref != 'refs/heads/main'\n        run: make pr\n      - uses: some/action@v1\n"),
+            job("changes", "", "      - uses: tj-actions/changed-files@v46\n"),
+            job("newissues", "", "      - uses: golangci/golangci-lint-action@v8\n        with:\n          only-new-issues: true\n"),
+            job("envwrap", "", "      - run: env X=1 podman build .\n"),
+            job("shellc", "", "      - run: bash -c 'docker build .'\n"),
+            job("own", "", "      - run: ./scripts/service start && make check\n      - uses: some/action@v1\n"),
         ]
         .concat();
         let place = |docker: bool, colima: bool| {
@@ -3625,6 +3713,8 @@ jobs:
             [
                 ("heredoc", Engine::Docker),
                 ("words", Engine::Docker),
+                // `./scripts/service` is the repository's own script, not the system's `service`
+                ("own", Engine::Docker),
                 ("wasm", Engine::Docker)
             ]
         );
@@ -3648,6 +3738,19 @@ jobs:
             ("newer", "act has no image for its label ubuntu-26.04-arm"),
             ("matrix", "its runs-on is not a label act has an image for"),
             ("after", "job mac it needs:"),
+            ("evname", "it reads `GITHUB_EVENT_NAME`"),
+            ("baseref", "it reads `GITHUB_BASE_REF`"),
+            ("evpath", "it reads `GITHUB_EVENT_PATH`"),
+            (
+                "secret",
+                "a step's `if: secrets.TOKEN != ''` reads `secrets.`",
+            ),
+            ("var", "reads `vars.`"),
+            ("ref", "reads `github.ref`"),
+            ("changes", "tj-actions/changed-files@v46 reads the PR"),
+            ("newissues", "golangci/golangci-lint-action@v8 reads the PR"),
+            ("envwrap", "it runs podman"),
+            ("shellc", "it runs docker"),
         ] {
             assert!(
                 why(&found, id).contains(reason),
@@ -3655,6 +3758,14 @@ jobs:
                 why(&found, id)
             );
         }
+
+        // A job a macOS job needs stays with it, though act could run it alone
+        let prep = found
+            .github
+            .iter()
+            .find(|k| k.job == "prep")
+            .expect("prep stays");
+        assert_eq!(prep.why, "job mac2 stays on GitHub and needs it");
 
         // Without colima a VM job says only a VM runs it, and init never writes colima unasked
         assert!(why(&place(true, false), "e2e").ends_with("only a VM runs it"));
@@ -3687,7 +3798,7 @@ jobs:
         let jobs = crate::run::expected_jobs(&cfg, |_| Some(ci.clone())).unwrap();
         assert_eq!(
             jobs["ci.yml"],
-            ["heredoc", "wasm", "words"].map(String::from).into()
+            ["heredoc", "own", "wasm", "words"].map(String::from).into()
         );
         assert_eq!(
             jobs[crate::runner::host::HOST],
