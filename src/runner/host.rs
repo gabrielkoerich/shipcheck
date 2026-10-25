@@ -222,7 +222,9 @@ pub fn in_a_jail() -> bool {
 
     // Safe: a null operation with no filter takes no further argument
     let sandboxed = unsafe { sandbox_check(libc::getpid(), std::ptr::null(), NONE) } == 1;
-    sandboxed
+    // A sandbox that passes these is reused only where results never post, since any can pass them
+    crate::run::home_overridden()
+        && sandboxed
         && denied("file-read-data", &home)
         && denied("file-write-data", &home.join(".shipcheck-probe"))
         && denied("network-outbound", &home.join(".docker/run/docker.sock"))
@@ -397,7 +399,9 @@ impl Jail {
      * Docker's or an agent's socket is out of reach. Mach services only from [`MACH_SERVICES`], and
      * no Apple events, so no copy of `open`, `osascript` or `launchctl` reaches launchd, Launch
      * Services or another app, which would start a process outside the sandbox. A pseudo-terminal
-     * only when the check opened it, which the `com.apple.sandbox.pty` extension marks
+     * only when the check opened it, which the `com.apple.sandbox.pty` extension marks, to read as
+     * to write, so the terminal shipcheck runs in is out of reach. Nothing in the temp dirs but the
+     * jail's own paths
      **/
     fn profile(&self) -> Result<String, String> {
         let user = Self::user()?;
@@ -421,6 +425,13 @@ impl Jail {
             .collect::<Result<_, String>>()?;
         let readable = subpaths(&self.readable(&user))?;
         let hidden = subpaths(&Self::hidden(&user))?;
+        // Other checks' homes and whatever else is in the temp dirs, the jail's own paths allowed below
+        let mut temp: Vec<PathBuf> = TEMP.iter().map(PathBuf::from).collect();
+        temp.push(std::env::temp_dir());
+        let mut temp: Vec<PathBuf> = temp.into_iter().map(resolved).collect();
+        temp.sort();
+        temp.dedup();
+        let temp = subpaths(&temp)?;
         let user = quote(&user)?;
         let mach: String = MACH_SERVICES
             .iter()
@@ -431,9 +442,10 @@ impl Jail {
              (deny file-write*)\n\
              (allow file-write*{writable} (literal \"/dev/null\") (regex #\"^/dev/fd/\"))\n\
              (allow file-write* (literal \"/dev/ptmx\") (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
-             (deny file-read-data (subpath {user}))\n\
+             (deny file-read-data (subpath {user}){temp})\n\
              (allow file-read-data{readable}{writable})\n\
              (deny file-read*{hidden})\n\
+             (deny file-read* (require-all (regex #\"^/dev/ttys[0-9]+$\") (require-not (extension \"com.apple.sandbox.pty\"))))\n\
              (deny network-outbound (remote unix-socket))\n\
              (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n\
              (allow network-outbound{sockets})\n\
@@ -538,18 +550,19 @@ impl Jail {
         let cache = |dir: &str| self.cache.join(dir);
         let base = self.path(jail_path());
         let shims = self.home.join(SHIMS);
-        // `gem install` goes to the home each check gets new, and the commands it installs run from there
+        // `gem install` goes to the home each check gets new, and the commands it installs run from
+        // there, after the trusted PATH so none shadows a tool of the user's
         let gems = self.home.join(".gem");
         let dirs = Some(shims)
             .filter(|s| s.is_dir())
             .into_iter()
-            .chain([gems.join("bin")])
-            .chain(std::env::split_paths(&base).collect::<Vec<_>>());
+            .chain(std::env::split_paths(&base).collect::<Vec<_>>())
+            .chain([gems.join("bin")]);
         let path = std::env::join_paths(dirs).unwrap_or(base);
         let rustup = Some(self.home.join(".rustup"))
             .filter(|r| r.is_dir())
             .unwrap_or_else(|| user_tool("RUSTUP_HOME", ".rustup"));
-        cmd.args(["sh", "-c", command])
+        cmd.args(["/bin/sh", "-c", command])
             .current_dir(dir)
             .env_clear()
             .envs(std::env::vars_os().filter(|(k, _)| keeps_var(&k.to_string_lossy(), extra)))
@@ -1121,8 +1134,10 @@ mod tests {
             jail.cache.join("bundle").to_string_lossy()
         );
         assert_eq!(env("GEM_HOME"), jail.home.join(".gem").to_string_lossy());
-        let gem_bin = format!("{}:", jail.home.join(".gem/bin").display());
-        assert!(env("PATH").starts_with(&gem_bin), "{}", env("PATH"));
+        // Last, so a gem's command never shadows a tool of the user's
+        let gem_bin = format!(":{}", jail.home.join(".gem/bin").display());
+        assert!(env("PATH").ends_with(&gem_bin), "{}", env("PATH"));
+        assert!(cmd.get_args().any(|a| a == "/bin/sh"));
     }
 
     #[test]
@@ -1301,20 +1316,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         let pid = dir.path().join("pid");
-        // The background sleep is a grandchild that would outlive a kill of sh alone
-        let cmd = format!("sleep 30 & echo $! > {}; wait", pid.display());
-        let started = Instant::now();
-        let exit = run_command(
-            &cmd,
-            dir.path(),
-            &jail(dir.path()),
-            &[],
-            &log,
-            Duration::from_millis(300),
-        )
-        .unwrap();
-        assert_eq!(exit, None);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The background sleep is a grandchild that would outlive a kill of sh alone. A slow start can
+        // pass the timeout before the pid is written, so a longer one tries again, which `mv` keeps whole
+        let cmd = format!(
+            "sleep 30 & echo $! > {0}.tmp && mv {0}.tmp {0}; wait",
+            pid.display()
+        );
+
+        for timeout in [300, 1000, 3000, 10000].map(Duration::from_millis) {
+            let started = Instant::now();
+            let exit =
+                run_command(&cmd, dir.path(), &jail(dir.path()), &[], &log, timeout).unwrap();
+            assert_eq!(exit, None);
+            assert!(started.elapsed() < timeout + Duration::from_secs(5));
+
+            if pid.exists() {
+                break;
+            }
+        }
+
         let pid: i32 = fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         // Safe: signal 0 only checks that the process exists
@@ -1323,6 +1343,65 @@ mod tests {
             0,
             "the grandchild still runs"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_check_reads_no_temp_dir_but_its_own_and_no_terminal() {
+        let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        fs::write(other.path().join("secret"), "x").unwrap();
+        fs::write(dir.path().join("mine"), "x").unwrap();
+        let log = dir.path().join("log");
+        let run = |cmd: &str| {
+            run_command(
+                cmd,
+                dir.path(),
+                &jail(dir.path()),
+                &[],
+                &log,
+                Duration::from_secs(10),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            run("cat mine"),
+            Some(0),
+            "{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        let secret = other.path().join("secret");
+        assert_ne!(run(&format!("cat {}", secret.display())), Some(0));
+        let tty = fs::read_dir("/dev")
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("ttys")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    && fs::File::open(p).is_ok()
+            });
+
+        // A pseudo-terminal of the check's own still works, as `script` opens one
+        assert_eq!(
+            run("/usr/bin/script -q /dev/null /bin/echo hi"),
+            Some(0),
+            "{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        // A terminal this process can open, as one an agent runs shipcheck in
+        if let Some(tty) = tty {
+            assert_ne!(
+                run(&format!("exec 3< {}", tty.display())),
+                Some(0),
+                "{}",
+                tty.display()
+            );
+        }
     }
 
     #[test]
@@ -1480,10 +1559,22 @@ mod tests {
         )));
         assert!(!profile.contains("/dev/tty\""));
         let user = resolved(crate::run::user_dir());
-        assert!(profile.contains(&format!(
-            "(deny file-read-data (subpath \"{}\"))",
-            user.display()
-        )));
+        let denied = profile
+            .lines()
+            .find(|l| l.starts_with("(deny file-read-data"))
+            .unwrap();
+
+        for dir in [
+            user.to_str().unwrap(),
+            "/private/tmp",
+            "/private/var/folders",
+        ] {
+            assert!(denied.contains(&format!("(subpath \"{dir}\")")), "{denied}");
+        }
+
+        assert!(profile.contains(
+            r#"(deny file-read* (require-all (regex #"^/dev/ttys[0-9]+$") (require-not (extension "com.apple.sandbox.pty"))))"#
+        ));
         assert!(profile.contains(&format!("(subpath \"/j/repo\") {paths})")));
         assert!(profile.contains("(deny network-outbound (remote unix-socket))\n"));
         assert!(profile.contains(
