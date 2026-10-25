@@ -65,7 +65,7 @@ enum Cmd {
         /// Test the index instead of the working copy
         #[arg(long)]
         staged: bool,
-        /// Run against the local origin/main without fetching it
+        /// Run against the local base branch, origin/HEAD's, without fetching it
         #[arg(long)]
         no_fetch: bool,
         /// Read shipcheck.toml and the workflows from this ref, for a trial
@@ -209,7 +209,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut rev = "HEAD".to_string();
     let mut fetch = true;
-    let mut base = "origin/main".to_string();
+    let mut base = run::default_base(&cwd);
     let mut base_set = false;
     let mut all = false;
     let mut explicit = false;
@@ -224,7 +224,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let mut posts: Option<String> = None;
     let (mut refname, mut pushed) = (String::new(), None);
     let on_base = |b: Option<String>, base: &mut String, base_set: &mut bool, fetch: &mut bool| {
-        // For trials: read shipcheck.toml and the workflows from another ref than origin/main
+        // For trials: read shipcheck.toml and the workflows from another ref than the default base
         if let Some(b) = b {
             *base = b;
             *base_set = true;
@@ -377,18 +377,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
     match name {
         "run" => {
-            if fetch {
-                let status = Command::new("git")
-                    .args(["fetch", "-q", "origin", "main"])
-                    .current_dir(&cwd)
-                    .status();
-
-                if !status.map(|s| s.success()).unwrap_or(false) {
-                    return Err("git fetch origin main failed, use --no-fetch to run against the local origin/main".into());
-                }
+            if fetch && !background::fetch_base(&cwd, &base) {
+                return Err(format!(
+                    "git fetch of {base} failed, use --no-fetch to run against the local {base}"
+                ));
             }
 
-            // A run that posts reads the config from GitHub's main, not one the clone was told
+            // A run that posts reads the config from GitHub's base branch, not one the clone was told
             if posts.is_some() && !background::fetch_base(&cwd, &base) {
                 say(&format!("could not fetch {base}, so nothing is posted"));
                 posts = None;
@@ -796,7 +791,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             }
 
             machine_setup(&root, &mut |line| println!("{line}"))?;
-            println!("next: review shipcheck.toml and AGENTS.md, commit them, and merge to main");
+            println!(
+                "next: review shipcheck.toml and AGENTS.md, commit them, and merge to {}",
+                run::default_base(&root).trim_start_matches("origin/")
+            );
             Ok(ExitCode::SUCCESS)
         }
         "install" => {
@@ -948,7 +946,7 @@ fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCod
     let repo = toplevel(cwd)?;
 
     // Plain `git commit` still works on it, the hooks never block git
-    if let Some(branch) = run::on_default_branch(&repo, "origin/main", None) {
+    if let Some(branch) = run::on_default_branch(&repo, &run::default_base(&repo), None) {
         return Err(format!(
             "{branch} is the default branch, PRs carry shipcheck's checks: `git switch -c <branch>`, then `shipcheck commit`"
         ));

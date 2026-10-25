@@ -112,10 +112,13 @@ fn main_checkout(root: &Path) -> PathBuf {
         .unwrap_or_else(|| root.to_path_buf())
 }
 
-/// Whether `shipcheck.toml` on main leaves the daemon on, which it does when there is none yet
+/// Whether `shipcheck.toml` on the base branch leaves the daemon on, which it does when there is none yet
 fn wanted_on_main(root: &Path) -> bool {
     Command::new("git")
-        .args(["show", "origin/main:shipcheck.toml"])
+        .args([
+            "show",
+            &format!("{}:shipcheck.toml", run::default_base(root)),
+        ])
         .current_dir(root)
         .output()
         .ok()
@@ -146,7 +149,11 @@ fn try_install(root: &Path) -> Result<String, String> {
     }
 
     let checkout = main_checkout(root);
-    DaemonConfig::add(&run::repo_id(&checkout)?, &checkout, "origin/main")?;
+    DaemonConfig::add(
+        &run::repo_id(&checkout)?,
+        &checkout,
+        &run::default_base(&checkout),
+    )?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // The service runs outside any sandbox for weeks, so it keeps only the PATH entries a jail would
     let path = crate::runner::host::jail_path()

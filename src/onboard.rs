@@ -94,6 +94,8 @@ pub struct Plan {
     pub stop: Option<String>,
     /// The file, job and reason of each job whose check failed when init tried it
     failed: Vec<(String, String, String)>,
+    /// The file, job and GitHub's check names of each job that stays on GitHub for PRs
+    github: Vec<(String, String, Option<Vec<String>>)>,
 }
 
 /// The person's choice for each step of a plan
@@ -130,6 +132,7 @@ pub fn plan(root: &Path, app: App, r: &mut dyn Report) -> Result<Plan, String> {
         ruleset: None,
         stop: None,
         failed: Vec::new(),
+        github: Vec::new(),
     };
     let text = if path.exists() {
         fs::read_to_string(&path).map_err(|e| format!("shipcheck.toml: {e}"))?
@@ -168,7 +171,7 @@ pub fn plan(root: &Path, app: App, r: &mut dyn Report) -> Result<Plan, String> {
     }
 
     workflows(root, &cfg, &mut plan)?;
-    plan.ruleset = ruleset_plan(root, &text, &plan.app, &plan.failed);
+    plan.ruleset = ruleset_plan(root, &text, &plan.app, &plan.github);
     Ok(plan)
 }
 
@@ -193,6 +196,13 @@ fn tried(
     let (results, versions) = try_checks(root, &text, r)?;
     let mut d = setup::detect_on(root, machine);
     let mut failed = Vec::new();
+
+    for v in d.versions.iter().filter(|v| !versions.contains(v)) {
+        d.skipped.push(format!(
+            "versions `{v}`: it does not run here, so init left it out"
+        ));
+    }
+
     d.versions = versions;
     d.checks.retain_mut(|c| match results.get(&c.name) {
         Some(Ok(command)) => {
@@ -244,8 +254,8 @@ type Tried = BTreeMap<String, Result<String, String>>;
 
 /**
  * Tries each `versions` command, then each check, then each safe variant of a check that failed.
- * A version that fails would fail every run, so it is left out, and only the checks that start
- * its tool fail with it. Returns the results and the versions that answered
+ * A version that fails would fail every run, so it is left out with a warning, and only the checks
+ * that start its tool fail with it. Returns the results and the versions that answered
  **/
 fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec<String>), String> {
     let cfg = RepoConfig::parse(text)?;
@@ -258,6 +268,10 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
             continue;
         };
         let tool = version.split_whitespace().next().unwrap_or_default();
+        r.done(
+            false,
+            &format!("`{version}` does not run, so shipcheck.toml leaves it out of versions"),
+        );
 
         for (name, command) in &cfg.host.checks {
             let starts = command
@@ -380,8 +394,13 @@ fn probe(root: &Path, host: &crate::config::Host, version: &str) -> Result<(), S
         .map(|_| ())
 }
 
+// A toolchain named `missing` is one this machine lacks
 #[cfg(test)]
-fn probe(_: &Path, _: &crate::config::Host, _: &str) -> Result<(), String> {
+fn probe(_: &Path, _: &crate::config::Host, version: &str) -> Result<(), String> {
+    if version.contains("+missing") {
+        return Err("error: toolchain 'missing' is not installed".into());
+    }
+
     Ok(())
 }
 
@@ -796,7 +815,10 @@ pub fn apply(
     if wrote {
         next.insert(
             0,
-            "Review shipcheck.toml, the workflow changes and AGENTS.md, commit them, and merge to main".into(),
+            format!(
+                "Review shipcheck.toml, the workflow changes and AGENTS.md, commit them, and merge to {}",
+                plan.base
+            ),
         );
     } else {
         next.insert(0, "Commit AGENTS.md if init changed it".into());
@@ -1067,19 +1089,10 @@ fn ask(plan: &Plan, step: Step, a: &mut Answers, s: Style) -> std::io::Result<()
     Ok(())
 }
 
-/// The remote's default branch, else main
+/// The base the daemon, the hooks and `shipcheck run` use, as a branch name
 fn base_branch(root: &Path) -> String {
-    Command::new("git")
-        .args(["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .and_then(|o| {
-            let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            name.strip_prefix("origin/").map(str::to_string)
-        })
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| "main".into())
+    let base = crate::run::default_base(root);
+    base.strip_prefix("origin/").unwrap_or(&base).to_string()
 }
 
 /// One job of a workflow: the shipcheck checks that run its commands, and the commands none runs
@@ -1206,18 +1219,11 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
         let source = fs::read_to_string(&path).map_err(|e| format!("{file}: {e}"))?;
         let jobs = crate::workflow::job_runs(&source);
         let covers = coverage(root, cfg, &file, &jobs);
-        let mut staying: Vec<&str> = kept
+        let staying: Vec<&str> = kept
             .iter()
             .filter(|k| k.file == file)
             .map(|k| k.job.as_str())
             .collect();
-
-        // No host check can run a job with no command, so it stays on GitHub and the rest is gated
-        for job in jobs.iter().filter(|_| cfg.runner == RunnerKind::Host) {
-            if setup::job_commands(job).is_empty() && !staying.contains(&job.id.as_str()) {
-                staying.push(&job.id);
-            }
-        }
 
         if !crate::workflow::runs_for_branches(&source) {
             continue;
@@ -1276,9 +1282,17 @@ fn gate(
         .map(|j| j.id.clone())
         .filter(|id| !ungated.contains(id))
         .collect();
-    let stay = jobs
+    let stays: Vec<&crate::workflow::Job> = jobs
         .iter()
         .filter(|j| ungated.contains(&j.id) && !base_only.contains(&j.id))
+        .collect();
+    plan.github.extend(
+        stays
+            .iter()
+            .map(|j| (file.to_string(), j.id.clone(), j.check_names.clone())),
+    );
+    let stay = stays
+        .iter()
         .map(|j| j.id.as_str())
         .collect::<Vec<_>>()
         .join(", ");
@@ -1299,11 +1313,22 @@ fn gate(
         return;
     }
 
+    // init is init: a workflow an earlier init gated is the person's now, and doctor reports drift
+    let before = crate::workflow::gated_jobs(source);
+
+    if !before.is_empty() {
+        plan.notes.push(format!(
+            "{file}: an earlier init gated {}, so init leaves it as it is",
+            before.join(", ")
+        ));
+        return;
+    }
+
     let Some(edited) = crate::workflow::gate_jobs(source, &gated, base) else {
         plan.notes.push(format!(
-            "{file}: a job has a form shipcheck does not edit. To run {} on GitHub only on {base} and for forks, give each `if: github.ref == 'refs/heads/{base}' || github.actor == 'dependabot[bot]' || {fork}` by hand",
+            "{file}: a job has a form shipcheck does not edit. To run {} on GitHub only where shipcheck does not, give each `if: {gate}` by hand, or `if: (<its own>) && {gate}`",
             gated.join(", "),
-            fork = crate::workflow::FORK
+            gate = crate::workflow::gate_condition(source, base)
         ));
         return;
     };
@@ -1348,10 +1373,13 @@ fn gate(
 /// Where else GitHub keeps running the gated jobs, since shipcheck runs only PRs into the base
 fn elsewhere(source: &str, base: &str) -> String {
     let (pushes, prs) = crate::workflow::other_branches(source, base);
+    let (kept, dropped): (Vec<String>, Vec<String>) = pushes
+        .into_iter()
+        .partition(|p| crate::workflow::push_condition(p).is_some());
     let mut more: Vec<String> = Vec::new();
 
-    if !pushes.is_empty() {
-        more.push(format!("on pushes to {}", pushes.join(", ")));
+    if !kept.is_empty() {
+        more.push(format!("on pushes to {}", kept.join(", ")));
     }
 
     if prs {
@@ -1359,7 +1387,15 @@ fn elsewhere(source: &str, base: &str) -> String {
     }
 
     more.push("on fork PRs".to_string());
-    format!(", and {}", more.join(" and "))
+    let lost = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ". Not on pushes to {}, since no `if:` can match that pattern",
+            dropped.join(", ")
+        )
+    };
+    format!(", and {}{lost}", more.join(" and "))
 }
 
 /// The changed lines between the first and the last that differ
@@ -1430,23 +1466,23 @@ pub fn job_checks(root: &Path, text: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The ruleset for the App's job checks and the checks of `stays`, the jobs gate left on GitHub for PRs
 fn ruleset_plan(
     root: &Path,
     text: &str,
     app: &App,
-    failed: &[(String, String, String)],
+    stays: &[(String, String, Option<Vec<String>>)],
 ) -> Option<Ruleset> {
     let app = app.id().filter(|a| a.parse::<u64>().is_ok())?;
     let names = job_checks(root, text).ok().filter(|n| !n.is_empty())?;
     let mut github = Vec::new();
     let mut notes = Vec::new();
 
-    for kept in kept(root, failed) {
-        match kept.checks {
-            Some(checks) => github.extend(checks),
+    for (file, job, checks) in stays {
+        match checks {
+            Some(checks) => github.extend(checks.iter().cloned()),
             None => notes.push(format!(
-                "{}, job {}: its check names depend on its matrix or an expression, require them by hand once a PR shows them",
-                kept.file, kept.job
+                "{file}, job {job}: its check names depend on its matrix or an expression, require them by hand once a PR shows them"
             )),
         }
     }
@@ -1886,13 +1922,135 @@ mod tests {
             (".github/workflows/lint.yml", lint),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan = super::plan(dir.path(), App::Own("1".into()), &mut Said::default()).unwrap();
         let change = &plan.workflows[0];
-        assert_eq!(plan.recommended().workflows, [true]);
         assert_eq!(
             Some(change.edited.clone()),
             crate::workflow::gate_jobs(lint, &["ruby".to_string()], "main")
         );
+        // yaml stays on GitHub for PRs, so the ruleset requires its check from GitHub Actions
+        assert_eq!(plan.ruleset.unwrap().github, ["yaml"]);
+    }
+
+    #[test]
+    fn the_ruleset_requires_every_job_gate_leaves_on_github() {
+        // A shipcheck.toml from an init whose trial failed test: test stays on GitHub, and release
+        // runs only on main, so no PR waits for it
+        let ci = "on: [push, pull_request]\njobs:\n  lint:\n    steps:\n      - run: make lint\n  test:\n    steps:\n      - run: make test\n  release:\n    if: github.ref == 'refs/heads/main'\n    steps:\n      - run: make release\n";
+        let config = "runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n";
+        let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
+        let plan = super::plan(dir.path(), App::Own("1".into()), &mut Said::default()).unwrap();
+        let rule = plan.ruleset.unwrap();
+        assert_eq!(rule.names, ["shipcheck/lint"]);
+        assert_eq!(rule.github, ["test"]);
+    }
+
+    #[test]
+    fn a_second_init_leaves_the_workflows_it_gated() {
+        let config =
+            "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\nclippy = \"cargo clippy\"\n";
+        let dir = repo(&[
+            (".github/workflows/ci.yml", CI),
+            (".github/workflows/lint.yml", LINT),
+            ("shipcheck.toml", config),
+        ]);
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let mut a = plan.recommended();
+        a.workflows = vec![true, false];
+        apply(
+            dir.path(),
+            &plan,
+            &a,
+            &mut finish_nothing,
+            &mut Said::default(),
+        )
+        .unwrap();
+        let gated = fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap();
+
+        // lint.yml, declined the first time, is offered again, ci.yml is not touched
+        let again = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let files: Vec<&str> = again.workflows.iter().map(|w| w.file.as_str()).collect();
+        assert_eq!(files, ["lint.yml"]);
+        assert!(
+            again
+                .notes
+                .contains(&"ci.yml: an earlier init gated test, so init leaves it as it is".into()),
+            "{:?}",
+            again.notes
+        );
+        apply(
+            dir.path(),
+            &again,
+            &again.recommended(),
+            &mut finish_nothing,
+            &mut Said::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".github/workflows/ci.yml")).unwrap(),
+            gated
+        );
+    }
+
+    #[test]
+    fn the_hand_edit_note_gives_the_gate_init_would_write() {
+        let flow =
+            "on: [push, pull_request]\njobs:\n  test: {runs-on: x, steps: [{run: cargo test}]}\n";
+        let config = "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n";
+        let dir = repo(&[
+            (".github/workflows/ci.yml", flow),
+            ("shipcheck.toml", config),
+        ]);
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let gate = crate::workflow::gate_condition(flow, "main");
+        let note = plan.notes.iter().find(|n| n.contains("by hand")).unwrap();
+        assert!(note.contains(&format!("`if: {gate}`")), "{note}");
+        assert_eq!(crate::workflow::ungate(&gate).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_version_that_does_not_run_is_left_out_with_a_warning() {
+        let dir = repo(&[]);
+        let text = "runner = \"host\"\n[host]\nversions = [\"rustc +missing --version\", \"cargo --version\"]\n[host.checks]\ntest = \"cargo test\"\n";
+        let mut said = Said::default();
+        let (tried, versions) = try_checks(dir.path(), text, &mut said).unwrap();
+        assert_eq!(versions, ["cargo --version"]);
+        assert!(tried["test"].is_ok());
+        assert!(
+            said.0.contains(
+                &"! `rustc +missing --version` does not run, so shipcheck.toml leaves it out of versions".into()
+            ),
+            "{:?}",
+            said.0
+        );
+    }
+
+    #[test]
+    fn init_gates_to_the_branch_runs_and_the_daemon_use() {
+        let dir = repo(&[(".github/workflows/ci.yml", CI)]);
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "master"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+        ]);
+        assert_eq!(crate::run::default_base(dir.path()), "origin/master");
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        assert_eq!(plan.base, "master");
+        assert!(plan.workflows[0].edited.contains("refs/heads/master"));
+        git(&["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        assert_eq!(crate::run::default_base(dir.path()), "origin/main");
     }
 
     #[test]

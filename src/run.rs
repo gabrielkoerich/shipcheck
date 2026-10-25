@@ -580,6 +580,17 @@ pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
     fs::write(&file, text).map_err(|e| e.to_string())
 }
 
+/// The remote's default branch as `origin/<branch>`, else `origin/main`: the base of runs, hooks and the daemon
+pub fn default_base(repo: &Path) -> String {
+    git(
+        repo,
+        &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .filter(|b| b.strip_prefix("origin/").is_some_and(|n| !n.is_empty()))
+    .unwrap_or_else(|| "origin/main".into())
+}
+
 /**
  * The default branch, `base` without `origin/`, when `commit` (no `sha`) runs with HEAD on it, or
  * when `post` names its tip, locally or on `base`. Both refuse there, PRs carry the checks

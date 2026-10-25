@@ -690,7 +690,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             .any(|w| w == "uv" || w == "uvx")
             && !c.command.contains("UV_PYTHON=")
     });
-    let found = "uv python find --show-version".to_string();
+    let found = "uv python find --show-version || echo missing".to_string();
 
     if unpinned && !d.versions.contains(&found) {
         d.versions.push(found);
@@ -2751,7 +2751,7 @@ jobs:
         assert!(
             found
                 .versions
-                .contains(&"uv python find --show-version".to_string()),
+                .contains(&"uv python find --show-version || echo missing".to_string()),
             "{:?}",
             found.versions
         );
@@ -3007,7 +3007,10 @@ jobs:
         assert_eq!(checks(&cfg), [("test", "uv run pytest")]);
         assert_eq!(
             cfg.host.versions,
-            ["uv --version", "uv python find --show-version"]
+            [
+                "uv --version",
+                "uv python find --show-version || echo missing"
+            ]
         );
         let (cfg, _, _) = init_with(&[("pyproject.toml", "")]);
         assert_eq!(checks(&cfg), [("test", "pytest")]);
