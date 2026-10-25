@@ -363,7 +363,12 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         }
     };
 
-    if !base_set {
+    let reads_base = matches!(
+        name,
+        "run" | "status" | "logs" | "post" | "doctor" | "on-commit" | "on-push"
+    );
+
+    if !base_set && reads_base {
         base = shipcheck::daemon::command_base(name, &cwd);
     }
 
@@ -815,7 +820,9 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             machine_setup(&root, &mut |line| println!("{line}"))?;
             println!(
                 "next: review shipcheck.toml and AGENTS.md, commit them, and merge to {}",
-                run::default_base(&root).trim_start_matches("origin/")
+                shipcheck::daemon::known_base(&root)
+                    .unwrap_or_else(|| "origin/main".into())
+                    .trim_start_matches("origin/")
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -968,7 +975,11 @@ fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCod
     let repo = toplevel(cwd)?;
 
     // Plain `git commit` still works on it, the hooks never block git
-    if let Some(branch) = run::on_default_branch(&repo, &run::default_base(&repo), None) {
+    if let Some(branch) = run::on_default_branch(
+        &repo,
+        &shipcheck::daemon::command_base("commit", &repo),
+        None,
+    ) {
         return Err(format!(
             "{branch} is the default branch, PRs carry shipcheck's checks: `git switch -c <branch>`, then `shipcheck commit`"
         ));
