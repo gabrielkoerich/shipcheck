@@ -1758,7 +1758,7 @@ fn mount_paths(run_dir: &Path) -> Vec<PathBuf> {
  **/
 const REAPER: &str = r#"read -r pgid || exit 0
 read -r done && exit 0
-kill -KILL -- "-$pgid" 2>/dev/null
+kill -s KILL -- "-$pgid" 2>/dev/null
 net=$1
 shift
 for p in "$@"; do
