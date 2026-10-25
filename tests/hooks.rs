@@ -52,6 +52,7 @@ fn on_push_runs_the_pushed_commit_and_on_commit_only_when_asked() {
     git(&work, &["checkout", "-q", "-b", "main"]);
     git(&work, &["config", "user.email", "t@example.com"]);
     git(&work, &["config", "user.name", "t"]);
+    git(&work, &["config", "commit.gpgsign", "false"]);
     fs::write(
         work.join("shipcheck.toml"),
         "runner = \"host\"\nretries = 0\n[host]\nchecks = { ok = \"true\" }\n",

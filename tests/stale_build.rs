@@ -58,6 +58,7 @@ fn a_run_never_uses_build_output_another_tree_left() {
     git(&main, &["checkout", "-q", "-b", "main"]);
     git(&main, &["config", "user.email", "t@example.com"]);
     git(&main, &["config", "user.name", "t"]);
+    git(&main, &["config", "commit.gpgsign", "false"]);
     write(
         &main,
         "Cargo.toml",
