@@ -102,6 +102,7 @@ pub fn line(
         }
     }
 
+    let kind = crate::runner::Runners::new(&plan.config, &plan.repo).kind();
     json!({
         "v": VERSION,
         "event": "run",
@@ -121,8 +122,8 @@ pub fn line(
         "machine": hostname(),
         "os": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": crate::runner::Runners::new(&plan.config, &plan.repo).kind(),
-        "tools": plan.tools.lines().flat_map(tools).collect::<Vec<_>>(),
+        "mode": kind,
+        "tools": run_tools(kind, &plan.tools),
         "cache_hit": run.cache_hit,
         "partial": run.partial,
         "skipped": entry.skipped.is_some(),
@@ -147,6 +148,14 @@ pub fn event(repo: &str, name: &str, mut fields: Value) -> Value {
 
 /// The runner's identity as one entry per tool: act's version, or each `[host] versions` command
 /// with its output
+/// act's identity is one line, a host check's version output can be several, so only mixed splits
+fn run_tools(kind: &str, identity: &str) -> Vec<String> {
+    match identity.split_once('\n') {
+        Some((act, host)) if kind == "mixed" => [vec![act.to_string()], tools(host)].concat(),
+        _ => tools(identity),
+    }
+}
+
 fn tools(identity: &str) -> Vec<String> {
     let mut parts = identity.split('\0');
     let mut out: Vec<String> = parts.next().map(String::from).into_iter().collect();
@@ -296,6 +305,25 @@ mod tests {
     use super::*;
     use crate::config::RepoConfig;
     use crate::run::WorkflowResult;
+
+    #[test]
+    fn a_host_version_of_many_lines_stays_one_tool() {
+        let host = "host\0rustc -vV\0rustc 1.90.0\nhost: aarch64-apple-darwin";
+        let one = [
+            "host",
+            "rustc -vV: rustc 1.90.0\nhost: aarch64-apple-darwin",
+        ];
+        assert_eq!(run_tools("host", host), one);
+        let mixed = format!("act version 0.2.89\n{host}");
+        assert_eq!(
+            run_tools("mixed", &mixed),
+            [&["act version 0.2.89"][..], &one].concat()
+        );
+        assert_eq!(
+            run_tools("act", "act version 0.2.89"),
+            ["act version 0.2.89"]
+        );
+    }
 
     fn plan() -> Plan {
         let config_text = b"workflows = [\"ci.yml\"]\n".to_vec();

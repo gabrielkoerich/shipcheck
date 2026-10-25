@@ -402,11 +402,6 @@ fn default_parallel(host: usize, engine: Option<(u32, u64)>) -> usize {
     cpus.min(engine_cpus as usize).min(by_memory).max(1)
 }
 
-/// The job id of a `"<file>/<job>"` name
-fn id_of(name: &str) -> &str {
-    name.split_once('/').map_or(name, |(_, id)| id)
-}
-
 impl RepoConfig {
     fn job_runner(&self, job: &Job) -> RunnerKind {
         job.runner.unwrap_or(self.runner)
@@ -468,13 +463,6 @@ impl RepoConfig {
                 Some(f) if kind == RunnerKind::Host && !self.workflows.iter().any(|w| w == f) => {
                     problems.push(format!(
                         "jobs entry {name:?} is on the host runner, but workflows does not list {f}, so it changes nothing"
-                    ))
-                }
-                // Without a check of its name the job would run nowhere and post no check
-                Some(_) if kind == RunnerKind::Host && !self.host.checks.contains_key(id_of(name)) => {
-                    problems.push(format!(
-                        "jobs entry {name:?} is on the host runner, but [host.checks] has no check {:?} to run in its place",
-                        id_of(name)
                     ))
                 }
                 Some(_) => {}
@@ -885,10 +873,6 @@ mod tests {
                 .contains("does not list ci.yml")
         );
         assert!(err("[jobs.\"ci.yml/test\"]\nrunner = \"host\"").contains("nothing would run"));
-        assert!(
-            err("workflows = [\"ci.yml\"]\n[host.checks]\nlint = \"x\"\n[jobs.\"ci.yml/test\"]\nrunner = \"host\"")
-                .contains("no check \"test\" to run in its place")
-        );
         // A host entry takes a job out of a listed workflow, the host check of its name stands in for it
         let out = "workflows = [\"ci.yml\"]\n[host.checks]\ntest = \"cargo test\"\n[jobs.\"ci.yml/test\"]\nrunner = \"host\"";
         let cfg = RepoConfig::parse(out).unwrap();

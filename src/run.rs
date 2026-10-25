@@ -373,6 +373,17 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
     let mut config = RepoConfig::parse(&String::from_utf8_lossy(&config_text))?;
     let files: BTreeSet<String> = workflows.keys().map(|p| file_name(p)).collect();
     config.validate(&files)?;
+
+    // Where each job runs needs the workflows, so a wrong entry fails here, before anything runs
+    if !config.jobs.is_empty() {
+        expected_jobs(&config, |file| {
+            workflows
+                .iter()
+                .find(|(path, _)| file_name(path) == file)
+                .map(|(_, body)| String::from_utf8_lossy(body).into_owned())
+        })?;
+    }
+
     let tree_files = git_raw(&repo, &["ls-tree", "-r", "-z", "--name-only", &tree])?;
     config.act.for_tree(
         String::from_utf8_lossy(&tree_files)
@@ -806,29 +817,52 @@ pub fn expected_jobs(
     Ok(jobs)
 }
 
-/// The act jobs of `config` per workflow file: each listed workflow whole, each act `[jobs]` entry,
-/// and every job they need, less the jobs a host entry takes out
+/**
+ * The act jobs of `config` per workflow file: each listed workflow whole, each act `[jobs]` entry,
+ * and every job they need, less the jobs host entries take out. A host entry must name a job of its
+ * file and a host check of that id, so no job is dropped without a check in its place
+ **/
 fn act_jobs(config: &RepoConfig, graphs: &Graphs) -> Result<crate::check::Jobs, String> {
     let mut chosen = select(graphs, &config.jobs_on(RunnerKind::Act), &config.workflows)?;
+    let moved = config.jobs_on(RunnerKind::Host);
 
-    for name in config.jobs_on(RunnerKind::Host) {
-        let Some((file, job)) = name.split_once('/') else {
-            continue;
-        };
-        let Some(picked) = chosen.get_mut(file) else {
-            continue;
-        };
-        picked.retain(|id| !names_job(id, job));
+    // Every host entry first, so a moved job may need another moved job
+    for name in &moved {
+        let (file, job) = name.split_once('/').unwrap_or((name, ""));
+        let real = graphs
+            .get(file)
+            .is_some_and(|graph| graph.iter().any(|(id, _)| names_job(id, job)));
 
-        let needs = graphs.get(file).into_iter().flatten();
-        let needed = needs
-            .filter(|(id, _)| picked.contains(id))
-            .find(|(_, needs)| needs.iter().any(|n| names_job(n, job)));
+        if !real {
+            return Err(format!("jobs entry {name:?} names no job of {file}"));
+        }
 
-        if let Some((id, _)) = needed {
+        if !config.host.checks.contains_key(job) {
             return Err(format!(
-                "jobs entry {name:?} is on the host runner, but act job {file}/{id} needs it"
+                "jobs entry {name:?} is on the host runner, but [host.checks] has no check {job:?} to run in its place"
             ));
+        }
+
+        if let Some(picked) = chosen.get_mut(file) {
+            picked.retain(|id| !names_job(id, job));
+        }
+    }
+
+    for (file, picked) in &chosen {
+        if picked.is_empty() && moved.iter().any(|m| m.starts_with(&format!("{file}/"))) {
+            return Err(format!(
+                "every job of {file} is on the host runner, so act would run nothing. Remove it from workflows"
+            ));
+        }
+
+        let graph = graphs.get(file).into_iter().flatten();
+
+        for (id, needs) in graph.filter(|(id, _)| picked.contains(id)) {
+            if let Some(need) = needs.iter().find(|n| !picked.contains(*n)) {
+                return Err(format!(
+                    "act job {file}/{id} needs {need}, which a jobs entry puts on the host runner"
+                ));
+            }
         }
     }
 
@@ -2932,20 +2966,56 @@ mod tests {
             names,
             ["shipcheck/build", "shipcheck/e2e", "shipcheck/lint"]
         );
-        let needed = jobs("workflows = [\"ci.yml\"]\n[jobs.\"ci.yml/build\"]\nrunner = \"host\"");
-        assert!(needed.unwrap_err().contains("act job ci.yml/e2e needs it"));
+        let listed = "workflows = [\"ci.yml\"]\n";
+        let entry = |id: &str| format!("[jobs.\"ci.yml/{id}\"]\nrunner = \"host\"\n");
+        let checks = |names: &[&str]| {
+            let lines: Vec<String> = names.iter().map(|n| format!("{n} = \"x\"\n")).collect();
+            format!("[host.checks]\n{}", lines.concat())
+        };
+        let err = |text: String| jobs(&text).unwrap_err();
+
+        assert!(
+            err(format!("{listed}{}{}", checks(&["build"]), entry("build")))
+                .contains("act job ci.yml/e2e needs build")
+        );
+        assert!(
+            err(format!("{listed}{}{}", checks(&["lnit"]), entry("lnit")))
+                .contains("\"ci.yml/lnit\" names no job of ci.yml")
+        );
+        assert!(err(format!("{listed}{}", entry("lint"))).contains("no check \"lint\""));
+        assert!(
+            err(format!("{listed}{}{}", checks(&["test"]), entry("lint")))
+                .contains("no check \"lint\"")
+        );
+        // Both moved at once, whatever order the entries come in
+        let both = jobs(&format!(
+            "{listed}{}{}{}",
+            checks(&["build", "e2e"]),
+            entry("e2e"),
+            entry("build")
+        ))
+        .unwrap();
+        assert_eq!(both["ci.yml"], set(&["lint"]));
+        assert_eq!(both[HOST], set(&["build", "e2e"]));
+        let all = format!(
+            "{listed}{}{}{}{}",
+            checks(&["build", "e2e", "lint"]),
+            entry("build"),
+            entry("e2e"),
+            entry("lint")
+        );
+        assert!(err(all).contains("every job of ci.yml is on the host runner"));
         assert!(jobs("runner = \"host\"\n[host.checks]\nt = \"x\"\n[jobs.\"ci.yml/nope\"]\nrunner = \"act\"").is_err());
 
         let graphs = BTreeMap::from([(
             "ci.yml".to_string(),
-            g(&[("lint__1", &[]), ("lint__2", &[])]),
+            g(&[("lint__1", &[]), ("lint__2", &[]), ("test", &[])]),
         )]);
-        let cfg = RepoConfig::parse(
-            "workflows = [\"ci.yml\"]\n[jobs.\"ci.yml/lint\"]\nrunner = \"host\"",
-        )
-        .unwrap();
-        assert!(
-            act_jobs(&cfg, &graphs).unwrap()["ci.yml"].is_empty(),
+        let cfg =
+            RepoConfig::parse(&format!("{listed}{}{}", checks(&["lint"]), entry("lint"))).unwrap();
+        assert_eq!(
+            act_jobs(&cfg, &graphs).unwrap()["ci.yml"],
+            set(&["test"]),
             "a host entry takes every leg"
         );
     }

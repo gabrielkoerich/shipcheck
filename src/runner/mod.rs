@@ -151,6 +151,28 @@ impl Runners {
 mod tests {
     use super::*;
 
+    struct Named(&'static str);
+
+    impl Runner for Named {
+        fn identity(&self) -> Result<String, String> {
+            Ok(self.0.to_string())
+        }
+
+        fn prepare(&self, workflow: &str, _file: &str) -> Result<String, String> {
+            Ok(workflow.to_string())
+        }
+
+        fn run(&self, _request: &RunRequest, _log: &Path) -> Result<Outcome, String> {
+            Err("not run".into())
+        }
+
+        fn reclaim(&self, _run_dir: &Path) {}
+
+        fn clean(&self, _repo_id: Option<&str>) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
     #[test]
     fn a_config_without_jobs_keys_its_one_runner_as_before() {
         let kind = |text: &str| {
@@ -167,11 +189,10 @@ mod tests {
             "runner = \"host\"\n[host.checks]\nt = \"x\"\n[jobs.\"ci.yml/e2e\"]\nrunner = \"act\"";
         assert_eq!(kind(mixed), ("mixed", 2));
         let config = RepoConfig::parse(mixed).unwrap();
-        let runners = Runners::new(&config, Path::new("/"));
-        // act needs its binary, which the test job may lack
-        if let Ok(act) = runners.act.as_ref().unwrap().identity() {
-            assert_eq!(runners.identity().unwrap(), format!("{act}\nhost"));
-        }
+        let mut runners = Runners::new(&config, Path::new("/"));
+        // A stand-in for act, whose binary the test job may lack
+        runners.act = Some(Box::new(Named("act version 0.2.89")));
+        assert_eq!(runners.identity().unwrap(), "act version 0.2.89\nhost");
 
         assert!(runners.for_file(host::HOST).is_ok() && runners.for_file("ci.yml").is_ok());
         let host = RepoConfig::parse("runner = \"host\"\n[host.checks]\nt = \"x\"").unwrap();

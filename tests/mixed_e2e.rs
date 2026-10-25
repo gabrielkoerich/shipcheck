@@ -50,7 +50,7 @@ const CONFIG: &str = "\
 runner = \"host\"
 
 [host.checks]
-test = \"test -f marker.txt\"
+test = \"test -f host.txt\"
 
 [act]
 cache_paths = []
@@ -84,6 +84,7 @@ fn host_checks_and_an_act_job_run_as_one_result() {
     git(&work, &["fetch", "-q", "origin"]);
     git(&work, &["checkout", "-q", "-b", "feature"]);
     fs::write(work.join("marker.txt"), "ok").unwrap();
+    fs::write(work.join("host.txt"), "ok").unwrap();
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "feature"]);
 
@@ -122,16 +123,26 @@ fn host_checks_and_an_act_job_run_as_one_result() {
     assert_eq!(only.workflows[0].file, "host");
     assert!(run::run_partial(&plan, &["lint".into()], &[], &mut |_| {}).is_err());
 
-    // The act job fails on its own when the tree lacks what it needs, beside a host check that fails too
-    git(&work, &["rm", "-q", "marker.txt"]);
-    git(&work, &["commit", "-q", "-m", "no marker"]);
-    let plan = run::plan(&work, "feature", "origin/main").unwrap();
-    let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
-    assert!(!entry.passed);
-    assert_eq!(entry.workflows[1].jobs["build"], "failure");
+    // Each side fails the run alone
+    let run_without = |file: &str| {
+        git(&work, &["rm", "-q", file]);
+        git(&work, &["commit", "-q", "-m", file]);
+        let plan = run::plan(&work, "feature", "origin/main").unwrap();
+        let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
+        git(&work, &["revert", "--no-edit", "HEAD"]);
+        entry
+    };
+    let host = run_without("host.txt");
+    assert!(!host.passed);
+    assert_eq!(host.workflows[0].jobs["test"], "failure");
+    assert!(host.workflows[1].passed);
+
+    let act = run_without("marker.txt");
+    assert!(!act.passed);
+    assert!(act.workflows[0].passed);
+    assert_eq!(act.workflows[1].jobs["build"], "failure");
     assert_eq!(
-        entry.workflows[1].jobs["e2e"],
+        act.workflows[1].jobs["e2e"],
         "not run, a job it needs did not pass"
     );
-    assert_eq!(entry.workflows[0].jobs["test"], "failure");
 }
