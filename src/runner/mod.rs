@@ -149,6 +149,16 @@ impl Runners {
     }
 }
 
+/// Linux runs `sh` scripts in dash, so tests run them in dash where the Mac has it, as on GitHub
+#[cfg(test)]
+pub(crate) fn posix_sh() -> &'static str {
+    if Path::new("/bin/dash").exists() {
+        "/bin/dash"
+    } else {
+        "sh"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
