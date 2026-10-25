@@ -324,7 +324,10 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         found.push(check(
             "sandbox",
             runner::host::sandbox().map(|s| {
-                format!("{s}: host checks write only to their clone, a new home and the repository's tool caches")
+                format!(
+                    "{s}: host checks write only to their clone, a new home and the repository's tool caches. {}",
+                    runner::host::branch_cache()
+                )
             }),
         ));
         #[cfg(target_os = "macos")]

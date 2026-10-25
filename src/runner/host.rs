@@ -17,8 +17,10 @@ pub struct Host {
     config: config::Host,
     /// Where `versions` run, so a toolchain file in the repository picks the version
     repo: PathBuf,
-    /// This run's copy of the base's cache, which its checks of another tree write
+    /// This run's directory under `runs`, with its copy of the base's cache or its checks' overlays
     copy: std::sync::OnceLock<Result<RunCopy, String>>,
+    /// Whether checks of another tree see the base's cache through an overlay instead of a copy
+    overlay: std::sync::OnceLock<bool>,
 }
 
 impl Host {
@@ -27,14 +29,15 @@ impl Host {
             config,
             repo: repo.to_path_buf(),
             copy: std::sync::OnceLock::new(),
+            overlay: std::sync::OnceLock::new(),
         }
     }
 
     /**
-     * The cache a check of a tree other than the base's writes: a copy-on-write copy of the base's,
-     * made once per run and removed with it, so no branch leaves a file another branch's run reads.
-     * A shared cache let one branch plant registry sources that cargo trusts once extracted. On
-     * APFS, btrfs or XFS the copy shares the base's blocks, on ext4 it is a full copy each run
+     * This run's directory under `runs`, made once per run and removed with it, so no branch leaves
+     * a file another branch's run reads. A shared cache let one branch plant registry sources that
+     * cargo trusts once extracted. With an overlay it holds each check's upper layer, otherwise a
+     * copy of the base's cache, which shares its blocks on APFS, btrfs or XFS and is a full copy on ext4
      **/
     fn run_cache(&self, repo_id: &str) -> Result<PathBuf, String> {
         let copy = self.copy.get_or_init(|| {
@@ -45,7 +48,13 @@ impl Host {
             let runs = real_dir(&dir.join("runs"))?;
             RunCopy::remove_unused(&runs);
             let copy = RunCopy::new(&runs)?;
-            clone_dir(&base, &copy.dir)?;
+
+            if *self.overlay.get_or_init(|| overlay(&runs).is_ok()) {
+                fs::create_dir(&copy.dir).map_err(|e| format!("{}: {e}", copy.dir.display()))?;
+            } else {
+                clone_dir(&base, &copy.dir)?;
+            }
+
             Ok(copy)
         });
 
@@ -53,6 +62,18 @@ impl Host {
             Ok(copy) => real_dir(&copy.dir),
             Err(e) => Err(e.clone()),
         }
+    }
+
+    /// This host with the overlay forced on or off, for tests of each way
+    #[cfg(test)]
+    fn with_overlay(self, on: bool) -> Self {
+        self.overlay.set(on).unwrap();
+        self
+    }
+
+    /// Whether this run's checks of another tree got overlays, known once `run_cache` ran
+    fn overlays(&self) -> bool {
+        self.overlay.get().copied().unwrap_or(false)
     }
 }
 
@@ -154,11 +175,11 @@ fn locked(file: &fs::File) -> bool {
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
-/// Removes a cache tree, read-only directories included, as Go's module cache makes them
+/// Removes a cache tree, read-only directories included, as Go's module cache and overlayfs make them
 fn remove_tree(dir: &Path) {
     let _ = Command::new("chmod")
         .arg("-R")
-        .arg("u+w")
+        .arg("u+rwx")
         .arg(dir)
         .stderr(Stdio::null())
         .status();
@@ -295,6 +316,74 @@ fn trusted_path_in(path: &std::ffi::OsStr, user: &Path, temp: &[PathBuf]) -> std
         .filter(|d| trusted_in(d, user, temp))
         .collect();
     std::env::join_paths(kept).unwrap_or_default()
+}
+
+/**
+ * Whether bwrap can lay a check's writes over the base's cache, with the upper layer in `dir`, and
+ * why not. It needs bwrap 0.10 or later and a kernel that mounts overlayfs in a user namespace
+ **/
+pub fn overlay(dir: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("only bwrap mounts an overlay".into());
+    }
+
+    let probe = tempfile::Builder::new()
+        .prefix(".probe-")
+        .tempdir_in(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .keep();
+    let [lower, upper, work] = ["lower", "upper", "work"].map(|d| probe.join(d));
+    let made = [&lower, &upper, &work]
+        .into_iter()
+        .try_for_each(fs::create_dir)
+        .map_err(|e| e.to_string());
+    let ran = made.and_then(|_| {
+        Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--dev", "/dev", "--overlay-src"])
+            .arg(&lower)
+            .arg("--overlay")
+            .args([&upper, &work, &lower])
+            .arg("true")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("bwrap: {e}"))
+    });
+    remove_tree(&probe);
+    let out = ran?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+
+    if err.contains("--overlay-src") {
+        let version = first_line("bwrap", &["--version"]).unwrap_or_else(|| "this bwrap".into());
+        return Err(format!("{version} has no --overlay-src"));
+    }
+
+    Err(format!("bwrap could not mount an overlay: {err}"))
+}
+
+/// How a branch run gets the base's cache, for doctor
+pub fn branch_cache() -> String {
+    if cfg!(target_os = "macos") {
+        return "Branch runs get a clonefile copy of the base's tool cache, which shares its blocks"
+            .into();
+    }
+
+    let dir = cache_dir(None);
+
+    match real_dir(&dir).and_then(|d| overlay(&d)) {
+        Ok(()) => "Branch runs see the base's tool cache through an overlay, and their writes go to a layer of their own that the run removes".into(),
+        Err(e) => format!("Branch runs get a copy of the base's tool cache, a full one on ext4 at about 4 s per GB, since {e}. bubblewrap 0.10 or later mounts an overlay instead, at no cost per GB"),
+    }
+}
+
+fn first_line(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().map(|l| l.trim().to_string())
 }
 
 /// The OS sandbox host checks run in, an error naming the fix when this machine has none
@@ -524,6 +613,8 @@ pub struct Jail {
     pub readable: Vec<PathBuf>,
     pub home: PathBuf,
     pub cache: PathBuf,
+    /// The upper and work directories of an overlay mounted on `cache`, which stays unchanged
+    pub overlay: Option<(PathBuf, PathBuf)>,
 }
 
 /// The setuid binaries of the system, read once
@@ -727,6 +818,15 @@ impl Jail {
             args.extend(["--bind".into(), path.clone().into(), path.clone().into()]);
         }
 
+        if let Some((upper, work)) = &self.overlay {
+            args.extend([
+                "--overlay-src".into(),
+                self.cache.clone().into(),
+                "--overlay".into(),
+            ]);
+            args.extend([upper, work, &self.cache].map(|p| p.clone().into()));
+        }
+
         // Read-only once every mount point in it exists
         args.extend(["--remount-ro".into(), user.into()]);
         Ok(args)
@@ -826,7 +926,7 @@ impl Jail {
 
 /**
  * The tool caches of host checks, per repository, written only by checks. Runs of the base's tree
- * write `base`, and every other run writes a copy of it of its own, under `runs`
+ * write `base`, and every other run writes an overlay of it or a copy of it of its own, under `runs`
  **/
 fn cache_dir(repo_id: Option<&str>) -> PathBuf {
     let dir = crate::run::home().join("hostcache");
@@ -1857,6 +1957,7 @@ fn version(
         readable: vec![repo],
         cache: home.clone(),
         home,
+        overlay: None,
     };
     // No launchd job, which costs 0.1 s a command on every plan: a leftover writes only this
     // temp home, removed on return, and signals only its own sandbox
@@ -1940,16 +2041,37 @@ impl Runner for Host {
             .get(request.job)
             .ok_or_else(|| format!("no host check {}", request.job))?;
         let (_dir, home) = temp_home()?;
-        let cache = if request.on_base {
-            real_dir(&cache_dir(Some(request.repo_id)).join("base"))?
+        let base = real_dir(&cache_dir(Some(request.repo_id)).join("base"))?;
+        let (cache, overlay) = if request.on_base {
+            (base, None)
         } else {
-            self.run_cache(request.repo_id)?
+            let run = self.run_cache(request.repo_id)?;
+
+            if self.overlays() {
+                // Each check its own upper layer, since two overlays must not share one
+                let layer = tempfile::Builder::new()
+                    .prefix("check-")
+                    .tempdir_in(&run)
+                    .map_err(|e| format!("{}: {e}", run.display()))?
+                    .keep();
+                let (upper, work) = (layer.join("upper"), layer.join("work"));
+                (base, Some((real_dir(&upper)?, real_dir(&work)?)))
+            } else {
+                (run, None)
+            }
         };
+        let mut writable = vec![real_dir(request.run_dir)?, home.clone()];
+
+        if overlay.is_none() {
+            writable.push(cache.clone());
+        }
+
         let jail = Jail {
-            writable: vec![real_dir(request.run_dir)?, home.clone(), cache.clone()],
+            writable,
             readable: Vec::new(),
             cache,
             home,
+            overlay,
         };
         let exit = run_command(
             command,
@@ -2034,6 +2156,18 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
 
+    /// The ways a branch run can get the base's cache here: a copy, and an overlay where bwrap mounts one
+    fn modes() -> Vec<bool> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut modes = vec![false];
+
+        if overlay(dir.path()).is_ok() {
+            modes.push(true);
+        }
+
+        modes
+    }
+
     /// A jail whose clone is `dir`, home and cache inside it
     fn jail(dir: &Path) -> Jail {
         let dir = dir.canonicalize().unwrap();
@@ -2042,6 +2176,7 @@ mod tests {
             readable: Vec::new(),
             home: real_dir(&dir.join("home")).unwrap(),
             cache: real_dir(&dir.join("cache")).unwrap(),
+            overlay: None,
         }
     }
 
@@ -2478,6 +2613,7 @@ mod tests {
             readable: vec!["/j/repo".into()],
             home: "/j/home".into(),
             cache: "/j/home".into(),
+            overlay: None,
         };
         let profile = jail.profile().unwrap();
         let paths = r#"(subpath "/j/clone \"x\"") (subpath "/j/home")"#;
@@ -2516,6 +2652,7 @@ mod tests {
             readable: Vec::new(),
             home: "/j".into(),
             cache: "/j".into(),
+            overlay: None,
         };
         assert!(bad.profile().unwrap_err().contains("not UTF-8"));
     }
@@ -2533,6 +2670,7 @@ mod tests {
             readable: Vec::new(),
             home: "/j/home".into(),
             cache: "/j/home".into(),
+            overlay: None,
         };
         let args: Vec<String> = jail
             .bwrap_args()
@@ -2605,6 +2743,7 @@ mod tests {
             readable: Vec::new(),
             home,
             cache,
+            overlay: None,
         };
         let log = clone.path().join("log");
         // As cli/cli's script/licenses does, then with a prefix, then with a template of its own.
@@ -2652,6 +2791,7 @@ mod tests {
             readable: Vec::new(),
             home,
             cache,
+            overlay: None,
         };
         let log = outside.path().join("log");
         let run = |cmd: &str| {
@@ -2842,6 +2982,12 @@ mod tests {
     #[test]
     #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_branch_run_never_sees_what_another_branch_run_left_in_the_cache() {
+        for overlay in modes() {
+            a_branch_run_sees_only_the_base(overlay);
+        }
+    }
+
+    fn a_branch_run_sees_only_the_base(overlay: bool) {
         let dir = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         let checks = BTreeMap::from([
@@ -2866,7 +3012,8 @@ mod tests {
                     ..Default::default()
                 },
                 dir.path(),
-            );
+            )
+            .with_overlay(overlay);
             let clone = tempfile::tempdir().unwrap();
             let log = dir.path().join(format!("{job}.log"));
             let (needs, artifacts) = (BTreeMap::new(), dir.path().join("artifacts"));
@@ -2888,16 +3035,78 @@ mod tests {
         assert_eq!(run("base", true).0, Some(0));
         assert_eq!(run("branch", false).0, Some(0));
         let (exit, log) = run("other", false);
+        let cache = cache_dir(Some(&repo_id));
+        let planted = cache.join("base/cargo/from-branch").exists();
+        let left: Vec<_> = fs::read_dir(cache.join("runs"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
         Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
         assert_eq!(
             exit,
             Some(0),
-            "saw the other branch's file or missed the base's: {log}"
+            "overlay {overlay}: saw the other branch's file or missed the base's: {log}"
         );
+        assert!(!planted, "overlay {overlay}: a branch run wrote the base");
+        assert!(left.is_empty(), "overlay {overlay}: {left:?}");
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_branch_run_without_an_overlay_writes_a_copy_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let base = cache_dir(Some(&repo_id)).join("base");
+        fs::create_dir_all(base.join("cargo")).unwrap();
+        fs::write(base.join("cargo/from-base"), "").unwrap();
+        let checks = BTreeMap::from([(
+            "copy".into(),
+            "case \"$CARGO_HOME\" in */runs/run-*/cargo) ;; *) exit 3 ;; esac && test -e \"$CARGO_HOME/from-base\" && touch \"$CARGO_HOME/from-branch\"".into(),
+        )]);
+        let host = Host::new(
+            config::Host {
+                checks,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .with_overlay(false);
+        let clone = tempfile::tempdir().unwrap();
+        let log = dir.path().join("copy.log");
+        let (needs, artifacts) = (BTreeMap::new(), dir.path().join("artifacts"));
+        let request = RunRequest {
+            run_dir: clone.path(),
+            file: HOST,
+            workflow: Path::new("/dev/null"),
+            job: "copy",
+            needs: &needs,
+            artifacts: &artifacts,
+            repo_id: &repo_id,
+            timeout: Duration::from_secs(30),
+            shard: false,
+            on_base: false,
+        };
+        let exit = host.run(&request, &log).unwrap().exit;
+        drop(host);
+        let planted = base.join("cargo/from-branch").exists();
+        let runs = fs::read_dir(cache_dir(Some(&repo_id)).join("runs"))
+            .unwrap()
+            .count();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(exit, Some(0), "{}", fs::read_to_string(&log).unwrap());
+        assert!(!planted, "the copy was the base");
+        assert_eq!(runs, 0, "the run left its copy");
     }
 
     #[test]
     fn a_run_leaves_the_copy_of_a_run_going_alone_and_removes_a_dead_runs() {
+        for overlay in modes() {
+            a_run_leaves_a_live_runs_dir_alone(overlay);
+        }
+    }
+
+    fn a_run_leaves_a_live_runs_dir_alone(overlay: bool) {
         let dir = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         let base = cache_dir(Some(&repo_id)).join("base");
@@ -2911,7 +3120,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let host = || Host::new(config::Host::default(), dir.path());
+        let host = || Host::new(config::Host::default(), dir.path()).with_overlay(overlay);
         let runs = cache_dir(Some(&repo_id)).join("runs");
         let dead = runs.join("run-dead");
         fs::create_dir_all(dead.join("cargo")).unwrap();
@@ -2922,8 +3131,8 @@ mod tests {
         let two = second.run_cache(&repo_id).unwrap();
         assert_ne!(one, two);
         assert!(
-            one.join("cargo").is_dir(),
-            "the second run removed the first's copy"
+            one.is_dir() && one.join("cargo").is_dir() != overlay,
+            "overlay {overlay}: the second run removed the first's copy"
         );
         assert!(!dead.exists(), "a copy no run holds stays");
         drop((first, second));
@@ -2938,11 +3147,17 @@ mod tests {
 
     #[test]
     fn runs_racing_on_one_cache_never_remove_each_others_copies() {
+        for overlay in modes() {
+            racing_runs_keep_their_dirs(overlay);
+        }
+    }
+
+    fn racing_runs_keep_their_dirs(overlay: bool) {
         let dir = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         fs::create_dir_all(cache_dir(Some(&repo_id)).join("base/cargo")).unwrap();
         let barrier = std::sync::Barrier::new(8);
-        let host = || Host::new(config::Host::default(), dir.path());
+        let host = || Host::new(config::Host::default(), dir.path()).with_overlay(overlay);
         // Recorded, not asserted, so a failing thread never leaves the others at a barrier
         let removed = std::sync::Mutex::new(Vec::new());
 
@@ -2961,7 +3176,10 @@ mod tests {
 
                     barrier.wait();
 
-                    if !copy.as_ref().is_ok_and(|c| c.join("cargo").is_dir()) {
+                    if !copy
+                        .as_ref()
+                        .is_ok_and(|c| c.is_dir() && c.join("cargo").is_dir() != overlay)
+                    {
                         removed.lock().unwrap().push(copy);
                     }
                 });
