@@ -580,15 +580,50 @@ pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
     fs::write(&file, text).map_err(|e| e.to_string())
 }
 
-/// The remote's default branch as `origin/<branch>`, else `origin/main`: the base of runs, hooks and the daemon
+/**
+ * The base of runs, hooks and the daemon: the default branch the remote reports, as
+ * `origin/<branch>`, else `origin/main`. Never the local origin/HEAD, which anyone with the clone can
+ * repoint at a branch whose shipcheck.toml and workflows would then run
+ **/
 pub fn default_base(repo: &Path) -> String {
-    git(
-        repo,
-        &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
-    )
-    .ok()
-    .filter(|b| b.strip_prefix("origin/").is_some_and(|n| !n.is_empty()))
-    .unwrap_or_else(|| "origin/main".into())
+    remote_default(repo).map_or_else(|| "origin/main".into(), |b| format!("origin/{b}"))
+}
+
+/// `git ls-remote --symref origin HEAD`'s branch, None when the remote does not answer in 5s
+fn remote_default(repo: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().ok()? {
+            break status;
+        }
+
+        if started.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    status.success().then_some(())?;
+    out.lines().find_map(|l| {
+        let (branch, name) = l.strip_prefix("ref: refs/heads/")?.split_once('\t')?;
+        (name == "HEAD" && !branch.is_empty()).then(|| branch.to_string())
+    })
 }
 
 /**

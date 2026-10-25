@@ -65,7 +65,7 @@ enum Cmd {
         /// Test the index instead of the working copy
         #[arg(long)]
         staged: bool,
-        /// Run against the local base branch, origin/HEAD's, without fetching it
+        /// Run against the local copy of the remote's default branch, without fetching it
         #[arg(long)]
         no_fetch: bool,
         /// Read shipcheck.toml and the workflows from this ref, for a trial

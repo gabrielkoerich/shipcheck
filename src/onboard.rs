@@ -2028,28 +2028,57 @@ mod tests {
     #[test]
     fn init_gates_to_the_branch_runs_and_the_daemon_use() {
         let dir = repo(&[(".github/workflows/ci.yml", CI)]);
-        let git = |args: &[&str]| {
-            assert!(
-                Command::new("git")
-                    .args(args)
-                    .current_dir(dir.path())
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
-            );
+        let origin = tempfile::tempdir().unwrap();
+        let git = |at: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(at)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
         };
-        git(&["init", "-q", "-b", "master"]);
-        git(&[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/master",
-        ]);
+        git(origin.path(), &["init", "-q", "--bare", "-b", "master"]);
+        git(dir.path(), &["init", "-q", "-b", "master"]);
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "a",
+            ],
+        );
+        git(
+            dir.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(
+            dir.path(),
+            &["push", "-q", "origin", "master", "master:evil"],
+        );
+        git(dir.path(), &["fetch", "-q", "origin"]);
+
+        // A local origin/HEAD at another branch does not pick the base, the remote does
+        git(
+            dir.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/evil",
+            ],
+        );
         assert_eq!(crate::run::default_base(dir.path()), "origin/master");
         let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
         assert_eq!(plan.base, "master");
         assert!(plan.workflows[0].edited.contains("refs/heads/master"));
-        git(&["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+
+        // A remote that does not answer means main, never the local origin/HEAD
+        git(dir.path(), &["remote", "set-url", "origin", "/nonexistent"]);
         assert_eq!(crate::run::default_base(dir.path()), "origin/main");
     }
 
