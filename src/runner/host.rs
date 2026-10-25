@@ -778,7 +778,6 @@ fn toolchains(home: &Path, user: &Path) -> Result<(), String> {
  **/
 static GROUPS: [AtomicI32; 64] = [const { AtomicI32::new(0) }; 64];
 
-// ponytail: 64 slots, a run with more checks at once leaves the extra ones to outlive a signal
 fn register(pgid: u32) -> Option<usize> {
     static HANDLER: std::sync::Once = std::sync::Once::new();
     HANDLER.call_once(|| {
@@ -818,10 +817,7 @@ extern "C" fn stop(sig: libc::c_int) {
 }
 
 fn kill_group(pgid: u32) {
-    // Safe: killpg only sends a signal, ESRCH when the group is gone is fine
-    unsafe {
-        libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
-    }
+    super::signal_group(pgid, libc::SIGKILL);
 }
 
 /// A check's `$GITHUB_STEP_SUMMARY`, in its jail's home

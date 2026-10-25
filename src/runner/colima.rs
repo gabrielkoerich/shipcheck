@@ -20,7 +20,6 @@ use crate::cache;
 pub struct Colima;
 
 /// The VM's packages, act pinned as ci.yml pins it, and GitHub's `/home/runner`. Part of the key.
-/// ponytail: apt's packages are whatever Ubuntu serves that day, a prepared image pins them
 const SETUP: &str = r#"set -eu
 apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
 sudo DEBIAN_FRONTEND=noninteractive apt-get $apt -qq update
@@ -87,7 +86,20 @@ if [ "$state" = exited ]; then
 elif [ -n "$pgid" ]; then
   kill -s KILL -- "-$pgid" 2>/dev/null
 fi
-colima delete --force --data --profile "$1" >/dev/null 2>&1
+# The locks this reaper holds stay out of colima's processes, which could outlive it
+closed=
+for fd in $LOCK_FDS; do closed="$closed $fd>&-"; done
+eval "colima delete --force --data --profile \"\$1\" $closed" >/dev/null 2>&1 &
+d=$!
+n=0
+limit=${DELETE_SECS:-120}
+while kill -0 "$d" 2>/dev/null && [ "$n" -lt "$limit" ]; do sleep 1; n=$((n + 1)); done
+if ! kill -0 "$d" 2>/dev/null; then
+  wait "$d" && rm -f "$2"
+else
+  # Its own group, which shipcheck started it in, so colima's limactl goes too, and this reaper last
+  kill -s KILL 0
+fi
 "#;
 
 /// Variables colima and lima read, and shipcheck's safe git config, nothing else of this user's
@@ -141,6 +153,93 @@ fn delete(profile: &str) -> bool {
 
 fn docker_context() -> Option<String> {
     first_line("docker", &["context", "show"]).ok()
+}
+
+/// What an outcome says of a job that ran out of time before act started
+fn timed_out() -> Outcome {
+    Outcome {
+        exit: None,
+        skipped: false,
+        unsupported_jobs: Vec::new(),
+        outputs: Default::default(),
+        shards: None,
+        summary: String::new(),
+    }
+}
+
+/// Whether a name is one `profile` gives, `sc-` and 12 lowercase hex digits, and no one else's
+fn is_profile(name: &str) -> bool {
+    name.strip_prefix("sc-").is_some_and(|h| {
+        h.len() == 12
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Where this home records each VM it starts until the VM is deleted
+fn records() -> std::path::PathBuf {
+    crate::run::home().join("colima")
+}
+
+/// The VMs this home started and has not seen deleted, which colima still lists
+fn ours(recorded: &[String], listed: &[String]) -> Vec<String> {
+    recorded
+        .iter()
+        .filter(|n| is_profile(n) && listed.contains(*n))
+        .cloned()
+        .collect()
+}
+
+/**
+ * Deletes the VMs this home started that are still there, while no colima job runs here, which
+ * the VM lock proves. A profile another home or another tool made, such as `sc-bench`, is never
+ * recorded here, so it is never touched
+ **/
+fn leftovers() -> Vec<String> {
+    let recorded: Vec<String> = fs::read_dir(records())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    if recorded.is_empty() {
+        return Vec::new();
+    }
+
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::run::home().join("locks").join("colima.lock"));
+
+    let Ok(mut lock) = lock else {
+        return Vec::new();
+    };
+
+    if lock.try_lock().is_err() {
+        return Vec::new();
+    }
+
+    // A run waiting on the lock names who holds it
+    let _ = lock.set_len(0);
+    let _ = write!(lock, "{}", std::process::id());
+
+    let listed = profiles();
+    let mut done = Vec::new();
+
+    // A record of a VM colima no longer lists is stale
+    for name in recorded.iter().filter(|n| !listed.contains(*n)) {
+        let _ = fs::remove_file(records().join(name));
+    }
+
+    for name in ours(&recorded, &listed) {
+        if delete(&name) {
+            let _ = fs::remove_file(records().join(&name));
+            done.push(format!("removed the colima VM {name}"));
+        }
+    }
+
+    done
 }
 
 /// The profiles colima has, from `colima list -j`, one object per line
@@ -217,8 +316,56 @@ impl Engine for Colima {
     }
 
     fn run(&self, act: &Act, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+        // The job's time starts now, waiting for the one VM too
+        let deadline = Instant::now() + request.timeout;
         let run_dir = request.run_dir;
         let isolated = act::isolated(request, &act::run_tag(run_dir), false)?;
+        let artifacts = crate::workflow::job_runs(&isolated)
+            .into_iter()
+            .flat_map(|j| j.steps)
+            .filter_map(|s| s.uses)
+            .find(|u| {
+                let action = u.split('@').next().unwrap_or(u);
+                ["actions/upload-artifact", "actions/download-artifact"].contains(&action)
+            });
+
+        if let Some(uses) = artifacts {
+            return Err(format!(
+                "a colima job cannot pass artifacts to or from other jobs yet, and it uses {uses}"
+            ));
+        }
+
+        let home = crate::run::home().join("locks");
+        fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+        // Opened without truncating, so a waiter reads the holder's pid
+        let mut one_vm = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(home.join("colima.lock"))
+            .map_err(|e| e.to_string())?;
+
+        while one_vm.try_lock().is_err() {
+            if Instant::now() > deadline {
+                let holder = fs::read_to_string(home.join("colima.lock")).unwrap_or_default();
+                fs::write(
+                    log_path,
+                    format!(
+                        "shipcheck: timed out waiting for another colima job's VM, held by shipcheck pid {}, or its cleanup\n",
+                        holder.trim()
+                    ),
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok(timed_out());
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        one_vm.set_len(0).map_err(|e| e.to_string())?;
+        write!(one_vm, "{}", std::process::id()).map_err(|e| e.to_string())?;
+
         fs::write(request.workflow, &isolated).map_err(|e| e.to_string())?;
         let args = act_args(request, act.labels(request.file));
         let profile = profile(run_dir);
@@ -227,19 +374,33 @@ impl Engine for Colima {
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         let dry = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         let status = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        // ponytail: one VM at a time on this machine, a VM count in `max_parallel` if jobs queue here
-        let home = crate::run::home().join("locks");
-        fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-        let one_vm = fs::File::create(home.join("colima.lock")).map_err(|e| e.to_string())?;
-        one_vm.lock().map_err(|e| e.to_string())?;
         let cpus =
             std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1).max(2));
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
         let context = docker_context();
 
-        // Started first, so a shipcheck killed while the VM boots still leaves no VM
-        let mut reaper = clean_env(&mut Command::new("sh"))
+        // Started first, so a shipcheck killed while the VM boots still leaves no VM. It holds the
+        // slot's and the VM's locks, so no new run takes either while it deletes the VM
+        let mut reaper = Command::new("sh");
+        let fds: Vec<_> = request
+            .slot_lock
+            .into_iter()
+            .chain([std::os::fd::AsRawFd::as_raw_fd(&one_vm)])
+            .collect();
+        let held = super::inherit(&mut reaper, fds);
+        let record = records().join(&profile);
+        fs::create_dir_all(records()).map_err(|e| e.to_string())?;
+        fs::write(&record, "").map_err(|e| e.to_string())?;
+        let mut reaper = clean_env(&mut reaper)
+            .env(
+                "LOCK_FDS",
+                held.iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
             .args(["-c", REAPER, "sh", &profile])
+            .arg(&record)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -262,22 +423,36 @@ impl Engine for Colima {
             .stderr(log)
             .process_group(0);
         let spawned = cmd.spawn().map_err(|e| format!("sh: {e}"));
-        let deadline = Instant::now() + request.timeout;
         let exit = spawned.and_then(|mut child| {
             if let Some(stdin) = reaper.stdin.as_mut() {
                 let _ = writeln!(stdin, "{}", child.id());
             }
 
+            // `exited` goes before the child is reaped, while no other process can have its id
+            let mut exited = || {
+                if let Some(stdin) = reaper.stdin.as_mut() {
+                    let _ = writeln!(stdin, "exited");
+                }
+            };
+
             loop {
-                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                    break Ok(status.code());
+                let ended = super::has_exited(child.id());
+
+                if matches!(ended, Ok(true)) {
+                    exited();
+                    break Ok(child.wait().map_err(|e| e.to_string())?.code());
                 }
 
-                if Instant::now() > deadline {
+                // A child shipcheck cannot see end is stopped as on a timeout
+                if ended.is_err() || Instant::now() > deadline {
                     // The group, so `colima ssh` and act's side go too
-                    let _ = Command::new("kill")
-                        .args(["-s", "KILL", "--", &format!("-{}", child.id())])
-                        .status();
+                    super::signal_group(child.id(), libc::SIGKILL);
+
+                    while !super::has_exited(child.id()).unwrap_or(true) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+
+                    exited();
                     let _ = child.wait();
                     break Ok(None);
                 }
@@ -286,12 +461,11 @@ impl Engine for Colima {
             }
         });
 
-        // The group is gone, so the reaper must not kill by its id, which can be reused
-        if let Some(stdin) = reaper.stdin.as_mut() {
-            let _ = writeln!(stdin, "exited");
-        }
-
         let deleted = delete(&profile);
+
+        if deleted {
+            let _ = fs::remove_file(&record);
+        }
 
         if let Some(stdin) = reaper.stdin.as_mut()
             && deleted
@@ -347,27 +521,55 @@ impl Engine for Colima {
         })
     }
 
-    /// A dead run's VM, found by the profile its checkout names
+    /// A dead run's VM, found by the profile its checkout names, when this home recorded it
     fn reclaim(&self, run_dir: &Path) {
         let name = profile(run_dir);
+        let record = records().join(&name);
 
-        if profiles().contains(&name) {
-            delete(&name);
+        if record.exists() && (!profiles().contains(&name) || delete(&name)) {
+            let _ = fs::remove_file(record);
         }
     }
 
     fn prune(&self) -> Vec<String> {
-        Vec::new()
+        leftovers()
     }
 
     fn clean(&self, _repo_id: Option<&str>) -> Vec<String> {
-        Vec::new()
+        leftovers()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_vms_this_home_recorded_are_ever_cleaned_up() {
+        let mine = profile(Path::new("/runs/acme/0/ci.yml/e2e"));
+        let other_home = profile(Path::new("/other/home/runs/acme/0/ci.yml/e2e"));
+        let listed: Vec<String> = [&mine, &other_home, "sc-bench", "shipcheck-test", "default"]
+            .map(String::from)
+            .to_vec();
+        // A record named like another tool's profile is not a profile shipcheck makes
+        let recorded = vec![
+            mine.clone(),
+            "sc-bench".into(),
+            "shipcheck-test".into(),
+            "sc-ABCDEF123456".into(),
+        ];
+        assert_eq!(ours(&recorded, &listed), std::slice::from_ref(&mine));
+        assert!(is_profile(&mine) && is_profile(&other_home));
+        for name in [
+            "sc-bench",
+            "shipcheck-test",
+            "sc-0123456789ab0",
+            "sc-ABCDEF123456",
+            "sc-",
+        ] {
+            assert!(!is_profile(name), "{name}");
+        }
+    }
 
     #[test]
     fn a_profile_is_per_checkout_and_never_another_tools() {
@@ -449,6 +651,77 @@ mod tests {
     }
 
     #[test]
+    fn the_reaper_keeps_its_locks_from_colima_and_gives_up_on_a_hung_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("colima.log");
+        let child = dir.path().join("child.pid");
+        // A lock at 10 or higher, which a shell cannot redirect
+        let lock = crate::runner::tests::high(fs::File::create(dir.path().join("x.lock")).unwrap());
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+
+        for (hang, kept) in [(false, false), (true, true)] {
+            let record = dir.path().join("sc-abc");
+            fs::write(&record, "").unwrap();
+            let _ = fs::remove_file(&log);
+            let mut cmd = Command::new(crate::runner::posix_sh());
+            let held =
+                super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
+            assert_eq!(held, [9]);
+            // It says its arguments and whether it got the lock, and when asked hangs in a child as limactl does
+            let fake = format!(
+                "#!/bin/sh\nif [ -e /dev/fd/9 ]; then echo \"open $*\" >> {log}; else echo \"closed $*\" >> {log}; fi\n{}",
+                if hang {
+                    format!("sleep 30 &\necho $! > {}\nwait\n", child.display())
+                } else {
+                    String::new()
+                },
+                log = log.display()
+            );
+            fs::write(dir.path().join("colima"), fake).unwrap();
+            fs::set_permissions(dir.path().join("colima"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            // Its own group, as shipcheck starts it, since on a hung delete it kills its group
+            let mut reaper = cmd
+                .args(["-c", REAPER, "sh", "sc-abc"])
+                .arg(&record)
+                .env("PATH", &path)
+                .env("LOCK_FDS", "9")
+                // Long enough for a quick delete on a busy machine, short for a hung one
+                .env("DELETE_SECS", if hang { "2" } else { "30" })
+                .stdin(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let status = reaper.wait().unwrap();
+            assert_eq!(status.success(), !hang, "hang {hang}: {status}");
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "a hung delete held the reaper"
+            );
+            assert_eq!(
+                fs::read_to_string(&log).unwrap(),
+                "closed delete --force --data --profile sc-abc\n",
+                "colima got the lock or another argument"
+            );
+            assert_eq!(record.exists(), kept, "hang {hang}");
+
+            if hang {
+                let pid: i32 = fs::read_to_string(&child).unwrap().trim().parse().unwrap();
+                let gone = || unsafe { libc::kill(pid, 0) } != 0;
+                let deadline = Instant::now() + Duration::from_secs(5);
+
+                while !gone() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+
+                assert!(gone(), "the hung delete's child outlived the reaper");
+            }
+        }
+    }
+
+    #[test]
     fn maps_the_jobs_labels_to_the_vm() {
         let dir = tempfile::tempdir().unwrap();
         let none = Default::default();
@@ -463,6 +736,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             shard: false,
             on_base: false,
+            slot_lock: None,
         };
         let args = act_args(&request, vec!["ubuntu-latest".into()]);
         let mapped: Vec<&String> = args
