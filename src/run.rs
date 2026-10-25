@@ -597,17 +597,19 @@ pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
 }
 
 /**
- * The base of runs, status, post and doctor: the default branch the remote reports, as
- * `origin/<branch>`, else `origin/main`. Never the local origin/HEAD, which anyone with the clone can
- * repoint at a branch whose shipcheck.toml and workflows would then run
+ * The remote's default branch as `origin/<branch>`, None when the remote did not answer. Asked once
+ * per process for each checkout and origin URL. Never the local origin/HEAD, which anyone with the
+ * clone can repoint at a branch whose shipcheck.toml and workflows would then run
  **/
-pub fn default_base(repo: &Path) -> String {
-    remote_base(repo).unwrap_or_else(|| "origin/main".into())
-}
-
-/// The remote's default branch as `origin/<branch>`, None when the remote did not answer
 pub fn remote_base(repo: &Path) -> Option<String> {
-    remote_default(repo).map(|b| format!("origin/{b}"))
+    static ASKED: std::sync::Mutex<BTreeMap<(PathBuf, String), Option<String>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let url = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    asked
+        .entry((repo.to_path_buf(), url))
+        .or_insert_with(|| remote_default(repo).map(|b| format!("origin/{b}")))
+        .clone()
 }
 
 /// `git ls-remote --symref origin HEAD`'s branch, None when the remote does not answer in 5s

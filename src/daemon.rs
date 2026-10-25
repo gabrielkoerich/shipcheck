@@ -98,22 +98,69 @@ impl DaemonConfig {
 }
 
 /**
- * The base a command reads shipcheck.toml from. The hooks run in git's foreground, so they take the
- * daemon's entry for the repository, else `origin/main`, and never ask the remote. The rest ask it
+ * The base every command reads shipcheck.toml and the workflows from: this checkout's daemon entry,
+ * then the default branch the remote reports, then `origin/main` with a warning. The hooks run in
+ * git's foreground, so they skip the remote and only say when `origin/main` is likely wrong
  **/
 pub fn command_base(command: &str, repo: &Path) -> String {
     command_base_in(&DaemonConfig::path(), command, repo)
 }
 
 fn command_base_in(file: &Path, command: &str, repo: &Path) -> String {
-    if !matches!(command, "on-commit" | "on-push") {
-        return run::default_base(repo);
+    if let Some(entry) = entry_in(file, repo) {
+        return entry.base;
     }
 
+    if matches!(command, "on-commit" | "on-push") {
+        if !main_is_default(repo) {
+            eprintln!(
+                "shipcheck: no daemon entry for this checkout, so the hook reads shipcheck.toml from origin/main. Run `shipcheck install` to use the default branch"
+            );
+        }
+
+        return origin_main();
+    }
+
+    run::remote_base(repo).unwrap_or_else(|| {
+        eprintln!(
+            "warning: origin did not say its default branch, so shipcheck reads shipcheck.toml from origin/main"
+        );
+        origin_main()
+    })
+}
+
+/// The base from this checkout's daemon entry or the remote, None when neither gives one
+pub fn known_base(repo: &Path) -> Option<String> {
+    entry_in(&DaemonConfig::path(), repo)
+        .map(|entry| entry.base)
+        .or_else(|| run::remote_base(repo))
+}
+
+/// The daemon's entry for this repository, when it names this checkout and not another clone
+fn entry_in(file: &Path, repo: &Path) -> Option<RepoEntry> {
+    let checkout = |p: &Path| crate::autostart::main_checkout(p).canonicalize().ok();
+    let here = checkout(repo)?;
     run::repo_id(repo)
         .ok()
         .and_then(|id| DaemonConfig::load_from(file).ok()?.repos.remove(&id))
-        .map_or_else(origin_main, |entry| entry.base)
+        .filter(|entry| checkout(&entry.path).as_ref() == Some(&here))
+}
+
+/// Whether the local refs agree main is the default branch, without asking the remote
+fn main_is_default(repo: &Path) -> bool {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let head = git(&["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]);
+    head.is_none_or(|h| h == "origin/main")
+        && git(&["rev-parse", "--verify", "-q", "refs/remotes/origin/main"]).is_some()
 }
 
 /**
@@ -126,14 +173,7 @@ pub fn posts_from(base: &str, repo: &Path) -> bool {
 }
 
 fn posts_from_in(file: &Path, base: &str, repo: &Path) -> bool {
-    let checkout = |p: &Path| crate::autostart::main_checkout(p).canonicalize().ok();
-    let here = checkout(repo);
-    let registered = run::repo_id(repo)
-        .ok()
-        .and_then(|id| DaemonConfig::load_from(file).ok()?.repos.remove(&id))
-        .filter(|entry| here.is_some() && checkout(&entry.path) == here);
-
-    registered.is_some_and(|entry| entry.base == base)
+    entry_in(file, repo).is_some_and(|entry| entry.base == base)
         || run::remote_base(repo).as_deref() == Some(base)
 }
 
@@ -1034,8 +1074,9 @@ mod tests {
 
         DaemonConfig::add_to(&file, "acme/app", &repo, "origin/dev").unwrap();
 
-        for hook in ["on-commit", "on-push"] {
-            assert_eq!(command_base_in(&file, hook, &repo), "origin/dev");
+        // This checkout's entry comes first for every command
+        for command in ["on-commit", "on-push", "run", "post"] {
+            assert_eq!(command_base_in(&file, command, &repo), "origin/dev");
         }
 
         assert!(posts_from_in(&file, "origin/dev", &repo));
@@ -1070,6 +1111,11 @@ mod tests {
         DaemonConfig::add_to(&file, "acme/app", &other, "origin/dev").unwrap();
         assert!(!posts_from_in(&file, "origin/master", &repo));
         assert!(!posts_from_in(&file, "origin/main", &repo));
+
+        // With no entry for this checkout and no answer, a command falls back to origin/main
+        assert_eq!(command_base_in(&file, "run", &repo), "origin/main");
+        assert_eq!(command_base_in(&file, "on-push", &repo), "origin/main");
+        assert!(!main_is_default(&repo));
     }
 
     #[test]
