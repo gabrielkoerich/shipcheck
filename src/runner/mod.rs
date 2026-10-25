@@ -56,6 +56,39 @@ pub struct RunRequest<'a> {
     pub shard: bool,
     /// The tree is the base's, so what the job leaves in shared caches may reach runs of the base
     pub on_base: bool,
+    /// The run slot's lock, which a reaper holds until its cleanup ends, so no new run takes the slot first
+    pub slot_lock: Option<std::os::fd::RawFd>,
+}
+
+/// Sends `signal` to process group `pgid`, by its id, which is gone or reused once the group was reaped
+pub fn signal_group(pgid: u32, signal: libc::c_int) {
+    // Safe: killpg only sends a signal, ESRCH when the group is gone is fine
+    unsafe {
+        libc::killpg(pgid as libc::pid_t, signal);
+    }
+}
+
+/**
+ * Lets the child keep these descriptors open across exec, so a lock on them lasts as long as it
+ * does. The parent's own copies keep their close-on-exec flag, only the child's are cleared
+ **/
+pub fn inherit(cmd: &mut std::process::Command, fds: Vec<std::os::fd::RawFd>) {
+    use std::os::unix::process::CommandExt;
+
+    // Safe: fcntl is async-signal-safe and touches only the child's descriptor table
+    unsafe {
+        cmd.pre_exec(move || {
+            for &fd in &fds {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                }
+            }
+
+            Ok(())
+        });
+    }
 }
 
 pub struct Outcome {
@@ -162,6 +195,23 @@ pub(crate) fn posix_sh() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_given_a_lock_holds_it_after_the_parent_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.lock");
+        let lock = std::fs::File::create(&path).unwrap();
+        lock.lock().unwrap();
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("2");
+        inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
+        let mut child = cmd.spawn().unwrap();
+        drop(lock);
+        let again = std::fs::File::create(&path).unwrap();
+        assert!(again.try_lock().is_err(), "the child should hold the lock");
+        child.wait().unwrap();
+        assert!(again.try_lock().is_ok(), "the lock goes with the child");
+    }
 
     struct Named(&'static str);
 

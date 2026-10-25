@@ -79,9 +79,9 @@ pub fn start(
     };
 
     for pid in older {
-        let _ = Command::new("kill")
-            .args(["-s", "TERM", "--", &format!("-{pid}")])
-            .status();
+        if let Ok(pid) = pid.parse() {
+            crate::runner::signal_group(pid, libc::SIGTERM);
+        }
     }
 
     if let Ok(pid) = spawn(cwd, plan, base, name, post, trigger, home_ok) {

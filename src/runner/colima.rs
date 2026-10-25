@@ -142,6 +142,64 @@ fn docker_context() -> Option<String> {
     first_line("docker", &["context", "show"]).ok()
 }
 
+/// What an outcome says of a job that ran out of time before act started
+fn timed_out() -> Outcome {
+    Outcome {
+        exit: None,
+        skipped: false,
+        unsupported_jobs: Vec::new(),
+        outputs: Default::default(),
+        shards: None,
+        summary: String::new(),
+    }
+}
+
+/// The `sc-` profiles lima has a directory for, read from disk, so a machine without one asks colima nothing
+fn lima_dirs() -> Vec<String> {
+    let colima = std::env::var_os("COLIMA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".colima")));
+    let Some(lima) = colima.map(|c| c.join("_lima")) else {
+        return Vec::new();
+    };
+
+    fs::read_dir(lima)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|n| n.strip_prefix("colima-").map(String::from))
+        .filter(|n| n.starts_with("sc-"))
+        .collect()
+}
+
+/**
+ * Deletes every `sc-` VM while no colima job runs on this machine, which the VM lock proves, so a
+ * VM that would not delete after its job does not wait for a later colima job to go
+ **/
+fn leftovers() -> Vec<String> {
+    let names = lima_dirs();
+
+    if names.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(lock) = fs::File::create(crate::run::home().join("locks").join("colima.lock")) else {
+        return Vec::new();
+    };
+
+    if lock.try_lock().is_err() {
+        return Vec::new();
+    }
+
+    let listed = profiles();
+    names
+        .into_iter()
+        .filter(|n| listed.contains(n) && delete(n))
+        .map(|n| format!("removed the colima VM {n}"))
+        .collect()
+}
+
 /// The profiles colima has, from `colima list -j`, one object per line
 fn profiles() -> Vec<String> {
     let Ok(out) = clean_env(&mut Command::new("colima"))
@@ -216,8 +274,42 @@ impl Engine for Colima {
     }
 
     fn run(&self, act: &Act, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+        // The job's time starts now, waiting for the one VM too
+        let deadline = Instant::now() + request.timeout;
         let run_dir = request.run_dir;
         let isolated = act::isolated(request, &act::run_tag(run_dir), false)?;
+        let artifacts = crate::workflow::job_runs(&isolated)
+            .into_iter()
+            .flat_map(|j| j.steps)
+            .filter_map(|s| s.uses)
+            .find(|u| {
+                let action = u.split('@').next().unwrap_or(u);
+                ["actions/upload-artifact", "actions/download-artifact"].contains(&action)
+            });
+
+        if let Some(uses) = artifacts {
+            return Err(format!(
+                "a colima job cannot pass artifacts to or from other jobs yet, and it uses {uses}"
+            ));
+        }
+
+        let home = crate::run::home().join("locks");
+        fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+        let one_vm = fs::File::create(home.join("colima.lock")).map_err(|e| e.to_string())?;
+
+        while one_vm.try_lock().is_err() {
+            if Instant::now() > deadline {
+                fs::write(
+                    log_path,
+                    "shipcheck: timed out waiting for another colima job's VM\n",
+                )
+                .map_err(|e| e.to_string())?;
+                return Ok(timed_out());
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
         fs::write(request.workflow, &isolated).map_err(|e| e.to_string())?;
         let args = act_args(request, act.labels(request.file));
         let profile = profile(run_dir);
@@ -226,17 +318,20 @@ impl Engine for Colima {
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         let dry = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         let status = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        let home = crate::run::home().join("locks");
-        fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-        let one_vm = fs::File::create(home.join("colima.lock")).map_err(|e| e.to_string())?;
-        one_vm.lock().map_err(|e| e.to_string())?;
         let cpus =
             std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1).max(2));
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
         let context = docker_context();
 
-        // Started first, so a shipcheck killed while the VM boots still leaves no VM
-        let mut reaper = clean_env(&mut Command::new("sh"))
+        // Started first, so a shipcheck killed while the VM boots still leaves no VM. It holds the
+        // slot's and the VM's locks, so no new run takes either while it deletes the VM
+        let mut reaper = Command::new("sh");
+        let locks = request
+            .slot_lock
+            .into_iter()
+            .chain([std::os::fd::AsRawFd::as_raw_fd(&one_vm)]);
+        super::inherit(&mut reaper, locks.collect());
+        let mut reaper = clean_env(&mut reaper)
             .args(["-c", REAPER, "sh", &profile])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -260,7 +355,6 @@ impl Engine for Colima {
             .stderr(log)
             .process_group(0);
         let spawned = cmd.spawn().map_err(|e| format!("sh: {e}"));
-        let deadline = Instant::now() + request.timeout;
         let exit = spawned.and_then(|mut child| {
             if let Some(stdin) = reaper.stdin.as_mut() {
                 let _ = writeln!(stdin, "{}", child.id());
@@ -273,9 +367,7 @@ impl Engine for Colima {
 
                 if Instant::now() > deadline {
                     // The group, so `colima ssh` and act's side go too
-                    let _ = Command::new("kill")
-                        .args(["-s", "KILL", "--", &format!("-{}", child.id())])
-                        .status();
+                    super::signal_group(child.id(), libc::SIGKILL);
                     let _ = child.wait();
                     break Ok(None);
                 }
@@ -349,17 +441,17 @@ impl Engine for Colima {
     fn reclaim(&self, run_dir: &Path) {
         let name = profile(run_dir);
 
-        if profiles().contains(&name) {
+        if lima_dirs().contains(&name) && profiles().contains(&name) {
             delete(&name);
         }
     }
 
     fn prune(&self) -> Vec<String> {
-        Vec::new()
+        leftovers()
     }
 
     fn clean(&self, _repo_id: Option<&str>) -> Vec<String> {
-        Vec::new()
+        leftovers()
     }
 }
 
@@ -461,6 +553,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             shard: false,
             on_base: false,
+            slot_lock: None,
         };
         let args = act_args(&request, vec!["ubuntu-latest".into()]);
         let mapped: Vec<&String> = args
