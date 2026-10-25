@@ -148,6 +148,7 @@ fn branch_patterns_match(patterns: &Yaml) -> bool {
 /// One `run` or `uses` step, with the working directory and shell from the step, the job or the workflow
 #[derive(Clone)]
 pub struct RunStep {
+    pub name: Option<String>,
     /// Empty for a `uses` step
     pub run: String,
     pub uses: Option<String>,
@@ -182,6 +183,8 @@ pub struct Job {
     pub base_only: bool,
     /// A step runs `docker` or `act`, or uses a `docker/` action, which needs a Docker daemon in the job
     pub runs_docker: bool,
+    /// The image of its `container:`, as written
+    pub container: Option<String>,
     /// The names GitHub gives its check runs, None when they depend on more than this reads
     pub check_names: Option<Vec<String>>,
 }
@@ -241,7 +244,7 @@ fn platforms(job: &Yaml) -> Platforms {
 
     for l in labels.iter().map(|l| l.to_lowercase()) {
         p.windows |= l.starts_with("windows");
-        p.mac |= l.starts_with("macos");
+        p.mac |= l.contains("macos") || l.contains("xcode");
         p.linux |= l.starts_with("ubuntu") || l.contains("linux");
     }
 
@@ -610,6 +613,7 @@ pub fn job_runs(source: &str) -> Vec<Job> {
                 }
 
                 Some(RunStep {
+                    name: s["name"].as_str().map(str::to_string),
                     dir: if run.is_some() {
                         pick(s, "working-directory")
                     } else {
@@ -659,6 +663,10 @@ pub fn job_runs(source: &str) -> Vec<Job> {
             pr_only: pr_only(job),
             base_only: base_only(job),
             runs_docker,
+            container: [&job["container"], &job["container"]["image"]]
+                .into_iter()
+                .find_map(|c| c.as_str())
+                .map(str::to_string),
             check_names: check_names(id, original),
         });
     }

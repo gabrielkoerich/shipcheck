@@ -160,7 +160,7 @@ fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan
     let cfg = RepoConfig::parse(&text)?;
 
     if plan.config.is_none() {
-        plan.existing = Some(match cfg.runner {
+        let mut existing = match cfg.runner {
             RunnerKind::Host => format!(
                 "checks {}",
                 cfg.host
@@ -171,7 +171,14 @@ fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan
                     .join(", ")
             ),
             _ => format!("workflows {}", cfg.workflows.join(", ")),
-        });
+        };
+        let acts = cfg.jobs_on(RunnerKind::Act);
+
+        if !acts.is_empty() {
+            existing.push_str(&format!(", and with act jobs {}", acts.join(", ")));
+        }
+
+        plan.existing = Some(existing);
     }
 
     workflows(root, &cfg, &mut plan)?;
@@ -216,6 +223,8 @@ fn tried(
         }
     });
 
+    let before = d.github.len();
+
     for (from, why) in failed {
         // A check from project files has no job, so nothing stays on GitHub for it
         let Some((file, job)) = from.split_once(", job ") else {
@@ -223,7 +232,6 @@ fn tried(
             continue;
         };
         let job = job.split(", after job ").next().unwrap_or(job);
-        plan.failed.push((file.into(), job.into(), why.clone()));
         d.github.push(setup::Kept {
             file: file.into(),
             job: job.into(),
@@ -232,7 +240,15 @@ fn tried(
         });
     }
 
-    if d.checks.is_empty() {
+    // A job whose check failed here can still run with act, and the jobs kept before stay kept
+    setup::place(root, machine, &mut d);
+    plan.failed.extend(
+        d.github[before..]
+            .iter()
+            .map(|k| (k.file.clone(), k.job.clone(), k.why.clone())),
+    );
+
+    if d.checks.is_empty() && d.acts.is_empty() {
         plan.stop = Some(format!(
             "no check passed when init tried it, so init wrote no shipcheck.toml and set nothing up:\n{}",
             d.explain()
@@ -240,10 +256,7 @@ fn tried(
         return Ok(None);
     }
 
-    Ok(Some((
-        setup::host_config(&d.checks, &d.versions),
-        format!("these host checks:\n{}", d.explain()),
-    )))
+    Ok(Some((setup::config_text(&d), setup::said_for(&d))))
 }
 
 /// Each check's command once it passed, or why it failed
@@ -1127,22 +1140,28 @@ fn coverage(
             )
     };
 
+    // act runs it whole, as a listed workflow's job or one `[jobs]` names
+    let on_act = |id: &str| {
+        names
+            .iter()
+            .find(|(f, j, _)| f == file && j == id)
+            .map(|(_, _, n)| n.clone())
+    };
+
     if cfg.runner != RunnerKind::Host {
-        let listed = cfg.workflows.iter().any(|w| w == file);
         return jobs
             .iter()
-            .map(|j| Cover {
-                job: j.id.clone(),
-                by: if listed {
-                    vec![name(file, &j.id)]
-                } else {
-                    Vec::new()
-                },
-                missing: if listed {
-                    Vec::new()
-                } else {
-                    vec!["shipcheck.toml does not list the workflow".into()]
-                },
+            .map(|j| {
+                let by: Vec<String> = on_act(&j.id).into_iter().collect();
+                Cover {
+                    job: j.id.clone(),
+                    missing: if by.is_empty() {
+                        vec!["shipcheck.toml does not list the workflow".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    by,
+                }
             })
             .collect();
     }
@@ -1162,6 +1181,14 @@ fn coverage(
 
     jobs.iter()
         .map(|job| {
+            if let Some(n) = on_act(&job.id) {
+                return Cover {
+                    job: job.id.clone(),
+                    by: vec![n],
+                    missing: Vec::new(),
+                };
+            }
+
             let mut cover = Cover {
                 job: job.id.clone(),
                 by: Vec::new(),
@@ -1173,6 +1200,9 @@ fn coverage(
                 cover
                     .missing
                     .push("init found no command in it to compare".into());
+            } else if let Some(step) = setup::dropped_step(job) {
+                // No check runs the step, so no check stands for the job
+                cover.missing.push(format!("no check runs its {step}"));
             }
 
             for (dir, command) in commands {
@@ -1211,6 +1241,11 @@ fn coverage(
 fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), String> {
     let base = plan.base.clone();
     let kept = kept(root, &plan.failed);
+    // A job the config runs with act is shipcheck's, whatever this machine could run
+    let on_act = crate::run::expected_jobs(cfg, |f| {
+        fs::read_to_string(root.join(".github/workflows").join(f)).ok()
+    })
+    .unwrap_or_default();
     let mut offered = false;
 
     for file in setup::workflow_files(root).unwrap_or_default() {
@@ -1221,6 +1256,7 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
         let staying: Vec<&str> = kept
             .iter()
             .filter(|k| k.file == file)
+            .filter(|k| !on_act.get(&file).is_some_and(|jobs| jobs.contains(&k.job)))
             .map(|k| k.job.as_str())
             .collect();
 
@@ -1637,6 +1673,13 @@ mod tests {
     const OWN_E2E: &str = include_str!("../tests/fixtures/own/e2e.yml");
     const OWN_LEAKS: &str = include_str!("../tests/fixtures/own/leaks.yml");
 
+    /// OWN_CI without the step that sets AppArmor up with `sudo`, which keeps the test job on GitHub
+    fn own_ci() -> String {
+        let start = OWN_CI.find("      - timeout-minutes: 5").unwrap();
+        let end = OWN_CI.find("      - run: cargo test").unwrap();
+        format!("{}{}", &OWN_CI[..start], &OWN_CI[end..])
+    }
+
     #[test]
     fn variants_drop_forced_color_then_turn_color_off() {
         assert_eq!(
@@ -1684,7 +1727,8 @@ mod tests {
     #[test]
     fn coverage_compares_commands_not_names() {
         // ci.yml's test job, without its service job: fmt, clippy and test run its three commands
-        let ci = OWN_CI.split("\n  service:").next().unwrap();
+        let own = own_ci();
+        let ci = own.split("\n  service:").next().unwrap();
         let dir = repo(&[
             (".github/workflows/ci.yml", ci),
             ("shipcheck.toml", SHIPCHECK_TOML),
@@ -1702,9 +1746,60 @@ mod tests {
     }
 
     #[test]
+    fn a_check_of_part_of_a_job_does_not_cover_it() {
+        // curl's checkdocs.yml proselint job: a check of its first step alone passed where proselint never ran
+        let ci = "on:\n  pull_request:\n  push:\njobs:\n  proselint:\n    steps:\n      - run: trim.pl\n      - name: check prose\n        run: |\n          cat <<JSON > rc.json\n          {}\n          JSON\n          proselint check --config rc.json docs\n";
+        let dir = repo(&[
+            (".github/workflows/ci.yml", ci),
+            (
+                "shipcheck.toml",
+                "runner = \"host\"\n[host]\nchecks = { proselint = \"trim.pl\" }\n",
+            ),
+        ]);
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        // Not gated: GitHub keeps running it on PRs
+        assert!(plan.workflows.is_empty());
+        assert_eq!(
+            plan.notes,
+            [
+                "ci.yml: GitHub keeps running it on PRs, for proselint, and no job of it runs only in shipcheck"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_the_config_runs_with_act_is_gated_like_a_host_check() {
+        let ci = "on:\n  pull_request:\n  push:\njobs:\n  lint:\n    steps:\n      - run: make lint\n  proselint:\n    steps:\n      - run: |\n          cat <<JSON > rc.json\n          {}\n          JSON\n          proselint check --config rc.json docs\n";
+        let dir = repo(&[
+            (".github/workflows/ci.yml", ci),
+            (
+                "shipcheck.toml",
+                "runner = \"host\"\n[host]\nchecks = { lint = \"make lint\" }\n\n[jobs.\"ci.yml/proselint\"]\nrunner = \"act\"\n",
+            ),
+        ]);
+        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let ci = &plan.workflows[0];
+        assert!(
+            ci.yes.starts_with("on PRs shipcheck runs shipcheck/lint, shipcheck/proselint, GitHub keeps running ci.yml on pushes to main"),
+            "{}",
+            ci.yes
+        );
+        // Both jobs keep the fork clause, so a fork's PR still runs them on GitHub
+        assert_eq!(
+            ci.diff
+                .matches("github.event.pull_request.head.repo.fork")
+                .count(),
+            2,
+            "{}",
+            ci.diff
+        );
+        assert!(plan.github.is_empty(), "{:?}", plan.github);
+    }
+
+    #[test]
     fn coverage_names_the_jobs_no_check_runs() {
         let dir = repo(&[
-            (".github/workflows/ci.yml", OWN_CI),
+            (".github/workflows/ci.yml", &own_ci()),
             (".github/workflows/e2e.yml", OWN_E2E),
             (".github/workflows/leaks.yml", OWN_LEAKS),
             ("shipcheck.toml", SHIPCHECK_TOML),
