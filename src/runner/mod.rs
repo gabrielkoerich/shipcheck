@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::config::{RepoConfig, RunnerKind};
+use crate::config::RepoConfig;
 
 pub mod act;
 pub mod gc;
@@ -92,14 +92,93 @@ pub fn cap_summary(text: &str) -> String {
     format!("{}\n\n[...cut at {MAX_SUMMARY} bytes...]", &text[..cut])
 }
 
-/// `repo` is the checkout the run reads git from, where host mode runs its `versions`
-pub fn from_config(config: &RepoConfig, repo: &Path) -> Box<dyn Runner> {
-    match config.runner {
-        RunnerKind::Host => Box::new(host::Host::new(config.host.clone(), repo)),
-        RunnerKind::Act => Box::new(
-            act::Act::new(config.act.clone())
-                .with_network(config.network)
-                .with_shards(config.shard_tests),
-        ),
+/// The runners a config uses: act for its workflow jobs, host for its `[host]` checks, or both
+pub struct Runners {
+    pub act: Option<Box<dyn Runner>>,
+    pub host: Option<Box<dyn Runner>>,
+}
+
+impl Runners {
+    /// `repo` is the checkout the run reads git from, where host checks run their `versions`
+    pub fn new(config: &RepoConfig, repo: &Path) -> Self {
+        Runners {
+            act: config.acts().then(|| {
+                Box::new(
+                    act::Act::new(config.act.clone())
+                        .with_network(config.network)
+                        .with_shards(config.shard_tests),
+                ) as Box<dyn Runner>
+            }),
+            host: config
+                .hosts()
+                .then(|| Box::new(host::Host::new(config.host.clone(), repo)) as Box<dyn Runner>),
+        }
+    }
+
+    pub fn all(&self) -> impl Iterator<Item = &dyn Runner> {
+        self.act.iter().chain(&self.host).map(|r| r.as_ref())
+    }
+
+    /// The host runner for [`host::HOST`]'s checks, act for a workflow's jobs
+    pub fn for_file(&self, file: &str) -> Result<&dyn Runner, String> {
+        let runner = if file == host::HOST {
+            &self.host
+        } else {
+            &self.act
+        };
+        runner
+            .as_deref()
+            .ok_or_else(|| format!("no runner for {file}"))
+    }
+
+    /// Each runner's identity, act's first, as the cache key holds it
+    pub fn identity(&self) -> Result<String, String> {
+        let ids: Vec<String> = self.all().map(|r| r.identity()).collect::<Result<_, _>>()?;
+        Ok(ids.join("\n"))
+    }
+
+    /// The kind the cache key holds: `act` or `host` alone, `mixed` for both
+    pub fn kind(&self) -> &'static str {
+        match (&self.act, &self.host) {
+            (Some(_), Some(_)) => "mixed",
+            (None, Some(_)) => "host",
+            _ => "act",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_config_without_jobs_keys_its_one_runner_as_before() {
+        let kind = |text: &str| {
+            let config = RepoConfig::parse(text).unwrap();
+            let runners = Runners::new(&config, Path::new("/"));
+            (runners.kind(), runners.all().count())
+        };
+        assert_eq!(kind("workflows = [\"ci.yml\"]"), ("act", 1));
+        assert_eq!(
+            kind("runner = \"host\"\n[host.checks]\nt = \"x\""),
+            ("host", 1)
+        );
+        let mixed =
+            "runner = \"host\"\n[host.checks]\nt = \"x\"\n[jobs.\"ci.yml/e2e\"]\nrunner = \"act\"";
+        assert_eq!(kind(mixed), ("mixed", 2));
+        let config = RepoConfig::parse(mixed).unwrap();
+        let runners = Runners::new(&config, Path::new("/"));
+        // act needs its binary, which the test job may lack
+        if let Ok(act) = runners.act.as_ref().unwrap().identity() {
+            assert_eq!(runners.identity().unwrap(), format!("{act}\nhost"));
+        }
+
+        assert!(runners.for_file(host::HOST).is_ok() && runners.for_file("ci.yml").is_ok());
+        let host = RepoConfig::parse("runner = \"host\"\n[host.checks]\nt = \"x\"").unwrap();
+        assert!(
+            Runners::new(&host, Path::new("/"))
+                .for_file("ci.yml")
+                .is_err()
+        );
     }
 }

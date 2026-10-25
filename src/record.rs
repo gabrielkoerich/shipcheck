@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::check::{self, iso};
-use crate::config::RunnerKind;
 use crate::report;
 use crate::run::{Entry, Plan, home, printable, unix_now};
 
@@ -122,8 +121,8 @@ pub fn line(
         "machine": hostname(),
         "os": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": if plan.config.runner == RunnerKind::Host { "host" } else { "act" },
-        "tools": tools(&plan.tools),
+        "mode": crate::runner::Runners::new(&plan.config, &plan.repo).kind(),
+        "tools": plan.tools.lines().flat_map(tools).collect::<Vec<_>>(),
         "cache_hit": run.cache_hit,
         "partial": run.partial,
         "skipped": entry.skipped.is_some(),

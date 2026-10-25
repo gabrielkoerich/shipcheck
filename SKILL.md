@@ -7,7 +7,7 @@ description: Run a repository's CI checks locally with shipcheck and read the re
 
 shipcheck runs the checks that `shipcheck.toml` names on this machine, for your working copy or a commit, and keeps the result for that git tree. The PR's required checks, one per job such as `shipcheck/test`, come from that result, so a passing local run is what lets the PR merge.
 
-There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the listed GitHub workflows, and each job runs in its own container.
+There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the listed GitHub workflows, and each job runs in its own container. `runner` is the default for every job: a `[jobs."ci.yml/e2e"]` table with `runner = "act"` runs that one job, and the jobs it needs, with act beside the host checks, in the same run and under the same `shipcheck` check. `shipcheck run --job ci.yml/e2e` runs one job of one workflow.
 
 Docs: https://shipcheck.run/llms.txt
 

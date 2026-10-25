@@ -103,6 +103,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mixed_run_gives_a_fixed_key() {
+        let (workflows, platforms) = fixtures();
+        let checks = BTreeMap::from([("test".to_string(), "cargo test".to_string())]);
+        let mut mixed = inputs(
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            &workflows,
+            &platforms,
+        );
+        mixed.config = b"runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n[jobs.\"ci.yml/e2e\"]\nrunner = \"act\"\n";
+        mixed.runner_kind = "mixed";
+        mixed.checks = &checks;
+        mixed.runner_version = "act version 0.2.89\nhost\0cargo --version\0cargo 1.90.0";
+        assert_eq!(
+            key(&mixed),
+            "b442fd424d6def9eac65d0f1bee96d6ed7e9163e4e7e75bbfebda98435cf6a01"
+        );
+    }
+
+    #[test]
     fn every_input_changes_the_key() {
         let (workflows, platforms) = fixtures();
         let base = key(&inputs("t1", &workflows, &platforms));

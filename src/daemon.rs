@@ -593,8 +593,8 @@ fn handle(
 
     let same_repo = pr.head_repo.eq_ignore_ascii_case(repo);
 
-    // Host mode runs a commit's code as this user outside any container, so never a fork's, not even from the cache
-    if plan.config.runner == crate::config::RunnerKind::Host && !same_repo {
+    // A host check runs a commit's code as this user outside any container, so never a fork's, not even from the cache
+    if plan.config.hosts() && !same_repo {
         return Ok(Some("not checked, host mode never checks a fork's PR"));
     }
 
@@ -1183,6 +1183,21 @@ mod tests {
     #[test]
     fn host_mode_never_checks_a_forks_pr() {
         let (dir, sha) = checkout("https://github.com/acme/app.git", HOST);
+        let fake = Fake::by("ann");
+        let pr = open_pr(5, &sha, "main", "eve/app");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
+        assert_eq!(
+            got,
+            Ok(Some("not checked, host mode never checks a fork's PR"))
+        );
+        assert!(fake.bodies().is_empty() && started.is_empty());
+    }
+
+    #[test]
+    fn a_mixed_config_never_checks_a_forks_pr() {
+        // Act is the default runner here, still the host checks beside its job run natively
+        let mixed = "[host]\nchecks = { lint = \"true\" }\n\n[jobs.\"ci.yml/test\"]\n";
+        let (dir, sha) = checkout("https://github.com/acme/app.git", mixed);
         let fake = Fake::by("ann");
         let pr = open_pr(5, &sha, "main", "eve/app");
         let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
