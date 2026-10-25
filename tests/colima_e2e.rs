@@ -25,7 +25,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-// The job's own Docker, which a container job never has, and a file only the tested tree holds
+/**
+ * The job's own Docker, which a container job never has, a file only the tested tree holds, and
+ * what the VM must not have: the Mac's files, shipcheck's environment, the host's Docker or the
+ * secrets file. With `slow.txt` it listens on a port the Mac must not see and waits
+ **/
 const CI: &str = "\
 on:
   push:
@@ -38,6 +42,11 @@ jobs:
       - run: test -f marker.txt
       - run: docker run --rm busybox true
       - run: test \"$(cat .github/workflows/ci.yml | head -1)\" = \"on:\"
+      - run: test ! -e /Users && test ! -e /Volumes
+      - run: test -z \"${SHIPCHECK_CANARY:-}\" && ! env | grep -q canary-7f3a
+      - run: test \"$(docker info --format '{{.Name}}')\" = \"$(hostname)\"
+      - run: test ! -e \"$HOME/sc/secrets\"
+      - run: if [ -f slow.txt ]; then python3 -u -m http.server 38517 & sleep 600; fi
 ";
 
 const CONFIG: &str = "\
@@ -93,12 +102,30 @@ fn repo(tmp: &Path) -> PathBuf {
     work
 }
 
+/// Every file under `dir`
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+
+    out
+}
+
 fn shipcheck(work: &Path, home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_shipcheck"));
     cmd.args(["run", "--sha", "HEAD", "--no-fetch"])
         .current_dir(work)
         .env("SHIPCHECK_HOME", home)
-        .env("SHIPCHECK_NO_DAEMON", "1");
+        .env("SHIPCHECK_NO_DAEMON", "1")
+        .env("SHIPCHECK_CANARY", "canary-7f3a");
     cmd
 }
 
@@ -122,8 +149,9 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
     assert!(ours().is_empty(), "a VM was left: {:?}", ours());
 
     // Killed while the VM runs, the reaper still deletes it
-    fs::write(work.join("marker.txt"), "again").unwrap();
-    git(&work, &["commit", "-q", "-am", "again"]);
+    fs::write(work.join("slow.txt"), "listen").unwrap();
+    git(&work, &["add", "slow.txt"]);
+    git(&work, &["commit", "-q", "-m", "slow"]);
     let mut run = shipcheck(&work, &home).spawn().unwrap();
     let started = Instant::now();
 
@@ -135,7 +163,33 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    std::thread::sleep(Duration::from_secs(5));
+    // No port of the VM reaches the Mac's loopback, and no host ssh config names it
+    let serving = || {
+        walk(&home.join("logs"))
+            .iter()
+            .any(|f| fs::read_to_string(f).is_ok_and(|t| t.contains("Serving HTTP on")))
+    };
+
+    while !serving() {
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "the job never listened"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let addr = "127.0.0.1:38517".parse().unwrap();
+    assert!(
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_err(),
+        "the VM's port reached the Mac"
+    );
+    let ssh = std::env::home_dir().unwrap().join(".ssh/config");
+    let vm = ours()[0].clone();
+    assert!(
+        !fs::read_to_string(ssh).unwrap_or_default().contains(&vm),
+        "colima wrote {vm} into ~/.ssh/config"
+    );
+
     run.kill().unwrap();
     let _ = run.wait();
     let killed = Instant::now();
