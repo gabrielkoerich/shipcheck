@@ -49,27 +49,39 @@ pub fn job_label(job: &str) -> String {
     format!("shipcheck-{job}")
 }
 
+/**
+ * What an act job's steps run on. Preparing the workflow, the markers and reading the results are
+ * act's and the same on every engine, an engine starts act for one job and cleans up after it
+ **/
+pub trait Engine: Sync {
+    /// Refuses a host whose isolation is known to be broken
+    fn preflight(&self) -> Result<(), String>;
+
+    /// Runs one job of the prepared workflow with act, as [`Runner::run`]
+    fn run(&self, act: &Act, request: &RunRequest, log: &Path) -> Result<Outcome, String>;
+
+    /// Removes what a dead run left for this job's checkout
+    fn reclaim(&self, run_dir: &Path);
+
+    /// Removes this engine's state that no run used for a while
+    fn prune(&self) -> Vec<String>;
+
+    /// Removes this engine's caches for one repository, or for all of them
+    fn clean(&self, repo_id: Option<&str>) -> Vec<String>;
+}
+
+/// Each job in a container on the current Docker context
+pub struct Docker;
+
+impl Act {
+    fn engine(&self, _file: &str, _job: &str) -> &dyn Engine {
+        &Docker
+    }
+}
+
 impl Runner for Act {
     fn preflight(&self) -> Result<(), String> {
-        let out = Command::new("docker")
-            .args([
-                "version",
-                "--format",
-                "{{.Server.Platform.Name}}|{{range .Server.Components}}{{.Name}}={{.Version}};{{end}}",
-            ])
-            .output()
-            .map_err(|e| format!("docker: {e}"))?;
-
-        if !out.status.success() {
-            return Err(format!(
-                "docker version failed, is a Docker engine running? {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-
-        if let Some(problem) = engine_problem(String::from_utf8_lossy(&out.stdout).trim()) {
-            return Err(problem);
-        }
+        Docker.preflight()?;
 
         // act before 0.2.86 served its cache on every interface and honoured ::set-env (CVE-2026-34041, -34042)
         let act = self.identity()?;
@@ -101,9 +113,32 @@ impl Runner for Act {
         Ok(version)
     }
 
+    fn prepare(&self, source: &str, file: &str) -> Result<String, String> {
+        self.prepare_workflow(source, file)
+    }
+
+    fn run(&self, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+        self.engine(request.file, request.job)
+            .run(self, request, log_path)
+    }
+
+    fn reclaim(&self, run_dir: &Path) {
+        Docker.reclaim(run_dir);
+    }
+
+    fn prune(&self) -> Vec<String> {
+        Docker.prune()
+    }
+
+    fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
+        Docker.clean(repo_id)
+    }
+}
+
+impl Act {
     /// Adds the `workflow_dispatch` trigger act runs by, expands matrices, gives jobs named in
     /// `[act.jobs]` their own `runs-on` label, and gives each job its own tool homes
-    fn prepare(&self, source: &str, file: &str) -> Result<String, String> {
+    fn prepare_workflow(&self, source: &str, file: &str) -> Result<String, String> {
         let mut root = workflow::load(source)?;
 
         let dispatch = key("workflow_dispatch");
@@ -261,8 +296,30 @@ impl Runner for Act {
 
         workflow::emit(root)
     }
+}
 
-    fn run(&self, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+impl Engine for Docker {
+    fn preflight(&self) -> Result<(), String> {
+        let out = Command::new("docker")
+            .args([
+                "version",
+                "--format",
+                "{{.Server.Platform.Name}}|{{range .Server.Components}}{{.Name}}={{.Version}};{{end}}",
+            ])
+            .output()
+            .map_err(|e| format!("docker: {e}"))?;
+
+        if !out.status.success() {
+            return Err(format!(
+                "docker version failed, is a Docker engine running? {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        engine_problem(String::from_utf8_lossy(&out.stdout).trim()).map_or(Ok(()), Err)
+    }
+
+    fn run(&self, act: &Act, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
         let run_dir = request.run_dir;
         let began = Instant::now();
         let (file, job) = (request.file, request.job);
@@ -296,7 +353,7 @@ impl Runner for Act {
             &nonce,
         )?;
         let shards = (request.shard && isolated.contains(shard::MARK))
-            .then(|| shard::count(self.shards, engine_resources()));
+            .then(|| shard::count(act.shards, engine_resources()));
 
         if let Some(n) = shards {
             shard::write_plugin(run_dir, n)?;
@@ -305,10 +362,10 @@ impl Runner for Act {
         fs::write(wf_path, keep_caches(run_dir, &isolated)?).map_err(|e| e.to_string())?;
 
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
-        let labels: BTreeSet<String> = platforms(&self.config)
+        let labels: BTreeSet<String> = platforms(&act.config)
             .into_keys()
             .chain(
-                self.config
+                act.config
                     .job_images(request.file)
                     .into_keys()
                     .map(|j| job_label(&j)),
@@ -316,7 +373,7 @@ impl Runner for Act {
             .collect();
         // act skips a job with no image without starting a container, and Docker has only about
         // 30 address pools for bridges, which a matrix of macOS legs would take for nothing
-        let network = match self.network {
+        let network = match act.network {
             config::Network::Internet if runs_here(&isolated, request.job, &labels) => {
                 Some(create_network(run_dir, request.timeout)?)
             }
@@ -326,11 +383,11 @@ impl Runner for Act {
         let port = free_port()?;
         let home = crate::run::home();
 
-        for (name, _) in volumes(&self.config, request.repo_id, &tag) {
+        for (name, _) in volumes(&act.config, request.repo_id, &tag) {
             gc::stamp(&home, "volumes", &name);
         }
 
-        let volumes = mounts(&self.config, request.repo_id, &tag, run_dir)?;
+        let volumes = mounts(&act.config, request.repo_id, &tag, run_dir)?;
 
         cmd.arg("workflow_dispatch")
             .arg("-W")
@@ -360,11 +417,11 @@ impl Runner for Act {
             cmd.arg("--container-options").arg(volumes.join(" "));
         }
 
-        for (label, image) in platforms(&self.config) {
+        for (label, image) in platforms(&act.config) {
             cmd.arg("-P").arg(format!("{label}={image}"));
         }
 
-        for (job, image) in self.config.job_images(request.file) {
+        for (job, image) in act.config.job_images(request.file) {
             cmd.arg("-P").arg(format!("{}={image}", job_label(&job)));
         }
 
