@@ -475,7 +475,7 @@ impl Jail {
             .map(|p| quote(p).map(|q| format!(" (literal {q})")))
             .collect::<Result<_, String>>()?;
         // A copy of launchctl outside /bin is killed at exec, so the path is enough
-        // ponytail: a compiled program that speaks launchd's XPC protocol may still boot out the user's jobs
+        // ponytail: assumes no allowed mach service reaches launchd for the check, launch_msg and XPC need a denied lookup
         let exec = format!("(deny process-exec* (literal \"{LAUNCHCTL}\"){setuid})\n");
         Ok(format!(
             "(version 1)\n(allow default)\n\
