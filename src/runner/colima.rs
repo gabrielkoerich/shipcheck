@@ -338,7 +338,7 @@ mod tests {
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let mut reaper = Command::new("sh")
+            let mut reaper = Command::new(crate::runner::posix_sh())
                 .args(["-c", REAPER, "sh", "sc-abc"])
                 .env("PATH", &path)
                 .stdin(Stdio::piped())
