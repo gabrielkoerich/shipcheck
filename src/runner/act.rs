@@ -560,7 +560,8 @@ impl Engine for Docker {
                 });
             }
 
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            // The reaper hears before the child is reaped, while no other process can have its id
+            if super::has_exited(child.id()) {
                 crate::run::timing(file, job, "act total", spawned);
 
                 // act ended by itself and removed its containers, so the reaper has nothing to do
@@ -568,18 +569,22 @@ impl Engine for Docker {
                     let _ = writeln!(stdin, "done");
                 }
 
-                break status.code();
+                break child.wait().map_err(|e| e.to_string())?.code();
             }
 
             if Instant::now() > deadline {
                 // The group, act's docker commands too, while its id is still act's
                 super::signal_group(child.id(), libc::SIGKILL);
-                let _ = child.wait();
+
+                while !super::has_exited(child.id()) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
 
                 if let Some(stdin) = reaper.as_mut().and_then(|r| r.stdin.as_mut()) {
                     let _ = writeln!(stdin, "exited");
                 }
 
+                let _ = child.wait();
                 break None;
             }
 
@@ -1848,10 +1853,23 @@ read -r state || state=
 [ "$state" = exited ] || kill -s KILL -- "-$pgid" 2>/dev/null
 net=$1
 shift
-for p in "$@"; do
-  docker ps -aq --filter name=^act- --filter "volume=$p" | while read -r id; do docker rm -f -v "$id"; done
-done
-docker network rm "$net"
+cleanup() {
+  for p in "$@"; do
+    docker ps -aq --filter name=^act- --filter "volume=$p" | while read -r id; do docker rm -f -v "$id"; done
+  done
+  docker network rm "$net"
+}
+# The slot's lock this reaper holds stays out of docker's processes, and a hung Docker gives up
+closed=
+for fd in $LOCK_FDS; do closed="$closed $fd>&-"; done
+eval "cleanup \"\$@\" $closed" &
+d=$!
+n=0
+limit=${CLEANUP_SECS:-120}
+while kill -0 "$d" 2>/dev/null && [ "$n" -lt "$limit" ]; do sleep 1; n=$((n + 1)); done
+kill -s KILL "$d" 2>/dev/null
+wait "$d" 2>/dev/null
+exit 0
 "#;
 
 /**
@@ -1862,6 +1880,10 @@ docker network rm "$net"
 fn reaper(run_dir: &Path, slot_lock: Option<std::os::fd::RawFd>) -> Option<std::process::Child> {
     let mut cmd = Command::new("sh");
     super::inherit(&mut cmd, slot_lock.into_iter().collect());
+    cmd.env(
+        "LOCK_FDS",
+        slot_lock.map(|f| f.to_string()).unwrap_or_default(),
+    );
     cmd.args(["-c", REAPER, "sh", &network_name(run_dir)])
         .args(mount_paths(run_dir))
         .stdin(Stdio::piped())

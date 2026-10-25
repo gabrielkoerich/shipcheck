@@ -68,6 +68,18 @@ pub fn signal_group(pgid: u32, signal: libc::c_int) {
     }
 }
 
+/// Whether a child ended, without reaping it, so its pid and group id stay its own until `wait`
+pub fn has_exited(pid: u32) -> bool {
+    // Safe: waitid with WNOWAIT only reads the child's state into a zeroed struct
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+
+        // An error, such as a child already reaped, counts as ended, so no caller waits forever
+        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) != 0 || info.si_pid() != 0
+    }
+}
+
 /**
  * Lets the child keep these descriptors open across exec, so a lock on them lasts as long as it
  * does. The parent's own copies keep their close-on-exec flag, only the child's are cleared
@@ -195,6 +207,27 @@ pub(crate) fn posix_sh() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ended_child_is_seen_before_it_is_reaped() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let started = std::time::Instant::now();
+
+        while !has_exited(child.id()) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Still not reaped, so wait gets its status
+        assert!(child.wait().unwrap().success());
+        let mut running = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        assert!(!has_exited(running.id()));
+        let _ = running.kill();
+        let _ = running.wait();
+    }
 
     #[test]
     fn a_child_given_a_lock_holds_it_after_the_parent_lets_go() {
