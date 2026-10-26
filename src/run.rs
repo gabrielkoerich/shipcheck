@@ -1612,6 +1612,9 @@ pub fn trial(
     let tree = git(&repo, &["rev-parse", &format!("{sha}^{{tree}}")])?;
     config.timeout_minutes = config.timeout_minutes.min(10);
     config.retries = 0;
+    // Only the host checks are tried, act's jobs need Docker and their own runs
+    config.jobs.clear();
+    config.workflows.clear();
     let names: Vec<String> = config.host.checks.keys().cloned().collect();
     let plan = Plan {
         key: format!("trial-{}", nonce(&tree)),

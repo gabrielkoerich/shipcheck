@@ -148,6 +148,7 @@ fn branch_patterns_match(patterns: &Yaml) -> bool {
 /// One `run` or `uses` step, with the working directory and shell from the step, the job or the workflow
 #[derive(Clone)]
 pub struct RunStep {
+    pub name: Option<String>,
     /// Empty for a `uses` step
     pub run: String,
     pub uses: Option<String>,
@@ -182,6 +183,8 @@ pub struct Job {
     pub base_only: bool,
     /// A step runs `docker` or `act`, or uses a `docker/` action, which needs a Docker daemon in the job
     pub runs_docker: bool,
+    /// The image of its `container:`, as written
+    pub container: Option<String>,
     /// The names GitHub gives its check runs, None when they depend on more than this reads
     pub check_names: Option<Vec<String>>,
 }
@@ -241,7 +244,7 @@ fn platforms(job: &Yaml) -> Platforms {
 
     for l in labels.iter().map(|l| l.to_lowercase()) {
         p.windows |= l.starts_with("windows");
-        p.mac |= l.starts_with("macos");
+        p.mac |= l.contains("macos") || l.contains("xcode");
         p.linux |= l.starts_with("ubuntu") || l.contains("linux");
     }
 
@@ -610,6 +613,7 @@ pub fn job_runs(source: &str) -> Vec<Job> {
                 }
 
                 Some(RunStep {
+                    name: s["name"].as_str().map(str::to_string),
                     dir: if run.is_some() {
                         pick(s, "working-directory")
                     } else {
@@ -659,6 +663,10 @@ pub fn job_runs(source: &str) -> Vec<Job> {
             pr_only: pr_only(job),
             base_only: base_only(job),
             runs_docker,
+            container: [&job["container"], &job["container"]["image"]]
+                .into_iter()
+                .find_map(|c| c.as_str())
+                .map(str::to_string),
             check_names: check_names(id, original),
         });
     }
@@ -689,6 +697,113 @@ pub fn ungate(cond: &str) -> Option<String> {
         c = c[1..at].trim().to_string();
         found = true;
     }
+}
+
+/// What act, which runs a job as `workflow_dispatch` on a branch of its own, gives other values than a PR
+/**
+ * Expression contexts act gives other values than a PR run, lowercase, since GitHub reads contexts
+ * in any case: the event, the refs, who opened it, the secrets and variables act has none of, and
+ * the whole `github` context at once
+ **/
+const CONTEXTS_ACT_LACKS: &[&str] = &[
+    "github.event",
+    "github.base_ref",
+    "github.head_ref",
+    "github.ref",
+    "github.repository_owner",
+    "github.actor",
+    "github.triggering_actor",
+    "default_branch",
+    "secrets.",
+    "vars.",
+    "tojson(github)",
+];
+
+/// The same as variables a step's shell reads, which keep their case
+const VARS_ACT_LACKS: &[&str] = &[
+    "GITHUB_EVENT_NAME",
+    "GITHUB_EVENT_PATH",
+    "GITHUB_BASE_REF",
+    "GITHUB_HEAD_REF",
+    "GITHUB_REF",
+    "GITHUB_ACTOR",
+    "GITHUB_REPOSITORY_OWNER",
+];
+
+/// What a step's `if:` may also read that act gives otherwise: a variable set from a secret or the ref
+const IF_ACT_LACKS: &[&str] = &["env."];
+
+/// The context or variable act lacks that a job's text reads, if any
+pub fn reads_what_act_lacks(text: &str) -> Option<&'static str> {
+    let lower = text.to_lowercase();
+    CONTEXTS_ACT_LACKS
+        .iter()
+        .find(|c| lower.contains(*c))
+        .or_else(|| VARS_ACT_LACKS.iter().find(|v| text.contains(*v)))
+        .copied()
+}
+
+/**
+ * Why act cannot tell what a job does on a PR: a job `if:` of its own, beside init's gate, which act
+ * may skip and a skip passes, a local action init does not read, or a value in the job or the
+ * workflow's `env` that reads the PR, who opened it, the ref, secrets or variables, which act
+ * leaves empty or sets otherwise, so a step such as a changed-files lint checks nothing
+ **/
+pub fn act_lacks_context(source: &str, id: &str) -> Option<String> {
+    let root = load(source).ok()?;
+    let mut job = root.get(&key("jobs"))?.as_hash()?.get(&key(id))?.clone();
+
+    if let Yaml::Hash(h) = &mut job
+        && let Some(cond) = h.get(&key("if")).and_then(Yaml::as_str).map(str::to_string)
+    {
+        let own = ungate(&cond).unwrap_or(cond);
+
+        if !own.trim().is_empty() {
+            return Some(format!(
+                "its `if: {}` can run otherwise under act, which runs it as workflow_dispatch",
+                own.trim()
+            ));
+        }
+
+        h.remove(&key("if"));
+    }
+
+    let steps = || job["steps"].as_vec().into_iter().flatten();
+
+    if let Some(local) = steps()
+        .filter_map(|s| s["uses"].as_str())
+        .find(|u| u.starts_with("./"))
+    {
+        return Some(format!(
+            "it uses the local action {local}, which init does not read"
+        ));
+    }
+
+    let step_if = steps().filter_map(|s| s["if"].as_str()).find_map(|c| {
+        reads_what_act_lacks(c)
+            .or_else(|| {
+                IF_ACT_LACKS
+                    .iter()
+                    .copied()
+                    .find(|w| c.to_lowercase().contains(w))
+            })
+            .map(|w| (c, w))
+    });
+
+    if let Some((cond, what)) = step_if {
+        return Some(format!(
+            "a step's `if: {cond}` reads `{what}`, which act sets otherwise or lacks"
+        ));
+    }
+
+    let workflow_env = root.get(&key("env")).cloned().unwrap_or(Yaml::Null);
+    let text = emit(Hash::from_iter([
+        (key(id), job),
+        (key("env"), workflow_env),
+    ]))
+    .ok()?;
+    reads_what_act_lacks(&text)
+        .map(|c| format!("it reads `{c}`, which act leaves empty or sets otherwise"))
 }
 
 /// The jobs whose `if:` holds a gate an init wrote
