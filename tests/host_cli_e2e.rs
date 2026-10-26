@@ -499,3 +499,60 @@ fn clean_removes_this_repository_and_all_the_results() {
     assert!(!repo.home.join("cache").exists(), "{out}");
     assert!(out.contains("daemon service left alone"), "{out}");
 }
+
+#[test]
+#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+fn clean_removes_the_host_caches_and_keeps_one_a_run_holds() {
+    // A base run leaves a read-only tree in its cache, as Go's module cache does
+    let config = "runner = \"host\"\nretries = 0\n[host]\nchecks = { ro = \"mkdir -p \\\"$GOPATH/pkg/mod/m\\\" && touch \\\"$GOPATH/pkg/mod/m/f\\\" && chmod -R a-w \\\"$GOPATH/pkg\\\"\" }\n";
+    let repo = Repo::new(config);
+    repo.git(&["switch", "-q", "main"]);
+    // Each base run is of a new tree, since clean keeps the results
+    let warm = |repo: &Repo, tree: &str| {
+        repo.write("tree.txt", tree);
+        repo.commit(tree);
+        repo.git(&["push", "-q", "origin", "main"]);
+        repo.git(&["fetch", "-q", "origin"]);
+        let (code, out) = repo.shipcheck(&["run", "--no-fetch"]);
+        assert_eq!(code, Some(0), "{out}");
+        // This repository's cache, at hostcache/<owner>/<repo>, the one whose name has `origin`
+        let caches: Vec<PathBuf> = fs::read_dir(repo.home.join("hostcache"))
+            .unwrap()
+            .flatten()
+            .flat_map(|owner| fs::read_dir(owner.path()).unwrap().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains("origin"))
+            .collect();
+        assert_eq!(caches.len(), 1, "{caches:?}: {out}");
+        let cache = caches[0].clone();
+        assert!(cache.join("base/go/pkg/mod/m/f").exists(), "{out}");
+        // A dead run's copy, with a lock no one holds
+        fs::create_dir_all(cache.join("runs/run-dead/go")).unwrap();
+        fs::write(cache.join("runs/run-dead.lock"), "").unwrap();
+        cache
+    };
+
+    let cache = warm(&repo, "one");
+    let (code, out) = repo.shipcheck(&["clean"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(!cache.exists(), "clean left the host cache: {out}");
+
+    let cache = warm(&repo, "two");
+    let live = fs::File::create(cache.join("runs/run-live.lock")).unwrap();
+    live.lock().unwrap();
+    let (code, out) = repo.shipcheck(&["clean", "--all"]);
+    assert_ne!(
+        code,
+        Some(0),
+        "clean --all ran while a run held its cache: {out}"
+    );
+    assert!(cache.join("base").exists(), "{out}");
+
+    drop(live);
+    let (code, out) = repo.shipcheck(&["clean", "--all"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        !repo.home.join("hostcache").exists(),
+        "clean --all left the host caches: {out}"
+    );
+}

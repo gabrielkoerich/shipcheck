@@ -2865,18 +2865,27 @@ pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
         Some(id) => home.join("runs").join(id),
         None => home.join("runs"),
     };
+    // A branch run also holds the lock of its host cache's `runs/run-X`
+    let hostcache = match &id {
+        Some(id) => home.join("hostcache").join(id),
+        None => home.join("hostcache"),
+    };
 
-    if let Ok(locks) = glob_locks(&runs) {
-        for lock in locks {
-            let file = fs::File::open(&lock).map_err(|e| e.to_string())?;
+    for lock in [&runs, &hostcache]
+        .into_iter()
+        .flat_map(|d| glob_locks(d).unwrap_or_default())
+    {
+        let file = fs::File::open(&lock).map_err(|e| e.to_string())?;
 
-            if file.try_lock().is_err() {
-                return Err("a run is in progress, clean once it finishes".into());
-            }
+        if file.try_lock().is_err() {
+            return Err("a run is in progress, clean once it finishes".into());
         }
     }
 
     done.extend(crate::runner::act::Act::default().clean(id.as_deref()));
+    done.extend(
+        crate::runner::host::Host::new(Default::default(), Path::new(".")).clean(id.as_deref()),
+    );
     let mut dirs = vec![runs];
 
     match &id {

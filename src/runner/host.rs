@@ -157,6 +157,25 @@ impl Drop for RunCopy {
     }
 }
 
+/// A `runs/run-X.lock` under `dir` that a live run holds, at any depth
+fn held_lock(dir: &Path) -> Option<PathBuf> {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if let Some(lock) = held_lock(&path) {
+                return Some(lock);
+            }
+        } else if path.extension().is_some_and(|e| e == "lock")
+            && fs::File::open(&path).is_ok_and(|f| !locked(&f))
+        {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 /// Whether `path` still names the inode `file` has open
 fn same_file(file: &fs::File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -2097,11 +2116,25 @@ impl Runner for Host {
     fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
         let dir = cache_dir(repo_id);
 
-        if dir.exists() && fs::remove_dir_all(&dir).is_ok() {
-            return vec![format!("removed {}", dir.display())];
+        if !dir.exists() {
+            return Vec::new();
         }
 
-        Vec::new()
+        if let Some(lock) = held_lock(&dir) {
+            return vec![format!(
+                "kept {}, a run holds {}",
+                dir.display(),
+                lock.display()
+            )];
+        }
+
+        remove_tree(&dir);
+
+        if dir.exists() {
+            return vec![format!("could not remove {}", dir.display())];
+        }
+
+        vec![format!("removed {}", dir.display())]
     }
 }
 
@@ -2712,6 +2745,7 @@ mod tests {
             readable: Vec::new(),
             home: home.clone(),
             cache: home,
+            overlay: None,
         };
         let left = tempfile::NamedTempFile::new_in("/var/tmp").unwrap();
         let log = clone.path().join("log");
