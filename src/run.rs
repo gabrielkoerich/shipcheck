@@ -1462,7 +1462,7 @@ pub fn select(
 
 /// The host checks `--job` names, under the one workflow host mode has. `--workflow` names none
 pub fn select_host(
-    checks: &BTreeMap<String, String>,
+    checks: &BTreeMap<String, crate::config::Check>,
     jobs: &[String],
     workflows: &[String],
 ) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
@@ -1750,6 +1750,9 @@ fn run_all(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, 
  * result named [`HOST`] whose jobs are the checks. Nothing from the base is written into the clone,
  * since the commands come from the plan and no workflow runs
  **/
+/// What a run and doctor say about a check with `sandbox = false`
+pub const UNSANDBOXED: &str = "runs outside the sandbox, as `sandbox = false` on the base says, with this user's full access to the home, its keys and tokens. For trusted repositories only";
+
 fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, String> {
     let checks = &ctx.plan.config.host.checks;
     let (templates, checkouts) = (ctx.templates.join(HOST), ctx.slot.join(HOST));
@@ -1758,6 +1761,10 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
     fs::create_dir_all(ctx.logs.join(HOST)).map_err(|e| e.to_string())?;
     git_cow::can_clone(&templates, &checkouts);
     let deadline = Instant::now() + Duration::from_secs(ctx.plan.config.timeout_minutes * 60);
+
+    for name in checks.iter().filter(|(_, c)| !c.sandbox).map(|(n, _)| n) {
+        say(&format!("{HOST}/{name}: {UNSANDBOXED}"));
+    }
 
     let runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<Msg>();
@@ -2980,8 +2987,8 @@ mod tests {
     #[test]
     fn job_picks_host_checks() {
         let checks = BTreeMap::from([
-            ("lint".to_string(), "make lint".to_string()),
-            ("test".to_string(), "make test".to_string()),
+            ("lint".to_string(), "make lint".into()),
+            ("test".to_string(), "make test".into()),
         ]);
         assert_eq!(
             select_host(&checks, &["test".into()], &[]).unwrap(),

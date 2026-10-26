@@ -231,7 +231,12 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             .map(|p| {
                 let list = p.config.workflows.join(", ");
                 let checks: Vec<&str> = p.config.host.checks.keys().map(String::as_str).collect();
-                let host = format!("runs host checks {} on {base}, natively as this user in a sandbox", checks.join(", "));
+                let mut host = format!("runs host checks {} on {base}, natively as this user in a sandbox", checks.join(", "));
+                let open: Vec<&str> = p.config.host.checks.iter().filter(|(_, c)| !c.sandbox).map(|(n, _)| n.as_str()).collect();
+
+                if !open.is_empty() {
+                    host = format!("{host}. {} {}", open.join(", "), crate::run::UNSANDBOXED);
+                }
 
                 if p.config.acts() && p.config.hosts() {
                     let acts = jobs_line(&p.config);

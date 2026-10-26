@@ -696,6 +696,8 @@ pub struct Jail {
     pub cache: PathBuf,
     /// The upper and work directories of an overlay mounted on `cache`, which stays unchanged
     pub overlay: Option<(PathBuf, PathBuf)>,
+    /// False for a check with `sandbox = false`, which runs with the user's own access
+    pub sandboxed: bool,
 }
 
 /// The setuid binaries of the system, read once
@@ -940,6 +942,7 @@ impl Jail {
     /// controlling terminal, so a timeout stops all of it and it cannot type into the terminal
     fn shell(&self, command: &str, dir: &Path, extra: &[String]) -> Result<Command, String> {
         let mut cmd = match sandbox()? {
+            _ if !self.sandboxed => Command::new("/usr/bin/env"),
             // macOS refuses a sandbox inside a sandbox, and the one around this process is as strict
             "sandbox-exec" if in_a_jail() => Command::new("/usr/bin/env"),
             "sandbox-exec" => {
@@ -991,9 +994,13 @@ impl Jail {
             .env("GOCACHE", cache("go-build"))
             .env("CI", "true")
             .env("GITHUB_STEP_SUMMARY", self.home.join(STEP_SUMMARY))
-            // Tests of the jail read it, since macOS refuses a sandbox inside a sandbox
-            .env("SHIPCHECK_JAIL", "1")
             .stdin(Stdio::null());
+
+        // Tests of the jail read it, since macOS refuses a sandbox inside a sandbox
+        if self.sandboxed {
+            cmd.env("SHIPCHECK_JAIL", "1");
+        }
+
         if self.home.join(SBF_SDK).is_dir() {
             cmd.env("SBF_SDK_PATH", self.home.join(SBF_SDK));
         }
@@ -2046,6 +2053,7 @@ fn version(
         cache: home.clone(),
         home,
         overlay: None,
+        sandboxed: true,
     };
     // No launchd job, which costs 0.1 s a command on every plan: a leftover writes only this
     // temp home, removed on return, and signals only its own sandbox
@@ -2135,7 +2143,8 @@ impl Runner for Host {
         } else {
             let run = self.run_cache(request.repo_id)?;
 
-            if self.overlays() {
+            // bwrap mounts the overlay, so a check outside the sandbox gets a copy
+            if self.overlays() && command.sandbox {
                 // Each check its own upper layer, since two overlays must not share one
                 let layer = tempfile::Builder::new()
                     .prefix("check-")
@@ -2160,6 +2169,7 @@ impl Runner for Host {
             cache,
             home,
             overlay,
+            sandboxed: command.sandbox,
         };
         let exit = run_command(
             command,
@@ -2283,7 +2293,38 @@ mod tests {
             home: real_dir(&dir.join("home")).unwrap(),
             cache: real_dir(&dir.join("cache")).unwrap(),
             overlay: None,
+            sandboxed: true,
         }
+    }
+
+    #[test]
+    fn a_check_with_sandbox_false_runs_outside_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut open = jail(dir.path());
+        open.sandboxed = false;
+        let cmd = open.shell("true", dir.path(), &[]).unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/env");
+        assert!(!cmd.get_envs().any(|(k, _)| k == "SHIPCHECK_JAIL"));
+
+        let file = outside.path().join("written");
+        let status = open
+            .shell(&format!("echo x > '{}'", file.display()), dir.path(), &[])
+            .unwrap()
+            .status()
+            .unwrap();
+        assert!(
+            status.success() && file.exists(),
+            "it writes outside its clone"
+        );
+
+        // Its home and caches still go to the run's own directories
+        let home = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "HOME")
+            .and_then(|(_, v)| v)
+            .unwrap();
+        assert_eq!(Path::new(home), open.home);
     }
 
     #[test]
@@ -2720,6 +2761,7 @@ mod tests {
             home: "/j/home".into(),
             cache: "/j/home".into(),
             overlay: None,
+            sandboxed: true,
         };
         let profile = jail.profile().unwrap();
         let paths = r#"(subpath "/j/clone \"x\"") (subpath "/j/home")"#;
@@ -2759,6 +2801,7 @@ mod tests {
             home: "/j".into(),
             cache: "/j".into(),
             overlay: None,
+            sandboxed: true,
         };
         assert!(bad.profile().unwrap_err().contains("not UTF-8"));
     }
@@ -2777,6 +2820,7 @@ mod tests {
             home: "/j/home".into(),
             cache: "/j/home".into(),
             overlay: None,
+            sandboxed: true,
         };
         let args: Vec<String> = jail
             .bwrap_args()
@@ -2819,6 +2863,7 @@ mod tests {
             home: home.clone(),
             cache: home,
             overlay: None,
+            sandboxed: true,
         };
         let left = tempfile::NamedTempFile::new_in("/var/tmp").unwrap();
         let log = clone.path().join("log");
@@ -2851,6 +2896,7 @@ mod tests {
             home,
             cache,
             overlay: None,
+            sandboxed: true,
         };
         let log = clone.path().join("log");
         // As cli/cli's script/licenses does, then with a prefix, then with a template of its own.
@@ -2899,6 +2945,7 @@ mod tests {
             home,
             cache,
             overlay: None,
+            sandboxed: true,
         };
         let log = outside.path().join("log");
         let run = |cmd: &str| {
@@ -3195,7 +3242,8 @@ mod tests {
                 format!(
                     "d=$(dirname \"$CARGO_HOME\"); rm -rf \"$d\" && ln -s '{}' \"$d\"; true",
                     target_path.display()
-                ),
+                )
+                .into(),
             ),
             (
                 "write".into(),
