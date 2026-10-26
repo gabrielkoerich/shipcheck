@@ -253,21 +253,30 @@ pub fn propose(root: &Path, machine: &Machine) -> Result<(Option<String>, String
 
     if let Some(why) = &found.act {
         // Only what GitHub runs for a PR, so no release or deploy runs on a laptop
-        let workflows: Vec<String> = workflow_files(root)
+        let (workflows, unrun): (Vec<String>, Vec<String>) = workflow_files(root)
             .unwrap_or_default()
             .into_iter()
-            .filter(|f| {
+            .partition(|f| {
                 fs::read_to_string(root.join(".github/workflows").join(f))
                     .is_ok_and(|s| crate::workflow::runs_for_branches(&s))
-            })
-            .collect();
+            });
         // A job that runs only off the base branch would be a check that never runs on GitHub's main
         let (pr_only, workflows): (Vec<String>, Vec<String>) = workflows
             .into_iter()
             .partition(|f| found.github.iter().any(|k| k.file == *f));
 
         if workflows.is_empty() {
-            return Ok((None, NOTHING_LOCAL.into()));
+            let mut said = NOTHING_LOCAL.to_string();
+
+            for k in &found.github {
+                said.push_str(&format!("\n  {}, job {}: {}", k.file, k.job, k.why));
+            }
+
+            for file in unrun {
+                said.push_str(&format!("\n  {file}: it runs on no PR or branch push"));
+            }
+
+            return Ok((None, said));
         }
 
         let mut said = format!("runner = \"act\": {why}");
@@ -311,7 +320,7 @@ pub const NOTHING_LOCAL: &str = "nothing to run locally: every job stays on GitH
 
 fn act_config(workflows: &[String]) -> String {
     format!(
-        "runner = \"act\"\n{}\n# Splits each one-line pytest step into parallel shards. A test that fails only after another test's leftovers can pass\nshard_tests = true\n",
+        "runner = \"act\"\n# act's jobs reach the internet, to download what their actions and steps set up\nnetwork = \"internet\"\n{}\n# Splits each one-line pytest step into parallel shards. A test that fails only after another test's leftovers can pass\nshard_tests = true\n",
         config_for(workflows),
     )
 }
@@ -4015,11 +4024,34 @@ jobs:
             ..Machine::default()
         };
         let (text, said) = propose(dir.path(), &machine).unwrap();
-        let cfg = RepoConfig::parse(&text.unwrap()).unwrap();
+        let text = text.unwrap();
+        let cfg = RepoConfig::parse(&text).unwrap();
         assert_eq!(cfg.workflows, ["ci.yml"], "{said}");
+        // Its jobs download what their actions and steps set up
+        assert_eq!(cfg.network, crate::config::Network::Internet, "{text}");
         for line in [
             "pr.yml stays on GitHub as it is, since act runs a workflow whole: job changed: tj-actions/changed-files@v46 reads the PR",
             "pr.yml stays on GitHub as it is, since act runs a workflow whole: job title: it reads `github.event`",
+        ] {
+            assert!(said.contains(line), "{line}\n{said}");
+        }
+
+        // With only those, init names why each job stays and what runs on no PR
+        let release = "on:\n  push:\n    tags: ['v*']\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make release\n";
+        // A matrix sends the repository to act, and a job beside it reading the PR keeps their workflow on GitHub
+        let both = format!(
+            "{ci}  title:\n    runs-on: ubuntu-latest\n    steps:\n      - run: test -n \"${{{{ github.event.pull_request.title }}}}\"\n"
+        );
+        let dir = repo(&[
+            (".github/workflows/pr.yml", &both),
+            (".github/workflows/release.yml", release),
+        ]);
+        let (text, said) = propose(dir.path(), &machine).unwrap();
+        assert!(text.is_none(), "{said}");
+        for line in [
+            NOTHING_LOCAL,
+            "\n  pr.yml, job title: it reads `github.event`",
+            "\n  release.yml: it runs on no PR or branch push",
         ] {
             assert!(said.contains(line), "{line}\n{said}");
         }
