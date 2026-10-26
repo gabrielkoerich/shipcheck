@@ -17,6 +17,10 @@ pub struct Host {
     config: config::Host,
     /// Where `versions` run, so a toolchain file in the repository picks the version
     repo: PathBuf,
+    /// This run's directory under `runs`, with its copy of the base's cache or its checks' overlays
+    copy: std::sync::OnceLock<Result<RunCopy, String>>,
+    /// Whether checks of another tree see the base's cache through an overlay instead of a copy
+    overlay: std::sync::OnceLock<bool>,
 }
 
 impl Host {
@@ -24,8 +28,280 @@ impl Host {
         Host {
             config,
             repo: repo.to_path_buf(),
+            copy: std::sync::OnceLock::new(),
+            overlay: std::sync::OnceLock::new(),
         }
     }
+
+    /**
+     * This run's directory under `runs`, made once per run and removed with it, so no branch leaves
+     * a file another branch's run reads. A shared cache let one branch plant registry sources that
+     * cargo trusts once extracted. With an overlay it holds each check's upper layer, otherwise a
+     * copy of the base's cache, which shares its blocks on APFS, btrfs or XFS and is a full copy on ext4
+     **/
+    fn run_cache(&self, repo_id: &str) -> Result<PathBuf, String> {
+        let copy = self.copy.get_or_init(|| {
+            let dir = cache_dir(Some(repo_id));
+            // The cache every branch once shared, which a branch may have written
+            remove_tree(&dir.join("branches"));
+            let base = real_dir(&dir.join("base"))?;
+            let runs = real_dir(&dir.join("runs"))?;
+            RunCopy::remove_unused(&runs);
+            let copy = RunCopy::new(&runs)?;
+
+            if *self.overlay.get_or_init(|| overlay(&runs).is_ok()) {
+                fs::create_dir(&copy.dir).map_err(|e| format!("{}: {e}", copy.dir.display()))?;
+            } else {
+                clone_dir(&base, &copy.dir)?;
+            }
+
+            Ok(copy)
+        });
+
+        let dir = match copy {
+            Ok(copy) => &copy.dir,
+            Err(e) => return Err(e.clone()),
+        };
+
+        // A check may write inside it, so before each check it must still be the directory made
+        if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+            return Err(format!(
+                "{} is no longer this run's directory",
+                dir.display()
+            ));
+        }
+
+        Ok(dir.clone())
+    }
+
+    /// This host with the overlay forced on or off, for tests of each way
+    #[cfg(test)]
+    fn with_overlay(self, on: bool) -> Self {
+        self.overlay.set(on).unwrap();
+        self
+    }
+
+    /// Whether this run's checks of another tree got overlays, known once `run_cache` ran
+    fn overlays(&self) -> bool {
+        self.overlay.get().copied().unwrap_or(false)
+    }
+}
+
+/**
+ * One run's copy of the base cache, `runs/run-X`, beside `runs/run-X.lock`, which the run holds
+ * locked while it lives. A copy whose lock another run can take is unused, as when its run died.
+ * The lock is taken under a name cleanup skips, and only then linked to its `.lock` name
+ **/
+struct RunCopy {
+    dir: PathBuf,
+    lock: PathBuf,
+    // Closed after `drop` removes both paths, which releases the lock
+    _file: fs::File,
+}
+
+impl RunCopy {
+    fn new(runs: &Path) -> Result<Self, String> {
+        let fail = |e: std::io::Error| format!("run cache in {}: {e}", runs.display());
+        let new = tempfile::Builder::new()
+            .prefix(".new-")
+            .tempfile_in(runs)
+            .map_err(fail)?;
+
+        if !locked(new.as_file()) {
+            return Err(format!("{}: could not lock", new.path().display()));
+        }
+
+        // A hard link keeps the locked inode and, unlike a rename, never replaces another's lock
+        let lock = loop {
+            let mut bytes = [0u8; 8];
+            std::io::Read::read_exact(
+                &mut fs::File::open("/dev/urandom").map_err(fail)?,
+                &mut bytes,
+            )
+            .map_err(fail)?;
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let lock = runs.join(format!("run-{hex}.lock"));
+
+            match fs::hard_link(new.path(), &lock) {
+                Ok(()) => break lock,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(fail(e)),
+            }
+        };
+        let (file, temp) = new.keep().map_err(|e| fail(e.error))?;
+        let _ = fs::remove_file(temp);
+        Ok(RunCopy {
+            dir: lock.with_extension(""),
+            lock,
+            _file: file,
+        })
+    }
+
+    fn remove_unused(runs: &Path) {
+        for entry in fs::read_dir(runs).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A live run links its lock and ends its probe within milliseconds of making them
+            let old = || {
+                fs::symlink_metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_secs(60)))
+            };
+
+            if name.starts_with(".probe-") {
+                if old() {
+                    remove_tree(&path);
+                }
+
+                continue;
+            }
+
+            // A lock its run took and never linked, as when it died between the two
+            if name.starts_with(".new-") {
+                if old() && fs::File::open(&path).is_ok_and(|f| locked(&f) && same_file(&f, &path))
+                {
+                    let _ = fs::remove_file(&path);
+                }
+
+                continue;
+            }
+
+            if path.extension().is_none_or(|e| e != "lock")
+                || !entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                continue;
+            }
+
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+
+            // The lock must still be the one at that path, not one another cleanup removed meanwhile
+            if locked(&file) && same_file(&file, &path) {
+                remove_tree(&path.with_extension(""));
+                let _ = fs::remove_file(&path);
+            }
+
+            drop(file);
+        }
+    }
+}
+
+impl Drop for RunCopy {
+    fn drop(&mut self) {
+        remove_tree(&self.dir);
+        let _ = fs::remove_file(&self.lock);
+    }
+}
+
+/// The regular `runs/run-X.lock` files of one repository's host cache, or of every repository's
+pub fn run_locks(repo_id: Option<&str>) -> Vec<PathBuf> {
+    // Real directories and files only, so a symlink a check left never leads elsewhere
+    let entries = |dir: &Path, dirs: bool| -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_type()
+                    .is_ok_and(|t| if dirs { t.is_dir() } else { t.is_file() })
+            })
+            .map(|e| e.path())
+            .collect()
+    };
+    let repos = match repo_id {
+        Some(id) => vec![cache_dir(Some(id))],
+        None => entries(&cache_dir(None), true)
+            .iter()
+            .flat_map(|owner| entries(owner, true))
+            .collect(),
+    };
+    repos
+        .iter()
+        .flat_map(|repo| entries(&repo.join("runs"), false))
+        .filter(|p| p.extension().is_some_and(|e| e == "lock"))
+        .collect()
+}
+
+/// Whether `path` still names the inode `file` has open
+fn same_file(file: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Takes an exclusive lock on `file` without waiting, held until the file is closed
+fn locked(file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    // Safe: flock only takes a lock on a descriptor this file owns
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Removes a cache tree, read-only directories included, as Go's module cache and overlayfs make them
+fn remove_tree(dir: &Path) {
+    // A symlink or a file is removed itself, never what it points at
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            let _ = fs::remove_file(dir);
+            return;
+        }
+        Err(_) => return,
+    }
+
+    // The system's chmod, never one earlier on PATH such as coreutils' gnubin on macOS
+    let chmod = ["/bin/chmod", "/usr/bin/chmod"]
+        .into_iter()
+        .find(|c| Path::new(c).exists())
+        .unwrap_or("chmod");
+    let _ = Command::new(chmod)
+        .arg("-R")
+        .arg("u+rwx")
+        .arg(dir)
+        .stderr(Stdio::null())
+        .status();
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Copies `src` to the new path `dst`, sharing blocks where the file system can
+fn clone_dir(src: &Path, dst: &Path) -> Result<(), String> {
+    // One clonefile call copies the whole tree on APFS
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let from = std::ffi::CString::new(src.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let to = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+
+        // Safe: both strings outlive the call, which only reads them
+        if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+    }
+
+    let copied = Command::new("cp")
+        .args(if cfg!(target_os = "linux") {
+            &["-a", "--reflink=auto"][..]
+        } else {
+            &["-pR"][..]
+        })
+        .arg(src)
+        .arg(dst)
+        .status()
+        .map_err(|e| format!("cp: {e}"))?;
+
+    if !copied.success() {
+        return Err(format!(
+            "could not copy {} to {}",
+            src.display(),
+            dst.display()
+        ));
+    }
+
+    Ok(())
 }
 
 /// What every check gets from the user's environment, besides the names `[host] env` adds.
@@ -121,6 +397,74 @@ fn trusted_path_in(path: &std::ffi::OsStr, user: &Path, temp: &[PathBuf]) -> std
         .filter(|d| trusted_in(d, user, temp))
         .collect();
     std::env::join_paths(kept).unwrap_or_default()
+}
+
+/**
+ * Whether bwrap can lay a check's writes over the base's cache, with the upper layer in `dir`, and
+ * why not. It needs bwrap 0.10 or later and a kernel that mounts overlayfs in a user namespace
+ **/
+pub fn overlay(dir: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("only bwrap mounts an overlay".into());
+    }
+
+    let probe = tempfile::Builder::new()
+        .prefix(".probe-")
+        .tempdir_in(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .keep();
+    let [lower, upper, work] = ["lower", "upper", "work"].map(|d| probe.join(d));
+    let made = [&lower, &upper, &work]
+        .into_iter()
+        .try_for_each(fs::create_dir)
+        .map_err(|e| e.to_string());
+    let ran = made.and_then(|_| {
+        Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--dev", "/dev", "--overlay-src"])
+            .arg(&lower)
+            .arg("--overlay")
+            .args([&upper, &work, &lower])
+            .arg("true")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("bwrap: {e}"))
+    });
+    remove_tree(&probe);
+    let out = ran?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+
+    if err.contains("--overlay-src") {
+        let version = first_line("bwrap", &["--version"]).unwrap_or_else(|| "this bwrap".into());
+        return Err(format!("{version} has no --overlay-src"));
+    }
+
+    Err(format!("bwrap could not mount an overlay: {err}"))
+}
+
+/// How a branch run gets the base's cache, for doctor
+pub fn branch_cache() -> String {
+    if cfg!(target_os = "macos") {
+        return "Branch runs get a clonefile copy of the base's tool cache, which shares its blocks"
+            .into();
+    }
+
+    let dir = cache_dir(None);
+
+    match real_dir(&dir).and_then(|d| overlay(&d)) {
+        Ok(()) => "Branch runs see the base's tool cache through an overlay, and their writes go to a layer of their own that the run removes".into(),
+        Err(e) => format!("Branch runs get a copy of the base's tool cache, a full one on ext4 at about 4 s per GB, since {e}. bubblewrap 0.10 or later mounts an overlay instead, at no cost per GB"),
+    }
+}
+
+fn first_line(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().map(|l| l.trim().to_string())
 }
 
 /// The OS sandbox host checks run in, an error naming the fix when this machine has none
@@ -350,6 +694,8 @@ pub struct Jail {
     pub readable: Vec<PathBuf>,
     pub home: PathBuf,
     pub cache: PathBuf,
+    /// The upper and work directories of an overlay mounted on `cache`, which stays unchanged
+    pub overlay: Option<(PathBuf, PathBuf)>,
 }
 
 /// The setuid binaries of the system, read once
@@ -456,6 +802,12 @@ impl Jail {
             .collect::<Result<_, String>>()?;
         let readable = subpaths(&self.readable(&user))?;
         let hidden = subpaths(&Self::hidden(&user))?;
+        // Writes go inside the cache, never to the directory itself, so no check swaps it for a symlink
+        let own = if self.cache != self.home && self.writable.contains(&self.cache) {
+            format!("(deny file-write* (literal {}))\n", quote(&self.cache)?)
+        } else {
+            String::new()
+        };
         // Other checks' homes and whatever else is in the temp dirs, the jail's own paths allowed below
         let mut temp: Vec<PathBuf> = TEMP.iter().map(PathBuf::from).collect();
         temp.push(std::env::temp_dir());
@@ -479,6 +831,7 @@ impl Jail {
             "(version 1)\n(allow default)\n\
              (deny file-write*)\n\
              (allow file-write*{writable} (literal \"/dev/null\") (regex #\"^/dev/fd/\"))\n\
+             {own}\
              (allow file-write* (literal \"/dev/ptmx\") (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
              (deny file-read-data (subpath {user}){temp})\n\
              (allow file-read-data{readable}{writable})\n\
@@ -551,6 +904,15 @@ impl Jail {
 
         for path in &self.writable {
             args.extend(["--bind".into(), path.clone().into(), path.clone().into()]);
+        }
+
+        if let Some((upper, work)) = &self.overlay {
+            args.extend([
+                "--overlay-src".into(),
+                self.cache.clone().into(),
+                "--overlay".into(),
+            ]);
+            args.extend([upper, work, &self.cache].map(|p| p.clone().into()));
         }
 
         // Read-only once every mount point in it exists
@@ -651,8 +1013,8 @@ impl Jail {
 }
 
 /**
- * The tool caches host checks share, per repository, written only by checks. Runs of the base's
- * tree get one and every other tree another, so a branch cannot plant a file a run of main reads
+ * The tool caches of host checks, per repository, written only by checks. Runs of the base's tree
+ * write `base`, and every other run writes an overlay of it or a copy of it of its own, under `runs`
  **/
 fn cache_dir(repo_id: Option<&str>) -> PathBuf {
     let dir = crate::run::home().join("hostcache");
@@ -1683,6 +2045,7 @@ fn version(
         readable: vec![repo],
         cache: home.clone(),
         home,
+        overlay: None,
     };
     // No launchd job, which costs 0.1 s a command on every plan: a leftover writes only this
     // temp home, removed on return, and signals only its own sandbox
@@ -1766,16 +2129,37 @@ impl Runner for Host {
             .get(request.job)
             .ok_or_else(|| format!("no host check {}", request.job))?;
         let (_dir, home) = temp_home()?;
-        let cache = real_dir(&cache_dir(Some(request.repo_id)).join(if request.on_base {
-            "base"
+        let base = real_dir(&cache_dir(Some(request.repo_id)).join("base"))?;
+        let (cache, overlay) = if request.on_base {
+            (base, None)
         } else {
-            "branches"
-        }))?;
+            let run = self.run_cache(request.repo_id)?;
+
+            if self.overlays() {
+                // Each check its own upper layer, since two overlays must not share one
+                let layer = tempfile::Builder::new()
+                    .prefix("check-")
+                    .tempdir_in(&run)
+                    .map_err(|e| format!("{}: {e}", run.display()))?
+                    .keep();
+                let (upper, work) = (layer.join("upper"), layer.join("work"));
+                (base, Some((real_dir(&upper)?, real_dir(&work)?)))
+            } else {
+                (run, None)
+            }
+        };
+        let mut writable = vec![real_dir(request.run_dir)?, home.clone()];
+
+        if overlay.is_none() {
+            writable.push(cache.clone());
+        }
+
         let jail = Jail {
-            writable: vec![real_dir(request.run_dir)?, home.clone(), cache.clone()],
+            writable,
             readable: Vec::new(),
             cache,
             home,
+            overlay,
         };
         let exit = run_command(
             command,
@@ -1801,11 +2185,29 @@ impl Runner for Host {
     fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
         let dir = cache_dir(repo_id);
 
-        if dir.exists() && fs::remove_dir_all(&dir).is_ok() {
-            return vec![format!("removed {}", dir.display())];
+        if !dir.exists() {
+            return Vec::new();
         }
 
-        Vec::new()
+        let held = run_locks(repo_id)
+            .into_iter()
+            .find(|lock| fs::File::open(lock).is_ok_and(|f| !locked(&f)));
+
+        if let Some(lock) = held {
+            return vec![format!(
+                "kept {}, a run holds {}",
+                dir.display(),
+                lock.display()
+            )];
+        }
+
+        remove_tree(&dir);
+
+        if dir.exists() {
+            return vec![format!("could not remove {}", dir.display())];
+        }
+
+        vec![format!("removed {}", dir.display())]
     }
 }
 
@@ -1860,6 +2262,18 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
 
+    /// The ways a branch run can get the base's cache here: a copy, and an overlay where bwrap mounts one
+    fn modes() -> Vec<bool> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut modes = vec![false];
+
+        if overlay(dir.path()).is_ok() {
+            modes.push(true);
+        }
+
+        modes
+    }
+
     /// A jail whose clone is `dir`, home and cache inside it
     fn jail(dir: &Path) -> Jail {
         let dir = dir.canonicalize().unwrap();
@@ -1868,6 +2282,7 @@ mod tests {
             readable: Vec::new(),
             home: real_dir(&dir.join("home")).unwrap(),
             cache: real_dir(&dir.join("cache")).unwrap(),
+            overlay: None,
         }
     }
 
@@ -2304,6 +2719,7 @@ mod tests {
             readable: vec!["/j/repo".into()],
             home: "/j/home".into(),
             cache: "/j/home".into(),
+            overlay: None,
         };
         let profile = jail.profile().unwrap();
         let paths = r#"(subpath "/j/clone \"x\"") (subpath "/j/home")"#;
@@ -2342,6 +2758,7 @@ mod tests {
             readable: Vec::new(),
             home: "/j".into(),
             cache: "/j".into(),
+            overlay: None,
         };
         assert!(bad.profile().unwrap_err().contains("not UTF-8"));
     }
@@ -2359,6 +2776,7 @@ mod tests {
             readable: Vec::new(),
             home: "/j/home".into(),
             cache: "/j/home".into(),
+            overlay: None,
         };
         let args: Vec<String> = jail
             .bwrap_args()
@@ -2400,6 +2818,7 @@ mod tests {
             readable: Vec::new(),
             home: home.clone(),
             cache: home,
+            overlay: None,
         };
         let left = tempfile::NamedTempFile::new_in("/var/tmp").unwrap();
         let log = clone.path().join("log");
@@ -2431,6 +2850,7 @@ mod tests {
             readable: Vec::new(),
             home,
             cache,
+            overlay: None,
         };
         let log = clone.path().join("log");
         // As cli/cli's script/licenses does, then with a prefix, then with a template of its own.
@@ -2478,6 +2898,7 @@ mod tests {
             readable: Vec::new(),
             home,
             cache,
+            overlay: None,
         };
         let log = outside.path().join("log");
         let run = |cmd: &str| {
@@ -2663,6 +3084,402 @@ mod tests {
         assert!(userns_fix(Some("1"), true).contains("is not loaded"));
         assert!(userns_fix(None, false).contains("max_user_namespaces"));
         assert!(userns_fix(Some("0"), false).contains("max_user_namespaces"));
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_branch_run_never_sees_what_another_branch_run_left_in_the_cache() {
+        for overlay in modes() {
+            a_branch_run_sees_only_the_base(overlay);
+        }
+    }
+
+    fn a_branch_run_sees_only_the_base(overlay: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let checks = BTreeMap::from([
+            (
+                "base".into(),
+                "mkdir -p \"$CARGO_HOME\" && touch \"$CARGO_HOME/from-base\"".into(),
+            ),
+            (
+                "branch".into(),
+                "mkdir -p \"$CARGO_HOME\" && touch \"$CARGO_HOME/from-branch\"".into(),
+            ),
+            (
+                "other".into(),
+                "test -e \"$CARGO_HOME/from-base\" && test ! -e \"$CARGO_HOME/from-branch\"".into(),
+            ),
+        ]);
+        // Each call is a run of its own, as each run makes its own runners
+        let run = |job: &str, on_base: bool| {
+            let host = Host::new(
+                config::Host {
+                    checks: checks.clone(),
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .with_overlay(overlay);
+            let clone = tempfile::tempdir().unwrap();
+            let log = dir.path().join(format!("{job}.log"));
+            let (needs, artifacts) = (BTreeMap::new(), dir.path().join("artifacts"));
+            let request = RunRequest {
+                run_dir: clone.path(),
+                file: HOST,
+                workflow: Path::new("/dev/null"),
+                job,
+                needs: &needs,
+                artifacts: &artifacts,
+                repo_id: &repo_id,
+                timeout: Duration::from_secs(30),
+                shard: false,
+                on_base,
+                slot_lock: None,
+            };
+            let exit = host.run(&request, &log).unwrap().exit;
+            (exit, fs::read_to_string(&log).unwrap())
+        };
+        assert_eq!(run("base", true).0, Some(0));
+        assert_eq!(run("branch", false).0, Some(0));
+        let (exit, log) = run("other", false);
+        let cache = cache_dir(Some(&repo_id));
+        let planted = cache.join("base/cargo/from-branch").exists();
+        let left: Vec<_> = fs::read_dir(cache.join("runs"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(
+            exit,
+            Some(0),
+            "overlay {overlay}: saw the other branch's file or missed the base's: {log}"
+        );
+        assert!(!planted, "overlay {overlay}: a branch run wrote the base");
+        assert!(left.is_empty(), "overlay {overlay}: {left:?}");
+    }
+
+    /// A branch run's request for `job` in `clone`
+    fn branch_request<'a>(
+        clone: &'a Path,
+        job: &'a str,
+        repo_id: &'a str,
+        empty: &'a (BTreeMap<String, BTreeMap<String, String>>, PathBuf),
+    ) -> RunRequest<'a> {
+        RunRequest {
+            run_dir: clone,
+            file: HOST,
+            workflow: Path::new("/dev/null"),
+            job,
+            needs: &empty.0,
+            artifacts: &empty.1,
+            repo_id,
+            timeout: Duration::from_secs(30),
+            shard: false,
+            on_base: false,
+            slot_lock: None,
+        }
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_check_that_swaps_its_runs_dir_for_a_symlink_never_gets_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let target_path = target.path().canonicalize().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let checks = BTreeMap::from([
+            (
+                "swap".into(),
+                format!(
+                    "d=$(dirname \"$CARGO_HOME\"); rm -rf \"$d\" && ln -s '{}' \"$d\"; true",
+                    target_path.display()
+                ),
+            ),
+            (
+                "write".into(),
+                "mkdir -p \"$CARGO_HOME\" && touch \"$CARGO_HOME/../x\"".into(),
+            ),
+        ]);
+        let host = Host::new(
+            config::Host {
+                checks,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .with_overlay(false);
+        let empty = (BTreeMap::new(), dir.path().join("artifacts"));
+        // One run, so both checks share the run's directory, as a retry does
+        let run = |job: &str| {
+            let clone = tempfile::tempdir().unwrap();
+            let log = dir.path().join(format!("{job}.log"));
+            let exit = host
+                .run(&branch_request(clone.path(), job, &repo_id, &empty), &log)
+                .map(|o| o.exit);
+            (exit, fs::read_to_string(&log).unwrap_or_default())
+        };
+        let _ = run("swap");
+        let (exit, log) = run("write");
+        drop(host);
+        let left: Vec<_> = fs::read_dir(&target_path)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(
+            left.is_empty(),
+            "a check wrote the symlink's target: {left:?}"
+        );
+        // The sandbox kept the directory, so the next check still had it
+        assert_eq!(exit, Ok(Some(0)), "{log}");
+    }
+
+    #[test]
+    fn a_runs_dir_replaced_by_a_symlink_is_refused_before_the_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let host = Host::new(config::Host::default(), dir.path()).with_overlay(false);
+        let run = host.run_cache(&repo_id).unwrap();
+        remove_tree(&run);
+        std::os::unix::fs::symlink(target.path(), &run).unwrap();
+        let again = host.run_cache(&repo_id);
+        drop(host);
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(again.is_err(), "the run's cache became {again:?}");
+    }
+
+    #[test]
+    fn remove_tree_removes_a_symlink_and_never_touches_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("f"), "x").unwrap();
+        fs::set_permissions(victim.join("f"), fs::Permissions::from_mode(0o444)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        remove_tree(&link);
+        let mode = fs::metadata(victim.join("f")).unwrap().permissions().mode() & 0o777;
+        assert!(fs::symlink_metadata(&link).is_err(), "the link stays");
+        assert_eq!(mode, 0o444, "chmod followed the link");
+
+        // A read-only tree, as Go's module cache is, goes whole
+        let ro = dir.path().join("ro");
+        fs::create_dir_all(ro.join("m")).unwrap();
+        fs::write(ro.join("m/f"), "x").unwrap();
+        fs::set_permissions(ro.join("m"), fs::Permissions::from_mode(0o555)).unwrap();
+        remove_tree(&ro);
+        assert!(!ro.exists());
+    }
+
+    #[test]
+    fn a_run_removes_dead_probes_unlinked_locks_and_the_old_shared_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let cache = cache_dir(Some(&repo_id));
+        let runs = cache.join("runs");
+        fs::create_dir_all(cache.join("base/cargo")).unwrap();
+        fs::create_dir_all(runs.join(".probe-old/lower")).unwrap();
+        fs::create_dir_all(runs.join(".probe-new/lower")).unwrap();
+        fs::write(runs.join(".new-dead"), "").unwrap();
+        fs::write(runs.join(".new-young"), "").unwrap();
+        let live = fs::File::create(runs.join(".new-live")).unwrap();
+        assert!(locked(&live));
+        assert!(
+            Command::new("touch")
+                .args(["-t", "200001010000"])
+                .arg(runs.join(".probe-old"))
+                .arg(runs.join(".new-dead"))
+                .arg(runs.join(".new-live"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::create_dir_all(cache.join("branches/go/pkg/mod/m")).unwrap();
+        fs::write(cache.join("branches/go/pkg/mod/m/f"), "x").unwrap();
+        fs::set_permissions(
+            cache.join("branches/go/pkg/mod/m"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+
+        let host = Host::new(config::Host::default(), dir.path()).with_overlay(false);
+        host.run_cache(&repo_id).unwrap();
+        let gone = |p: &str| fs::symlink_metadata(cache.join(p)).is_err();
+        let (branches, old, new, dead, kept) = (
+            gone("branches"),
+            gone("runs/.probe-old"),
+            gone("runs/.probe-new"),
+            gone("runs/.new-dead"),
+            !gone("runs/.new-live") && !gone("runs/.new-young"),
+        );
+        drop((host, live));
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(branches, "the old shared cache stays");
+        assert!(old, "a dead probe stays");
+        assert!(!new, "a probe that may still run was removed");
+        assert!(dead, "an unlinked lock no run holds stays");
+        assert!(
+            kept,
+            "a lock a live run holds, or one just made, was removed"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_branch_run_without_an_overlay_writes_a_copy_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let base = cache_dir(Some(&repo_id)).join("base");
+        fs::create_dir_all(base.join("cargo")).unwrap();
+        fs::write(base.join("cargo/from-base"), "").unwrap();
+        let checks = BTreeMap::from([(
+            "copy".into(),
+            "case \"$CARGO_HOME\" in */runs/run-*/cargo) ;; *) exit 3 ;; esac && test -e \"$CARGO_HOME/from-base\" && touch \"$CARGO_HOME/from-branch\"".into(),
+        )]);
+        let host = Host::new(
+            config::Host {
+                checks,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .with_overlay(false);
+        let clone = tempfile::tempdir().unwrap();
+        let log = dir.path().join("copy.log");
+        let (needs, artifacts) = (BTreeMap::new(), dir.path().join("artifacts"));
+        let request = RunRequest {
+            run_dir: clone.path(),
+            file: HOST,
+            workflow: Path::new("/dev/null"),
+            job: "copy",
+            needs: &needs,
+            artifacts: &artifacts,
+            repo_id: &repo_id,
+            timeout: Duration::from_secs(30),
+            shard: false,
+            on_base: false,
+            slot_lock: None,
+        };
+        let exit = host.run(&request, &log).unwrap().exit;
+        drop(host);
+        let planted = base.join("cargo/from-branch").exists();
+        let runs = fs::read_dir(cache_dir(Some(&repo_id)).join("runs"))
+            .unwrap()
+            .count();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(exit, Some(0), "{}", fs::read_to_string(&log).unwrap());
+        assert!(!planted, "the copy was the base");
+        assert_eq!(runs, 0, "the run left its copy");
+    }
+
+    #[test]
+    fn a_run_leaves_the_copy_of_a_run_going_alone_and_removes_a_dead_runs() {
+        for overlay in modes() {
+            a_run_leaves_a_live_runs_dir_alone(overlay);
+        }
+    }
+
+    fn a_run_leaves_a_live_runs_dir_alone(overlay: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let base = cache_dir(Some(&repo_id)).join("base");
+        fs::create_dir_all(base.join("cargo")).unwrap();
+        // A copy keeps the base's times, and an old base once made a live copy look abandoned
+        assert!(
+            Command::new("touch")
+                .args(["-t", "200001010000"])
+                .arg(&base)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let host = || Host::new(config::Host::default(), dir.path()).with_overlay(overlay);
+        let runs = cache_dir(Some(&repo_id)).join("runs");
+        let dead = runs.join("run-dead");
+        fs::create_dir_all(dead.join("cargo")).unwrap();
+        fs::write(runs.join("run-dead.lock"), "").unwrap();
+
+        let (first, second) = (host(), host());
+        let one = first.run_cache(&repo_id).unwrap();
+        let two = second.run_cache(&repo_id).unwrap();
+        assert_ne!(one, two);
+        assert!(
+            one.is_dir() && one.join("cargo").is_dir() != overlay,
+            "overlay {overlay}: the second run removed the first's copy"
+        );
+        assert!(!dead.exists(), "a copy no run holds stays");
+        drop((first, second));
+        let left: Vec<_> = fs::read_dir(&runs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn runs_racing_on_one_cache_never_remove_each_others_copies() {
+        for overlay in modes() {
+            racing_runs_keep_their_dirs(overlay);
+        }
+    }
+
+    fn racing_runs_keep_their_dirs(overlay: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        fs::create_dir_all(cache_dir(Some(&repo_id)).join("base/cargo")).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let host = || Host::new(config::Host::default(), dir.path()).with_overlay(overlay);
+        // Recorded, not asserted, so a failing thread never leaves the others at a barrier
+        let removed = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    barrier.wait();
+                    let mine = host();
+                    let copy = mine.run_cache(&repo_id);
+                    barrier.wait();
+
+                    // Each cleanup runs while every other copy is in use
+                    for _ in 0..5 {
+                        let _ = host().run_cache(&repo_id);
+                    }
+
+                    barrier.wait();
+
+                    if !copy
+                        .as_ref()
+                        .is_ok_and(|c| c.is_dir() && c.join("cargo").is_dir() != overlay)
+                    {
+                        removed.lock().unwrap().push(copy);
+                    }
+                });
+            }
+        });
+
+        let runs = cache_dir(Some(&repo_id)).join("runs");
+        let left: Vec<_> = fs::read_dir(&runs)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        host().clean(Some(&repo_id));
+        assert!(
+            removed.lock().unwrap().is_empty(),
+            "{:?}",
+            removed.lock().unwrap()
+        );
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
