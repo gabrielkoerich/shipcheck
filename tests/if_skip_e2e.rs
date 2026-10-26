@@ -52,7 +52,8 @@ jobs:
       - run: exit 1
 ";
 
-// GitHub skips `deploy` on every PR, so its skip stands beside a job that passed
+// GitHub skips `deploy` on every PR, and the chain that needs it, so the skips stand beside a
+// job that passed
 const PUSH: &str = "\
 on: [push, pull_request]
 jobs:
@@ -62,6 +63,33 @@ jobs:
       - run: true
   deploy:
     if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  publish:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  notify:
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+";
+
+// GitHub runs `report` on a PR although its need is skipped
+const ALWAYS: &str = "\
+on: [push, pull_request]
+jobs:
+  deploy:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  report:
+    needs: deploy
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - run: exit 1
@@ -87,9 +115,10 @@ fn a_skip_passes_only_when_github_skips_the_job_on_every_pr() {
     fs::write(work.join(".github/workflows/dispatch.yml"), DISPATCH).unwrap();
     fs::write(work.join(".github/workflows/vars.yml"), VARS).unwrap();
     fs::write(work.join(".github/workflows/push.yml"), PUSH).unwrap();
+    fs::write(work.join(".github/workflows/always.yml"), ALWAYS).unwrap();
     fs::write(
         work.join("shipcheck.toml"),
-        "workflows = [\"dispatch.yml\", \"vars.yml\", \"push.yml\"]\nretries = 0\n[act]\ncache_paths = []\n",
+        "workflows = [\"dispatch.yml\", \"vars.yml\", \"push.yml\", \"always.yml\"]\nretries = 0\n[act]\ncache_paths = []\n",
     )
     .unwrap();
     git(&work, &["add", "-A"]);
@@ -117,7 +146,13 @@ fn a_skip_passes_only_when_github_skips_the_job_on_every_pr() {
     skip_fails(state("dispatch.yml", "test__2"));
     skip_fails(state("vars.yml", "e2e"));
     assert_eq!(state("push.yml", "check"), "success");
-    assert_eq!(state("push.yml", "deploy"), "skipped");
+    for job in ["deploy", "publish", "notify"] {
+        assert_eq!(state("push.yml", job), "skipped", "{job}");
+    }
+    assert!(
+        state("always.yml", "report").starts_with("failure, a job it needs was skipped"),
+        "{entry:?}"
+    );
     assert!(!entry.passed, "{entry:?}");
     assert!(
         !run::cached(&plan.key).is_some_and(|e| e.passed),

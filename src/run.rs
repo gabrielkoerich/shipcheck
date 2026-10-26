@@ -1902,7 +1902,17 @@ fn run_workflow(
     }
 
     let allowed = workflow::allowed_failures(&body)?;
-    let skip_on_prs = skipped_on_every_pr(&body);
+    let ifs = job_ifs(&body);
+    let skip_on_prs = skipped_on_every_pr(&ifs);
+    let runs_anyway = |job: &str| {
+        !skip_on_prs.iter().any(|j| names_job(job, j))
+            && ifs.iter().any(|(j, c)| {
+                names_job(job, j)
+                    && ["always()", "failure()", "cancelled()"]
+                        .iter()
+                        .any(|f| c.contains(f))
+            })
+    };
     let artifacts = ctx.slot.with_extension("artifacts").join(file);
     let _ = fs::remove_dir_all(&artifacts);
     fs::create_dir_all(&artifacts).map_err(|e| e.to_string())?;
@@ -1945,7 +1955,10 @@ fn run_workflow(
                         |n: &&String| states[*n] != "success" && !states[*n].ends_with(ALLOWED);
 
                     if let Some(n) = needs.iter().find(unmet) {
-                        let state = if states[n] == "skipped" {
+                        // GitHub runs a job whose `if:` checks status even when its need was skipped
+                        let state = if states[n] == "skipped" && runs_anyway(job) {
+                            NEED_SKIPPED
+                        } else if states[n] == "skipped" {
                             "skipped"
                         } else {
                             NOT_RUN
@@ -2108,27 +2121,38 @@ fn act_skip(state: String, job: &str, skip_on_prs: &BTreeSet<String>) -> String 
 const IF_SKIP: &str =
     "failure, act skipped it by its `if:`, which may hold on a PR, and only GitHub can tell";
 
-/// The jobs whose `if:`, without init's gate, is false on every PR, so GitHub skips them on one
-fn skipped_on_every_pr(source: &str) -> BTreeSet<String> {
+const NEED_SKIPPED: &str =
+    "failure, a job it needs was skipped, but its `if:` may run it anyway, as GitHub would";
+
+/// Each job's `if:` without init's gate, `false` for the YAML boolean
+fn job_ifs(source: &str) -> BTreeMap<String, String> {
     let Ok(root) = workflow::load(source) else {
-        return BTreeSet::new();
+        return BTreeMap::new();
     };
     let Some(jobs) = root
         .get(&yaml_rust2::Yaml::String("jobs".into()))
         .and_then(|j| j.as_hash())
     else {
-        return BTreeSet::new();
+        return BTreeMap::new();
     };
 
     jobs.iter()
-        .filter(|(_, job)| match &job["if"] {
-            yaml_rust2::Yaml::Boolean(b) => !b,
-            yaml_rust2::Yaml::String(c) => {
-                false_on_every_pr(&workflow::ungate(c).unwrap_or(c.clone()))
-            }
-            _ => false,
+        .filter_map(|(id, job)| {
+            let cond = match &job["if"] {
+                yaml_rust2::Yaml::Boolean(b) => b.to_string(),
+                yaml_rust2::Yaml::String(c) => workflow::ungate(c).unwrap_or(c.clone()),
+                _ => return None,
+            };
+            Some((id.as_str()?.to_string(), cond))
         })
-        .filter_map(|(id, _)| id.as_str().map(String::from))
+        .collect()
+}
+
+/// The jobs GitHub skips on every PR by their own `if:`
+fn skipped_on_every_pr(ifs: &BTreeMap<String, String>) -> BTreeSet<String> {
+    ifs.iter()
+        .filter(|(_, c)| false_on_every_pr(c))
+        .map(|(j, _)| j.clone())
         .collect()
 }
 
@@ -4185,7 +4209,7 @@ mod tests {
             job("gated_vars", &format!("(vars.RUN_E2E == 'true') && {gate}")),
         ]
         .concat();
-        let skip_on_prs = skipped_on_every_pr(&wf);
+        let skip_on_prs = skipped_on_every_pr(&job_ifs(&wf));
         let state = |job: &str| {
             act_skip(
                 job_state(job, Some(0), true, false, &marks(&[]), false),
