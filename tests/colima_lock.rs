@@ -12,7 +12,7 @@ fn a_colima_job_that_waits_past_its_time_for_the_vm_times_out() {
     // SAFETY: this is the only test in this binary
     unsafe { std::env::set_var("SHIPCHECK_HOME", &home) };
     fs::create_dir_all(home.join("locks")).unwrap();
-    // Another colima job holds the one VM
+    // The leftover cleanup holds the lock every colima job shares
     let held = fs::File::create(home.join("locks/colima.lock")).unwrap();
     held.lock().unwrap();
 
@@ -48,6 +48,21 @@ fn a_colima_job_that_waits_past_its_time_for_the_vm_times_out() {
             .unwrap()
             .contains("timed out waiting for another colima job's VM")
     );
+
+    // Every VM slot taken by other colima jobs, while they share the cleanup lock
+    held.unlock().unwrap();
+    held.lock_shared().unwrap();
+    let slots: Vec<_> = (0..64)
+        .map(|i| {
+            let f = fs::File::create(home.join(format!("locks/colima-vm-{i}.lock"))).unwrap();
+            f.lock().unwrap();
+            f
+        })
+        .collect();
+    let outcome = Colima.run(&Act::default(), &request, &log).unwrap();
+    assert_eq!(outcome.exit, None, "it timed out with every slot taken");
+    assert!(fs::read_to_string(&log).unwrap().contains("in use"));
+    drop(slots);
 
     // A job that passes artifacts is refused, rather than lose them in its VM
     fs::write(&workflow, "on: push\njobs:\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/upload-artifact@v4\n").unwrap();
