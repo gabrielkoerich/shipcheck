@@ -2160,7 +2160,7 @@ fn skipped_on_every_pr(ifs: &BTreeMap<String, String>) -> BTreeSet<String> {
  * A condition that and-s a term false on every PR: a push event, one branch or a tag. An `||` or a
  * `!` other than `!=` could make it hold, so a condition with one never counts
  **/
-fn false_on_every_pr(cond: &str) -> bool {
+pub(crate) fn false_on_every_pr(cond: &str) -> bool {
     let c = cond.trim();
     let c = c
         .strip_prefix("${{")
