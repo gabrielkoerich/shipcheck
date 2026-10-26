@@ -14,6 +14,9 @@ const KEEP_OLD_PIN: Duration = Duration::from_secs(24 * 3600);
 /// a release stops pinning, so the image leaves machines that never stamped it
 pub const OLD_PINS: &[&str] = &[];
 
+/// A gone home's volume goes only when Docker made it longer ago than this
+const ORPHAN_AGE: Duration = Duration::from_secs(24 * 3600);
+
 /// An empty volume no run used this long goes, the wait keeps one a run just made for its mount
 const KEEP_EMPTY: Duration = Duration::from_secs(3600);
 
@@ -44,6 +47,8 @@ pub trait Engine {
     fn volumes(&self) -> Option<Vec<Volume>>;
     /// The names of the volumes whose name contains `part`, None when Docker cannot list them
     fn named(&self, part: &str) -> Option<Vec<String>>;
+    /// When Docker made the volume, None when it cannot say
+    fn created(&self, name: &str) -> Option<SystemTime>;
     /// Whether a container, running or stopped, matches the `docker ps` filter. True on any doubt
     fn used(&self, filter: &str) -> bool;
     /// The image's id, None when it is not on this machine
@@ -73,6 +78,16 @@ impl Engine for Docker {
         Some(out.split_whitespace().map(String::from).collect())
     }
 
+    fn created(&self, name: &str) -> Option<SystemTime> {
+        parse_created(&docker(&[
+            "volume",
+            "inspect",
+            "-f",
+            "{{.CreatedAt}}",
+            name,
+        ])?)
+    }
+
     fn used(&self, filter: &str) -> bool {
         docker(&["ps", "-a", "-q", "--filter", filter]).is_none_or(|ids| !ids.is_empty())
     }
@@ -84,6 +99,36 @@ impl Engine for Docker {
     fn remove(&self, kind: &str, name: &str) -> bool {
         docker(&[kind, "rm", name]).is_some()
     }
+}
+
+/// Docker's `CreatedAt`, RFC 3339 such as `2026-10-25T23:40:46Z` or with an offset
+fn parse_created(text: &str) -> Option<SystemTime> {
+    let (date, rest) = text.trim().split_once('T')?;
+    let mut ymd = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (ymd.next()??, ymd.next()??, ymd.next()??);
+    let (clock, offset) = rest.split_at(rest.find(['Z', '+', '-'])?);
+    let mut hms = clock
+        .split('.')
+        .next()?
+        .splitn(3, ':')
+        .map(|p| p.parse::<i64>().ok());
+    let (h, mi, sec) = (hms.next()??, hms.next()??, hms.next()??);
+    let offset = match offset {
+        "Z" => 0,
+        o => {
+            let (oh, om) = o[1..].split_once(':')?;
+            let secs = oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60;
+            if o.starts_with('-') { -secs } else { secs }
+        }
+    };
+    // Days since 1970 from a civil date, as in Howard Hinnant's `days_from_civil`
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset;
+    Some(std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
 }
 
 /// Docker joins labels as `k=v,k=v`, and `create_volume` refuses a value with a comma
@@ -309,7 +354,7 @@ pub fn prune(
             }
         }
 
-        done.extend(remove_orphans(engine, &listed, here));
+        done.extend(remove_orphans(engine, &listed, here, now));
 
         for tag in tags {
             done.extend(
@@ -338,10 +383,22 @@ pub fn prune(
     done
 }
 
-fn remove_orphans(engine: &dyn Engine, listed: &[Volume], here: &Here) -> Vec<String> {
+/// A home in another mount namespace, such as a sandbox's private /tmp, looks gone from here, and
+/// its runs make volumes, so only a volume older than a day can be a gone home's
+fn remove_orphans(
+    engine: &dyn Engine,
+    listed: &[Volume],
+    here: &Here,
+    now: SystemTime,
+) -> Vec<String> {
+    let old = |name: &str| {
+        engine
+            .created(name)
+            .is_some_and(|t| now.duration_since(t).is_ok_and(|a| a > ORPHAN_AGE))
+    };
     listed
         .iter()
-        .filter(|v| here.sweep && orphan(v, here) && remove_volume(engine, &v.name))
+        .filter(|v| here.sweep && orphan(v, here) && old(&v.name) && remove_volume(engine, &v.name))
         .map(|v| format!("removed volume {} of another home", v.name))
         .collect()
 }
@@ -360,7 +417,7 @@ pub fn clean(engine: &dyn Engine, here: &Here, prefix: &str, orphans: bool) -> V
     }
 
     if orphans {
-        done.extend(remove_orphans(engine, &listed, here));
+        done.extend(remove_orphans(engine, &listed, here, SystemTime::now()));
     }
 
     done
@@ -507,6 +564,8 @@ mod tests {
         images: Vec<String>,
         containers: Vec<String>,
         refuse: Vec<String>,
+        /// Volumes Docker made an hour ago, every other one is a month old
+        new: Vec<String>,
         removed: RefCell<Vec<String>>,
     }
 
@@ -522,6 +581,15 @@ mod tests {
                     .map(|v| v.name.clone())
                     .collect(),
             )
+        }
+
+        fn created(&self, name: &str) -> Option<SystemTime> {
+            let ago = if self.new.iter().any(|n| n == name) {
+                DAY / 24
+            } else {
+                30 * DAY
+            };
+            Some(SystemTime::now() - ago)
         }
 
         fn used(&self, filter: &str) -> bool {
@@ -697,6 +765,52 @@ mod tests {
     }
 
     #[test]
+    fn only_an_old_pin_is_ever_due() {
+        let old = ["catthehacker/ubuntu@sha256:old"];
+        assert!(!image_due("postgres:16", None, &old));
+        assert!(!image_due("postgres:16", Some(100 * DAY), &old));
+        assert!(image_due(old[0], None, &old));
+        assert!(image_due(old[0], Some(2 * DAY), &old));
+        assert!(!image_due(old[0], Some(DAY / 2), &old));
+    }
+
+    #[test]
+    fn a_gone_homes_volume_goes_only_once_a_day_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let gone = tmp.path().join("gone");
+        // A sandbox's home behind a private /tmp on this host, whose run just made its volume
+        let fake = Fake {
+            volumes: vec![
+                labeled("shipcheck-111111-new", &gone),
+                labeled("shipcheck-111111-old", &gone),
+            ],
+            new: strings(&["shipcheck-111111-new"]),
+            ..Fake::default()
+        };
+
+        prune(&fake, &here(&home, true), &[], &[], SystemTime::now());
+        assert_eq!(*fake.removed.borrow(), ["shipcheck-111111-old"]);
+        fake.removed.borrow_mut().clear();
+        clean(&fake, &here(&home, true), P, true);
+        assert_eq!(*fake.removed.borrow(), ["shipcheck-111111-old"]);
+    }
+
+    #[test]
+    fn parses_dockers_created_at() {
+        let at = |t: &str| {
+            parse_created(t).map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+        };
+        assert_eq!(at("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(at("2026-10-25T23:40:46Z\n"), Some(1_792_971_646));
+        assert_eq!(at("2024-02-29T12:00:00.123+01:00"), Some(1_709_204_400));
+        assert_eq!(at("2024-02-29T10:00:00-01:00"), Some(1_709_204_400));
+        assert_eq!(at("yesterday"), None);
+        assert_eq!(at(""), None);
+    }
+
+    #[test]
     fn prune_removes_only_unused_old_pins() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path();
@@ -846,6 +960,10 @@ mod tests {
             Some(all.into_iter().filter(|n| n.contains(self.0)).collect())
         }
 
+        fn created(&self, name: &str) -> Option<SystemTime> {
+            Docker.created(name)
+        }
+
         fn used(&self, filter: &str) -> bool {
             Docker.used(filter)
         }
@@ -870,16 +988,18 @@ mod tests {
 
     #[test]
     #[ignore = "needs Docker"]
-    fn docker_prune_removes_the_volumes_of_a_gone_home_only() {
+    fn docker_prune_touches_only_what_it_may() {
         let tmp = tempfile::tempdir().unwrap();
         let (live, gone) = (tmp.path().join("live"), tmp.path().join("gone"));
         fs::create_dir(&live).unwrap();
-        let id = &crate::cache::hex(&rand_bytes())[..6];
+        let id = &crate::cache::hex(&rand_bytes())[..16];
         let before = others(id);
+        // `shipcheck-` and six hex digits make a name shipcheck's, the whole id makes it this test's
+        let p = &id[..6];
         let names = [
-            format!("shipcheck-{id}-gone"),
-            format!("shipcheck-{id}-bare"),
-            format!("shipcheck-{id}-live"),
+            format!("shipcheck-{p}-{id}-gone"),
+            format!("shipcheck-{p}-{id}-bare"),
+            format!("shipcheck-{p}-{id}-live"),
             format!("shipcheck-review-{id}"),
             format!("act-CI-t-{id}-0a-env"),
         ];
@@ -905,7 +1025,8 @@ mod tests {
             Only(id).remove("volume", name);
         }
 
-        assert_eq!(kept, [false, true, true, true, false]);
+        // The gone home's volume is new, so it stays a day, as a sandbox's would
+        assert_eq!(kept, [true, true, true, true, false]);
         assert_eq!(
             others(id),
             before,
