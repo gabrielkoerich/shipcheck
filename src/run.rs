@@ -630,18 +630,28 @@ pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
  * clone can repoint at a branch whose shipcheck.toml and workflows would then run
  **/
 pub fn remote_base(repo: &Path) -> Option<String> {
-    static ASKED: std::sync::Mutex<BTreeMap<(PathBuf, String), Option<String>>> =
-        std::sync::Mutex::new(BTreeMap::new());
+    remote_head(repo).map(|(branch, _)| format!("origin/{branch}"))
+}
+
+/// The commit the remote's default branch is at, which no local ref can move
+pub fn remote_base_sha(repo: &Path) -> Option<String> {
+    remote_head(repo).map(|(_, sha)| sha)
+}
+
+/// The remote's default branch and its commit, asked once per process for each checkout and URL
+fn remote_head(repo: &Path) -> Option<(String, String)> {
+    type Asked = BTreeMap<(PathBuf, String), Option<(String, String)>>;
+    static ASKED: std::sync::Mutex<Asked> = std::sync::Mutex::new(BTreeMap::new());
     let url = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
     let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
     asked
         .entry((repo.to_path_buf(), url))
-        .or_insert_with(|| remote_default(repo).map(|b| format!("origin/{b}")))
+        .or_insert_with(|| remote_default(repo))
         .clone()
 }
 
-/// `git ls-remote --symref origin HEAD`'s branch, None when the remote does not answer in 5s
-fn remote_default(repo: &Path) -> Option<String> {
+/// `git ls-remote --symref origin HEAD`'s branch and commit, None when the remote does not answer in 5s
+fn remote_default(repo: &Path) -> Option<(String, String)> {
     use std::io::Read;
 
     let mut child = Command::new("git")
@@ -671,10 +681,16 @@ fn remote_default(repo: &Path) -> Option<String> {
     let mut out = String::new();
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     status.success().then_some(())?;
-    out.lines().find_map(|l| {
+    let branch = out.lines().find_map(|l| {
         let (branch, name) = l.strip_prefix("ref: refs/heads/")?.split_once('\t')?;
         (name == "HEAD" && !branch.is_empty()).then(|| branch.to_string())
-    })
+    })?;
+    let sha = out.lines().find_map(|l| {
+        let (sha, name) = l.split_once('\t')?;
+        (name == "HEAD" && sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| sha.to_string())
+    })?;
+    Some((branch, sha))
 }
 
 /**
@@ -2312,16 +2328,16 @@ fn run_job(
         let at = Instant::now();
         let link = standalone_git(&dir, &ctx.plan.sha)?;
         timing(file, job, "standalone_git", at);
-        // The default branch the remote reports, never `--base` or the local origin/HEAD, which a
+        // The commit the remote reports, never `--base` or a local ref such as origin/main, which a
         // caller can point at a branch. Only host checks keep a cache per base
         let on_base = file == HOST
             && ctx
                 .base_tree
                 .get_or_init(|| {
-                    let base = remote_base(&ctx.plan.repo)?;
+                    let sha = remote_base_sha(&ctx.plan.repo)?;
                     git(
                         &ctx.plan.repo,
-                        &["rev-parse", "--verify", "-q", &format!("{base}^{{tree}}")],
+                        &["rev-parse", "--verify", "-q", &format!("{sha}^{{tree}}")],
                     )
                     .ok()
                 })
@@ -2865,18 +2881,27 @@ pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
         Some(id) => home.join("runs").join(id),
         None => home.join("runs"),
     };
+    // A branch run also holds the lock of its host cache's `runs/run-X`
+    let locks = glob_locks(&runs)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(crate::runner::host::run_locks(id.as_deref()));
 
-    if let Ok(locks) = glob_locks(&runs) {
-        for lock in locks {
-            let file = fs::File::open(&lock).map_err(|e| e.to_string())?;
+    for lock in locks {
+        // A lock that cannot be opened is no run's
+        let Ok(file) = fs::File::open(&lock) else {
+            continue;
+        };
 
-            if file.try_lock().is_err() {
-                return Err("a run is in progress, clean once it finishes".into());
-            }
+        if file.try_lock().is_err() {
+            return Err("a run is in progress, clean once it finishes".into());
         }
     }
 
     done.extend(crate::runner::act::Act::default().clean(id.as_deref()));
+    done.extend(
+        crate::runner::host::Host::new(Default::default(), Path::new(".")).clean(id.as_deref()),
+    );
     let mut dirs = vec![runs];
 
     match &id {
@@ -2928,16 +2953,19 @@ pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
     Ok(done)
 }
 
-/// Every `<n>.lock` under `dir`, at any depth
+/// Every regular `<n>.lock` file under `dir`, at any depth, never through a symlink
 fn glob_locks(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
 
     for entry in fs::read_dir(dir)?.flatten() {
         let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
 
-        if path.is_dir() {
+        if kind.is_dir() {
             found.extend(glob_locks(&path).unwrap_or_default());
-        } else if path.extension().is_some_and(|e| e == "lock") {
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "lock") {
             found.push(path);
         }
     }
