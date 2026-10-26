@@ -246,7 +246,7 @@ pub fn usage(home: &Path, prefix: &str) -> Result<String, String> {
     }
 
     Ok(format!(
-        "this home keeps {count} volumes, {}, which go after a run once unused for 14 days, or now with `shipcheck clean`. Its runs used {} images, {}, which stay",
+        "Docker volumes of this home: {count}, {}, removed after a run once unused for 14 days, or now with `shipcheck clean`. Images its runs used: {}, {}, kept",
         gigabytes(bytes),
         images.len(),
         gigabytes(image_bytes)
