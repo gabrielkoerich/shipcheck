@@ -1508,6 +1508,7 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
             .max_parallel(crate::runner::act::engine_resources()),
     );
     let ctx = Ctx {
+        slot_lock: std::os::fd::AsRawFd::as_raw_fd(&_slot),
         plan,
         runners: &runners,
         acts: &acts,
@@ -1847,6 +1848,8 @@ impl Drop for SlotGuard<'_> {
 }
 
 struct Ctx<'a> {
+    /// The run slot's lock, which a job's reaper inherits
+    slot_lock: std::os::fd::RawFd,
     slots: &'a Slots,
     plan: &'a Plan,
     runners: &'a Runners,
@@ -2199,6 +2202,7 @@ fn run_job(
             timeout,
             shard,
             on_base,
+            slot_lock: Some(ctx.slot_lock),
         };
         let host = file == HOST;
         let runner = ctx.runners.for_file(file)?;

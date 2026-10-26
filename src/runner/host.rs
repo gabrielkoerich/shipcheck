@@ -817,10 +817,7 @@ extern "C" fn stop(sig: libc::c_int) {
 }
 
 fn kill_group(pgid: u32) {
-    // Safe: killpg only sends a signal, ESRCH when the group is gone is fine
-    unsafe {
-        libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
-    }
+    super::signal_group(pgid, libc::SIGKILL);
 }
 
 /// A check's `$GITHUB_STEP_SUMMARY`, in its jail's home

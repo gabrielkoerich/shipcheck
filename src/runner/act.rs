@@ -173,20 +173,22 @@ impl Runner for Act {
             .run(self, request, log_path)
     }
 
+    // colima's are checked on disk first, so a machine without its VMs pays nothing
     fn reclaim(&self, run_dir: &Path) {
         Docker.reclaim(run_dir);
-
-        if self.uses_colima() {
-            super::colima::Colima.reclaim(run_dir);
-        }
+        super::colima::Colima.reclaim(run_dir);
     }
 
     fn prune(&self) -> Vec<String> {
-        Docker.prune()
+        let mut done = Docker.prune();
+        done.extend(super::colima::Colima.prune());
+        done
     }
 
     fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
-        Docker.clean(repo_id)
+        let mut done = Docker.clean(repo_id);
+        done.extend(super::colima::Colima.clean(repo_id));
+        done
     }
 }
 
@@ -524,7 +526,7 @@ impl Engine for Docker {
 
         crate::run::timing(file, job, "act prepare", began);
         let spawned = Instant::now();
-        let mut reaper = reaper(run_dir);
+        let mut reaper = reaper(run_dir, request.slot_lock);
         // A group of its own, so the reaper can stop act and the docker commands it runs
         cmd.process_group(0);
         let mut child = cmd.spawn().map_err(|e| format!("act: {e}"))?;
@@ -558,7 +560,10 @@ impl Engine for Docker {
                 });
             }
 
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            // The reaper hears before the child is reaped, while no other process can have its id
+            let ended = super::has_exited(child.id());
+
+            if matches!(ended, Ok(true)) {
                 crate::run::timing(file, job, "act total", spawned);
 
                 // act ended by itself and removed its containers, so the reaper has nothing to do
@@ -566,11 +571,22 @@ impl Engine for Docker {
                     let _ = writeln!(stdin, "done");
                 }
 
-                break status.code();
+                break child.wait().map_err(|e| e.to_string())?.code();
             }
 
-            if Instant::now() > deadline {
-                let _ = child.kill();
+            // A child shipcheck cannot see end is stopped as on a timeout, never taken as done
+            if ended.is_err() || Instant::now() > deadline {
+                // The group, act's docker commands too, while its id is still act's
+                super::signal_group(child.id(), libc::SIGKILL);
+
+                while !super::has_exited(child.id()).unwrap_or(true) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+
+                if let Some(stdin) = reaper.as_mut().and_then(|r| r.stdin.as_mut()) {
+                    let _ = writeln!(stdin, "exited");
+                }
+
                 let _ = child.wait();
                 break None;
             }
@@ -578,7 +594,7 @@ impl Engine for Docker {
             std::thread::sleep(Duration::from_millis(if timed { 50 } else { 200 }));
         };
 
-        // Without `done`, as after a timeout, it stops act and removes what act left
+        // Without `done`, as after a timeout, it removes what act left
         if let Some(mut reaper) = reaper {
             drop(reaper.stdin.take());
             let _ = reaper.wait();
@@ -1835,19 +1851,46 @@ fn mount_paths(run_dir: &Path) -> Vec<PathBuf> {
  * end of input without it means shipcheck is gone. Its own group, so a signal to shipcheck's spares it
  **/
 const REAPER: &str = r#"read -r pgid || exit 0
-read -r done && exit 0
-kill -s KILL -- "-$pgid" 2>/dev/null
+read -r state || state=
+[ "$state" = done ] && exit 0
+[ "$state" = exited ] || kill -s KILL -- "-$pgid" 2>/dev/null
 net=$1
 shift
-for p in "$@"; do
-  docker ps -aq --filter name=^act- --filter "volume=$p" | while read -r id; do docker rm -f -v "$id"; done
-done
-docker network rm "$net"
+cleanup() {
+  for p in "$@"; do
+    docker ps -aq --filter name=^act- --filter "volume=$p" | while read -r id; do docker rm -f -v "$id"; done
+  done
+  docker network rm "$net"
+}
+# The slot's lock this reaper holds stays out of docker's processes, and a hung Docker gives up
+closed=
+for fd in $LOCK_FDS; do closed="$closed $fd>&-"; done
+eval "cleanup \"\$@\" $closed" &
+d=$!
+n=0
+limit=${CLEANUP_SECS:-120}
+while kill -0 "$d" 2>/dev/null && [ "$n" -lt "$limit" ]; do sleep 1; n=$((n + 1)); done
+kill -s KILL "$d" 2>/dev/null
+wait "$d" 2>/dev/null
+exit 0
 "#;
 
-fn reaper(run_dir: &Path) -> Option<std::process::Child> {
-    Command::new("sh")
-        .args(["-c", REAPER, "sh", &network_name(run_dir)])
+/**
+ * Kills act's group and removes what act left, unless shipcheck writes `done`. After `exited` it
+ * only cleans up, since the group is reaped and its id can be another's. It holds the slot's lock
+ * until it ends, so no new run reuses the slot's network and mounts while it cleans
+ **/
+fn reaper(run_dir: &Path, slot_lock: Option<std::os::fd::RawFd>) -> Option<std::process::Child> {
+    let mut cmd = Command::new("sh");
+    let held = super::inherit(&mut cmd, slot_lock.into_iter().collect());
+    cmd.env(
+        "LOCK_FDS",
+        held.iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    cmd.args(["-c", REAPER, "sh", &network_name(run_dir)])
         .args(mount_paths(run_dir))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2569,41 +2612,54 @@ jobs:
         fs::write(&docker, fake).unwrap();
         fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
+        // A slot lock at 10 or higher, which a shell cannot redirect, so it must come in lower
+        let lock =
+            crate::runner::tests::high(fs::File::create(dir.path().join("slot.lock")).unwrap());
 
-        for ended in [true, false] {
+        // Ended by itself, killed at the timeout, or shipcheck died
+        for state in ["done", "exited", ""] {
             let _ = fs::remove_file(&log);
             let mut act = Command::new("sleep")
                 .arg("30")
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let mut reaper = Command::new(crate::runner::posix_sh())
+            let mut cmd = Command::new(crate::runner::posix_sh());
+            let held =
+                super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
+            let mut reaper = cmd
                 .args(["-c", REAPER, "sh", "net-1", "/runs/0"])
                 .env("PATH", &path)
+                .env("LOCK_FDS", held[0].to_string())
                 .stdin(Stdio::piped())
                 .spawn()
                 .unwrap();
             let mut stdin = reaper.stdin.take().unwrap();
             writeln!(stdin, "{}", act.id()).unwrap();
 
-            if ended {
-                writeln!(stdin, "done").unwrap();
+            if !state.is_empty() {
+                writeln!(stdin, "{state}").unwrap();
             }
 
             drop(stdin);
             assert!(reaper.wait().unwrap().success());
             let calls = fs::read_to_string(&log).unwrap_or_default();
+            let cleanup = "ps -aq --filter name=^act- --filter volume=/runs/0\nrm -f -v c1\nnetwork rm net-1\n";
 
-            if ended {
-                assert_eq!(calls, "");
-                assert!(act.try_wait().unwrap().is_none(), "act was killed");
-                let _ = act.kill();
-            } else {
-                assert_eq!(
-                    calls,
-                    "ps -aq --filter name=^act- --filter volume=/runs/0\nrm -f -v c1\nnetwork rm net-1\n"
-                );
+            match state {
+                "done" => assert_eq!(calls, ""),
+                _ => assert_eq!(calls, cleanup, "{state}"),
+            }
+
+            // After `exited` the group id may be another's, so only a dead shipcheck's reaper kills
+            if state.is_empty() {
                 assert!(act.wait().unwrap().code().is_none(), "act still runs");
+            } else {
+                assert!(
+                    act.try_wait().unwrap().is_none(),
+                    "{state} killed the group"
+                );
+                let _ = act.kill();
             }
 
             let _ = act.wait();
