@@ -1999,14 +1999,20 @@ fn reaper(run_dir: &Path, slot_lock: Option<std::os::fd::RawFd>) -> Option<std::
             .collect::<Vec<_>>()
             .join(" "),
     );
-    cmd.args(["-c", REAPER, "sh", &network_name(run_dir), &run_tag(run_dir)])
-        .args(mount_paths(run_dir))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok()
+    cmd.args([
+        "-c",
+        REAPER,
+        "sh",
+        &network_name(run_dir),
+        &run_tag(run_dir),
+    ])
+    .args(mount_paths(run_dir))
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .process_group(0)
+    .spawn()
+    .ok()
 }
 
 /// What separates a run's act process from another's: its containers, apt volume and network
@@ -2804,6 +2810,111 @@ jobs:
         assert_eq!(act.engine("ci.yml", "test").name(), "docker");
         assert_eq!(act.engine("other.yml", "e2e").name(), "docker");
         assert!(act.uses_colima() && !Act::default().uses_colima());
+    }
+
+    /// Every volume name on the machine without `part`
+    fn volumes_without(part: &str) -> BTreeSet<String> {
+        let out = Command::new("docker")
+            .args(["volume", "ls", "-q"])
+            .output()
+            .unwrap();
+        (String::from_utf8_lossy(&out.stdout).split_whitespace())
+            .filter(|n| !n.contains(part))
+            .map(String::from)
+            .collect()
+    }
+
+    /**
+     * shipcheck stands in a child copy of this test: it starts the reaper and a fake act, then
+     * waits for the signal. Ctrl-C reaches shipcheck's group only, act and the reaper have their
+     * own, so the reaper has to clean up from the end of its input alone
+     **/
+    #[test]
+    #[ignore = "needs Docker"]
+    fn a_signal_to_shipcheck_makes_the_reaper_remove_acts_volumes() {
+        if let Some(dir) = std::env::var_os("SHIPCHECK_REAPER_CHILD") {
+            let mut reaper = reaper(Path::new(&dir), None).unwrap();
+            let act = Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            writeln!(reaper.stdin.as_mut().unwrap(), "{}", act.id()).unwrap();
+            println!("ready");
+            std::io::stdout().flush().unwrap();
+            // The signal ends this process first
+            let _ = act.wait_with_output();
+            let _ = reaper.wait();
+            return;
+        }
+
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let tmp = tempfile::tempdir().unwrap();
+            let run_dir = tmp.path().join("run");
+            fs::create_dir(&run_dir).unwrap();
+            let tag = run_tag(&run_dir);
+            let before = volumes_without(&tag);
+            let name = format!("act-CI-test-{tag}-0abc-env");
+            let made = Command::new("docker")
+                .args(["volume", "create", &name])
+                .output()
+                .unwrap();
+            assert!(made.status.success());
+
+            let mut shipcheck = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "runner::act::tests::a_signal_to_shipcheck_makes_the_reaper_remove_acts_volumes",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SHIPCHECK_REAPER_CHILD", &run_dir)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut out = std::io::BufReader::new(shipcheck.stdout.take().unwrap());
+            let mut line = String::new();
+
+            while !line.contains("ready") {
+                line.clear();
+                assert!(std::io::BufRead::read_line(&mut out, &mut line).unwrap() > 0);
+            }
+
+            // Safe: kill only sends a signal to the child this test started
+            unsafe { libc::kill(shipcheck.id() as libc::pid_t, signal) };
+            let status = shipcheck.wait().unwrap();
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(signal)
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+
+            let exists = || {
+                Command::new("docker")
+                    .args(["volume", "inspect", &name])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            };
+
+            while exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+
+            let left = exists();
+
+            if left {
+                let _ = Command::new("docker")
+                    .args(["volume", "rm", &name])
+                    .output();
+            }
+
+            assert!(!left, "signal {signal} left {name}");
+            assert_eq!(
+                volumes_without(&tag),
+                before,
+                "the test changed volumes it did not make"
+            );
+        }
     }
 
     #[test]
