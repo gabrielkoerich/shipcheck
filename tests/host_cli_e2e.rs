@@ -549,10 +549,43 @@ fn clean_removes_the_host_caches_and_keeps_one_a_run_holds() {
     assert!(cache.join("base").exists(), "{out}");
 
     drop(live);
+    // A dangling lock and a loop, as a crash or a check can leave, neither stops nor hangs clean
+    for dir in [repo.home.join("runs"), cache.join("runs")] {
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/x.lock", dir.join("gone.lock")).unwrap();
+        std::os::unix::fs::symlink(".", dir.join("loop")).unwrap();
+    }
+    let started = Instant::now();
     let (code, out) = repo.shipcheck(&["clean", "--all"]);
+    assert!(started.elapsed() < Duration::from_secs(30), "{out}");
     assert_eq!(code, Some(0), "{out}");
     assert!(
         !repo.home.join("hostcache").exists(),
         "clean --all left the host caches: {out}"
+    );
+}
+
+#[test]
+#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+fn a_local_ref_moved_to_a_branch_never_makes_its_run_a_base_run() {
+    let config = "runner = \"host\"\nretries = 0\n[host]\nchecks = { plant = \"mkdir -p \\\"$CARGO_HOME\\\" && touch \\\"$CARGO_HOME/planted\\\"\" }\n";
+    let repo = Repo::new(config);
+    repo.write("branch.txt", "x");
+    repo.commit("branch");
+    // origin/main now names the branch, and the remote's main is still the old commit
+    repo.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let (code, out) = repo.shipcheck(&["run", "--no-fetch"]);
+    assert_eq!(code, Some(0), "{out}");
+    let planted: Vec<PathBuf> = fs::read_dir(repo.home.join("hostcache"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|owner| fs::read_dir(owner.path()).into_iter().flatten().flatten())
+        .map(|e| e.path().join("base/cargo/planted"))
+        .filter(|p| p.exists())
+        .collect();
+    assert!(
+        planted.is_empty(),
+        "a branch run wrote the base's cache: {planted:?}"
     );
 }

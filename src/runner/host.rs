@@ -43,7 +43,7 @@ impl Host {
         let copy = self.copy.get_or_init(|| {
             let dir = cache_dir(Some(repo_id));
             // The cache every branch once shared, which a branch may have written
-            let _ = fs::remove_dir_all(dir.join("branches"));
+            remove_tree(&dir.join("branches"));
             let base = real_dir(&dir.join("base"))?;
             let runs = real_dir(&dir.join("runs"))?;
             RunCopy::remove_unused(&runs);
@@ -58,10 +58,20 @@ impl Host {
             Ok(copy)
         });
 
-        match copy {
-            Ok(copy) => real_dir(&copy.dir),
-            Err(e) => Err(e.clone()),
+        let dir = match copy {
+            Ok(copy) => &copy.dir,
+            Err(e) => return Err(e.clone()),
+        };
+
+        // A check may write inside it, so before each check it must still be the directory made
+        if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+            return Err(format!(
+                "{} is no longer this run's directory",
+                dir.display()
+            ));
         }
+
+        Ok(dir.clone())
     }
 
     /// This host with the overlay forced on or off, for tests of each way
@@ -130,8 +140,35 @@ impl RunCopy {
     fn remove_unused(runs: &Path) {
         for entry in fs::read_dir(runs).into_iter().flatten().flatten() {
             let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A live run links its lock and ends its probe within milliseconds of making them
+            let old = || {
+                fs::symlink_metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_secs(60)))
+            };
 
-            if path.extension().is_none_or(|e| e != "lock") {
+            if name.starts_with(".probe-") {
+                if old() {
+                    remove_tree(&path);
+                }
+
+                continue;
+            }
+
+            // A lock its run took and never linked, as when it died between the two
+            if name.starts_with(".new-") {
+                if old() && fs::File::open(&path).is_ok_and(|f| locked(&f) && same_file(&f, &path))
+                {
+                    let _ = fs::remove_file(&path);
+                }
+
+                continue;
+            }
+
+            if path.extension().is_none_or(|e| e != "lock")
+                || !entry.file_type().is_ok_and(|t| t.is_file())
+            {
                 continue;
             }
 
@@ -157,23 +194,33 @@ impl Drop for RunCopy {
     }
 }
 
-/// A `runs/run-X.lock` under `dir` that a live run holds, at any depth
-fn held_lock(dir: &Path) -> Option<PathBuf> {
-    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            if let Some(lock) = held_lock(&path) {
-                return Some(lock);
-            }
-        } else if path.extension().is_some_and(|e| e == "lock")
-            && fs::File::open(&path).is_ok_and(|f| !locked(&f))
-        {
-            return Some(path);
-        }
-    }
-
-    None
+/// The regular `runs/run-X.lock` files of one repository's host cache, or of every repository's
+pub fn run_locks(repo_id: Option<&str>) -> Vec<PathBuf> {
+    // Real directories and files only, so a symlink a check left never leads elsewhere
+    let entries = |dir: &Path, dirs: bool| -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_type()
+                    .is_ok_and(|t| if dirs { t.is_dir() } else { t.is_file() })
+            })
+            .map(|e| e.path())
+            .collect()
+    };
+    let repos = match repo_id {
+        Some(id) => vec![cache_dir(Some(id))],
+        None => entries(&cache_dir(None), true)
+            .iter()
+            .flat_map(|owner| entries(owner, true))
+            .collect(),
+    };
+    repos
+        .iter()
+        .flat_map(|repo| entries(&repo.join("runs"), false))
+        .filter(|p| p.extension().is_some_and(|e| e == "lock"))
+        .collect()
 }
 
 /// Whether `path` still names the inode `file` has open
@@ -196,7 +243,22 @@ fn locked(file: &fs::File) -> bool {
 
 /// Removes a cache tree, read-only directories included, as Go's module cache and overlayfs make them
 fn remove_tree(dir: &Path) {
-    let _ = Command::new("chmod")
+    // A symlink or a file is removed itself, never what it points at
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            let _ = fs::remove_file(dir);
+            return;
+        }
+        Err(_) => return,
+    }
+
+    // The system's chmod, never one earlier on PATH such as coreutils' gnubin on macOS
+    let chmod = ["/bin/chmod", "/usr/bin/chmod"]
+        .into_iter()
+        .find(|c| Path::new(c).exists())
+        .unwrap_or("chmod");
+    let _ = Command::new(chmod)
         .arg("-R")
         .arg("u+rwx")
         .arg(dir)
@@ -740,6 +802,12 @@ impl Jail {
             .collect::<Result<_, String>>()?;
         let readable = subpaths(&self.readable(&user))?;
         let hidden = subpaths(&Self::hidden(&user))?;
+        // Writes go inside the cache, never to the directory itself, so no check swaps it for a symlink
+        let own = if self.cache != self.home && self.writable.contains(&self.cache) {
+            format!("(deny file-write* (literal {}))\n", quote(&self.cache)?)
+        } else {
+            String::new()
+        };
         // Other checks' homes and whatever else is in the temp dirs, the jail's own paths allowed below
         let mut temp: Vec<PathBuf> = TEMP.iter().map(PathBuf::from).collect();
         temp.push(std::env::temp_dir());
@@ -763,6 +831,7 @@ impl Jail {
             "(version 1)\n(allow default)\n\
              (deny file-write*)\n\
              (allow file-write*{writable} (literal \"/dev/null\") (regex #\"^/dev/fd/\"))\n\
+             {own}\
              (allow file-write* (literal \"/dev/ptmx\") (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
              (deny file-read-data (subpath {user}){temp})\n\
              (allow file-read-data{readable}{writable})\n\
@@ -2120,7 +2189,11 @@ impl Runner for Host {
             return Vec::new();
         }
 
-        if let Some(lock) = held_lock(&dir) {
+        let held = run_locks(repo_id)
+            .into_iter()
+            .find(|lock| fs::File::open(lock).is_ok_and(|f| !locked(&f)));
+
+        if let Some(lock) = held {
             return vec![format!(
                 "kept {}, a run holds {}",
                 dir.display(),
@@ -3062,6 +3135,7 @@ mod tests {
                 timeout: Duration::from_secs(30),
                 shard: false,
                 on_base,
+                slot_lock: None,
             };
             let exit = host.run(&request, &log).unwrap().exit;
             (exit, fs::read_to_string(&log).unwrap())
@@ -3084,6 +3158,178 @@ mod tests {
         );
         assert!(!planted, "overlay {overlay}: a branch run wrote the base");
         assert!(left.is_empty(), "overlay {overlay}: {left:?}");
+    }
+
+    /// A branch run's request for `job` in `clone`
+    fn branch_request<'a>(
+        clone: &'a Path,
+        job: &'a str,
+        repo_id: &'a str,
+        empty: &'a (BTreeMap<String, BTreeMap<String, String>>, PathBuf),
+    ) -> RunRequest<'a> {
+        RunRequest {
+            run_dir: clone,
+            file: HOST,
+            workflow: Path::new("/dev/null"),
+            job,
+            needs: &empty.0,
+            artifacts: &empty.1,
+            repo_id,
+            timeout: Duration::from_secs(30),
+            shard: false,
+            on_base: false,
+            slot_lock: None,
+        }
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_check_that_swaps_its_runs_dir_for_a_symlink_never_gets_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let target_path = target.path().canonicalize().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let checks = BTreeMap::from([
+            (
+                "swap".into(),
+                format!(
+                    "d=$(dirname \"$CARGO_HOME\"); rm -rf \"$d\" && ln -s '{}' \"$d\"; true",
+                    target_path.display()
+                ),
+            ),
+            (
+                "write".into(),
+                "mkdir -p \"$CARGO_HOME\" && touch \"$CARGO_HOME/../x\"".into(),
+            ),
+        ]);
+        let host = Host::new(
+            config::Host {
+                checks,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .with_overlay(false);
+        let empty = (BTreeMap::new(), dir.path().join("artifacts"));
+        // One run, so both checks share the run's directory, as a retry does
+        let run = |job: &str| {
+            let clone = tempfile::tempdir().unwrap();
+            let log = dir.path().join(format!("{job}.log"));
+            let exit = host
+                .run(&branch_request(clone.path(), job, &repo_id, &empty), &log)
+                .map(|o| o.exit);
+            (exit, fs::read_to_string(&log).unwrap_or_default())
+        };
+        let _ = run("swap");
+        let (exit, log) = run("write");
+        drop(host);
+        let left: Vec<_> = fs::read_dir(&target_path)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(
+            left.is_empty(),
+            "a check wrote the symlink's target: {left:?}"
+        );
+        // The sandbox kept the directory, so the next check still had it
+        assert_eq!(exit, Ok(Some(0)), "{log}");
+    }
+
+    #[test]
+    fn a_runs_dir_replaced_by_a_symlink_is_refused_before_the_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let host = Host::new(config::Host::default(), dir.path()).with_overlay(false);
+        let run = host.run_cache(&repo_id).unwrap();
+        remove_tree(&run);
+        std::os::unix::fs::symlink(target.path(), &run).unwrap();
+        let again = host.run_cache(&repo_id);
+        drop(host);
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(again.is_err(), "the run's cache became {again:?}");
+    }
+
+    #[test]
+    fn remove_tree_removes_a_symlink_and_never_touches_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("f"), "x").unwrap();
+        fs::set_permissions(victim.join("f"), fs::Permissions::from_mode(0o444)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        remove_tree(&link);
+        let mode = fs::metadata(victim.join("f")).unwrap().permissions().mode() & 0o777;
+        assert!(fs::symlink_metadata(&link).is_err(), "the link stays");
+        assert_eq!(mode, 0o444, "chmod followed the link");
+
+        // A read-only tree, as Go's module cache is, goes whole
+        let ro = dir.path().join("ro");
+        fs::create_dir_all(ro.join("m")).unwrap();
+        fs::write(ro.join("m/f"), "x").unwrap();
+        fs::set_permissions(ro.join("m"), fs::Permissions::from_mode(0o555)).unwrap();
+        remove_tree(&ro);
+        assert!(!ro.exists());
+    }
+
+    #[test]
+    fn a_run_removes_dead_probes_unlinked_locks_and_the_old_shared_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let cache = cache_dir(Some(&repo_id));
+        let runs = cache.join("runs");
+        fs::create_dir_all(cache.join("base/cargo")).unwrap();
+        fs::create_dir_all(runs.join(".probe-old/lower")).unwrap();
+        fs::create_dir_all(runs.join(".probe-new/lower")).unwrap();
+        fs::write(runs.join(".new-dead"), "").unwrap();
+        fs::write(runs.join(".new-young"), "").unwrap();
+        let live = fs::File::create(runs.join(".new-live")).unwrap();
+        assert!(locked(&live));
+        assert!(
+            Command::new("touch")
+                .args(["-t", "200001010000"])
+                .arg(runs.join(".probe-old"))
+                .arg(runs.join(".new-dead"))
+                .arg(runs.join(".new-live"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::create_dir_all(cache.join("branches/go/pkg/mod/m")).unwrap();
+        fs::write(cache.join("branches/go/pkg/mod/m/f"), "x").unwrap();
+        fs::set_permissions(
+            cache.join("branches/go/pkg/mod/m"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+
+        let host = Host::new(config::Host::default(), dir.path()).with_overlay(false);
+        host.run_cache(&repo_id).unwrap();
+        let gone = |p: &str| fs::symlink_metadata(cache.join(p)).is_err();
+        let (branches, old, new, dead, kept) = (
+            gone("branches"),
+            gone("runs/.probe-old"),
+            gone("runs/.probe-new"),
+            gone("runs/.new-dead"),
+            !gone("runs/.new-live") && !gone("runs/.new-young"),
+        );
+        drop((host, live));
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(branches, "the old shared cache stays");
+        assert!(old, "a dead probe stays");
+        assert!(!new, "a probe that may still run was removed");
+        assert!(dead, "an unlinked lock no run holds stays");
+        assert!(
+            kept,
+            "a lock a live run holds, or one just made, was removed"
+        );
     }
 
     #[test]
@@ -3120,6 +3366,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             shard: false,
             on_base: false,
+            slot_lock: None,
         };
         let exit = host.run(&request, &log).unwrap().exit;
         drop(host);
