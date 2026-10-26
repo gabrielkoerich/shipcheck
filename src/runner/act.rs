@@ -224,6 +224,7 @@ impl Act {
         };
 
         let root_shell = shard::default_shell(&root);
+        let top_env = root.get(&key("env")).cloned().unwrap_or(Yaml::Null);
         let jobs = workflow::jobs_mut(&mut root)?;
         *jobs = expand_matrices(std::mem::take(jobs));
 
@@ -334,10 +335,12 @@ impl Act {
                 job.insert(key("runs-on"), key("ubuntu-24.04"));
             }
 
+            let job_env = job.get(&key("env")).cloned().unwrap_or(Yaml::Null);
+
             if let Some(Yaml::Array(steps)) = job.get_mut(&key("steps")) {
                 *steps = std::mem::take(steps)
                     .into_iter()
-                    .flat_map(guarded)
+                    .flat_map(|s| guarded(s, [&job_env, &top_env]))
                     .collect();
                 steps.insert(
                     0,
@@ -365,24 +368,44 @@ impl Act {
  * when act skips the step on a job that still passes. `always()` and `!cancelled()` count as true.
  * None when the step is skipped on every PR, or runs only on a failure, as GitHub answers the same
  **/
-fn step_guard(cond: &str) -> Option<String> {
+fn step_guard(cond: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
     let c = cond.trim();
     let c = c
         .strip_prefix("${{")
         .and_then(|c| c.strip_suffix("}}"))
         .unwrap_or(c)
         .trim();
-    let reads = [
-        "github.event",
-        "github.ref",
-        "github.head_ref",
-        "github.base_ref",
-        "github.actor",
-        "github.triggering_actor",
-        "vars.",
-    ]
-    .iter()
-    .any(|p| c.contains(p));
+    let reads_pr = |text: &str| {
+        [
+            "github.event",
+            "github.ref",
+            "github.head_ref",
+            "github.base_ref",
+            "github.actor",
+            "github.triggering_actor",
+            "vars.",
+        ]
+        .iter()
+        .any(|p| text.contains(p))
+    };
+    // An `env.NAME` reads what its value reads, as the step's, the job's or the workflow's `env` sets it
+    let names = c.match_indices("env.").filter_map(|(at, _)| {
+        let before = c[..at].chars().next_back();
+
+        if before.is_some_and(|b| b.is_alphanumeric() || b == '_' || b == '.') {
+            return None;
+        }
+
+        let name: String = c[at + 4..]
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '-')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    });
+    let reads = reads_pr(c)
+        || names
+            .into_iter()
+            .any(|n| env(&n).is_some_and(|v| reads_pr(&v)));
     let passing = c
         .replace("!cancelled()", "true")
         .replace("always()", "true");
@@ -399,8 +422,15 @@ fn step_guard(cond: &str) -> Option<String> {
 }
 
 /// A step, after the guard `step_guard` gives it. The guard has no `id`, so no step reads it
-fn guarded(s: Yaml) -> Vec<Yaml> {
-    let Some(cond) = s["if"].as_str().and_then(step_guard) else {
+fn guarded(s: Yaml, outer_env: [&Yaml; 2]) -> Vec<Yaml> {
+    let env = |name: &str| {
+        [&s["env"], outer_env[0], outer_env[1]]
+            .into_iter()
+            .find(|e| !matches!(e[name], Yaml::BadValue))
+            .and_then(|e| e[name].as_str())
+            .map(String::from)
+    };
+    let Some(cond) = s["if"].as_str().and_then(|c| step_guard(c, env)) else {
         return vec![s];
     };
     let name = (s["name"].as_str())
@@ -2552,8 +2582,24 @@ jobs:
         assert_eq!(ifs.iter().filter(|(n, _)| *n == "shipcheck if").count(), 3);
         assert_eq!(steps[at("echo x=1")]["id"].as_str(), Some("o"));
 
+        // An env value that reads the PR makes the step's `if:` read it, a static one does not
+        let wf = "on: push\nenv:\n  TOP: ${{ github.event_name == 'pull_request' }}\njobs:\n  t:\n    runs-on: ubuntu-latest\n    env:\n      IS_PR: ${{ github.event_name == 'pull_request' }}\n      X: 'false'\n      SHADOW: ${{ github.event_name == 'pull_request' }}\n    steps:\n      - if: env.IS_PR == 'true'\n        run: make pr\n      - if: env.TOP == 'true'\n        run: make top\n      - if: env.X == 'true'\n        run: make static\n      - if: env.SHADOW == 'true'\n        env:\n          SHADOW: false\n        run: make shadowed\n";
+        let out = load(&Act::default().prepare(wf, "ci.yml").unwrap());
+        let steps = out["jobs"]["t"]["steps"].as_vec().unwrap();
+        let before = |run: &str| {
+            let at = steps
+                .iter()
+                .position(|s| s["run"].as_str() == Some(run))
+                .unwrap();
+            steps[at - 1]["name"].as_str() == Some("shipcheck if")
+        };
+        assert!(before("make pr"), "{steps:?}");
+        assert!(before("make top"), "{steps:?}");
+        assert!(!before("make static"), "{steps:?}");
+        assert!(!before("make shadowed"), "{steps:?}");
+
         // The workflow as it runs, which the cache key holds, carries the guards
-        assert_eq!(inject(wf, "n").unwrap().matches("shipcheck if").count(), 3);
+        assert_eq!(inject(wf, "n").unwrap().matches("shipcheck if").count(), 2);
     }
 
     #[test]

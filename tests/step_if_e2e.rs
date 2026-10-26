@@ -59,8 +59,21 @@ jobs:
         run: exit 1
 ";
 
-// GitHub skips the deploy on every PR and the report on a passing job, and the last step reads
-// the output of the first, past the guards
+// The step reads the event through the job's env
+const ENV: &str = "\
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      IS_PR: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - if: env.IS_PR == 'true'
+        run: exit 1
+";
+
+// GitHub skips the step on a static env, the deploy on every PR and the report on a passing
+// job, and the last steps read the output of the first, past the guards
 const OK: &str = "\
 on: [push, pull_request]
 jobs:
@@ -69,7 +82,11 @@ jobs:
     strategy:
       matrix:
         n: [1, 2]
+    env:
+      X: 'false'
     steps:
+      - if: env.X == 'true'
+        run: exit 1
       - id: o
         run: echo x=1 >> \"$GITHUB_OUTPUT\"
       - if: github.ref == 'refs/heads/main'
@@ -103,6 +120,7 @@ fn a_step_act_skips_fails_the_job_when_a_pr_may_run_it() {
         ("pr.yml", PR),
         ("vars.yml", VARS),
         ("always.yml", ALWAYS),
+        ("env.yml", ENV),
         ("ok.yml", OK),
     ] {
         fs::write(work.join(".github/workflows").join(file), text).unwrap();
@@ -110,7 +128,7 @@ fn a_step_act_skips_fails_the_job_when_a_pr_may_run_it() {
 
     fs::write(
         work.join("shipcheck.toml"),
-        "workflows = [\"pr.yml\", \"vars.yml\", \"always.yml\", \"ok.yml\"]\nretries = 0\n[act]\ncache_paths = []\n",
+        "workflows = [\"pr.yml\", \"vars.yml\", \"always.yml\", \"env.yml\", \"ok.yml\"]\nretries = 0\n[act]\ncache_paths = []\n",
     )
     .unwrap();
     git(&work, &["add", "-A"]);
@@ -134,7 +152,7 @@ fn a_step_act_skips_fails_the_job_when_a_pr_may_run_it() {
             .clone()
     };
 
-    for file in ["pr.yml", "vars.yml", "always.yml"] {
+    for file in ["pr.yml", "vars.yml", "always.yml", "env.yml"] {
         assert_eq!(state(file, "test"), "failure", "{file}");
     }
 
