@@ -561,40 +561,78 @@ fn needs_vm(job: &crate::workflow::Job) -> Option<String> {
 }
 
 /**
- * Why a run here, by act or a host check, would see the PR otherwise than GitHub: a repository
- * script a step starts that reads the event or the refs, or `HEAD^` or `HEAD~` in a workflow that
- * runs on PRs, which there is the PR's base and here only the commit before
+ * Why a run here, by act or a host check, would see the PR otherwise than GitHub. A file in the
+ * repository a step's command names, or the Makefile, justfile or package.json its task runner
+ * reads, that reads the event or the refs. Or HEAD in a workflow that runs on PRs, which there is
+ * the merge commit, with HEAD^ the base, and here the branch's own commit
  **/
 fn reads_the_pr(job: &crate::workflow::Job, source: &str, root: &Path) -> Option<String> {
     let on_prs = crate::workflow::runs_on_prs(source);
+    // A path that stays in the repository, else None
+    let inside = |dir: &Path, word: &str| -> Option<PathBuf> {
+        let word = word.strip_prefix("./").unwrap_or(word);
+        let ok = !word.is_empty() && !word.starts_with('/') && !word.split('/').any(|p| p == "..");
+        ok.then(|| dir.join(word))
+    };
+    let reads = |file: &Path| {
+        let small = fs::metadata(file).is_ok_and(|m| m.is_file() && m.len() < 1 << 20);
+        small
+            .then(|| fs::read_to_string(file).ok())
+            .flatten()
+            .and_then(|text| crate::workflow::reads_what_act_lacks(&text))
+    };
 
     for step in &job.steps {
-        if on_prs && (step.run.contains("HEAD^") || step.run.contains("HEAD~")) {
-            return Some("it compares with HEAD^ or HEAD~, which on a PR is its base and here only the commit before".into());
+        let head = step
+            .run
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|w| w == "HEAD");
+
+        if on_prs && (head || step.run.contains("git log -1")) {
+            return Some("it reads HEAD, which on a PR is GitHub's merge commit and HEAD^ its base, and here the branch's own commit".into());
         }
 
-        for words in started(&step.run) {
-            let shell = ["sh", "bash", "zsh", "dash"].contains(&words[0].as_str());
-            let Some(script) = (if shell { words.get(1) } else { words.first() }) else {
-                continue;
-            };
-            let path = script.strip_prefix("./").unwrap_or(script);
+        let Some(mut dir) = inside(root, step.dir.as_deref().unwrap_or(".")) else {
+            continue;
+        };
 
-            if !script.contains('/') || path.starts_with('/') || path.contains("..") {
+        for words in started(&step.run) {
+            if words[0] == "cd" {
+                match words.get(1).and_then(|d| inside(&dir, d)) {
+                    Some(d) => dir = d,
+                    None => break,
+                }
+
                 continue;
             }
 
-            let file = root.join(path);
-            let small = fs::metadata(&file).is_ok_and(|m| m.is_file() && m.len() < 1 << 20);
+            let runner: &[&str] = match words[0].as_str() {
+                "make" | "gmake" => &["Makefile", "makefile", "GNUmakefile"],
+                "just" => &["justfile", "Justfile", ".justfile"],
+                "npm" | "yarn" | "pnpm" | "bun" | "npx" => &["package.json"],
+                _ => &[],
+            };
+            let named = words
+                .iter()
+                .filter(|w| !w.starts_with('-'))
+                .map(String::as_str)
+                .chain(runner.iter().copied());
 
-            if let Some(what) = small
-                .then(|| fs::read_to_string(&file).ok())
-                .flatten()
-                .and_then(|text| crate::workflow::reads_what_act_lacks(&text))
-            {
-                return Some(format!(
-                    "its script {script} reads `{what}`, which only GitHub's run of a PR has"
-                ));
+            for word in named {
+                let Some(file) = inside(&dir, word) else {
+                    continue;
+                };
+
+                if let Some(what) = reads(&file) {
+                    let shown = file
+                        .strip_prefix(root)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string();
+                    return Some(format!(
+                        "its file {shown} reads `{what}`, which only GitHub's run of a PR has"
+                    ));
+                }
             }
         }
     }
@@ -3104,7 +3142,7 @@ jobs:
         );
         for line in [
             // A job made of steps a check leaves out stays on GitHub, so init never offers to cut its trigger
-            "job pre-commit: a check would leave out its step `uv run prek run --from-ref origin/${GITHUB_BASE_REF} --to-ref HEAD`, a step with `if:` or `continue-on-error`",
+            "ci.yml, job pre-commit: it reads HEAD, which on a PR is GitHub's merge commit and HEAD^ its base, and here the branch's own commit",
             "job test-msrv: a check would leave out its step `cargo +${{ env.MSRV }} test --locked --all-features`, a step with an expression",
             "job docker-build: runs Docker, which shipcheck never gives a job",
             "job test-win: runs on Windows, which shipcheck does not support yet",
@@ -3989,13 +4027,60 @@ jobs:
 
     #[test]
     fn a_check_of_a_script_that_reads_the_pr_or_a_diff_from_head_stays_on_github() {
-        let ci = "on: pull_request\njobs:\n  changed:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./scripts/lint-changed.sh\n  last:\n    runs-on: ubuntu-latest\n    steps:\n      - run: git diff HEAD^ --check\n  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./scripts/lint.sh\n";
+        let job = |id: &str, step: &str| {
+            format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {step}\n")
+        };
+        let jobs = [
+            ("changed", "./scripts/lint-changed.sh".to_string()),
+            ("py", "python scripts/changed.py".into()),
+            ("node", "node scripts/changed.js".into()),
+            ("cdrun", "cd tools && ./lint-changed.sh".into()),
+            (
+                "wd",
+                "./lint-changed.sh\n        working-directory: tools".into(),
+            ),
+            ("mk", "make lint-changed".into()),
+            ("npmrun", "npm run lint:changed".into()),
+            ("last", "git diff HEAD^ --check".into()),
+            ("head", "./scripts/lint.sh --since HEAD".into()),
+            (
+                "logone",
+                "git log -1 --format=%B | grep -q skip-lint || ./scripts/lint.sh".into(),
+            ),
+            ("plain", "./scripts/lint.sh".into()),
+        ];
+        let ci = format!(
+            "on: pull_request\njobs:\n{}",
+            jobs.iter()
+                .map(|(id, step)| job(id, step))
+                .collect::<String>()
+        );
         let found = detect_with(
             &[
-                (".github/workflows/ci.yml", ci),
+                (".github/workflows/ci.yml", &ci),
                 (
                     "scripts/lint-changed.sh",
                     "git diff origin/$GITHUB_BASE_REF --name-only | xargs lint\n",
+                ),
+                (
+                    "scripts/changed.py",
+                    "import os\nprint(os.environ['GITHUB_BASE_REF'])\n",
+                ),
+                (
+                    "scripts/changed.js",
+                    "console.log(process.env.GITHUB_HEAD_REF)\n",
+                ),
+                (
+                    "tools/lint-changed.sh",
+                    "git diff origin/$GITHUB_BASE_REF\n",
+                ),
+                (
+                    "Makefile",
+                    "lint-changed:\n\tgit diff origin/$$GITHUB_BASE_REF\n",
+                ),
+                (
+                    "package.json",
+                    "{\"scripts\": {\"lint:changed\": \"git diff origin/$GITHUB_BASE_REF\"}}\n",
                 ),
                 ("scripts/lint.sh", "lint .\n"),
             ],
@@ -4011,15 +4096,28 @@ jobs:
                 .map(|k| k.why.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(
-            why("changed"),
-            "its script ./scripts/lint-changed.sh reads `GITHUB_BASE_REF`, which only GitHub's run of a PR has"
-        );
-        assert!(
-            why("last").starts_with("it compares with HEAD^ or HEAD~"),
-            "{}",
-            why("last")
-        );
+        for (id, file, what) in [
+            ("changed", "scripts/lint-changed.sh", "GITHUB_BASE_REF"),
+            ("py", "scripts/changed.py", "GITHUB_BASE_REF"),
+            ("node", "scripts/changed.js", "GITHUB_HEAD_REF"),
+            ("cdrun", "tools/lint-changed.sh", "GITHUB_BASE_REF"),
+            ("wd", "tools/lint-changed.sh", "GITHUB_BASE_REF"),
+            ("mk", "Makefile", "GITHUB_BASE_REF"),
+            ("npmrun", "package.json", "GITHUB_BASE_REF"),
+        ] {
+            assert_eq!(
+                why(id),
+                format!("its file {file} reads `{what}`, which only GitHub's run of a PR has"),
+                "{id}"
+            );
+        }
+        for id in ["last", "head", "logone"] {
+            assert!(
+                why(id).starts_with("it reads HEAD, which on a PR is GitHub's merge commit"),
+                "{id}: {}",
+                why(id)
+            );
+        }
     }
 
     /// The jobs no host check runs, on GitHub or on act, in that order
