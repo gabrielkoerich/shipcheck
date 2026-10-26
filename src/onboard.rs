@@ -1007,6 +1007,10 @@ impl Report for Spinners {
     }
 }
 
+/// What quitting leaves: the trials' clones stay in shipcheck's cache, where they speed up later runs
+const QUIT: &str =
+    "Quit, nothing written to the repository. Trial clones stay in shipcheck's cache";
+
 /**
  * The terminal wizard: QuickStart or every step, a review that can reopen a step, then apply.
  * Nothing is written before apply, and Ctrl-C or quit leaves everything as it was
@@ -1014,7 +1018,7 @@ impl Report for Spinners {
 pub fn tui(root: &Path, find: fn() -> App, finish: Finish) -> Result<bool, String> {
     match wizard(root, find, finish) {
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-            let _ = cliclack::outro_cancel("Quit, nothing changed");
+            let _ = cliclack::outro_cancel(QUIT);
             Ok(false)
         }
         Err(e) => Err(e.to_string()),
@@ -1054,7 +1058,7 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
 
     // Every choice is made in the tabs, and nothing is written before Apply on the Review tab
     let Some((plan, a)) = crate::tabs::run(root, plan)? else {
-        cliclack::outro_cancel("Quit, nothing changed")?;
+        cliclack::outro_cancel(QUIT)?;
         return Ok(Ok(false));
     };
 

@@ -194,6 +194,8 @@ pub struct Wizard<'a> {
     pub cursor: usize,
     /// How far the detail is scrolled down, since a diff can be longer than the screen
     pub scroll: u16,
+    /// How far the detail can scroll at the size it was last drawn, so PgDn stops at its end
+    most: std::cell::Cell<u16>,
     pub error: Option<String>,
     pub end: Option<End>,
 }
@@ -220,6 +222,7 @@ impl<'a> Wizard<'a> {
             tab: 0,
             cursor: 0,
             scroll: 0,
+            most: std::cell::Cell::new(0),
             error: None,
             end: None,
         }
@@ -268,7 +271,10 @@ impl<'a> Wizard<'a> {
 
                 out
             }
-            "Review" => vec!["Apply".into(), "Quit, nothing written".into()],
+            "Review" => vec![
+                "Apply".into(),
+                "Quit, nothing written to the repository".into(),
+            ],
             _ => Vec::new(),
         }
     }
@@ -347,6 +353,8 @@ impl<'a> Wizard<'a> {
                     vec!["No branch rule: init could not read this repository on GitHub".into()]
                 }
             },
+            // A plan that could not be worked out lists nothing to apply, only its error
+            _ if self.error.is_some() => Vec::new(),
             _ => self.plan.review(a),
         }
     }
@@ -368,7 +376,7 @@ impl<'a> Wizard<'a> {
                 self.cursor = self.cursor.saturating_sub(1);
                 self.scroll = 0;
             }
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.most.get()),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Char(' ') | KeyCode::Enter => self.choose(),
             KeyCode::Char('q') | KeyCode::Esc => self.end = Some(End::Quit),
@@ -516,8 +524,11 @@ impl<'a> Wizard<'a> {
 
         let detail_widget = Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL))
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll, 0));
+            .wrap(Wrap { trim: false });
+        // line_count counts the borders, two lines, and the inside is two shorter than the area
+        let lines = detail_widget.line_count(detail.width) as u16;
+        self.most.set(lines.saturating_sub(detail.height));
+        let detail_widget = detail_widget.scroll((self.scroll.min(self.most.get()), 0));
         f.render_widget(detail_widget, detail);
         f.render_widget(
             Paragraph::new("←/→ 1-5: step  ↑/↓: line  PgUp/PgDn: scroll  space: change  q: quit"),
@@ -835,8 +846,32 @@ mod review {
             "Apply would write {cfg:?}"
         );
         w.go(4);
+        assert!(
+            !w.detail().iter().any(|l| l.contains("shipcheck.toml")),
+            "the review lists what it cannot apply: {:?}",
+            w.detail()
+        );
         w.key(KeyCode::Enter);
         assert_eq!(w.end, None, "Apply went through with nothing to run here");
+    }
+
+    #[test]
+    fn page_down_stops_at_the_end_of_the_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = wiz(dir.path());
+        w.go(2);
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        t.draw(|f| w.draw(f)).unwrap();
+
+        for _ in 0..50 {
+            w.key(KeyCode::PageDown);
+            t.draw(|f| w.draw(f)).unwrap();
+        }
+
+        assert!(w.most.get() > 0, "the diff fits, so the test shows nothing");
+        assert_eq!(w.scroll, w.most.get());
+        w.key(KeyCode::PageUp);
+        assert_eq!(w.scroll, w.most.get().saturating_sub(10));
     }
 
     #[test]
