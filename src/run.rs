@@ -1902,7 +1902,17 @@ fn run_workflow(
     }
 
     let allowed = workflow::allowed_failures(&body)?;
-    let pr_only = workflow::pr_only_jobs(&body);
+    let ifs = job_ifs(&body);
+    let skip_on_prs = skipped_on_every_pr(&ifs);
+    let runs_anyway = |job: &str| {
+        !skip_on_prs.iter().any(|j| names_job(job, j))
+            && ifs.iter().any(|(j, c)| {
+                names_job(job, j)
+                    && ["always()", "failure()", "cancelled()"]
+                        .iter()
+                        .any(|f| c.contains(f))
+            })
+    };
     let artifacts = ctx.slot.with_extension("artifacts").join(file);
     let _ = fs::remove_dir_all(&artifacts);
     fs::create_dir_all(&artifacts).map_err(|e| e.to_string())?;
@@ -1945,7 +1955,10 @@ fn run_workflow(
                         |n: &&String| states[*n] != "success" && !states[*n].ends_with(ALLOWED);
 
                     if let Some(n) = needs.iter().find(unmet) {
-                        let state = if states[n] == "skipped" {
+                        // GitHub runs a job whose `if:` checks status even when its need was skipped
+                        let state = if states[n] == "skipped" && runs_anyway(job) {
+                            NEED_SKIPPED
+                        } else if states[n] == "skipped" {
                             "skipped"
                         } else {
                             NOT_RUN
@@ -1996,7 +2009,7 @@ fn run_workflow(
                                 &marks,
                                 allowed.contains(&job),
                             );
-                            let state = act_skip(state, &job, &pr_only);
+                            let state = act_skip(state, &job, &skip_on_prs);
                             let allow = state.ends_with(ALLOWED);
 
                             if exit == Some(0) && run.exit != Some(0) && !allow {
@@ -2095,18 +2108,81 @@ fn job_state(
     }
 }
 
-/// act runs a PR's checks as `workflow_dispatch`, so its skip of a job whose `if:` reads the PR, or
-/// of a matrix leg of one, says nothing of whether GitHub would run it
-fn act_skip(state: String, job: &str, pr_only: &BTreeSet<String>) -> String {
-    if state == "skipped" && pr_only.iter().any(|j| names_job(job, j)) {
-        PR_SKIP.into()
+/// act runs a PR's checks as `workflow_dispatch`, so its skip of a job, or of a matrix leg of one,
+/// stands only when the job's `if:` is false on every PR, as GitHub would skip it too
+fn act_skip(state: String, job: &str, skip_on_prs: &BTreeSet<String>) -> String {
+    if state == "skipped" && !skip_on_prs.iter().any(|j| names_job(job, j)) {
+        IF_SKIP.into()
     } else {
         state
     }
 }
 
-const PR_SKIP: &str =
-    "failure, act skipped it but its `if:` reads the PR, which only GitHub can tell";
+const IF_SKIP: &str =
+    "failure, act skipped it by its `if:`, which may hold on a PR, and only GitHub can tell";
+
+const NEED_SKIPPED: &str =
+    "failure, a job it needs was skipped, but its `if:` may run it anyway, as GitHub would";
+
+/// Each job's `if:` without init's gate, `false` for the YAML boolean
+fn job_ifs(source: &str) -> BTreeMap<String, String> {
+    let Ok(root) = workflow::load(source) else {
+        return BTreeMap::new();
+    };
+    let Some(jobs) = root
+        .get(&yaml_rust2::Yaml::String("jobs".into()))
+        .and_then(|j| j.as_hash())
+    else {
+        return BTreeMap::new();
+    };
+
+    jobs.iter()
+        .filter_map(|(id, job)| {
+            let cond = match &job["if"] {
+                yaml_rust2::Yaml::Boolean(b) => b.to_string(),
+                yaml_rust2::Yaml::String(c) => workflow::ungate(c).unwrap_or(c.clone()),
+                _ => return None,
+            };
+            Some((id.as_str()?.to_string(), cond))
+        })
+        .collect()
+}
+
+/// The jobs GitHub skips on every PR by their own `if:`
+fn skipped_on_every_pr(ifs: &BTreeMap<String, String>) -> BTreeSet<String> {
+    ifs.iter()
+        .filter(|(_, c)| false_on_every_pr(c))
+        .map(|(j, _)| j.clone())
+        .collect()
+}
+
+/**
+ * A condition that and-s a term false on every PR: a push event, one branch or a tag. An `||` or a
+ * `!` other than `!=` could make it hold, so a condition with one never counts
+ **/
+fn false_on_every_pr(cond: &str) -> bool {
+    let c = cond.trim();
+    let c = c
+        .strip_prefix("${{")
+        .and_then(|c| c.strip_suffix("}}"))
+        .unwrap_or(c)
+        .trim();
+
+    if c == "false" {
+        return true;
+    }
+
+    !c.contains("||")
+        && !c.replace("!=", "").contains('!')
+        && [
+            "github.event_name == 'push'",
+            "github.ref == ",
+            "github.ref_name == ",
+            "startsWith(github.ref, 'refs/tags/",
+        ]
+        .iter()
+        .any(|p| c.contains(p))
+}
 
 /// A workflow passes when every job passed, was skipped or is an allowed failure, and one passed
 /// or was skipped, as act said its `if:` skipped it, so GitHub counts it as passed
@@ -4111,25 +4187,59 @@ mod tests {
     }
 
     #[test]
-    fn a_skip_of_a_job_whose_if_reads_the_pr_fails() {
-        let wf = "on: pull_request\njobs:\n  label:\n    if: contains(github.event.pull_request.labels.*.name, 'slow')\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: make slow\n  push:\n    if: github.event_name == 'push'\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n  release:\n    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)\n    runs-on: ubuntu-latest\n    steps:\n      - run: make release\n";
-        let pr_only = workflow::pr_only_jobs(wf);
+    fn a_skip_stands_only_when_the_if_is_false_on_every_pr() {
+        let job = |id: &str, cond: &str| {
+            format!(
+                "  {id}:\n    if: {cond}\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n"
+            )
+        };
+        let gate = "(github.ref == 'refs/heads/main' || github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.fork)";
+        let wf = [
+            "on: [push, pull_request, workflow_dispatch]\njobs:\n  label:\n    if: contains(github.event.pull_request.labels.*.name, 'slow')\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [a, b]\n    steps:\n      - run: make slow\n".to_string(),
+            job("dispatch", "github.event_name != 'workflow_dispatch'"),
+            job("vars", "vars.RUN_E2E == 'true'"),
+            job("either", "github.event_name == 'push' || github.event_name == 'pull_request'"),
+            job("not_tag", "${{ !startsWith(github.ref, 'refs/tags/') }}"),
+            job("push", "github.event_name == 'push'"),
+            job("release", "github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"),
+            job("tag", "startsWith(github.ref, 'refs/tags/')"),
+            job("off", "false"),
+            job("off_expr", "${{ false }}"),
+            job("gated_push", &format!("(github.event_name == 'push') && {gate}")),
+            job("gated_vars", &format!("(vars.RUN_E2E == 'true') && {gate}")),
+        ]
+        .concat();
+        let skip_on_prs = skipped_on_every_pr(&job_ifs(&wf));
         let state = |job: &str| {
             act_skip(
                 job_state(job, Some(0), true, false, &marks(&[]), false),
                 job,
-                &pr_only,
+                &skip_on_prs,
             )
         };
-        let states = BTreeMap::from([("label".to_string(), state("label"))]);
-        assert!(!workflow_passed(&states), "{states:?}");
-        // A matrix leg is the job it comes from
-        assert_eq!(state("label__2"), PR_SKIP);
+
+        // GitHub runs these on a PR, or may, so act's skip says nothing
+        for job in [
+            "label",
+            "label__2",
+            "dispatch",
+            "vars",
+            "either",
+            "not_tag",
+            "gated_vars",
+        ] {
+            assert_eq!(state(job), IF_SKIP, "{job}");
+            let states = BTreeMap::from([(job.to_string(), state(job))]);
+            assert!(!workflow_passed(&states), "{job}: {states:?}");
+        }
+
         // GitHub skips these on a PR too
-        assert_eq!(state("push"), "skipped");
-        assert_eq!(state("release"), "skipped");
+        for job in ["push", "release", "tag", "off", "off_expr", "gated_push"] {
+            assert_eq!(state(job), "skipped", "{job}");
+        }
+
         assert_eq!(
-            act_skip("success".into(), "label", &pr_only),
+            act_skip("success".into(), "vars", &skip_on_prs),
             "success",
             "a job act ran stands"
         );
