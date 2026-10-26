@@ -753,10 +753,10 @@ impl Engine for Docker {
     }
 
     fn prune(&self) -> Vec<String> {
-        let (home, prefix, default, host) = here_parts();
+        let (home, prefix, host) = here_parts();
         gc::prune(
             &gc::Docker,
-            &here(&home, &prefix, &default, &host),
+            &here(&home, &prefix, &host),
             &run_tags(&home),
             gc::OLD_PINS,
             std::time::SystemTime::now(),
@@ -773,8 +773,8 @@ impl Engine for Docker {
         }
 
         let prefix = repo_id.map(volume_prefix).unwrap_or_else(home_prefix);
-        let (home, own, default, host) = here_parts();
-        let here = here(&home, &own, &default, &host);
+        let (home, own, host) = here_parts();
+        let here = here(&home, &own, &host);
         done.extend(gc::clean(&gc::Docker, &here, &prefix, repo_id.is_none()));
         // Networks are per slot, not per repository, and Docker refuses to remove one in use
         let prefix = format!("{}net-", home_prefix());
@@ -2145,24 +2145,19 @@ fn prefix_of(home: &Path) -> String {
     format!("shipcheck-{hash}-")
 }
 
-/// The home, its prefix, the default home's prefix and the host name, which `here` borrows
-pub fn here_parts() -> (PathBuf, String, String, String) {
+/// The home, its prefix and the host name, which `here` borrows
+pub fn here_parts() -> (PathBuf, String, String) {
     let home = crate::run::home();
     let prefix = prefix_of(&home);
-    (
-        home,
-        prefix,
-        prefix_of(&crate::run::default_home()),
-        gc::hostname(),
-    )
+    (home, prefix, gc::hostname())
 }
 
-pub fn here<'a>(home: &'a Path, prefix: &'a str, default: &'a str, host: &'a str) -> gc::Here<'a> {
+pub fn here<'a>(home: &'a Path, prefix: &'a str, host: &'a str) -> gc::Here<'a> {
     gc::Here {
         home,
         prefix,
-        default_prefix: default,
         host,
+        sweep: !crate::run::home_overridden(),
     }
 }
 
