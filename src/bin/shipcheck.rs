@@ -449,6 +449,19 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     started.elapsed()
                 ));
                 let code = report(&entry, snapshot, json, true);
+
+                if !explicit {
+                    run::record_tested(
+                        &plan.repo,
+                        &run::Tested {
+                            tree: plan.tree.clone(),
+                            staged,
+                            passed: entry.passed,
+                            partial: true,
+                        },
+                    )?;
+                }
+
                 record.partial = true;
                 keep_record(&plan, &entry, &record, &run::partial_log_dir(&plan.key));
                 say(PARTIAL);
@@ -506,6 +519,11 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             let _key = run::lock_key(&plan.key)?;
             // Only a pass is reused, a cached failure runs again so a flaky one cannot stick
             let entry = match run::lookup(&plan).filter(|e| e.passed) {
+                // A `paths` skip is never stored, so it is no cached result
+                Some(entry) if entry.skipped.is_some() => {
+                    say(&format!("tested {what}, tree {tree}: nothing ran"));
+                    entry
+                }
                 Some(entry) => {
                     record.cache_hit = true;
                     say(&format!(
@@ -533,6 +551,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                         tree: plan.tree.clone(),
                         staged,
                         passed: entry.passed,
+                        partial: false,
                     },
                 )?;
             }
