@@ -152,7 +152,7 @@ fn runs_caches_and_tests_the_working_copy() {
         String::from_utf8_lossy(&status.stderr)
     );
     let init = Command::new(bin)
-        .arg("init")
+        .args(["init", "--yes"])
         .current_dir(&work)
         .output()
         .unwrap();
