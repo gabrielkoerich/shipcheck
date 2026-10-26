@@ -54,7 +54,7 @@ git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path sh
 ## Set up a repository
 
 1. Install the binary, above.
-2. Run `shipcheck init` in a clone of the repository, on `main`.
+2. Run `shipcheck init` in a clone of the repository, on `main`. An agent or a script runs `shipcheck init --yes`. Without a terminal and without `--yes`, `init` only prints its plan.
 3. Commit the `shipcheck.toml` it writes and merge it to `main`.
 4. Install the [shipcheck App](https://github.com/apps/shipcheck-run) on the repository. `init` prints this link.
 
