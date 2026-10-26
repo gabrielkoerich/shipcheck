@@ -687,7 +687,8 @@ mod tests {
                 .arg(&record)
                 .env("PATH", &path)
                 .env("LOCK_FDS", "9")
-                .env("DELETE_SECS", "2")
+                // Long enough for a quick delete on a busy machine, short for a hung one
+                .env("DELETE_SECS", if hang { "2" } else { "30" })
                 .stdin(Stdio::null())
                 .process_group(0)
                 .spawn()
