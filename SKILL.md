@@ -56,17 +56,17 @@ A tree that already passed answers at once, so a run after a rebase that changed
 
 ## Set up a repository: `shipcheck init`
 
-The repository owner runs this once per repository, in a clone on `main`:
+The repository owner runs this once per repository, in a clone on `main`. An agent runs it with `--yes`:
 
 ```sh
-shipcheck init
+shipcheck init --yes
 ```
 
 1. It writes `shipcheck.toml` with a check for each workflow job it can run here, and prints what it left out and why. In host mode it first runs each check once in the sandbox, as `shipcheck run` would. A check that fails is tried again without forced color, then with color off. A job no host check runs as GitHub does, such as one with a heredoc step, an action no command stands for, a `container:`, a toolchain this machine lacks, or a check that still fails, goes to act as a `[jobs."<file>/<job>"]` entry with `runner = "act"` when Docker runs here, and `network = "internet"` comes with it, since those jobs download what their steps set up. A job stays on GitHub with the reason when act cannot run it as GitHub does either: macOS or Windows, a runner label act has no image for, an `if:` or a value that reads the PR, an action that reports to GitHub, or Docker or a kernel change inside the job. colima can run that last kind, but init never writes `engine = "colima"`, since the VM reaches this machine's loopback: the owner opts in. When every job has to stay on GitHub, it writes no file and stops.
 2. On a terminal its steps are tabs, Checks, Install, Workflows, GitHub and Review, which the person moves between and goes back to: where each job runs (a host check, act, a colima VM the person opts into, or GitHub), the [shipcheck App](https://github.com/apps/shipcheck-run) link, hosted Actions only on `main`, and a ruleset that requires each `shipcheck/<job>` check and PRs into the default branch. It changes nothing until the person applies on the Review tab. `--yes` applies the recommended choices with no questions, but opens no browser and creates no ruleset.
 3. It writes the agent instructions into `AGENTS.md` and the other files agents read, then does what `shipcheck install` does.
 
-Without a terminal it writes every check that passed and the instructions, installs the hooks and starts the daemon, and skips the App, workflow and ruleset steps. Read the checks it wrote, commit `shipcheck.toml` and `AGENTS.md`, and merge them to `main`. The owner installs the App on the repository once.
+Without a terminal and without `--yes` it tries each check and prints the plan and the review that `--yes` would apply, then writes nothing: no `shipcheck.toml`, no `AGENTS.md`, no hooks, no daemon and no sign-in. Run `shipcheck init --yes` to apply it. Then read the checks it wrote, commit `shipcheck.toml`, `AGENTS.md` and the workflow changes, and merge them to `main`. The owner installs the App on the repository once.
 
 ## Set up a machine: `shipcheck install`
 

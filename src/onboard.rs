@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{RepoConfig, RunnerKind};
@@ -943,19 +943,107 @@ impl Report for Lines<'_> {
 /// `init --yes`: no questions, the plan in plain text and the recommended choices applied
 pub fn plain(root: &Path, app: App, out: &mut dyn Write, finish: Finish) -> Result<bool, String> {
     let s = Style::stdout();
+    let Some((plan, a)) = show(
+        root,
+        app,
+        out,
+        "--yes takes the recommended choice of each step",
+    )?
+    else {
+        return Ok(false);
+    };
+    let _ = writeln!(out, "\n{}", s.bold("Applying"));
+    let next = apply(root, &plan, &a, finish, &mut Lines { out, style: s })?;
+    next_steps(out, s, &next);
+    Ok(true)
+}
+
+/**
+ * `init` with no terminal and no `--yes`: the plan `--yes` would apply, and nothing written. The
+ * trials clone into a scratch home, whose git worktree entries in the repository are removed after,
+ * so neither the repository nor shipcheck's home keeps a trace. Call it before any thread starts,
+ * since it sets SHIPCHECK_HOME
+ **/
+pub fn preview(root: &Path, app: App, out: &mut dyn Write) -> Result<(), String> {
+    let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let had = worktrees(root).is_some_and(|w| w.exists());
+    let home = std::env::var_os("SHIPCHECK_HOME");
+    // Safe: init calls it from the main thread before anything else runs
+    unsafe { std::env::set_var("SHIPCHECK_HOME", scratch.path()) };
+    let shown = show(
+        root,
+        app,
+        out,
+        "the recommended choice of each step, which --yes applies",
+    );
+
+    // Safe: as above, the trials' threads have ended
+    match home {
+        Some(home) => unsafe { std::env::set_var("SHIPCHECK_HOME", home) },
+        None => unsafe { std::env::remove_var("SHIPCHECK_HOME") },
+    }
+
+    forget_worktrees(root, scratch.path(), had);
+
+    if shown?.is_some() {
+        let _ = writeln!(out, "\nnothing written: rerun with --yes to apply");
+    }
+
+    Ok(())
+}
+
+/// The repository's folder of git worktree entries
+fn worktrees(root: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).join("worktrees"))
+}
+
+/// Removes the repository's git worktree entries for checkouts under `dir`, and no other, and the folder when it had none
+fn forget_worktrees(root: &Path, dir: &Path, had: bool) {
+    let Some(worktrees) = worktrees(root) else {
+        return;
+    };
+    let dirs = [dir.to_path_buf(), dir.canonicalize().unwrap_or_default()];
+
+    for entry in fs::read_dir(&worktrees).into_iter().flatten().flatten() {
+        let gitdir = fs::read_to_string(entry.path().join("gitdir")).unwrap_or_default();
+        let under =
+            |d: &PathBuf| !d.as_os_str().is_empty() && Path::new(gitdir.trim()).starts_with(d);
+
+        if dirs.iter().any(under) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+
+    // remove_dir removes only an empty folder
+    if !had {
+        let _ = fs::remove_dir(&worktrees);
+    }
+}
+
+/// Prints the plan, each step and the review of its recommended choices. None when init stops
+fn show(
+    root: &Path,
+    app: App,
+    out: &mut dyn Write,
+    intro: &str,
+) -> Result<Option<(Plan, Answers)>, String> {
+    let s = Style::stdout();
     let _ = writeln!(out, "{}", s.bold("shipcheck init"));
     let plan = plan(root, app, &mut Lines { out, style: s })?;
 
     if let Some(why) = &plan.stop {
         let _ = writeln!(out, "\n{why}");
-        return Ok(false);
+        return Ok(None);
     }
 
-    let _ = writeln!(
-        out,
-        "{}",
-        s.dim("--yes takes the recommended choice of each step")
-    );
+    let _ = writeln!(out, "{}", s.dim(intro));
 
     for (n, step) in plan.steps().into_iter().enumerate() {
         let _ = writeln!(
@@ -981,30 +1069,7 @@ pub fn plain(root: &Path, app: App, out: &mut dyn Write, finish: Finish) -> Resu
         let _ = writeln!(out, "  {line}");
     }
 
-    let _ = writeln!(out, "\n{}", s.bold("Applying"));
-    let next = apply(root, &plan, &a, finish, &mut Lines { out, style: s })?;
-    next_steps(out, s, &next);
-    Ok(true)
-}
-
-/// `init` for an agent or a script: shipcheck.toml alone, with only the checks that passed when init tried them
-pub fn config_only(root: &Path, out: &mut dyn Write) -> Result<Option<String>, String> {
-    if root.join("shipcheck.toml").exists() {
-        return Ok(None);
-    }
-
-    let style = Style::stdout();
-    let plan = plan(root, App::NotPublic, &mut Lines { out, style })?;
-
-    if let Some(why) = plan.stop {
-        return Ok(Some(why));
-    }
-
-    let Some((text, said)) = plan.config else {
-        return Ok(None);
-    };
-    crate::agents::write_in_repo(root, &root.join("shipcheck.toml"), &text)?;
-    Ok(Some(format!("wrote shipcheck.toml with {said}")))
+    Ok(Some((plan, a)))
 }
 
 fn next_steps(out: &mut dyn Write, s: Style, next: &[String]) {

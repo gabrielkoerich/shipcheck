@@ -816,7 +816,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 && std::io::stderr().is_terminal();
             let finish = &mut |say: &mut dyn FnMut(&str)| machine_setup(&root, say);
 
-            // A person gets the wizard, `--yes` the recommended choices, an agent or a script no change outside the repository
+            // A person gets the wizard, `--yes` the recommended choices, an agent or a script without `--yes` only the plan
             if yes {
                 shipcheck::onboard::plain(
                     &root,
@@ -832,22 +832,11 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            if let Some(wrote) = shipcheck::onboard::config_only(&root, &mut std::io::stdout())? {
-                println!("{wrote}");
-            }
-
-            // Instructions, hooks and the daemon for a repository with nothing to run would only mislead
-            if !root.join("shipcheck.toml").exists() {
-                return Ok(ExitCode::SUCCESS);
-            }
-
-            machine_setup(&root, &mut |line| println!("{line}"))?;
-            println!(
-                "next: review shipcheck.toml and AGENTS.md, commit them, and merge to {}",
-                shipcheck::daemon::known_base(&root)
-                    .unwrap_or_else(|| "origin/main".into())
-                    .trim_start_matches("origin/")
-            );
+            shipcheck::onboard::preview(
+                &root,
+                shipcheck::onboard::App::find(),
+                &mut std::io::stdout(),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         "install" => {

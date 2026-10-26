@@ -1,7 +1,8 @@
 //! `init --yes` tries each host check it would write in the jail, through the built binary
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const CI: &str = "on: [push, pull_request]
@@ -43,17 +44,13 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-#[test]
-fn init_writes_only_the_checks_that_passed_its_trial() {
-    let tmp = tempfile::tempdir().unwrap();
-    let origin = tmp.path().join("origin.git");
-    let work = tmp.path().join("work");
+/// A clone of a bare origin on `main` with CI's jobs pushed, and a home for shipcheck
+fn repo(tmp: &Path) -> (PathBuf, PathBuf) {
+    let origin = tmp.join("origin.git");
+    let work = tmp.join("work");
     fs::create_dir(&origin).unwrap();
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
-    git(
-        tmp.path(),
-        &["clone", "-q", &origin.to_string_lossy(), "work"],
-    );
+    git(tmp, &["clone", "-q", &origin.to_string_lossy(), "work"]);
     git(&work, &["checkout", "-q", "-b", "main"]);
     git(&work, &["config", "user.name", "t"]);
     git(&work, &["config", "user.email", "t@t"]);
@@ -68,7 +65,7 @@ fn init_writes_only_the_checks_that_passed_its_trial() {
     git(&work, &["push", "-q", "origin", "main"]);
     git(&work, &["remote", "set-head", "origin", "main"]);
 
-    let home = tmp.path().join("home");
+    let home = tmp.join("home");
 
     // `tmutil addexclusion` can take 10s a folder, so mark them excluded as it would
     for dir in ["templates", "runs", "hostcache"] {
@@ -87,10 +84,16 @@ fn init_writes_only_the_checks_that_passed_its_trial() {
         }
     }
 
+    (work, home)
+}
+
+/// `shipcheck init` with these arguments and no terminal, its output, failing the test when it fails
+fn init(work: &Path, home: &Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
-        .args(["init", "--yes"])
-        .current_dir(&work)
-        .env("SHIPCHECK_HOME", &home)
+        .arg("init")
+        .args(args)
+        .current_dir(work)
+        .env("SHIPCHECK_HOME", home)
         .env("SHIPCHECK_NO_DAEMON", "1")
         .env("SHIPCHECK_APP_ID", "1")
         // No Docker on this PATH, so a failed check stays on GitHub rather than going to act
@@ -105,6 +108,61 @@ fn init_writes_only_the_checks_that_passed_its_trial() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(out.status.success(), "{said}");
+    said
+}
+
+/// Every file under `dir` with its contents, and every directory
+fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut out = BTreeMap::new();
+
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            out.insert(path.clone(), None);
+            out.extend(snapshot(&path));
+        } else {
+            out.insert(path.clone(), fs::read(&path).ok());
+        }
+    }
+
+    out
+}
+
+#[test]
+fn init_without_a_terminal_or_yes_shows_the_plan_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, home) = repo(tmp.path());
+    let (repo_before, home_before) = (snapshot(&work), snapshot(&home));
+    let said = init(&work, &home, &[]);
+    assert!(said.contains("plain ... passed"), "{said}");
+    assert!(said.contains("Review"), "{said}");
+    assert!(said.contains("rerun with --yes to apply"), "{said}");
+    let changed = |before: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+                   after: BTreeMap<PathBuf, Option<Vec<u8>>>| {
+        let keys: std::collections::BTreeSet<_> =
+            before.keys().chain(after.keys()).cloned().collect();
+        keys.into_iter()
+            .filter(|k| before.get(k) != after.get(k))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        changed(&home_before, snapshot(&home)),
+        Vec::<PathBuf>::new(),
+        "SHIPCHECK_HOME changed"
+    );
+    assert_eq!(
+        changed(&repo_before, snapshot(&work)),
+        Vec::<PathBuf>::new(),
+        "the repository changed"
+    );
+}
+
+#[test]
+fn init_writes_only_the_checks_that_passed_its_trial() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, home) = repo(tmp.path());
+    let said = init(&work, &home, &["--yes"]);
 
     let config = fs::read_to_string(work.join("shipcheck.toml")).unwrap();
     assert!(config.contains("plain = \"./check.sh plain\""), "{config}");
