@@ -12,7 +12,10 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 
 use crate::config::Engine;
 use crate::onboard::{Answers, App, Plan};
-use crate::setup::{Detected, Kept};
+use crate::setup::{Detected, Kept, Machine};
+
+const LOOPBACK: &str =
+    "A colima VM reaches this machine's loopback and the internet, so it is for trusted code only";
 
 pub const TABS: [&str; 5] = ["Checks", "Install", "Workflows", "GitHub", "Review"];
 
@@ -64,17 +67,18 @@ fn colima_able(k: &Kept) -> bool {
  * go to act or stay on GitHub, a job on act may stay on GitHub, and a job only a VM runs may go to
  * colima, which reaches this machine's loopback, so it is never the default
  **/
-pub fn rows(d: &Detected, docker: bool) -> Vec<Row> {
+pub fn rows(root: &Path, d: &Detected, machine: &Machine) -> Vec<Row> {
     let mut rows = Vec::new();
 
     for c in &d.checks {
         if let Some((file, job)) = job_of(&c.from) {
+            // act must run it as GitHub does, by the rules init placed the other jobs with
+            let act = crate::setup::act_engine_for(root, machine, &file, &job);
             rows.push(Row {
                 file,
                 job,
                 place: Place::Host,
-                // act runs only where Docker does
-                choices: if docker {
+                choices: if matches!(act, Ok(Engine::Docker)) {
                     vec![Place::Host, Place::Act, Place::GitHub]
                 } else {
                     vec![Place::Host, Place::GitHub]
@@ -95,7 +99,11 @@ pub fn rows(d: &Detected, docker: bool) -> Vec<Row> {
             job: k.job.clone(),
             place,
             choices: vec![place, Place::GitHub],
-            why: k.why.clone(),
+            why: if place == Place::Vm {
+                format!("{}. {LOOPBACK}", k.why)
+            } else {
+                k.why.clone()
+            },
         });
     }
 
@@ -180,25 +188,38 @@ pub struct Wizard<'a> {
     pub answers: Answers,
     base: Option<Detected>,
     moves: BTreeMap<(String, String), Place>,
-    docker: bool,
+    /// Each job with the places init first offered it
+    first: Vec<Row>,
     pub tab: usize,
     pub cursor: usize,
+    /// How far the detail is scrolled down, since a diff can be longer than the screen
+    pub scroll: u16,
     pub error: Option<String>,
     pub end: Option<End>,
 }
 
 impl<'a> Wizard<'a> {
     pub fn new(root: &'a Path, plan: Plan) -> Self {
+        Self::on(root, plan, &Machine::this())
+    }
+
+    pub fn on(root: &'a Path, plan: Plan, machine: &Machine) -> Self {
         let answers = plan.recommended();
+        let first = plan
+            .detected
+            .as_ref()
+            .map(|d| rows(root, d, machine))
+            .unwrap_or_default();
         Wizard {
             root,
             base: plan.detected.clone(),
             plan,
             answers,
             moves: BTreeMap::new(),
-            docker: crate::setup::Machine::this().docker,
+            first,
             tab: 0,
             cursor: 0,
+            scroll: 0,
             error: None,
             end: None,
         }
@@ -254,20 +275,16 @@ impl<'a> Wizard<'a> {
 
     /// The jobs where they are now, each with the places init first offered it
     fn rows(&self) -> Vec<Row> {
-        let first = self
-            .base
-            .as_ref()
-            .map(|d| rows(d, self.docker))
-            .unwrap_or_default();
         let mut now = self
             .plan
             .detected
             .as_ref()
-            .map(|d| rows(d, self.docker))
+            .map(|d| rows(self.root, d, &Machine::default()))
             .unwrap_or_default();
 
         for r in &mut now {
-            if let Some(f) = first
+            if let Some(f) = self
+                .first
                 .iter()
                 .find(|f| (&f.file, &f.job) == (&r.file, &r.job))
             {
@@ -343,8 +360,16 @@ impl<'a> Wizard<'a> {
             KeyCode::Right | KeyCode::Tab => self.go((self.tab + 1) % tabs),
             KeyCode::Left | KeyCode::BackTab => self.go((self.tab + tabs - 1) % tabs),
             KeyCode::Char(c) if ('1'..='5').contains(&c) => self.go(c as usize - '1' as usize),
-            KeyCode::Down if self.cursor + 1 < count => self.cursor += 1,
-            KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Down if self.cursor + 1 < count => {
+                self.cursor += 1;
+                self.scroll = 0;
+            }
+            KeyCode::Up => {
+                self.cursor = self.cursor.saturating_sub(1);
+                self.scroll = 0;
+            }
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Char(' ') | KeyCode::Enter => self.choose(),
             KeyCode::Char('q') | KeyCode::Esc => self.end = Some(End::Quit),
             _ => {}
@@ -354,9 +379,11 @@ impl<'a> Wizard<'a> {
     fn go(&mut self, tab: usize) {
         self.tab = tab;
         self.cursor = 0;
+        self.scroll = 0;
     }
 
     fn choose(&mut self) {
+        let count = self.items().len();
         let a = &mut self.answers;
 
         match (TABS[self.tab], self.cursor) {
@@ -373,7 +400,7 @@ impl<'a> Wizard<'a> {
                     *on = !*on;
                 }
             }
-            ("GitHub", i) => {
+            ("GitHub", i) if i < count => {
                 let app = self.plan.app == App::Hosted;
 
                 match (app, i) {
@@ -381,7 +408,9 @@ impl<'a> Wizard<'a> {
                     _ => a.ruleset = !a.ruleset,
                 }
             }
-            ("Review", 0) => self.end = Some(End::Apply),
+            // A plan that could not be worked out again is never applied
+            ("Review", 0) if self.error.is_none() => self.end = Some(End::Apply),
+            ("Review", 0) => {}
             ("Review", _) => self.end = Some(End::Quit),
             _ => {}
         }
@@ -402,14 +431,28 @@ impl<'a> Wizard<'a> {
             self.answers.open_app,
             self.answers.ruleset,
         );
+        // Each file's edit keeps the person's answer, a file the move first offers gets the recommended one
+        let files: Vec<(String, bool)> = self
+            .plan
+            .workflows
+            .iter()
+            .map(|w| w.file.clone())
+            .zip(self.answers.workflows.iter().copied())
+            .collect();
 
         match crate::onboard::replan(self.root, &mut self.plan, d) {
             Ok(()) => self.error = None,
             Err(e) => self.error = Some(e),
         }
 
-        // The workflow edits follow the new placement, the other answers stay
         self.answers = self.plan.recommended();
+
+        for (w, on) in self.plan.workflows.iter().zip(&mut self.answers.workflows) {
+            if let Some((_, was)) = files.iter().find(|(f, _)| *f == w.file) {
+                *on = *was;
+            }
+        }
+
         (
             self.answers.config,
             self.answers.open_app,
@@ -473,12 +516,11 @@ impl<'a> Wizard<'a> {
 
         let detail_widget = Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL))
-            .wrap(Wrap { trim: false });
+            .wrap(Wrap { trim: false })
+            .scroll((self.scroll, 0));
         f.render_widget(detail_widget, detail);
         f.render_widget(
-            Paragraph::new(
-                "←/→ or 1-5: step   ↑/↓: line   space: change   q: quit, nothing written",
-            ),
+            Paragraph::new("←/→ 1-5: step  ↑/↓: line  PgUp/PgDn: scroll  space: change  q: quit"),
             help,
         );
     }
@@ -537,16 +579,14 @@ mod tests {
     fn wizard(dir: &Path) -> Wizard<'_> {
         fs::create_dir_all(dir.join(".github/workflows")).unwrap();
         fs::write(dir.join(".github/workflows/ci.yml"), CI).unwrap();
-        let mut plan = crate::onboard::plan(dir, App::NotPublic, &mut Quiet).unwrap();
+        let mut plan = crate::onboard::plan_at(dir, "main", App::NotPublic, &mut Quiet).unwrap();
         let machine = crate::setup::Machine {
             docker: true,
             colima: true,
             ..Default::default()
         };
         crate::onboard::replan(dir, &mut plan, crate::setup::detect_on(dir, &machine)).unwrap();
-        let mut w = Wizard::new(dir, plan);
-        w.docker = true;
-        w
+        Wizard::on(dir, plan, &machine)
     }
 
     fn config(w: &Wizard) -> String {
@@ -699,6 +739,159 @@ mod tests {
                 "Apply",
             ][tab];
             assert!(screen.contains(want), "{tab}: {want}\n{screen}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod review {
+    use super::*;
+    use crate::onboard::Report;
+    use std::fs;
+
+    struct Quiet;
+    impl Report for Quiet {
+        fn start(&mut self, _: &str) {}
+        fn done(&mut self, _: bool, _: &str) {}
+    }
+
+    const W: &str = "on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  envpr:\n    runs-on: ubuntu-latest\n    env:\n      BASE: ${{ github.base_ref }}\n    steps:\n      - run: make c\n  heredoc:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat <<EOF > a\n          x\n          EOF\n          make test\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker build .\n";
+
+    fn wiz(dir: &Path) -> Wizard<'_> {
+        fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        fs::write(dir.join(".github/workflows/ci.yml"), W).unwrap();
+        let mut plan = crate::onboard::plan_at(dir, "main", App::NotPublic, &mut Quiet).unwrap();
+        let m = crate::setup::Machine {
+            docker: true,
+            colima: true,
+            ..Default::default()
+        };
+        crate::onboard::replan(dir, &mut plan, crate::setup::detect_on(dir, &m)).unwrap();
+        Wizard::on(dir, plan, &m)
+    }
+
+    fn sel(w: &mut Wizard, job: &str) {
+        w.go(0);
+        w.cursor = w
+            .items()
+            .iter()
+            .position(|i| i.contains(&format!("job {job}:")))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_host_check_act_would_run_otherwise_is_never_offered_act() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = wiz(dir.path());
+        sel(&mut w, "envpr");
+        w.key(KeyCode::Char(' '));
+        let cfg = w.plan.config.as_ref().unwrap().0.clone();
+        assert!(
+            !cfg.contains("[jobs.\"ci.yml/envpr\"]"),
+            "a job #72 keeps off act went to act"
+        );
+    }
+
+    #[test]
+    fn a_job_on_colima_says_the_vm_reaches_the_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = wiz(dir.path());
+        sel(&mut w, "e2e");
+        w.key(KeyCode::Char(' '));
+        let shown: Vec<String> = (0..TABS.len())
+            .flat_map(|t| {
+                w.tab = t;
+                let mut v = w.items();
+                v.extend(w.detail());
+                v
+            })
+            .collect();
+        sel(&mut w, "e2e");
+        assert!(
+            shown
+                .iter()
+                .chain(w.detail().iter())
+                .any(|l| l.contains("loopback")),
+            "no loopback warning once on colima"
+        );
+    }
+
+    #[test]
+    fn moving_every_job_to_github_cannot_be_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = wiz(dir.path());
+        for job in ["lint", "envpr", "heredoc"] {
+            loop {
+                sel(&mut w, job);
+                if w.items()[w.cursor].contains(": GitHub") {
+                    break;
+                }
+                w.key(KeyCode::Char(' '));
+            }
+        }
+        let cfg = w.plan.config.as_ref().map(|c| c.0.clone());
+        assert!(
+            cfg.is_none() || w.error.is_some(),
+            "Apply would write {cfg:?}"
+        );
+        w.go(4);
+        w.key(KeyCode::Enter);
+        assert_eq!(w.end, None, "Apply went through with nothing to run here");
+    }
+
+    #[test]
+    fn moving_a_job_keeps_each_workflow_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = wiz(dir.path());
+        w.go(2);
+        w.key(KeyCode::Char(' '));
+        assert_eq!(w.answers.workflows, [false]);
+        sel(&mut w, "e2e");
+        w.key(KeyCode::Char(' '));
+        assert_eq!(
+            w.answers.workflows,
+            [false],
+            "the move reset the person's answer"
+        );
+    }
+
+    #[test]
+    fn space_on_an_empty_github_tab_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = wiz(dir.path());
+        w.go(3);
+        w.key(KeyCode::Char(' '));
+        assert!(
+            !w.answers.ruleset,
+            "space on an empty tab turned the ruleset on"
+        );
+    }
+
+    #[test]
+    fn every_tab_draws_at_any_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = wiz(dir.path());
+        for (x, y) in [
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (10, 3),
+            (20, 5),
+            (30, 8),
+            (40, 10),
+            (80, 24),
+            (79, 23),
+            (60, 15),
+        ] {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(x, y)).unwrap();
+            for tab in 0..TABS.len() {
+                w.go(tab);
+                let n = w.items().len().max(1);
+                for c in 0..n {
+                    w.cursor = c;
+                    t.draw(|f| w.draw(f)).unwrap();
+                }
+            }
         }
     }
 }

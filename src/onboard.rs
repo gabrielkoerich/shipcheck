@@ -126,7 +126,12 @@ pub fn plan(root: &Path, app: App, r: &mut dyn Report) -> Result<Plan, String> {
     plan_at(root, &base_branch(root)?, app, r)
 }
 
-fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan, String> {
+pub(crate) fn plan_at(
+    root: &Path,
+    base: &str,
+    app: App,
+    r: &mut dyn Report,
+) -> Result<Plan, String> {
     let path = root.join("shipcheck.toml");
     let mut plan = Plan {
         base: base.to_string(),
@@ -278,6 +283,7 @@ fn tried(
  * shipcheck.toml and the workflow edits and required checks that go with it. Nothing is written
  **/
 pub fn replan(root: &Path, plan: &mut Plan, d: setup::Detected) -> Result<(), String> {
+    let nothing = d.checks.is_empty() && d.acts.is_empty();
     let text = setup::config_text(&d);
     let cfg = RepoConfig::parse(&text)?;
     plan.config = Some((text.clone(), setup::said_for(&d)));
@@ -287,6 +293,12 @@ pub fn replan(root: &Path, plan: &mut Plan, d: setup::Detected) -> Result<(), St
     plan.github.clear();
     workflows(root, &cfg, plan)?;
     plan.ruleset = ruleset_plan(root, &text, &plan.app, &plan.github);
+
+    // As init does when every job stays on GitHub, which an empty shipcheck.toml would not say
+    if nothing {
+        return Err("every job runs on GitHub, so there is no shipcheck.toml to write: move a job here, or quit".into());
+    }
+
     Ok(())
 }
 
