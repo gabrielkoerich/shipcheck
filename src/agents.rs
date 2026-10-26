@@ -36,7 +36,7 @@ pub fn merge_block(text: Option<&str>) -> Result<String, String> {
     if let Some(start) = text.find(START) {
         let Some(len) = text[start..].find(END) else {
             return Err(format!(
-                "its shipcheck block has no `{END}`, add it where the block ends and run `shipcheck init` again"
+                "its shipcheck block has no `{END}`, add it where the block ends and run `shipcheck init --yes` again"
             ));
         };
         let end = start + len + END.len();
@@ -234,10 +234,12 @@ pub fn notes(root: &Path) -> Vec<String> {
                 None
             } else if text.contains(START) {
                 Some(format!(
-                    "{name} has an older shipcheck block: `shipcheck init`"
+                    "{name} has an older shipcheck block: `shipcheck init --yes`"
                 ))
             } else {
-                Some(format!("{name} has no shipcheck block: `shipcheck init`"))
+                Some(format!(
+                    "{name} has no shipcheck block: `shipcheck init --yes`"
+                ))
             }
         })
         .collect()

@@ -58,9 +58,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set up this repository: shipcheck.toml, agent instructions, hooks
+    /// Set up this repository: shipcheck.toml, agent instructions, hooks. Without a terminal and without --yes it only previews
     Init {
-        /// Take the recommended choices without asking
+        /// Take the recommended choices without asking, as a script or an agent does
         #[arg(long)]
         yes: bool,
     },
@@ -430,7 +430,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
             if plan.defaults {
                 say(&format!(
-                    "no shipcheck.toml on {base}, running every workflow that runs for branches, on pull_request or push: {}. This result is not a PR check, `shipcheck init` and merge shipcheck.toml to main for that",
+                    "no shipcheck.toml on {base}, running every workflow that runs for branches, on pull_request or push: {}. This result is not a PR check, `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main for that",
                     plan.config.workflows.join(", ")
                 ));
             }
@@ -689,7 +689,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
             if plan.defaults {
                 return Err(format!(
-                    "{base} has no shipcheck.toml, so this result ran the defaults and is not a check. Run `shipcheck init` and merge shipcheck.toml to main"
+                    "{base} has no shipcheck.toml, so this result ran the defaults and is not a check. Run `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main"
                 ));
             }
 
@@ -816,7 +816,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 && std::io::stderr().is_terminal();
             let finish = &mut |say: &mut dyn FnMut(&str)| machine_setup(&root, say);
 
-            // A person gets the wizard, `--yes` the recommended choices, an agent or a script no change outside the repository
+            // A person gets the wizard, `--yes` the recommended choices, an agent or a script without `--yes` only the plan
             if yes {
                 shipcheck::onboard::plain(
                     &root,
@@ -832,23 +832,17 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            if let Some(wrote) = shipcheck::onboard::config_only(&root, &mut std::io::stdout())? {
-                println!("{wrote}");
-            }
-
-            // Instructions, hooks and the daemon for a repository with nothing to run would only mislead
-            if !root.join("shipcheck.toml").exists() {
+            // The preview's own process, which the one below starts with a scratch home
+            if std::env::var_os(shipcheck::onboard::PREVIEW).is_some() {
+                shipcheck::onboard::preview(
+                    &root,
+                    shipcheck::onboard::App::find(),
+                    &mut std::io::stdout(),
+                )?;
                 return Ok(ExitCode::SUCCESS);
             }
 
-            machine_setup(&root, &mut |line| println!("{line}"))?;
-            println!(
-                "next: review shipcheck.toml and AGENTS.md, commit them, and merge to {}",
-                shipcheck::daemon::known_base(&root)
-                    .unwrap_or_else(|| "origin/main".into())
-                    .trim_start_matches("origin/")
-            );
-            Ok(ExitCode::SUCCESS)
+            Ok(ExitCode::from(shipcheck::onboard::preview_apart(&root)?))
         }
         "install" => {
             let root = toplevel(&cwd)?;
