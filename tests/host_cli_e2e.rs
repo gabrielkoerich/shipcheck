@@ -378,6 +378,11 @@ fn a_change_outside_paths_passes_and_is_never_cached() {
         out.contains("nothing to run: no change under paths"),
         "{out}"
     );
+    assert!(out.contains(": nothing ran"), "{out}");
+    assert!(
+        !out.contains("cached result"),
+        "a skip is no cached result: {out}"
+    );
     assert_eq!(repo.cached(), 0, "a paths skip must never be cached");
 
     // A change under paths runs, and its pass is cached
@@ -389,6 +394,18 @@ fn a_change_outside_paths_passes_and_is_never_cached() {
     assert_eq!(code, Some(0), "{out}");
     assert!(out.contains("running, attempt"), "{out}");
     assert_eq!(repo.cached(), 1);
+}
+
+// A partial run that passed is not the check, and commit says it was partial
+#[test]
+fn commit_after_a_partial_run_says_it_was_partial() {
+    let repo = Repo::new(MARKER);
+    repo.write("marker.txt", "x");
+    let (code, out) = repo.shipcheck(&["run", "--no-fetch", "--job", "marker"]);
+    assert_eq!(code, Some(0), "{out}");
+    let (code, out) = repo.shipcheck(&["commit", "-m", "wip"]);
+    assert_eq!(code, Some(2), "{out}");
+    assert!(out.contains("the last run was partial"), "{out}");
 }
 
 // `shipcheck logs` hands no control character from a check to the terminal
