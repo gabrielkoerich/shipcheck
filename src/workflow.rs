@@ -700,29 +700,54 @@ pub fn ungate(cond: &str) -> Option<String> {
 }
 
 /// What act, which runs a job as `workflow_dispatch` on a branch of its own, gives other values than a PR
-const CONTEXT_ACT_LACKS: &[&str] = &[
+/**
+ * Expression contexts act gives other values than a PR run, lowercase, since GitHub reads contexts
+ * in any case: the event, the refs, who opened it, the secrets and variables act has none of, and
+ * the whole `github` context at once
+ **/
+const CONTEXTS_ACT_LACKS: &[&str] = &[
     "github.event",
     "github.base_ref",
     "github.head_ref",
+    "github.ref",
     "github.repository_owner",
     "github.actor",
     "github.triggering_actor",
     "default_branch",
+    "secrets.",
+    "vars.",
+    "tojson(github)",
+];
+
+/// The same as variables a step's shell reads, which keep their case
+const VARS_ACT_LACKS: &[&str] = &[
     "GITHUB_EVENT_NAME",
     "GITHUB_EVENT_PATH",
     "GITHUB_BASE_REF",
     "GITHUB_HEAD_REF",
+    "GITHUB_REF",
     "GITHUB_ACTOR",
     "GITHUB_REPOSITORY_OWNER",
 ];
 
-/// What a step's `if:` may read that act gives otherwise: the ref, and secrets and variables it has none of
-const IF_ACT_LACKS: &[&str] = &["github.ref", "secrets.", "vars.", "env."];
+/// What a step's `if:` may also read that act gives otherwise: a variable set from a secret or the ref
+const IF_ACT_LACKS: &[&str] = &["env."];
+
+/// The context or variable act lacks that a job's text reads, if any
+pub fn reads_what_act_lacks(text: &str) -> Option<&'static str> {
+    let lower = text.to_lowercase();
+    CONTEXTS_ACT_LACKS
+        .iter()
+        .find(|c| lower.contains(*c))
+        .or_else(|| VARS_ACT_LACKS.iter().find(|v| text.contains(*v)))
+        .copied()
+}
 
 /**
  * Why act cannot tell what a job does on a PR: a job `if:` of its own, beside init's gate, which act
- * may skip and a skip passes, or a value anywhere in the job that reads the PR or who opened it,
- * which act leaves empty, so a step such as a changed-files lint checks nothing. None when it reads none
+ * may skip and a skip passes, a local action init does not read, or a value in the job or the
+ * workflow's `env` that reads the PR, who opened it, the ref, secrets or variables, which act
+ * leaves empty or sets otherwise, so a step such as a changed-files lint checks nothing
  **/
 pub fn act_lacks_context(source: &str, id: &str) -> Option<String> {
     let root = load(source).ok()?;
@@ -743,10 +768,27 @@ pub fn act_lacks_context(source: &str, id: &str) -> Option<String> {
         h.remove(&key("if"));
     }
 
-    let steps = job["steps"].as_vec().into_iter().flatten();
-    let step_if = steps
-        .filter_map(|s| s["if"].as_str())
-        .find_map(|c| IF_ACT_LACKS.iter().find(|w| c.contains(*w)).map(|w| (c, w)));
+    let steps = || job["steps"].as_vec().into_iter().flatten();
+
+    if let Some(local) = steps()
+        .filter_map(|s| s["uses"].as_str())
+        .find(|u| u.starts_with("./"))
+    {
+        return Some(format!(
+            "it uses the local action {local}, which init does not read"
+        ));
+    }
+
+    let step_if = steps().filter_map(|s| s["if"].as_str()).find_map(|c| {
+        reads_what_act_lacks(c)
+            .or_else(|| {
+                IF_ACT_LACKS
+                    .iter()
+                    .copied()
+                    .find(|w| c.to_lowercase().contains(w))
+            })
+            .map(|w| (c, w))
+    });
 
     if let Some((cond, what)) = step_if {
         return Some(format!(
@@ -754,10 +796,13 @@ pub fn act_lacks_context(source: &str, id: &str) -> Option<String> {
         ));
     }
 
-    let text = emit(Hash::from_iter([(key(id), job)])).ok()?;
-    CONTEXT_ACT_LACKS
-        .iter()
-        .find(|c| text.contains(*c))
+    let workflow_env = root.get(&key("env")).cloned().unwrap_or(Yaml::Null);
+    let text = emit(Hash::from_iter([
+        (key(id), job),
+        (key("env"), workflow_env),
+    ]))
+    .ok()?;
+    reads_what_act_lacks(&text)
         .map(|c| format!("it reads `{c}`, which act leaves empty or sets otherwise"))
 }
 

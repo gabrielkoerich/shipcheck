@@ -273,9 +273,12 @@ pub fn propose(root: &Path, machine: &Machine) -> Result<(Option<String>, String
         let mut said = format!("runner = \"act\": {why}");
 
         for file in pr_only {
-            said.push_str(&format!(
-                "\n{file} stays on GitHub as it is: a job's `if:` depends on the PR or the default branch"
-            ));
+            for k in found.github.iter().filter(|k| k.file == file) {
+                said.push_str(&format!(
+                    "\n{file} stays on GitHub as it is, since act runs a workflow whole: job {}: {}",
+                    k.job, k.why
+                ));
+            }
         }
 
         return Ok((Some(act_config(&workflows)), said));
@@ -558,6 +561,87 @@ fn needs_vm(job: &crate::workflow::Job) -> Option<String> {
 }
 
 /**
+ * Why a run here, by act or a host check, would see the PR otherwise than GitHub: a repository
+ * script a step starts that reads the event or the refs, or `HEAD^` or `HEAD~` in a workflow that
+ * runs on PRs, which there is the PR's base and here only the commit before
+ **/
+fn reads_the_pr(job: &crate::workflow::Job, source: &str, root: &Path) -> Option<String> {
+    let on_prs = crate::workflow::runs_on_prs(source);
+
+    for step in &job.steps {
+        if on_prs && (step.run.contains("HEAD^") || step.run.contains("HEAD~")) {
+            return Some("it compares with HEAD^ or HEAD~, which on a PR is its base and here only the commit before".into());
+        }
+
+        for words in started(&step.run) {
+            let shell = ["sh", "bash", "zsh", "dash"].contains(&words[0].as_str());
+            let Some(script) = (if shell { words.get(1) } else { words.first() }) else {
+                continue;
+            };
+            let path = script.strip_prefix("./").unwrap_or(script);
+
+            if !script.contains('/') || path.starts_with('/') || path.contains("..") {
+                continue;
+            }
+
+            let file = root.join(path);
+            let small = fs::metadata(&file).is_ok_and(|m| m.is_file() && m.len() < 1 << 20);
+
+            if let Some(what) = small
+                .then(|| fs::read_to_string(&file).ok())
+                .flatten()
+                .and_then(|text| crate::workflow::reads_what_act_lacks(&text))
+            {
+                return Some(format!(
+                    "its script {script} reads `{what}`, which only GitHub's run of a PR has"
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Why act would run a job otherwise than GitHub does: what it reads, reports or publishes
+fn act_differs(job: &crate::workflow::Job, source: &str, root: &Path) -> Option<String> {
+    if let Some(why) = crate::workflow::act_lacks_context(source, &job.id) {
+        return Some(why);
+    }
+
+    let reports = job
+        .steps
+        .iter()
+        .filter_map(|s| s.uses.as_deref())
+        .find(|u| {
+            let lower = u.to_lowercase();
+            REPORTERS.iter().any(|r| lower.starts_with(r))
+                || ships(u.split('@').next().unwrap_or(u), &['-', '_', '/'])
+        });
+
+    if let Some(u) = reports {
+        return Some(format!("it reports to GitHub or publishes with {u}"));
+    }
+
+    let pr_aware = job.steps.iter().find(|s| {
+        let lower = s.uses.as_deref().unwrap_or_default().to_lowercase();
+        let only_new = lower.starts_with("golangci/golangci-lint-action")
+            && s.with
+                .iter()
+                .any(|(k, v)| k == "only-new-issues" && v.as_deref() != Some("false"));
+        PR_AWARE.iter().any(|p| lower.starts_with(p)) || only_new
+    });
+
+    if let Some(s) = pr_aware {
+        return Some(format!(
+            "{} reads the PR, which act's run has none of",
+            s.uses.as_deref().unwrap_or_default()
+        ));
+    }
+
+    reads_the_pr(job, source, root)
+}
+
+/**
  * Why act cannot run a job here as GitHub does, or the engine it would use. A job off Linux, on a
  * label act has no image for, one whose `if:` or values read the PR, one that reports to GitHub, or
  * one that needs a VM, since colima reaches this machine's loopback and is for its owner to choose
@@ -566,6 +650,7 @@ fn act_engine(
     job: &crate::workflow::Job,
     machine: &Machine,
     source: &str,
+    root: &Path,
 ) -> Result<Engine, String> {
     // act checks Docker before any job, a colima job's too
     if !machine.docker {
@@ -582,38 +667,8 @@ fn act_engine(
         return Err(format!("act has no image for its label {l}"));
     }
 
-    if let Some(why) = crate::workflow::act_lacks_context(source, &job.id) {
+    if let Some(why) = act_differs(job, source, root) {
         return Err(why);
-    }
-
-    let reports = job
-        .steps
-        .iter()
-        .filter_map(|s| s.uses.as_deref())
-        .find(|u| {
-            let lower = u.to_lowercase();
-            REPORTERS.iter().any(|r| lower.starts_with(r))
-                || ships(u.split('@').next().unwrap_or(u), &['-', '_', '/'])
-        });
-
-    if let Some(u) = reports {
-        return Err(format!("it reports to GitHub or publishes with {u}"));
-    }
-
-    let pr_aware = job.steps.iter().find(|s| {
-        let lower = s.uses.as_deref().unwrap_or_default().to_lowercase();
-        let only_new = lower.starts_with("golangci/golangci-lint-action")
-            && s.with
-                .iter()
-                .any(|(k, v)| k == "only-new-issues" && v.as_deref() != Some("false"));
-        PR_AWARE.iter().any(|p| lower.starts_with(p)) || only_new
-    });
-
-    if let Some(s) = pr_aware {
-        return Err(format!(
-            "{} reads the PR, which act's run has none of",
-            s.uses.as_deref().unwrap_or_default()
-        ));
     }
 
     if let Some(what) = needs_vm(job) {
@@ -653,10 +708,11 @@ pub fn place(root: &Path, machine: &Machine, d: &mut Detected) {
 
         for n in &before {
             let need = jobs.iter().find(|j| j.id == *n).ok_or("no job")?;
-            act_engine(need, machine, source).map_err(|why| format!("job {n} it needs: {why}"))?;
+            act_engine(need, machine, source, root)
+                .map_err(|why| format!("job {n} it needs: {why}"))?;
         }
 
-        act_engine(job, machine, source)
+        act_engine(job, machine, source, root)
     };
     let kept = std::mem::take(&mut d.github);
     let (needs, own): (Vec<Kept>, Vec<Kept>) =
@@ -1013,6 +1069,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     let mut d = Detected::default();
     let ruby_file = fs::read_to_string(root.join(".ruby-version")).ok();
     let mut files = Vec::new();
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
     for file in workflow_files(root).unwrap_or_default() {
         let source =
@@ -1027,7 +1084,8 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             continue;
         }
 
-        files.push((file, crate::workflow::job_runs(&source)));
+        files.push((file.clone(), crate::workflow::job_runs(&source)));
+        sources.insert(file, source);
     }
 
     let all = || {
@@ -1048,16 +1106,24 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             job.matrix.as_deref().unwrap_or_default()
         ));
 
-        // Their workflows stay out of `workflows` and as they are on GitHub
+        // act runs a listed workflow whole, so one job act would run otherwise keeps its workflow as it is on GitHub
         for (file, jobs) in &files {
-            for j in jobs.iter().filter(|j| j.pr_only) {
-                d.github.push(Kept {
-                    file: file.clone(),
-                    job: j.id.escape_debug().to_string(),
-                    why: PR_ONLY.into(),
-                    checks: j.check_names.clone(),
-                    act: None,
-                });
+            for j in jobs {
+                let why = if j.pr_only {
+                    Some(PR_ONLY.to_string())
+                } else {
+                    act_differs(j, &sources[file], root)
+                };
+
+                if let Some(why) = why {
+                    d.github.push(Kept {
+                        file: file.clone(),
+                        job: j.id.escape_debug().to_string(),
+                        why,
+                        checks: j.check_names.clone(),
+                        act: None,
+                    });
+                }
             }
         }
 
@@ -1071,9 +1137,11 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             .filter(|j| !only.contains(&j.id))
             .filter_map(|j| {
                 // A check without one of its steps would test less than the job, so it stays whole
-                let why = stays(j, machine, off_linux).or_else(|| {
-                    dropped_step(j).map(|s| format!("a check would leave out its {s}"))
-                })?;
+                let why = stays(j, machine, off_linux)
+                    .or_else(|| reads_the_pr(j, &sources[file], root))
+                    .or_else(|| {
+                        dropped_step(j).map(|s| format!("a check would leave out its {s}"))
+                    })?;
                 Some((j.id.clone(), why))
             })
             .collect();
@@ -3812,6 +3880,145 @@ jobs:
         assert!(
             text.contains("engine = \"colima\"") && !text.contains("network"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_job_that_reads_what_act_lacks_anywhere_stays_on_github() {
+        let heredoc = "      - run: |\n          cat <<EOF > a\n          x\n          EOF\n          make test\n";
+        let wf = |env: &str, extra: &str, steps: &str| {
+            format!(
+                "on: pull_request\n{env}jobs:\n  j:\n    runs-on: ubuntu-latest\n{extra}    steps:\n{steps}{heredoc}"
+            )
+        };
+        let run = |r: &str| wf("", "", &format!("      - run: {r}\n"));
+        for (case, source, reason) in [
+            ("plain", wf("", "", ""), None),
+            (
+                "wfenv",
+                wf(
+                    "env:\n  PR: ${{ github.event.pull_request.number }}\n",
+                    "",
+                    "",
+                ),
+                Some("`github.event`"),
+            ),
+            (
+                "varenv",
+                wf("", "    env:\n      X: ${{ vars.Y }}\n", ""),
+                Some("`vars.`"),
+            ),
+            (
+                "secretwith",
+                wf(
+                    "",
+                    "",
+                    "      - uses: some/action@v1\n        with:\n          token: ${{ secrets.TOKEN }}\n",
+                ),
+                Some("`secrets.`"),
+            ),
+            (
+                "refrun",
+                run("echo ${{ github.ref }}"),
+                Some("`github.ref`"),
+            ),
+            (
+                "envref",
+                run("test \"$GITHUB_REF\" = x"),
+                Some("`GITHUB_REF`"),
+            ),
+            (
+                "local",
+                wf("", "", "      - uses: ./.github/actions/x\n"),
+                Some("local action ./.github/actions/x"),
+            ),
+            (
+                "tojson",
+                run("echo '${{ toJSON(github) }}'"),
+                Some("`tojson(github)`"),
+            ),
+            (
+                "case",
+                run("echo ${{ github.EVENT_NAME }}"),
+                Some("`github.event`"),
+            ),
+        ] {
+            let found = detect_with(&[(".github/workflows/ci.yml", &source)], true);
+            let act = found
+                .github
+                .iter()
+                .find(|k| k.job == "j")
+                .and_then(|k| k.act.clone());
+
+            match reason {
+                None => assert!(
+                    found.acts.iter().any(|(k, _)| k.job == "j"),
+                    "{case}: {}",
+                    found.explain()
+                ),
+                Some(r) => assert!(
+                    act.as_deref().is_some_and(|a| a.contains(r)),
+                    "{case}: {act:?}\n{source}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn act_running_a_repository_whole_still_holds_back_what_it_would_run_otherwise() {
+        let ci = "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        node: [20, 22]\n    steps:\n      - run: npm test\n";
+        let pr = "on: pull_request\njobs:\n  changed:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: tj-actions/changed-files@v46\n  title:\n    runs-on: ubuntu-latest\n    steps:\n      - run: test -n \"${{ github.event.pull_request.title }}\"\n";
+        let dir = repo(&[
+            (".github/workflows/ci.yml", ci),
+            (".github/workflows/pr.yml", pr),
+        ]);
+        let machine = Machine {
+            docker: true,
+            ..Machine::default()
+        };
+        let (text, said) = propose(dir.path(), &machine).unwrap();
+        let cfg = RepoConfig::parse(&text.unwrap()).unwrap();
+        assert_eq!(cfg.workflows, ["ci.yml"], "{said}");
+        for line in [
+            "pr.yml stays on GitHub as it is, since act runs a workflow whole: job changed: tj-actions/changed-files@v46 reads the PR",
+            "pr.yml stays on GitHub as it is, since act runs a workflow whole: job title: it reads `github.event`",
+        ] {
+            assert!(said.contains(line), "{line}\n{said}");
+        }
+    }
+
+    #[test]
+    fn a_check_of_a_script_that_reads_the_pr_or_a_diff_from_head_stays_on_github() {
+        let ci = "on: pull_request\njobs:\n  changed:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./scripts/lint-changed.sh\n  last:\n    runs-on: ubuntu-latest\n    steps:\n      - run: git diff HEAD^ --check\n  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./scripts/lint.sh\n";
+        let found = detect_with(
+            &[
+                (".github/workflows/ci.yml", ci),
+                (
+                    "scripts/lint-changed.sh",
+                    "git diff origin/$GITHUB_BASE_REF --name-only | xargs lint\n",
+                ),
+                ("scripts/lint.sh", "lint .\n"),
+            ],
+            false,
+        );
+        let checks: Vec<&str> = found.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(checks, ["plain"], "{}", found.explain());
+        let why = |id: &str| {
+            found
+                .github
+                .iter()
+                .find(|k| k.job == id)
+                .map(|k| k.why.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            why("changed"),
+            "its script ./scripts/lint-changed.sh reads `GITHUB_BASE_REF`, which only GitHub's run of a PR has"
+        );
+        assert!(
+            why("last").starts_with("it compares with HEAD^ or HEAD~"),
+            "{}",
+            why("last")
         );
     }
 

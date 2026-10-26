@@ -247,8 +247,6 @@ fn tried(
         });
     }
 
-    // A job whose check failed here can still run with act
-    setup::place(root, machine, &mut d);
     plan.failed.extend(
         d.github
             .iter()
@@ -1765,7 +1763,8 @@ mod tests {
                 "runner = \"host\"\n[host]\nchecks = { proselint = \"trim.pl\" }\n",
             ),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         // Not gated: GitHub keeps running it on PRs
         assert!(plan.workflows.is_empty());
         assert_eq!(
@@ -1786,7 +1785,8 @@ mod tests {
                 "runner = \"host\"\n[host]\nchecks = { lint = \"make lint\" }\n\n[jobs.\"ci.yml/proselint\"]\nrunner = \"act\"\n",
             ),
         ]);
-        let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         let ci = &plan.workflows[0];
         assert!(
             ci.yes.starts_with("on PRs shipcheck runs shipcheck/lint, shipcheck/proselint, GitHub keeps running ci.yml on pushes to main"),
@@ -1806,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_whose_check_fails_its_trial_runs_with_act() {
+    fn a_job_whose_check_fails_its_trial_stays_on_github_untried_by_act() {
         let ci = "on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  broken:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make fails-in-trial\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci)]);
         let machine = setup::Machine {
@@ -1814,7 +1814,8 @@ mod tests {
             ..setup::Machine::default()
         };
         let (text, said) = setup::propose(dir.path(), &machine).unwrap();
-        let mut plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
+        let mut plan =
+            super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
         plan.failed.clear();
         let (text, said) = super::tried(
             dir.path(),
@@ -1826,12 +1827,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(
-            text.contains("[jobs.\"ci.yml/broken\"]\nrunner = \"act\""),
-            "{text}"
-        );
+        // act would run it without a trial, so it is written nowhere and GitHub keeps it
+        assert!(!text.contains("broken"), "{text}");
         assert!(text.contains("lint = \"make lint\""), "{text}");
-        assert!(plan.failed.is_empty(), "{:?}", plan.failed);
+        assert_eq!(plan.failed.len(), 1, "{:?}", plan.failed);
         assert!(
             said.contains("ci.yml, job broken: failed when init tried it"),
             "{said}"
