@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -49,17 +51,6 @@ jobs:
       - run: exit 1
 ";
 
-/// Removes the Docker volumes and images of the test's home, even when an assertion fails
-struct CleanOnDrop;
-
-impl Drop for CleanOnDrop {
-    fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
-            .args(["clean", "--all"])
-            .output();
-    }
-}
-
 #[test]
 #[ignore = "needs act and Docker"]
 fn runs_caches_and_tests_the_working_copy() {
@@ -67,7 +58,7 @@ fn runs_caches_and_tests_the_working_copy() {
     // SAFETY: this is the only test in this binary that reads or writes the environment
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
     // Declared after `tmp`, so it drops first and removes the volumes while the home still exists
-    let _volumes = CleanOnDrop;
+    let _volumes = common::CleanOnDrop;
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();

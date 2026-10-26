@@ -518,8 +518,10 @@ impl Engine for Docker {
         let port = free_port()?;
         let home = crate::run::home();
 
-        for (name, _) in volumes(&act.config, request.repo_id, &tag) {
+        // Stamped first, so a parallel run's prune never takes it for an empty one no run used
+        for (name, path) in volumes(&act.config, request.repo_id, &tag) {
             gc::stamp(&home, "volumes", &name);
+            gc::create_volume(&name, &home, request.repo_id, path)?;
         }
 
         let volumes = mounts(&act.config, request.repo_id, &tag, run_dir)?;
@@ -751,13 +753,13 @@ impl Engine for Docker {
     }
 
     fn prune(&self) -> Vec<String> {
-        let now = std::time::SystemTime::now();
+        let (home, prefix, host) = here_parts();
         gc::prune(
             &gc::Docker,
-            &crate::run::home(),
-            &home_prefix(),
+            &here(&home, &prefix, &host),
+            &run_tags(&home),
             gc::OLD_PINS,
-            now,
+            std::time::SystemTime::now(),
         )
     }
 
@@ -771,7 +773,9 @@ impl Engine for Docker {
         }
 
         let prefix = repo_id.map(volume_prefix).unwrap_or_else(home_prefix);
-        done.extend(gc::clean(&gc::Docker, &crate::run::home(), &prefix));
+        let (home, own, host) = here_parts();
+        let here = here(&home, &own, &host);
+        done.extend(gc::clean(&gc::Docker, &here, &prefix, repo_id.is_none()));
         // Networks are per slot, not per repository, and Docker refuses to remove one in use
         let prefix = format!("{}net-", home_prefix());
         let Ok(listed) = Command::new("docker")
@@ -1955,10 +1959,15 @@ read -r state || state=
 [ "$state" = done ] && exit 0
 [ "$state" = exited ] || kill -s KILL -- "-$pgid" 2>/dev/null
 net=$1
-shift
+tag=$2
+shift 2
 cleanup() {
   for p in "$@"; do
     docker ps -aq --filter name=^act- --filter "volume=$p" | while read -r id; do docker rm -f -v "$id"; done
+  done
+  # act removes its volumes only when it ends by itself
+  docker volume ls -q --filter "name=-$tag-" | while read -r v; do
+    case $v in act-*-"$tag"-*-env) docker volume rm "$v" ;; esac
   done
   docker network rm "$net"
 }
@@ -1990,14 +1999,20 @@ fn reaper(run_dir: &Path, slot_lock: Option<std::os::fd::RawFd>) -> Option<std::
             .collect::<Vec<_>>()
             .join(" "),
     );
-    cmd.args(["-c", REAPER, "sh", &network_name(run_dir)])
-        .args(mount_paths(run_dir))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok()
+    cmd.args([
+        "-c",
+        REAPER,
+        "sh",
+        &network_name(run_dir),
+        &run_tag(run_dir),
+    ])
+    .args(mount_paths(run_dir))
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .process_group(0)
+    .spawn()
+    .ok()
 }
 
 /// What separates a run's act process from another's: its containers, apt volume and network
@@ -2128,9 +2143,50 @@ fn volume_prefix(repo_id: &str) -> String {
 /// The start of every volume name under this `SHIPCHECK_HOME`, so `clean --all` of one home leaves
 /// the volumes of another, such as a test's, alone
 pub fn home_prefix() -> String {
-    let home = crate::run::home();
+    prefix_of(&crate::run::home())
+}
+
+fn prefix_of(home: &Path) -> String {
     let hash = cache::hex(&Sha256::digest(home.to_string_lossy().as_bytes())[..3]);
     format!("shipcheck-{hash}-")
+}
+
+/// The home, its prefix and the host name, which `here` borrows
+pub fn here_parts() -> (PathBuf, String, String) {
+    let home = crate::run::home();
+    let prefix = prefix_of(&home);
+    (home, prefix, gc::hostname())
+}
+
+pub fn here<'a>(home: &'a Path, prefix: &'a str, host: &'a str) -> gc::Here<'a> {
+    gc::Here {
+        home,
+        prefix,
+        host,
+        sweep: !crate::run::home_overridden(),
+    }
+}
+
+/// The run tags of every checkout dir under `runs/<owner>/<repo>/<slot>`, and of the slot itself,
+/// which was the checkout before one per job
+pub fn run_tags(home: &Path) -> Vec<String> {
+    let mut dirs = vec![home.join("runs")];
+    let mut tags = Vec::new();
+
+    for depth in 1..=5 {
+        dirs = dirs
+            .iter()
+            .flat_map(|d| fs::read_dir(d).into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+
+        if depth >= 3 {
+            tags.extend(dirs.iter().map(|d| run_tag(d)));
+        }
+    }
+
+    tags
 }
 
 /**
@@ -2756,15 +2812,121 @@ jobs:
         assert!(act.uses_colima() && !Act::default().uses_colima());
     }
 
+    /// Every volume name on the machine without `part`
+    fn volumes_without(part: &str) -> BTreeSet<String> {
+        let out = Command::new("docker")
+            .args(["volume", "ls", "-q"])
+            .output()
+            .unwrap();
+        (String::from_utf8_lossy(&out.stdout).split_whitespace())
+            .filter(|n| !n.contains(part))
+            .map(String::from)
+            .collect()
+    }
+
+    /**
+     * shipcheck stands in a child copy of this test: it starts the reaper and a fake act, then
+     * waits for the signal. Ctrl-C reaches shipcheck's group only, act and the reaper have their
+     * own, so the reaper has to clean up from the end of its input alone
+     **/
+    #[test]
+    #[ignore = "needs Docker"]
+    fn a_signal_to_shipcheck_makes_the_reaper_remove_acts_volumes() {
+        if let Some(dir) = std::env::var_os("SHIPCHECK_REAPER_CHILD") {
+            let mut reaper = reaper(Path::new(&dir), None).unwrap();
+            let act = Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            writeln!(reaper.stdin.as_mut().unwrap(), "{}", act.id()).unwrap();
+            println!("ready");
+            std::io::stdout().flush().unwrap();
+            // The signal ends this process first
+            let _ = act.wait_with_output();
+            let _ = reaper.wait();
+            return;
+        }
+
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let tmp = tempfile::tempdir().unwrap();
+            let run_dir = tmp.path().join("run");
+            fs::create_dir(&run_dir).unwrap();
+            let tag = run_tag(&run_dir);
+            let before = volumes_without(&tag);
+            let name = format!("act-CI-test-{tag}-0abc-env");
+            let made = Command::new("docker")
+                .args(["volume", "create", &name])
+                .output()
+                .unwrap();
+            assert!(made.status.success());
+
+            let mut shipcheck = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "runner::act::tests::a_signal_to_shipcheck_makes_the_reaper_remove_acts_volumes",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SHIPCHECK_REAPER_CHILD", &run_dir)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut out = std::io::BufReader::new(shipcheck.stdout.take().unwrap());
+            let mut line = String::new();
+
+            while !line.contains("ready") {
+                line.clear();
+                assert!(std::io::BufRead::read_line(&mut out, &mut line).unwrap() > 0);
+            }
+
+            // Safe: kill only sends a signal to the child this test started
+            unsafe { libc::kill(shipcheck.id() as libc::pid_t, signal) };
+            let status = shipcheck.wait().unwrap();
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(signal)
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+
+            let exists = || {
+                Command::new("docker")
+                    .args(["volume", "inspect", &name])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            };
+
+            while exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+
+            let left = exists();
+
+            if left {
+                let _ = Command::new("docker")
+                    .args(["volume", "rm", &name])
+                    .output();
+            }
+
+            assert!(!left, "signal {signal} left {name}");
+            assert_eq!(
+                volumes_without(&tag),
+                before,
+                "the test changed volumes it did not make"
+            );
+        }
+    }
+
     #[test]
     fn the_reaper_cleans_up_only_when_shipcheck_dies_first() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("docker.log");
         let docker = dir.path().join("docker");
-        // `ps` names one container, every call is logged
+        // `ps` names one container, `volume ls` an act volume, one that is not and one whose tag is out of
+        // place, as Docker's substring filter lets through. Every call is logged
         let fake = format!(
-            "#!/bin/sh\necho \"$*\" >> {}\n[ \"$1\" = ps ] && echo c1\nexit 0\n",
+            "#!/bin/sh\necho \"$*\" >> {}\n[ \"$1\" = ps ] && echo c1\n[ \"$1\" = volume ] && [ \"$2\" = ls ] && printf 'act-CI-t-13f69a23-0a-env\\nact-x-13f69a23-0a\\nact-13f69a23-x-env\\n'\nexit 0\n",
             log.display()
         );
         fs::write(&docker, fake).unwrap();
@@ -2786,7 +2948,7 @@ jobs:
             let held =
                 super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
             let mut reaper = cmd
-                .args(["-c", REAPER, "sh", "net-1", "/runs/0"])
+                .args(["-c", REAPER, "sh", "net-1", "13f69a23", "/runs/0"])
                 .env("PATH", &path)
                 .env("LOCK_FDS", held[0].to_string())
                 .stdin(Stdio::piped())
@@ -2802,7 +2964,7 @@ jobs:
             drop(stdin);
             assert!(reaper.wait().unwrap().success());
             let calls = fs::read_to_string(&log).unwrap_or_default();
-            let cleanup = "ps -aq --filter name=^act- --filter volume=/runs/0\nrm -f -v c1\nnetwork rm net-1\n";
+            let cleanup = "ps -aq --filter name=^act- --filter volume=/runs/0\nrm -f -v c1\nvolume ls -q --filter name=-13f69a23-\nvolume rm act-CI-t-13f69a23-0a-env\nnetwork rm net-1\n";
 
             match state {
                 "done" => assert_eq!(calls, ""),
