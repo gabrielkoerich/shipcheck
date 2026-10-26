@@ -1495,6 +1495,8 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
 
     prune(&home, SystemTime::now());
     crate::templates::prune(&home, SystemTime::now(), &slot.with_extension("lock"));
+    // A host check that outlived a crashed run could otherwise edit this slot's next checkout
+    crate::runner::host::reap_slot(&slot)?;
     {
         let _git = git_lock(&id)?;
         remove_checkouts(plan, &runners, &slot);
