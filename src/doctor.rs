@@ -347,7 +347,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                 "colima",
                 runner::colima::version().map(|v| {
                     format!(
-                        "{v}, a VM of its own for each of {}. For trusted repositories only: the VM reaches this machine's 127.0.0.1 through 192.168.5.2 and the internet whatever `network` says, so also the artifact servers of docker runs going at the same time, and act runs beside the job's code",
+                        "{v}, a VM of its own for each of {}. For trusted repositories only: the VM reaches this machine's 127.0.0.1 through 192.168.5.2 and the internet whatever `network` says, so also the artifact servers of docker runs going at the same time, and act runs beside the job's code. The cache key holds colima's and lima's versions, not the VM image's digest, so an image colima swaps under the same version is not seen",
                         on_vm.join(", ")
                     )
                 }),

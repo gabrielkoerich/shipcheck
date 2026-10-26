@@ -147,6 +147,7 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
     assert!(text.contains("ci.yml/e2e: success"), "{text}");
     assert!(text.contains("host/test: success"), "{text}");
     assert!(ours().is_empty(), "a VM was left: {:?}", ours());
+    assert!(walk(&home.join("colima")).is_empty(), "a record was left");
 
     // Killed while the VM runs, the reaper still deletes it
     fs::write(work.join("slow.txt"), "listen").unwrap();
@@ -201,6 +202,16 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
             ours()
         );
         std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // The reaper removes its record once the delete succeeds
+    while !walk(&home.join("colima")).is_empty() {
+        assert!(
+            killed.elapsed() < Duration::from_secs(130),
+            "a record was left: {:?}",
+            walk(&home.join("colima"))
+        );
+        std::thread::sleep(Duration::from_millis(200));
     }
 
     // Other profiles, such as a developer's own, are never touched
