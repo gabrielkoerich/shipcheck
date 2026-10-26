@@ -434,6 +434,230 @@ const PR_AWARE: &[&str] = &[
     "danger/",
 ];
 
+/// Commands that read the PR's event or its review themselves, and under act or here find none and may pass
+const PR_AWARE_COMMANDS: &[&str] = &["danger", "danger-swift", "danger-kotlin", "reviewdog"];
+
+/// The flags of each launcher that take the next word as their value. pnpm's `-w` is `--workspace-root` and takes none
+fn value_flags(launcher: &str) -> &'static [&'static str] {
+    match launcher {
+        "npm" => &["-w", "--workspace", "--prefix"],
+        "pnpm" => &["--filter", "-F", "--dir", "-C"],
+        "yarn" => &["--cwd"],
+        "bun" => &["--cwd", "--filter", "-F"],
+        "npx" | "bunx" | "pnpx" => &["-p", "--package"],
+        _ => &[],
+    }
+}
+
+/// `words` past their leading flags, and the value a flag in `values` takes, such as `--filter web`
+fn past_flags<'a>(words: &'a [String], values: &[&str]) -> &'a [String] {
+    let mut at = 0;
+
+    while let Some(w) = words.get(at).filter(|w| w.starts_with('-')) {
+        at += if values.contains(&w.as_str()) { 2 } else { 1 };
+    }
+
+    &words[at.min(words.len())..]
+}
+
+/// `words` past a package manager, its flags and `yarn workspace <name>`, so at its subcommand or script
+fn past_manager(words: &[String]) -> &[String] {
+    let Some(manager) = words.first() else {
+        return words;
+    };
+    let values = value_flags(manager);
+    let after = past_flags(&words[1..], values);
+
+    if manager == "yarn" && after.first().is_some_and(|w| w == "workspace") {
+        return past_flags(after.get(2..).unwrap_or_default(), values);
+    }
+
+    after
+}
+
+/// The command `words` runs, past launchers such as `npx`, `yarn dlx`, `pnpm --filter web exec`, `bundle exec` or `go run`
+fn launched(words: &[String]) -> &[String] {
+    let mut rest = words;
+
+    loop {
+        let first = rest.first().map(String::as_str).unwrap_or_default();
+        let values = value_flags(first);
+        rest = match first {
+            "npx" | "bunx" | "pnpx" => past_flags(&rest[1..], values),
+            "yarn" | "pnpm" | "bun" => {
+                let after = past_manager(rest);
+
+                if matches!(
+                    after.first().map(String::as_str),
+                    Some("run" | "dlx" | "exec" | "x")
+                ) {
+                    past_flags(&after[1..], values)
+                } else {
+                    after
+                }
+            }
+            "npm" => {
+                let after = past_manager(rest);
+
+                if after.first().is_some_and(|w| w == "exec") {
+                    past_flags(&after[1..], values)
+                } else {
+                    return rest;
+                }
+            }
+            "bundle" if rest.get(1).is_some_and(|w| w == "exec") => &rest[2..],
+            // `mint run danger/swift danger-swift ci` names the package, then its command
+            "mint" if rest.get(1).is_some_and(|w| w == "run") => {
+                let after = past_flags(&rest[2..], values);
+                if after.len() > 1 && after[0].contains('/') {
+                    &after[1..]
+                } else {
+                    after
+                }
+            }
+            "swift" | "go" if rest.get(1).is_some_and(|w| w == "run") => {
+                past_flags(&rest[2..], values)
+            }
+            _ => return rest,
+        };
+    }
+}
+
+/// The command of `words` that reads the PR's event itself, past a launcher. `danger local` and reviewdog's local reporter read none
+fn reads_the_event(words: &[String]) -> Option<String> {
+    let run = launched(words);
+    let first = run.first()?;
+    // `npx danger@11 ci` and `go run github.com/reviewdog/reviewdog/cmd/reviewdog@latest` name a version
+    let path = first
+        .split_once('@')
+        .filter(|(p, _)| !p.is_empty())
+        .map_or(first.as_str(), |(p, _)| p);
+    let name = path.rsplit('/').next()?;
+    let args = &run[1..];
+    let local = match name {
+        "danger" | "danger-swift" | "danger-kotlin" => args
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .is_some_and(|a| a == "local"),
+        "reviewdog" => {
+            args.iter().any(|a| a == "-reporter=local")
+                || args
+                    .windows(2)
+                    .any(|w| w[0] == "-reporter" && w[1] == "local")
+        }
+        _ => true,
+    };
+
+    (PR_AWARE_COMMANDS.contains(&name) && !local).then(|| name.to_string())
+}
+
+/**
+ * The lines a task runner runs for `words`: the `package.json` script npm, yarn, pnpm or bun names,
+ * or the recipe of the make target or just recipe, the first one when none is named
+ **/
+fn task_lines(dir: &Path, words: &[String]) -> Vec<String> {
+    // The same cap as a file a step names
+    let read = |name: &str| {
+        let file = dir.join(name);
+        let small = fs::metadata(&file).is_ok_and(|m| m.is_file() && m.len() < 1 << 20);
+        small.then(|| fs::read_to_string(&file).ok()).flatten()
+    };
+    let named = |rest: &[String]| {
+        rest.iter()
+            .find(|w| !w.starts_with('-') && !w.contains('='))
+            .cloned()
+    };
+
+    match words.first().map(String::as_str) {
+        Some(manager @ ("npm" | "yarn" | "pnpm" | "bun")) => {
+            let values = value_flags(manager);
+            let after = past_manager(words);
+            let script = match (manager, after.first().map(String::as_str)) {
+                ("npm", Some("run" | "run-script")) => past_flags(&after[1..], values).first(),
+                ("npm", Some("test" | "start")) => after.first(),
+                ("npm", _) => None,
+                (_, Some("run")) => past_flags(&after[1..], values).first(),
+                _ => after.first(),
+            };
+            let json: Option<serde_json::Value> =
+                read("package.json").and_then(|t| serde_json::from_str(&t).ok());
+            script
+                .and_then(|s| json?["scripts"][s.as_str()].as_str().map(String::from))
+                .into_iter()
+                .collect()
+        }
+        Some("make" | "gmake") => {
+            let text = ["GNUmakefile", "makefile", "Makefile"]
+                .iter()
+                .find_map(|f| read(f))
+                .unwrap_or_default();
+            recipe(&text, named(&words[1..]).as_deref(), |l| {
+                l.starts_with('\t')
+            })
+        }
+        Some("just") => {
+            let text = ["justfile", "Justfile", ".justfile"]
+                .iter()
+                .find_map(|f| read(f))
+                .unwrap_or_default();
+            recipe(&text, named(&words[1..]).as_deref(), |l| {
+                l.starts_with(' ') || l.starts_with('\t')
+            })
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The tool that reads the PR's event in the scripts or recipes `words` runs, three task runners deep
+fn event_in_tasks(dir: &Path, words: &[String], depth: u8) -> Option<String> {
+    if depth == 3 {
+        return None;
+    }
+
+    task_lines(dir, words)
+        .iter()
+        .flat_map(|l| started(l))
+        .find_map(|w| reads_the_event(&w).or_else(|| event_in_tasks(dir, &w, depth + 1)))
+}
+
+/// The body lines of the rule `target` of a Makefile or justfile, the first rule when None
+fn recipe(text: &str, target: Option<&str>, body: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut lines = text.lines().peekable();
+    // A special target such as `.PHONY`, an assignment such as `X := 1`, or just's `set` and `export` heads no rule
+    let heads = |l: &str| {
+        let assigns = [":=", "::=", "?=", "+=", "!="]
+            .iter()
+            .any(|a| l.contains(a));
+        !body(l)
+            && !l.starts_with(['#', '.'])
+            && !l.starts_with("set ")
+            && !l.starts_with("export ")
+            && !assigns
+            && l.split_once(':').is_some_and(|(h, _)| !h.contains('='))
+    };
+
+    while let Some(line) = lines.next() {
+        if !heads(line) {
+            continue;
+        }
+
+        let names = line.split_once(':').map_or("", |(h, _)| h);
+        let hit = target.is_none_or(|t| names.split_whitespace().next() == Some(t));
+
+        if hit {
+            let mut out = Vec::new();
+
+            while let Some(l) = lines.next_if(|l| body(l) || l.trim().is_empty()) {
+                out.push(l.trim().trim_start_matches(['@', '-']).to_string());
+            }
+
+            return out;
+        }
+    }
+
+    Vec::new()
+}
+
 /// Commands that run containers, whose daemon a job gets only on a VM of its own
 const CONTAINERS: &[&str] = &[
     "act",
@@ -608,6 +832,15 @@ fn reads_the_pr(job: &crate::workflow::Job, source: &str, root: &Path) -> Option
         };
 
         for words in started(&step.run) {
+            // The command itself, or a line of the script or recipe its task runner runs
+            let tool = reads_the_event(&words).or_else(|| event_in_tasks(&dir, &words, 0));
+
+            if let Some(tool) = tool {
+                return Some(format!(
+                    "it runs {tool}, which reads the PR's event itself, and only GitHub's run of a PR has it"
+                ));
+            }
+
             if words[0] == "cd" {
                 match words.get(1).and_then(|d| inside(&dir, d)) {
                     Some(d) => dir = d,
@@ -4085,6 +4318,114 @@ jobs:
             "\n  release.yml: it runs on no PR or branch push",
         ] {
             assert!(said.contains(line), "{line}\n{said}");
+        }
+    }
+
+    #[test]
+    fn a_tool_that_reads_the_pr_event_itself_stays_on_github() {
+        let job = |id: &str, step: &str| {
+            format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {step}\n")
+        };
+        let jobs = [
+            ("danger", "npx danger ci"),
+            ("dlx", "yarn dlx danger@11 ci"),
+            ("yarn", "yarn danger ci"),
+            ("yarnrun", "yarn run danger ci"),
+            ("pnpm", "pnpm danger ci"),
+            ("filter", "pnpm --filter web exec danger ci"),
+            ("bunx", "bun x danger ci"),
+            ("swift", "swift run danger-swift ci"),
+            ("mint", "mint run danger/swift danger-swift ci"),
+            (
+                "gorun",
+                "go run github.com/reviewdog/reviewdog/cmd/reviewdog@latest -reporter=github-pr-check",
+            ),
+            ("review", "reviewdog -reporter=github-pr-review -f=eslint"),
+            ("npmrun", "npm run danger"),
+            ("make", "make danger"),
+            ("just", "just danger"),
+            ("pnpmroot", "pnpm -w danger ci"),
+            ("npmws", "npm -w web exec danger ci"),
+            ("silent", "npm run --silent danger"),
+            ("yarnws", "yarn workspace web danger ci"),
+            ("chain", "npm run a"),
+            ("makemake", "make outer"),
+            ("makedefault", "make"),
+            ("justdefault", "just"),
+            ("local", "npx danger local"),
+            ("reviewlocal", "reviewdog -reporter=local -f=eslint"),
+            ("plain", "./scripts/lint.sh"),
+        ];
+        let ci = format!(
+            "on: pull_request\njobs:\n{}",
+            jobs.iter()
+                .map(|(id, step)| job(id, step))
+                .collect::<String>()
+        );
+        // With Docker too, so act is no way around it
+        let found = detect_with(
+            &[
+                (".github/workflows/ci.yml", &ci),
+                ("scripts/lint.sh", "lint .\n"),
+                (
+                    "package.json",
+                    "{\"scripts\": {\"danger\": \"danger ci\", \"a\": \"npm run b\", \"b\": \"danger ci\"}}\n",
+                ),
+                // The first rule past a special target and assignments is the default
+                (
+                    "Makefile",
+                    ".PHONY: danger outer\nX := 1\nY ?= 2\ndanger:\n\t@npx danger ci\n\nouter:\n\tmake danger\n",
+                ),
+                (
+                    "justfile",
+                    "set shell := [\"bash\", \"-c\"]\nexport A := \"b\"\ndanger:\n    yarn danger ci\n",
+                ),
+            ],
+            true,
+        );
+        // A local run reads no PR, so those two are checks
+        let checks: Vec<&str> = found.checks.iter().map(|c| c.name.as_str()).collect();
+        for id in ["local", "reviewlocal", "plain"] {
+            assert!(checks.contains(&id), "{id}: {}", found.explain());
+        }
+        assert!(found.acts.is_empty(), "{}", found.explain());
+        for (id, tool) in [
+            ("danger", "danger"),
+            ("dlx", "danger"),
+            ("yarn", "danger"),
+            ("yarnrun", "danger"),
+            ("pnpm", "danger"),
+            ("filter", "danger"),
+            ("bunx", "danger"),
+            ("swift", "danger-swift"),
+            ("mint", "danger-swift"),
+            ("gorun", "reviewdog"),
+            ("review", "reviewdog"),
+            ("npmrun", "danger"),
+            ("make", "danger"),
+            ("just", "danger"),
+            ("pnpmroot", "danger"),
+            ("npmws", "danger"),
+            ("silent", "danger"),
+            ("yarnws", "danger"),
+            ("chain", "danger"),
+            ("makemake", "danger"),
+            ("makedefault", "danger"),
+            ("justdefault", "danger"),
+        ] {
+            let why = found
+                .github
+                .iter()
+                .find(|k| k.job == id)
+                .map(|k| k.why.clone())
+                .unwrap_or_default();
+            assert_eq!(
+                why,
+                format!(
+                    "it runs {tool}, which reads the PR's event itself, and only GitHub's run of a PR has it"
+                ),
+                "{id}"
+            );
         }
     }
 
