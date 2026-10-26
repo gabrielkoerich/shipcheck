@@ -58,9 +58,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set up this repository: shipcheck.toml, agent instructions, hooks
+    /// Set up this repository: shipcheck.toml, agent instructions, hooks. Without a terminal and without --yes it only previews
     Init {
-        /// Take the recommended choices without asking
+        /// Take the recommended choices without asking, as a script or an agent does
         #[arg(long)]
         yes: bool,
     },
@@ -430,7 +430,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
             if plan.defaults {
                 say(&format!(
-                    "no shipcheck.toml on {base}, running every workflow that runs for branches, on pull_request or push: {}. This result is not a PR check, `shipcheck init` and merge shipcheck.toml to main for that",
+                    "no shipcheck.toml on {base}, running every workflow that runs for branches, on pull_request or push: {}. This result is not a PR check, `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main for that",
                     plan.config.workflows.join(", ")
                 ));
             }
@@ -689,7 +689,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
             if plan.defaults {
                 return Err(format!(
-                    "{base} has no shipcheck.toml, so this result ran the defaults and is not a check. Run `shipcheck init` and merge shipcheck.toml to main"
+                    "{base} has no shipcheck.toml, so this result ran the defaults and is not a check. Run `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main"
                 ));
             }
 
@@ -832,12 +832,17 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            shipcheck::onboard::preview(
-                &root,
-                shipcheck::onboard::App::find(),
-                &mut std::io::stdout(),
-            )?;
-            Ok(ExitCode::SUCCESS)
+            // The preview's own process, which the one below starts with a scratch home
+            if std::env::var_os(shipcheck::onboard::PREVIEW).is_some() {
+                shipcheck::onboard::preview(
+                    &root,
+                    shipcheck::onboard::App::find(),
+                    &mut std::io::stdout(),
+                )?;
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            Ok(ExitCode::from(shipcheck::onboard::preview_apart(&root)?))
         }
         "install" => {
             let root = toplevel(&cwd)?;

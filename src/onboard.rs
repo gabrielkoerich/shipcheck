@@ -958,34 +958,84 @@ pub fn plain(root: &Path, app: App, out: &mut dyn Write, finish: Finish) -> Resu
     Ok(true)
 }
 
+/// Set in init's preview process, whose trials then leave the repository's worktree entries alone
+pub const PREVIEW: &str = "SHIPCHECK_INIT_PREVIEW";
+
+/// The child's pid while `preview_apart` waits on it, for the signal handler
+static PREVIEW_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn forward(sig: libc::c_int) {
+    let pid = PREVIEW_CHILD.load(std::sync::atomic::Ordering::SeqCst);
+
+    if pid > 0 {
+        // Safe: kill only sends a signal
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
 /**
  * `init` with no terminal and no `--yes`: the plan `--yes` would apply, and nothing written. The
- * trials clone into a scratch home, whose git worktree entries in the repository are removed after,
- * so neither the repository nor shipcheck's home keeps a trace. Call it before any thread starts,
- * since it sets SHIPCHECK_HOME
+ * preview runs as its own process with a scratch home, since a trial leaves templates and slots
+ * in the home it uses and git worktree entries in the repository. This process waits, passing on
+ * SIGINT, SIGTERM and SIGHUP, then removes those entries and the scratch home however the preview
+ * ended. The exit code is the preview's, or 128 plus the signal that ended it
  **/
-pub fn preview(root: &Path, app: App, out: &mut dyn Write) -> Result<(), String> {
+pub fn preview_apart(root: &Path) -> Result<u8, String> {
+    use std::os::unix::process::ExitStatusExt;
+
     let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
     let had = worktrees(root).is_some_and(|w| w.exists());
-    let home = std::env::var_os("SHIPCHECK_HOME");
-    // Safe: init calls it from the main thread before anything else runs
-    unsafe { std::env::set_var("SHIPCHECK_HOME", scratch.path()) };
-    let shown = show(
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut child = std::process::Command::new(exe)
+        .arg("init")
+        .current_dir(root)
+        .env("SHIPCHECK_HOME", scratch.path())
+        .env(PREVIEW, "1")
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("shipcheck: {e}"))?;
+    PREVIEW_CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    // Safe: the handler calls only kill and reads an atomic
+    for sig in signals {
+        unsafe {
+            libc::signal(sig, forward as *const () as libc::sighandler_t);
+        }
+    }
+
+    let status = child.wait();
+
+    for sig in signals {
+        // Safe: back to the default action
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+        }
+    }
+
+    PREVIEW_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
+    forget_worktrees(root, scratch.path(), had);
+    drop(scratch);
+    let status = status.map_err(|e| e.to_string())?;
+    Ok(match (status.code(), status.signal()) {
+        (Some(code), _) => code.clamp(0, 255) as u8,
+        (None, Some(sig)) => (128 + sig).clamp(0, 255) as u8,
+        _ => 1,
+    })
+}
+
+/// The preview itself, in the process `preview_apart` starts
+pub fn preview(root: &Path, app: App, out: &mut dyn Write) -> Result<(), String> {
+    if show(
         root,
         app,
         out,
         "the recommended choice of each step, which --yes applies",
-    );
-
-    // Safe: as above, the trials' threads have ended
-    match home {
-        Some(home) => unsafe { std::env::set_var("SHIPCHECK_HOME", home) },
-        None => unsafe { std::env::remove_var("SHIPCHECK_HOME") },
-    }
-
-    forget_worktrees(root, scratch.path(), had);
-
-    if shown?.is_some() {
+    )?
+    .is_some()
+    {
         let _ = writeln!(out, "\nnothing written: rerun with --yes to apply");
     }
 

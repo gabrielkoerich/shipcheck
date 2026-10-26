@@ -233,7 +233,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                     host
                 } else if p.defaults {
                     format!(
-                        "not on {base}, so runs use the workflows that run for branches: {list}. For the PR check, `shipcheck init` and merge shipcheck.toml to main"
+                        "not on {base}, so runs use the workflows that run for branches: {list}. For the PR check, `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main"
                     )
                 } else if !p.config.jobs.is_empty() {
                     format!("runs {} with act on {base}", jobs_line(&p.config))

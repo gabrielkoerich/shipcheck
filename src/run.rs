@@ -239,6 +239,16 @@ pub fn migrate_home() {
 const REBUILT: [&str; 3] = ["templates", "runs", "hostcache"];
 
 /**
+ * Drops the repository's worktree entries whose folders are gone. Not in init's preview, whose
+ * trials remove their own and must leave the repository's other entries as they are
+ **/
+fn prune_worktrees(repo: &Path) {
+    if std::env::var_os(crate::onboard::PREVIEW).is_none() {
+        let _ = git(repo, &["worktree", "prune"]);
+    }
+}
+
+/**
  * Keeps Time Machine off what a run can rebuild, so a backup holds the results and logs and not
  * clones of every repository. `tmutil addexclusion` sets a flag on the folder itself, needs no root
  * and follows the folder, so it runs only when the flag is missing
@@ -248,6 +258,13 @@ fn exclude_from_backup(_: &Path) {}
 
 #[cfg(target_os = "macos")]
 fn exclude_from_backup(home: &Path) {
+    // macOS keeps its temporary folder out of backups already, and tmutil takes seconds a folder
+    let temp = std::env::temp_dir();
+
+    if home.starts_with(&temp) || temp.canonicalize().is_ok_and(|t| home.starts_with(t)) {
+        return;
+    }
+
     for dir in REBUILT.map(|d| home.join(d)) {
         if fs::create_dir_all(&dir).is_err() || excluded(&dir) {
             continue;
@@ -383,7 +400,7 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
 
             if on_prs.is_empty() {
                 return Err(format!(
-                    "{base_ref} has no {CONFIG} and no workflow that runs for branches. Run `shipcheck init`"
+                    "{base_ref} has no {CONFIG} and no workflow that runs for branches. Run `shipcheck init`, or `shipcheck init --yes` from a script or an agent"
                 ));
             }
 
@@ -1566,7 +1583,7 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
 
     {
         let _git = git_lock(&id)?;
-        let _ = git(&plan.repo, &["worktree", "prune"]);
+        prune_worktrees(&plan.repo);
     }
 
     for line in runners.all().flat_map(|r| r.prune()) {
@@ -1847,7 +1864,7 @@ fn remove_checkouts(plan: &Plan, runners: &Runners, slot: &Path) {
     }
 
     let _ = fs::remove_dir_all(slot);
-    let _ = git(&plan.repo, &["worktree", "prune"]);
+    prune_worktrees(&plan.repo);
 }
 
 /// Ends the state of a failed job with `continue-on-error: true`, which does not fail the workflow
@@ -2529,7 +2546,7 @@ fn checkout(
 ) -> Result<(), String> {
     if dir.exists() {
         empty_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let _ = git(&ctx.plan.repo, &["worktree", "prune"]);
+        prune_worktrees(&ctx.plan.repo);
     }
 
     let parent = template.parent().ok_or("template has no parent")?;

@@ -129,23 +129,35 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     out
 }
 
+type Snapshot = BTreeMap<PathBuf, Option<Vec<u8>>>;
+
+/// The paths whose contents differ between two snapshots
+fn changed(before: &Snapshot, after: Snapshot) -> Vec<PathBuf> {
+    let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+    keys.into_iter()
+        .filter(|k| before.get(k) != after.get(k))
+        .collect()
+}
+
+/// A worktree entry of the repository's own whose folder is gone, which only `git worktree prune` drops
+fn stale_entry(work: &Path) {
+    let entry = work.join(".git/worktrees/gone");
+    fs::create_dir_all(&entry).unwrap();
+    fs::write(entry.join("gitdir"), "/nonexistent/gone/.git\n").unwrap();
+    fs::write(entry.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(entry.join("commondir"), "../..\n").unwrap();
+}
+
 #[test]
 fn init_without_a_terminal_or_yes_shows_the_plan_and_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let (work, home) = repo(tmp.path());
+    stale_entry(&work);
     let (repo_before, home_before) = (snapshot(&work), snapshot(&home));
     let said = init(&work, &home, &[]);
     assert!(said.contains("plain ... passed"), "{said}");
     assert!(said.contains("Review"), "{said}");
     assert!(said.contains("rerun with --yes to apply"), "{said}");
-    let changed = |before: &BTreeMap<PathBuf, Option<Vec<u8>>>,
-                   after: BTreeMap<PathBuf, Option<Vec<u8>>>| {
-        let keys: std::collections::BTreeSet<_> =
-            before.keys().chain(after.keys()).cloned().collect();
-        keys.into_iter()
-            .filter(|k| before.get(k) != after.get(k))
-            .collect::<Vec<_>>()
-    };
     assert_eq!(
         changed(&home_before, snapshot(&home)),
         Vec::<PathBuf>::new(),
@@ -156,6 +168,78 @@ fn init_without_a_terminal_or_yes_shows_the_plan_and_writes_nothing() {
         Vec::<PathBuf>::new(),
         "the repository changed"
     );
+}
+
+#[test]
+fn a_preview_stopped_mid_trial_leaves_nothing_behind() {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (work, home) = repo(tmp.path());
+        // A check that is still running when the signal comes
+        fs::write(work.join("check.sh"), "#!/bin/sh\nsleep 60\n").unwrap();
+        git(&work, &["commit", "-qam", "slow"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        stale_entry(&work);
+        let (repo_before, home_before) = (snapshot(&work), snapshot(&home));
+        let mut init = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+            .arg("init")
+            .current_dir(&work)
+            .env("SHIPCHECK_HOME", &home)
+            .env("SHIPCHECK_NO_DAEMON", "1")
+            .env("SHIPCHECK_APP_ID", "1")
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env_remove("SHIPCHECK_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        // The trial has a checkout once the repository lists one under the scratch home
+        let scratch = loop {
+            let found = fs::read_dir(work.join(".git/worktrees"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name() != "gone")
+                .find_map(|e| fs::read_to_string(e.path().join("gitdir")).ok());
+
+            if let Some(gitdir) = found {
+                break PathBuf::from(gitdir.trim());
+            }
+
+            assert!(started.elapsed().as_secs() < 120, "no trial started");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        // Safe: kill only sends a signal to the init this test started
+        unsafe { libc::kill(init.id() as i32, sig) };
+        let status = init.wait().unwrap();
+        assert_eq!(status.code(), Some(128 + sig), "{sig}");
+        // The scratch home holds the trial's templates or slots
+        let scratch_home = scratch
+            .ancestors()
+            .find(|a| {
+                a.file_name()
+                    .is_some_and(|n| n == "templates" || n == "runs")
+            })
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap();
+        assert!(
+            !scratch_home.exists(),
+            "{sig}: the scratch home {scratch_home:?} is left"
+        );
+        assert_eq!(
+            changed(&home_before, snapshot(&home)),
+            Vec::<PathBuf>::new(),
+            "{sig}: SHIPCHECK_HOME changed"
+        );
+        assert_eq!(
+            changed(&repo_before, snapshot(&work)),
+            Vec::<PathBuf>::new(),
+            "{sig}: the repository changed"
+        );
+    }
 }
 
 #[test]
