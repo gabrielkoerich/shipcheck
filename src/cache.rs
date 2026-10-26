@@ -10,7 +10,7 @@ pub struct KeyInputs<'a> {
     /// `act` or `host`
     pub runner_kind: &'a str,
     /// The `[host]` checks by name, empty under act
-    pub checks: &'a BTreeMap<String, String>,
+    pub checks: &'a BTreeMap<String, crate::config::Check>,
     /// `act --version`, or for host each `versions` command with its output
     pub runner_version: &'a str,
     pub shipcheck_version: &'a str,
@@ -34,7 +34,7 @@ pub fn key(inputs: &KeyInputs) -> String {
     for (name, command) in inputs.checks {
         h.update(format!(
             "check\0{name}\0{}\n",
-            hex(&Sha256::digest(command))
+            hex(&Sha256::digest(&command.run))
         ));
     }
 
@@ -59,7 +59,7 @@ pub fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    static NO_CHECKS: BTreeMap<String, String> = BTreeMap::new();
+    static NO_CHECKS: BTreeMap<String, crate::config::Check> = BTreeMap::new();
 
     fn inputs<'a>(
         tree: &'a str,
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn a_mixed_run_gives_a_fixed_key() {
         let (workflows, platforms) = fixtures();
-        let checks = BTreeMap::from([("test".to_string(), "cargo test".to_string())]);
+        let checks = BTreeMap::from([("test".to_string(), "cargo test".into())]);
         let mut mixed = inputs(
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
             &workflows,
@@ -151,15 +151,15 @@ mod tests {
         other.runner_kind = "host";
         assert_ne!(base, key(&other));
 
-        let checks = BTreeMap::from([("test".to_string(), "npm test".to_string())]);
+        let checks = BTreeMap::from([("test".to_string(), "npm test".into())]);
         let mut with_check = inputs("t1", &workflows, &platforms);
         with_check.checks = &checks;
         assert_ne!(base, key(&with_check));
-        let renamed = BTreeMap::from([("tests".to_string(), "npm test".to_string())]);
+        let renamed = BTreeMap::from([("tests".to_string(), "npm test".into())]);
         let mut other = inputs("t1", &workflows, &platforms);
         other.checks = &renamed;
         assert_ne!(key(&with_check), key(&other));
-        let changed = BTreeMap::from([("test".to_string(), "true".to_string())]);
+        let changed = BTreeMap::from([("test".to_string(), "true".into())]);
         other.checks = &changed;
         assert_ne!(key(&with_check), key(&other));
     }

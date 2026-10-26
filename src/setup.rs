@@ -4766,7 +4766,7 @@ jobs:
         cfg.host
             .checks
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(k, v)| (k.as_str(), &**v))
             .collect()
     }
 
