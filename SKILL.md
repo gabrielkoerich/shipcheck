@@ -7,7 +7,7 @@ description: Run a repository's CI checks locally with shipcheck and read the re
 
 shipcheck runs the checks that `shipcheck.toml` names on this machine, for your working copy or a commit, and keeps the result for that git tree. The PR's required checks, one per job such as `shipcheck/test`, come from that result, so a passing local run is what lets the PR merge.
 
-There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the jobs of the workflows listed in `workflows`, each in its own container. A listed workflow runs under act in both modes.
+There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the jobs of the workflows listed in `workflows`, each in its own container. With `runner = "host"` and no `[jobs]` table, `workflows` must be empty, or the run exits 2. A job then runs under act through a `[jobs]` table with `runner = "act"`, below.
 
 `runner` sets the mode of every job. A `[jobs."<file>/<job>"]` table changes it for one job, in the same run and under the same `shipcheck` check:
 
