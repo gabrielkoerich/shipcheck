@@ -391,8 +391,8 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
         .iter()
         .filter(|(name, _)| !tried.contains_key(*name))
         .map(|(name, command)| {
-            let mut commands = vec![command.clone()];
-            commands.extend(variants(command));
+            let mut commands = vec![command.run.clone()];
+            commands.extend(variants(&command.run));
             (name.clone(), commands)
         })
         .collect();
@@ -413,7 +413,7 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
         round.host.versions = versions.clone();
         round.host.checks = todo
             .iter()
-            .map(|(n, c)| (n.clone(), c[0].clone()))
+            .map(|(n, c)| (n.clone(), c[0].clone().into()))
             .collect();
         let results = run_trial(root, round)?;
         let mut next = Vec::new();
@@ -425,7 +425,7 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
                 .ok_or("a check init tried has no result")?;
 
             if t.passed {
-                let how = if command == cfg.host.checks[&name] {
+                let how = if command == cfg.host.checks[&name].run {
                     ""
                 } else {
                     ", with color off"
@@ -1306,7 +1306,7 @@ fn coverage(
         .map(|(key, command)| {
             (
                 name(crate::runner::host::HOST, key),
-                command,
+                &command.run,
                 setup::commands(command),
             )
         })

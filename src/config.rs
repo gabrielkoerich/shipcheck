@@ -50,11 +50,74 @@ pub struct RepoConfig {
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Host {
-    pub checks: BTreeMap<String, String>,
+    pub checks: BTreeMap<String, Check>,
     /// Commands whose output goes into the cache key, so a toolchain change runs again
     pub versions: Vec<String>,
     /// Names of variables passed from the user's environment, beyond the base list
     pub env: Vec<String>,
+}
+
+/// A host check: its command, or a table with `run` and `sandbox = false` to run it outside the OS sandbox
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub run: String,
+    pub sandbox: bool,
+}
+
+impl<'de> Deserialize<'de> for Check {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            run: String,
+            #[serde(default = "yes")]
+            sandbox: bool,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Command(String),
+            Table(Table),
+        }
+
+        Ok(match Either::deserialize(d)? {
+            Either::Command(run) => Check { run, sandbox: true },
+            Either::Table(t) => Check {
+                run: t.run,
+                sandbox: t.sandbox,
+            },
+        })
+    }
+}
+
+impl std::ops::Deref for Check {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.run
+    }
+}
+
+impl PartialEq<&str> for Check {
+    fn eq(&self, other: &&str) -> bool {
+        self.run == *other
+    }
+}
+
+impl From<&str> for Check {
+    fn from(run: &str) -> Self {
+        Check {
+            run: run.into(),
+            sandbox: true,
+        }
+    }
+}
+
+impl From<String> for Check {
+    fn from(run: String) -> Self {
+        Check { run, sandbox: true }
+    }
 }
 
 /// `shard_tests = true` for as many shards as the container has CPUs, at most 6, or a fixed number
@@ -719,6 +782,26 @@ impl RepoConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_check_is_a_command_or_a_table_that_may_leave_the_sandbox() {
+        let cfg = RepoConfig::parse(
+            "runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n[host.checks.ios]\nrun = \"xcodebuild test\"\nsandbox = false\n[host.checks.unit]\nrun = \"make test\"\n",
+        )
+        .unwrap();
+        let c = &cfg.host.checks;
+        assert_eq!(c["lint"], "make lint");
+        assert!(c["lint"].sandbox && c["unit"].sandbox);
+        assert_eq!(c["ios"], "xcodebuild test");
+        assert!(!c["ios"].sandbox);
+        assert!(
+            RepoConfig::parse(
+                "runner = \"host\"\n[host.checks.ios]\nrun = \"x\"\nsandboxed = false\n"
+            )
+            .is_err(),
+            "a misspelled key is an error, never a sandboxed check"
+        );
+    }
 
     #[test]
     fn parallel_jobs_leave_one_host_cpu_and_fit_the_engine() {
