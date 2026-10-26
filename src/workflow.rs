@@ -446,6 +446,34 @@ fn matrix_axis(matrix: &Yaml) -> Option<String> {
 }
 
 /**
+ * Whether `check` is a check name GitHub could give the job `id`: its `name`, or its id, with what
+ * a matrix or an expression fills in. For a job whose names `check_names` cannot tell
+ **/
+pub fn may_name(source: &str, id: &str, check: &str) -> bool {
+    let Some(job) = load(source)
+        .ok()
+        .and_then(|root| root.get(&key("jobs"))?.as_hash()?.get(&key(id)).cloned())
+    else {
+        return false;
+    };
+    let fixed = match job["name"].as_str() {
+        Some(name) => name
+            .split("${{")
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_string(),
+        None => id.to_string(),
+    };
+    let expression = job["name"].as_str().is_some_and(|n| n.contains("${{"));
+
+    !fixed.is_empty()
+        && (check == fixed
+            || check.starts_with(&format!("{fixed} ("))
+            || expression && check.starts_with(&fixed))
+}
+
+/**
  * GitHub's check names for a job: its `name`, else its id. For a matrix of plain axes, one per
  * leg, `id (a, b)` or the name with each `${{ matrix.x }}` filled in. None for anything else
  **/

@@ -49,6 +49,7 @@ pub fn config_for(workflows: &[String]) -> String {
 }
 
 /// A host check `init` found, and where it came from
+#[derive(Clone)]
 pub struct Found {
     pub name: String,
     pub command: String,
@@ -56,6 +57,7 @@ pub struct Found {
 }
 
 /// A job that keeps running on GitHub for PRs, since shipcheck cannot run it here
+#[derive(Clone)]
 pub struct Kept {
     pub file: String,
     pub job: String,
@@ -66,7 +68,7 @@ pub struct Kept {
     pub act: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Detected {
     pub checks: Vec<Found>,
     pub versions: Vec<String>,
@@ -196,7 +198,7 @@ impl Detected {
             out.push("run with act, since no host check runs them as GitHub does:".into());
             out.extend(self.acts.iter().map(|(k, engine)| {
                 let on = match engine {
-                    Engine::Colima => " on a colima VM of its own",
+                    Engine::Colima => " on a colima VM of its own, which reaches this machine's loopback and the internet, so it is for trusted code only",
                     Engine::Docker => "",
                 };
                 format!("  {}, job {}{on}: {}", k.file, k.job, k.why)
@@ -749,17 +751,7 @@ pub fn place(root: &Path, machine: &Machine, d: &mut Detected) {
 
     let engine = |k: &Kept| -> Result<Engine, String> {
         let (source, jobs) = files.get(&k.file).ok_or("no workflow")?;
-        let job = jobs.iter().find(|j| j.id == k.job).ok_or("no job")?;
-        let mut before = Vec::new();
-        needed(jobs, &job.needs, &mut before, &mut vec![job.id.clone()]);
-
-        for n in &before {
-            let need = jobs.iter().find(|j| j.id == *n).ok_or("no job")?;
-            act_engine(need, machine, source, root)
-                .map_err(|why| format!("job {n} it needs: {why}"))?;
-        }
-
-        act_engine(job, machine, source, root)
+        engine_of(root, source, jobs, &k.job, machine)
     };
     let kept = std::mem::take(&mut d.github);
     let (needs, own): (Vec<Kept>, Vec<Kept>) =
@@ -791,6 +783,45 @@ pub fn place(root: &Path, machine: &Machine, d: &mut Detected) {
             _ => d.github.push(k),
         }
     }
+}
+
+/// The engine act runs a job and every job it needs on here as GitHub does, or why it cannot
+fn engine_of(
+    root: &Path,
+    source: &str,
+    jobs: &[crate::workflow::Job],
+    id: &str,
+    machine: &Machine,
+) -> Result<Engine, String> {
+    let job = jobs.iter().find(|j| j.id == id).ok_or("no job")?;
+    let mut before = Vec::new();
+    needed(jobs, &job.needs, &mut before, &mut vec![job.id.clone()]);
+
+    for n in &before {
+        let need = jobs.iter().find(|j| j.id == *n).ok_or("no job")?;
+        act_engine(need, machine, source, root)
+            .map_err(|why| format!("job {n} it needs: {why}"))?;
+    }
+
+    act_engine(job, machine, source, root)
+}
+
+/// `engine_of` for a job of a workflow file in `root`
+pub fn act_engine_for(
+    root: &Path,
+    machine: &Machine,
+    file: &str,
+    id: &str,
+) -> Result<Engine, String> {
+    let source =
+        fs::read_to_string(root.join(".github/workflows").join(file)).map_err(|e| e.to_string())?;
+    engine_of(
+        root,
+        &source,
+        &crate::workflow::job_runs(&source),
+        id,
+        machine,
+    )
 }
 
 /// The job a job was kept on GitHub for, since that job stays there and needs it
