@@ -324,8 +324,6 @@ const MACH_SERVICES: &[&str] = &[
     "com.apple.SystemConfiguration.DNSConfiguration",
     "com.apple.trustd",
     "com.apple.trustd.agent",
-    // Process lists for pgrep and pkill, since ps is setuid and denied
-    "com.apple.sysmond",
 ];
 
 /// Credentials in the user's home, hidden again in case a toolchain path above reaches one
@@ -704,15 +702,33 @@ done
 exec /usr/bin/mktemp -p "${TMPDIR:-/tmp}" "$@"
 "#;
 
+/// The setuid binaries a check would run by name from `path`, the first match of each name
+fn denied_by_name(path: &std::ffi::OsStr) -> Vec<String> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+
+    setuid()
+        .iter()
+        .filter_map(|p| p.file_name()?.to_str().map(|n| (n.to_string(), p)))
+        .filter(|(name, denied)| {
+            dirs.iter()
+                .map(|d| d.join(name))
+                .find(|c| c.is_file())
+                .is_some_and(|first| resolved(first) == **denied)
+        })
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// The jail's `mktemp`, and a command for each setuid binary that says why the jail denies it
 fn shims(home: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let bin = home.join(SHIMS);
     fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
     let mut files = vec![("mktemp".to_string(), MKTEMP.to_string())];
-    files.extend(setuid().iter().filter_map(|p| {
-        let name = p.file_name()?.to_str()?;
-        Some((name.to_string(), format!("#!/bin/sh\necho \"shipcheck: {name} is setuid root, which a macOS host check cannot run, since shipcheck could not stop it once it outlived the check. Use pgrep to find processes, or run this job under act\" >&2\nexit 126\n")))
+    // Only where the name finds the setuid binary first, so a user's own `ps` still runs
+    files.extend(denied_by_name(&jail_path()).into_iter().map(|name| {
+        let text = format!("#!/bin/sh\necho \"shipcheck: {name} is setuid root, which a macOS host check cannot run, since shipcheck could not stop it once it outlived the check. Run this job under act instead\" >&2\nexit 126\n");
+        (name, text)
     }));
 
     for (name, text) in files {
@@ -2871,11 +2887,27 @@ mod tests {
         let (exit, text) = run("ps -p $$");
         assert_eq!(exit, Some(126), "{text}");
         assert!(
-            text.contains("ps is setuid root") && text.contains("pgrep"),
+            text.contains("ps is setuid root") && text.contains("under act"),
             "{text}"
         );
-        let (exit, text) = run("pgrep -x launchd >/dev/null; test $? -le 1");
-        assert_eq!(exit, Some(0), "{text}");
+        // pgrep has no process list here, so it cannot show a root process's arguments either
+        let (exit, text) = run("pgrep -lf securityd");
+        assert_ne!(exit, Some(0), "{text}");
+        assert!(!text.contains("/usr/libexec/securityd"), "{text}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_users_own_tool_of_a_setuid_name_is_not_shadowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ps = dir.path().join("ps");
+        fs::write(&ps, "#!/bin/sh\necho procps\n").unwrap();
+        fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
+        let ahead = std::env::join_paths([dir.path(), Path::new("/bin")]).unwrap();
+        assert!(!denied_by_name(&ahead).contains(&"ps".to_string()));
+        assert!(denied_by_name("/bin".as_ref()).contains(&"ps".to_string()));
     }
 
     #[test]
