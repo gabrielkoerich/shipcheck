@@ -93,6 +93,8 @@ fn init_writes_only_the_checks_that_passed_its_trial() {
         .env("SHIPCHECK_HOME", &home)
         .env("SHIPCHECK_NO_DAEMON", "1")
         .env("SHIPCHECK_APP_ID", "1")
+        // No Docker on this PATH, so a failed check stays on GitHub rather than going to act
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env_remove("SHIPCHECK_TOKEN")
         .stdin(Stdio::null())
         .output()
@@ -140,4 +142,29 @@ fn init_writes_only_the_checks_that_passed_its_trial() {
         .map(|e| e.file_name())
         .collect();
     assert!(logs.is_empty(), "a trial keeps no logs: {logs:?}");
+}
+
+#[test]
+fn a_trial_tries_the_host_checks_and_never_an_act_job() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    git(&work, &["config", "user.name", "t"]);
+    git(&work, &["config", "user.email", "t@t"]);
+    git(&work, &["config", "commit.gpgsign", "false"]);
+    git(&work, &["remote", "add", "origin", &work.to_string_lossy()]);
+    fs::write(work.join("a.txt"), "a").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "a"]);
+    // An act job that names no job would fail the whole run if the trial ran it
+    let config = shipcheck::config::RepoConfig::parse(
+        "runner = \"host\"\n[host.checks]\nok = \"true\"\n[jobs.\"ci.yml/missing\"]\nrunner = \"act\"\n",
+    )
+    .unwrap();
+    // SAFETY: the only test in this binary that sets the environment, the other passes its own to a child
+    unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
+    let tried = shipcheck::run::trial(&work, config, &mut |_| {}).unwrap();
+    assert_eq!(tried.keys().collect::<Vec<_>>(), ["ok"]);
+    assert!(tried["ok"].passed, "{}", tried["ok"].log);
 }
