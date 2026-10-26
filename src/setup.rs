@@ -434,6 +434,36 @@ const PR_AWARE: &[&str] = &[
     "danger/",
 ];
 
+/// Commands that read the PR's event or its review themselves, and under act or here find none and may pass
+const PR_AWARE_COMMANDS: &[&str] = &["danger", "danger-swift", "danger-kotlin", "reviewdog"];
+
+/// The command of `words` that reads the PR's event itself, past a launcher such as `npx` or `bundle exec`
+fn reads_the_event(words: &[String]) -> Option<String> {
+    let skip = match words.first().map(String::as_str) {
+        Some("npx" | "bunx" | "pnpx") => 1,
+        Some("yarn" | "pnpm" | "npm" | "bundle")
+            if words
+                .get(1)
+                .is_some_and(|w| ["dlx", "exec"].contains(&w.as_str())) =>
+        {
+            2
+        }
+        _ => 0,
+    };
+    let rest = words.get(skip..)?;
+    let first = rest.iter().find(|w| !w.starts_with('-'))?;
+    let name = first.rsplit('/').next()?;
+    // `npx danger@11 ci` names a version
+    let name = name.split_once('@').map_or(name, |(n, _)| n);
+
+    if PR_AWARE_COMMANDS.contains(&name) {
+        return Some(name.to_string());
+    }
+
+    (name == "commitlint" && rest.iter().any(|w| w == "--from-env"))
+        .then(|| "commitlint --from-env".to_string())
+}
+
 /// Commands that run containers, whose daemon a job gets only on a VM of its own
 const CONTAINERS: &[&str] = &[
     "act",
@@ -608,6 +638,12 @@ fn reads_the_pr(job: &crate::workflow::Job, source: &str, root: &Path) -> Option
         };
 
         for words in started(&step.run) {
+            if let Some(tool) = reads_the_event(&words) {
+                return Some(format!(
+                    "it runs {tool}, which reads the PR's event itself, and only GitHub's run of a PR has it"
+                ));
+            }
+
             if words[0] == "cd" {
                 match words.get(1).and_then(|d| inside(&dir, d)) {
                     Some(d) => dir = d,
@@ -4085,6 +4121,57 @@ jobs:
             "\n  release.yml: it runs on no PR or branch push",
         ] {
             assert!(said.contains(line), "{line}\n{said}");
+        }
+    }
+
+    #[test]
+    fn a_tool_that_reads_the_pr_event_itself_stays_on_github() {
+        let job = |id: &str, step: &str| {
+            format!("  {id}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {step}\n")
+        };
+        let jobs = [
+            ("danger", "npx danger ci"),
+            ("dlx", "yarn dlx danger@11 ci"),
+            ("review", "reviewdog -reporter=github-pr-review -f=eslint"),
+            ("commits", "npx commitlint --from-env"),
+            ("plain", "./scripts/lint.sh"),
+        ];
+        let ci = format!(
+            "on: pull_request\njobs:\n{}",
+            jobs.iter()
+                .map(|(id, step)| job(id, step))
+                .collect::<String>()
+        );
+        // With Docker too, so act is no way around it
+        let found = detect_with(
+            &[
+                (".github/workflows/ci.yml", &ci),
+                ("scripts/lint.sh", "lint .\n"),
+            ],
+            true,
+        );
+        let checks: Vec<&str> = found.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(checks, ["plain"], "{}", found.explain());
+        assert!(found.acts.is_empty(), "{}", found.explain());
+        for (id, tool) in [
+            ("danger", "danger"),
+            ("dlx", "danger"),
+            ("review", "reviewdog"),
+            ("commits", "commitlint --from-env"),
+        ] {
+            let why = found
+                .github
+                .iter()
+                .find(|k| k.job == id)
+                .map(|k| k.why.clone())
+                .unwrap_or_default();
+            assert_eq!(
+                why,
+                format!(
+                    "it runs {tool}, which reads the PR's event itself, and only GitHub's run of a PR has it"
+                ),
+                "{id}"
+            );
         }
     }
 
