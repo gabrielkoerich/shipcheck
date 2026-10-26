@@ -590,6 +590,9 @@ pub struct Tested {
     pub tree: String,
     pub staged: bool,
     pub passed: bool,
+    /// A `--job` or `--workflow` run, which is never the check
+    #[serde(default)]
+    pub partial: bool,
 }
 
 fn tested_file(repo: &Path) -> PathBuf {
@@ -699,6 +702,12 @@ pub fn commit(
     allow_failed: bool,
 ) -> Result<String, String> {
     let repo = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
+
+    if tested.partial {
+        return Err(
+            "the last run was partial, with --job or --workflow, which is not the check: run `shipcheck run`, then `shipcheck commit`".into(),
+        );
+    }
 
     if !tested.passed && !allow_failed {
         return Err(
@@ -1322,6 +1331,37 @@ pub fn run_partial(
 
 /// The jobs to run per workflow file: every job of each named workflow, each job whose id or
 /// matrix leg matches a name, or `<file>/<job>` for one file's, and every job they need
+/// Each job as `--job` takes it: by name, as `<file>/<job>`, and a matrix job's legs
+fn job_names(graphs: &Graphs) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for (file, graph) in graphs {
+        let mut legs: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+        for (id, _) in graph {
+            let base = id
+                .rsplit_once("__")
+                .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .map_or(id.as_str(), |(b, _)| b);
+            let entry = legs.entry(base).or_default();
+
+            if base != id {
+                entry.push(id);
+            }
+        }
+
+        for (base, of) in legs {
+            out.push(if of.is_empty() {
+                format!("{base} ({file}/{base})")
+            } else {
+                format!("{base} ({file}/{base}, legs {})", of.join(", "))
+            });
+        }
+    }
+
+    out
+}
+
 pub fn select(
     graphs: &Graphs,
     jobs: &[String],
@@ -1364,11 +1404,10 @@ pub fn select(
         }
 
         if !found {
-            let all: Vec<_> = graphs
-                .values()
-                .flat_map(|g| g.iter().map(|(j, _)| j.as_str()))
-                .collect();
-            return Err(format!("no job {job}, the jobs are: {}", all.join(", ")));
+            return Err(format!(
+                "no job {job}, the jobs are: {}",
+                job_names(graphs).join(", ")
+            ));
         }
     }
 
@@ -3135,7 +3174,11 @@ mod tests {
         assert_eq!(picked["ci.yml"], set(&["lint"]));
         assert_eq!(picked["docs.yml"], set(&["docs"]));
 
-        assert!(select(&graphs, &s(&["nope"]), &[]).is_err());
+        // The refusal names each job as --job takes it
+        assert_eq!(
+            select(&graphs, &s(&["nope"]), &[]).unwrap_err(),
+            "no job nope, the jobs are: build (ci.yml/build), deploy (ci.yml/deploy), lint (ci.yml/lint), test (ci.yml/test, legs test__1, test__2), tests (ci.yml/tests), docs (docs.yml/docs)"
+        );
         assert!(select(&graphs, &s(&["test__"]), &[]).is_err());
         assert!(select(&graphs, &[], &s(&["release.yml"])).is_err());
 
@@ -3735,6 +3778,7 @@ mod tests {
             tree: sh(&repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
             staged: false,
             passed: true,
+            partial: false,
         };
         let path = std::env::join_paths(
             std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
@@ -3775,6 +3819,7 @@ mod tests {
             tree: sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
             staged: false,
             passed: true,
+            partial: false,
         };
         let msg = ["-m".to_string(), "all".to_string()];
         let head = sh(repo, &["rev-parse", "HEAD"]);
@@ -3790,6 +3835,14 @@ mod tests {
                 .unwrap_err()
                 .contains("failed")
         );
+
+        // A partial run that passed is still not the check, and the refusal says so
+        let partial = Tested {
+            partial: true,
+            ..tested.clone()
+        };
+        let err = commit(repo, &partial, &msg, true).unwrap_err();
+        assert!(err.starts_with("the last run was partial"), "{err}");
 
         fs::write(repo.join("c.txt"), "after the run").unwrap();
         let err = commit(repo, &tested, &msg, false).unwrap_err();
@@ -3819,6 +3872,7 @@ mod tests {
             tree: sh(repo, &["rev-parse", &format!("{staged}^{{tree}}")]),
             staged: true,
             passed: true,
+            partial: false,
         };
         commit(repo, &tested, &msg, false).unwrap();
         assert_eq!(sh(repo, &["rev-parse", "HEAD^{tree}"]), tested.tree);
