@@ -103,7 +103,10 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 
     let home = run::home();
 
-    if let Ok(usage) = runner::gc::usage(&home, &runner::act::home_prefix()) {
+    let (_, prefix, host) = runner::act::here_parts();
+    let here = runner::act::here(&home, &prefix, &host);
+
+    if let Ok(usage) = runner::gc::usage(&here, &runner::act::run_tags(&home)) {
         found.push(Check {
             name: "disk",
             ok: true,

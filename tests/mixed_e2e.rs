@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -65,6 +67,8 @@ fn host_checks_and_an_act_job_run_as_one_result() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
+    // Declared after `tmp`, so it drops first and removes the volumes while the home still exists
+    let _volumes = common::CleanOnDrop;
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();
