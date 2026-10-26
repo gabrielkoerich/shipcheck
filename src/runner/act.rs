@@ -224,6 +224,7 @@ impl Act {
         };
 
         let root_shell = shard::default_shell(&root);
+        let top_env = root.get(&key("env")).cloned().unwrap_or(Yaml::Null);
         let jobs = workflow::jobs_mut(&mut root)?;
         *jobs = expand_matrices(std::mem::take(jobs));
 
@@ -334,7 +335,13 @@ impl Act {
                 job.insert(key("runs-on"), key("ubuntu-24.04"));
             }
 
+            let job_env = job.get(&key("env")).cloned().unwrap_or(Yaml::Null);
+
             if let Some(Yaml::Array(steps)) = job.get_mut(&key("steps")) {
+                *steps = std::mem::take(steps)
+                    .into_iter()
+                    .flat_map(|s| guarded(s, [&job_env, &top_env]))
+                    .collect();
                 steps.insert(
                     0,
                     step("shipcheck homes", None, format!("{own_mounts}{path_lines}")),
@@ -353,6 +360,98 @@ impl Act {
 
         workflow::emit(root)
     }
+}
+
+/**
+ * The `if:` of a guard before a step whose `if:` reads what act's `workflow_dispatch` and a PR
+ * answer differently: the event, the ref, the actor or `vars`. The guard runs, and fails the job,
+ * when act skips the step on a job that still passes. `always()` and `!cancelled()` count as true.
+ * None when the step is skipped on every PR, or runs only on a failure, as GitHub answers the same
+ **/
+fn step_guard(cond: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let c = cond.trim();
+    let c = c
+        .strip_prefix("${{")
+        .and_then(|c| c.strip_suffix("}}"))
+        .unwrap_or(c)
+        .trim();
+    let reads_pr = |text: &str| {
+        [
+            "github.event",
+            "github.ref",
+            "github.head_ref",
+            "github.base_ref",
+            "github.actor",
+            "github.triggering_actor",
+            "vars.",
+        ]
+        .iter()
+        .any(|p| text.contains(p))
+    };
+    // An `env.NAME` reads what its value reads, as the step's, the job's or the workflow's `env` sets it
+    let names = c.match_indices("env.").filter_map(|(at, _)| {
+        let before = c[..at].chars().next_back();
+
+        if before.is_some_and(|b| b.is_alphanumeric() || b == '_' || b == '.') {
+            return None;
+        }
+
+        let name: String = c[at + 4..]
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '-')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    });
+    let reads = reads_pr(c)
+        || names
+            .into_iter()
+            .any(|n| env(&n).is_some_and(|v| reads_pr(&v)));
+    let passing = c
+        .replace("!cancelled()", "true")
+        .replace("always()", "true");
+
+    if !reads
+        || crate::run::false_on_every_pr(c)
+        || passing.contains("failure()")
+        || passing.contains("cancelled()")
+    {
+        return None;
+    }
+
+    Some(format!("${{{{ success() && !({passing}) }}}}"))
+}
+
+/// A step, after the guard `step_guard` gives it. The guard has no `id`, so no step reads it
+fn guarded(s: Yaml, outer_env: [&Yaml; 2]) -> Vec<Yaml> {
+    let env = |name: &str| {
+        [&s["env"], outer_env[0], outer_env[1]]
+            .into_iter()
+            .find(|e| !matches!(e[name], Yaml::BadValue))
+            .and_then(|e| e[name].as_str())
+            .map(String::from)
+    };
+    let Some(cond) = s["if"].as_str().and_then(|c| step_guard(c, env)) else {
+        return vec![s];
+    };
+    let name = (s["name"].as_str())
+        .or(s["uses"].as_str())
+        .or(s["run"].as_str().and_then(|r| r.lines().next()))
+        .unwrap_or("a step")
+        .to_string();
+    let mut guard = step(
+        "shipcheck if",
+        Some(&cond),
+        "echo \"::error::act skipped the step '$STEP' by its if:, which may hold on a PR, and only GitHub can tell\"\nexit 1".into(),
+    );
+
+    if let Yaml::Hash(h) = &mut guard {
+        h.insert(
+            key("env"),
+            Yaml::Hash(Hash::from_iter([(key("STEP"), key(&name))])),
+        );
+    }
+
+    vec![guard, s]
 }
 
 impl Engine for Docker {
@@ -2444,6 +2543,63 @@ jobs:
         let out = load(&Act::default().prepare(&gated, "ci.yml").unwrap());
         assert!(matches!(out["jobs"]["a"]["if"], Yaml::BadValue), "{out:?}");
         assert_eq!(out["jobs"]["b"]["if"].as_str(), Some("always()"));
+    }
+
+    #[test]
+    fn guards_a_step_whose_if_a_pr_may_answer_otherwise() {
+        let wf = "on: [push, pull_request]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - id: o\n        run: echo x=1 >> \"$GITHUB_OUTPUT\"\n      - name: pr\n        if: github.event_name == 'pull_request'\n        run: make test\n      - if: \"${{ always() && vars.E2E == 'true' }}\"\n        run: make e2e\n      - if: \"${{ !cancelled() && github.head_ref != '' }}\"\n        run: make lint\n      - if: github.ref == 'refs/heads/main'\n        run: make deploy\n      - if: failure() && github.event_name == 'pull_request'\n        run: make report\n      - if: steps.o.outputs.x == '1' && matrix.os != 'windows'\n        run: make more\n";
+        let out = load(&Act::default().prepare(wf, "ci.yml").unwrap());
+        let steps = out["jobs"]["t"]["steps"].as_vec().unwrap();
+        let ifs: Vec<(&str, &str)> = steps
+            .iter()
+            .map(|s| {
+                (
+                    s["name"].as_str().or(s["run"].as_str()).unwrap_or(""),
+                    s["if"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        let guard = |c: &str| ("shipcheck if", format!("${{{{ success() && !({c}) }}}}"));
+        let at = |name: &str| ifs.iter().position(|(n, _)| n.starts_with(name)).unwrap();
+
+        for (step, cond) in [
+            ("pr", "github.event_name == 'pull_request'"),
+            ("make e2e", "true && vars.E2E == 'true'"),
+            ("make lint", "true && github.head_ref != ''"),
+        ] {
+            let g = &ifs[at(step) - 1];
+            assert_eq!((g.0, g.1.to_string()), guard(cond), "{ifs:?}");
+            assert!(matches!(steps[at(step) - 1]["id"], Yaml::BadValue));
+            assert_eq!(steps[at(step) - 1]["env"]["STEP"].as_str(), Some(step));
+        }
+
+        // GitHub skips the deploy on every PR, runs the report only on a failure, and the last
+        // step reads only what act knows
+        for step in ["make deploy", "make report", "make more"] {
+            assert_ne!(ifs[at(step) - 1].0, "shipcheck if", "{ifs:?}");
+        }
+
+        assert_eq!(ifs.iter().filter(|(n, _)| *n == "shipcheck if").count(), 3);
+        assert_eq!(steps[at("echo x=1")]["id"].as_str(), Some("o"));
+
+        // An env value that reads the PR makes the step's `if:` read it, a static one does not
+        let wf = "on: push\nenv:\n  TOP: ${{ github.event_name == 'pull_request' }}\njobs:\n  t:\n    runs-on: ubuntu-latest\n    env:\n      IS_PR: ${{ github.event_name == 'pull_request' }}\n      X: 'false'\n      SHADOW: ${{ github.event_name == 'pull_request' }}\n    steps:\n      - if: env.IS_PR == 'true'\n        run: make pr\n      - if: env.TOP == 'true'\n        run: make top\n      - if: env.X == 'true'\n        run: make static\n      - if: env.SHADOW == 'true'\n        env:\n          SHADOW: false\n        run: make shadowed\n";
+        let out = load(&Act::default().prepare(wf, "ci.yml").unwrap());
+        let steps = out["jobs"]["t"]["steps"].as_vec().unwrap();
+        let before = |run: &str| {
+            let at = steps
+                .iter()
+                .position(|s| s["run"].as_str() == Some(run))
+                .unwrap();
+            steps[at - 1]["name"].as_str() == Some("shipcheck if")
+        };
+        assert!(before("make pr"), "{steps:?}");
+        assert!(before("make top"), "{steps:?}");
+        assert!(!before("make static"), "{steps:?}");
+        assert!(!before("make shadowed"), "{steps:?}");
+
+        // The workflow as it runs, which the cache key holds, carries the guards
+        assert_eq!(inject(wf, "n").unwrap().matches("shipcheck if").count(), 2);
     }
 
     #[test]
