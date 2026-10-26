@@ -96,6 +96,10 @@ pub struct Plan {
     failed: Vec<(String, String, String)>,
     /// The file, job and GitHub's check names of each job that stays on GitHub for PRs
     github: Vec<(String, String, Option<Vec<String>>)>,
+    /// Where each job runs, for a shipcheck.toml of host checks init derived, which the person can change
+    pub detected: Option<setup::Detected>,
+    /// The checks the default branch requires now, which the ruleset keeps for a job whose names init cannot tell. None when GitHub did not say
+    required: Option<Vec<String>>,
 }
 
 /// The person's choice for each step of a plan
@@ -124,7 +128,32 @@ pub fn plan(root: &Path, app: App, r: &mut dyn Report) -> Result<Plan, String> {
     plan_at(root, &base_branch(root)?, app, r)
 }
 
-fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan, String> {
+/// Why init makes no ruleset when GitHub would not say what the branch requires now
+const KEPT_RULES: &str = "branch rules: GitHub did not say which checks the default branch requires now, so init leaves its rules as they are. Run `shipcheck init` again when `gh` is signed in and online";
+
+pub(crate) fn plan_at(
+    root: &Path,
+    base: &str,
+    app: App,
+    r: &mut dyn Report,
+) -> Result<Plan, String> {
+    // Only a plan that can make a ruleset asks GitHub
+    let required = if app.id().is_some() {
+        required_now(root, base)
+    } else {
+        Some(Vec::new())
+    };
+    plan_with(root, base, app, required, r)
+}
+
+/// `plan_at` with the checks the branch requires now already read
+fn plan_with(
+    root: &Path,
+    base: &str,
+    app: App,
+    required: Option<Vec<String>>,
+    r: &mut dyn Report,
+) -> Result<Plan, String> {
     let path = root.join("shipcheck.toml");
     let mut plan = Plan {
         base: base.to_string(),
@@ -137,7 +166,13 @@ fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan
         stop: None,
         failed: Vec::new(),
         github: Vec::new(),
+        detected: None,
+        required,
     };
+    if plan.required.is_none() {
+        plan.notes.push(KEPT_RULES.into());
+    }
+
     let text = if path.exists() {
         fs::read_to_string(&path).map_err(|e| format!("shipcheck.toml: {e}"))?
     } else {
@@ -187,7 +222,13 @@ fn plan_at(root: &Path, base: &str, app: App, r: &mut dyn Report) -> Result<Plan
     }
 
     workflows(root, &cfg, &mut plan)?;
-    plan.ruleset = ruleset_plan(root, &text, &plan.app, &plan.github);
+    plan.ruleset = ruleset_plan(
+        root,
+        &text,
+        &plan.app,
+        &plan.github,
+        plan.required.as_deref(),
+    );
     Ok(plan)
 }
 
@@ -205,6 +246,9 @@ fn tried(
     plan: &mut Plan,
 ) -> Result<Option<(String, String)>, String> {
     if RepoConfig::parse(&text)?.runner != RunnerKind::Host {
+        // Only act jobs and no check to try, still each job has a place the person may change
+        let d = setup::detect_on(root, machine);
+        plan.detected = d.act.is_none().then_some(d);
         return Ok(Some((text, said)));
     }
 
@@ -262,7 +306,39 @@ fn tried(
         return Ok(None);
     }
 
-    Ok(Some((setup::config_text(&d), setup::said_for(&d))))
+    let out = (setup::config_text(&d), setup::said_for(&d));
+    plan.detected = Some(d);
+    Ok(Some(out))
+}
+
+/**
+ * The plan again after the person moved jobs between host checks, act and GitHub: a new
+ * shipcheck.toml and the workflow edits and required checks that go with it. Nothing is written
+ **/
+pub fn replan(root: &Path, plan: &mut Plan, d: setup::Detected) -> Result<(), String> {
+    let nothing = d.checks.is_empty() && d.acts.is_empty();
+    let text = setup::config_text(&d);
+    let cfg = RepoConfig::parse(&text)?;
+    plan.config = Some((text.clone(), setup::said_for(&d)));
+    plan.detected = Some(d);
+    plan.workflows.clear();
+    plan.notes.clear();
+    plan.github.clear();
+    workflows(root, &cfg, plan)?;
+    plan.ruleset = ruleset_plan(
+        root,
+        &text,
+        &plan.app,
+        &plan.github,
+        plan.required.as_deref(),
+    );
+
+    // As init does when every job stays on GitHub, which an empty shipcheck.toml would not say
+    if nothing {
+        return Err("every job runs on GitHub, so there is no shipcheck.toml to write: move a job here, or quit".into());
+    }
+
+    Ok(())
 }
 
 /// Each check's command once it passed, or why it failed
@@ -970,12 +1046,9 @@ impl Report for Spinners {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Then {
-    Apply,
-    Change,
-    Quit,
-}
+/// What quitting leaves: the trials' clones stay in shipcheck's cache, where they speed up later runs
+const QUIT: &str =
+    "Quit, nothing written to the repository. Trial clones stay in shipcheck's cache";
 
 /**
  * The terminal wizard: QuickStart or every step, a review that can reopen a step, then apply.
@@ -984,7 +1057,7 @@ enum Then {
 pub fn tui(root: &Path, find: fn() -> App, finish: Finish) -> Result<bool, String> {
     match wizard(root, find, finish) {
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-            let _ = cliclack::outro_cancel("Quit, nothing changed");
+            let _ = cliclack::outro_cancel(QUIT);
             Ok(false)
         }
         Err(e) => Err(e.to_string()),
@@ -1022,48 +1095,11 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
         return Ok(Ok(false));
     }
 
-    let quick = cliclack::select("Setup")
-        .item(true, "QuickStart", "recommended choices, then a review")
-        .item(false, "Advanced", "every step, one by one")
-        .interact()?;
-    let mut a = plan.recommended();
-
-    if !quick {
-        for step in plan.steps() {
-            ask(&plan, step, &mut a, s)?;
-        }
-    }
-
-    loop {
-        cliclack::note(s.bold("Review"), plan.review(&a).join("\n"))?;
-        let then = cliclack::select("Apply these choices?")
-            .item(Then::Apply, "Apply", "")
-            .item(Then::Change, "Change a step", "")
-            .item(Then::Quit, "Quit without changes", "")
-            .interact()?;
-
-        match then {
-            Then::Apply => break,
-            Then::Quit => {
-                cliclack::outro_cancel("Quit, nothing changed")?;
-                return Ok(Ok(false));
-            }
-            Then::Change => {
-                let mut pick = cliclack::select("Which step?");
-
-                for (n, step) in plan.steps().into_iter().enumerate() {
-                    pick = pick.item(
-                        step,
-                        format!("{}  {}", n + 1, plan.title(step)),
-                        plan.effect(step, &a),
-                    );
-                }
-
-                let step = pick.interact()?;
-                ask(&plan, step, &mut a, s)?;
-            }
-        }
-    }
+    // Every choice is made in the tabs, and nothing is written before Apply on the Review tab
+    let Some((plan, a)) = crate::tabs::run(root, plan)? else {
+        cliclack::outro_cancel(QUIT)?;
+        return Ok(Ok(false));
+    };
 
     let next = match apply(root, &plan, &a, finish, &mut report) {
         Ok(next) => next,
@@ -1079,31 +1115,6 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
         .collect();
     cliclack::outro_note(s.bold("Next"), next.join("\n"))?;
     Ok(Ok(true))
-}
-
-/// Shows a step and records its answer, the current one preselected
-fn ask(plan: &Plan, step: Step, a: &mut Answers, s: Style) -> std::io::Result<()> {
-    cliclack::note(s.bold(&plan.title(step)), plan.details(step, s).join("\n"))?;
-    let recommended = plan.default(step);
-    let label = |yes: bool| {
-        let mut a = a.clone();
-        plan.set(step, &mut a, yes);
-        plan.effect(step, &a)
-    };
-    let hint = |yes: bool| {
-        if yes == recommended {
-            "recommended"
-        } else {
-            ""
-        }
-    };
-    let yes = cliclack::select(plan.question(step))
-        .item(true, format!("Yes: {}", label(true)), hint(true))
-        .item(false, format!("No: {}", label(false)), hint(false))
-        .initial_value(plan.answer(step, a))
-        .interact()?;
-    plan.set(step, a, yes);
-    Ok(())
 }
 
 /// The base the daemon, the hooks and `shipcheck run` use, as a branch name. Offline it refuses to guess
@@ -1247,7 +1258,11 @@ fn coverage(
 /// The workflow edits for the jobs shipcheck checks, and notes for the workflows left alone
 fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), String> {
     let base = plan.base.clone();
-    let kept = kept(root, &plan.failed);
+    // What the person placed, else what this machine can run
+    let kept = match &plan.detected {
+        Some(d) => d.github.clone(),
+        None => kept(root, &plan.failed),
+    };
     // A job the config runs with act is shipcheck's, whatever this machine could run
     let on_act = crate::run::expected_jobs(cfg, |f| {
         fs::read_to_string(root.join(".github/workflows").join(f)).ok()
@@ -1514,27 +1529,106 @@ fn ruleset_plan(
     text: &str,
     app: &App,
     stays: &[(String, String, Option<Vec<String>>)],
+    required: Option<&[String]>,
 ) -> Option<Ruleset> {
     let app = app.id().filter(|a| a.parse::<u64>().is_ok())?;
+    // Without what the branch requires now, a new ruleset could leave a check out, so there is none
+    let required = required?;
     let names = job_checks(root, text).ok().filter(|n| !n.is_empty())?;
     let mut github = Vec::new();
     let mut notes = Vec::new();
 
     for (file, job, checks) in stays {
-        match checks {
-            Some(checks) => github.extend(checks.iter().cloned()),
-            None => notes.push(format!(
-                "{file}, job {job}: its check names depend on its matrix or an expression, require them by hand once a PR shows them"
-            )),
+        if let Some(checks) = checks {
+            github.extend(checks.iter().cloned());
+            continue;
         }
+
+        // Names init cannot tell, from a matrix or an expression, stay required as the branch requires them now
+        let source =
+            fs::read_to_string(root.join(".github/workflows").join(file)).unwrap_or_default();
+        let now: Vec<String> = required
+            .iter()
+            .filter(|c| crate::workflow::may_name(&source, job, c))
+            .cloned()
+            .collect();
+
+        if now.is_empty() {
+            notes.push(format!(
+                "{file}, job {job}: its check names depend on its matrix or an expression, require them by hand once a PR shows them"
+            ));
+        }
+
+        github.extend(now);
     }
 
+    github.sort();
+    github.dedup();
     Some(Ruleset {
         app,
         names,
         github,
         notes,
     })
+}
+
+/**
+ * The checks `base` requires now, by rulesets and by branch protection, with the person's `gh`
+ * login. None when GitHub did not answer, so the caller keeps the branch rules as they are. A
+ * branch with no protection answers 404 "Branch not protected", which is no requirement
+ **/
+fn required_now(root: &Path, base: &str) -> Option<Vec<String>> {
+    let get = |path: String| -> Option<Option<serde_json::Value>> {
+        let out = Command::new("gh")
+            .args(["api", &path])
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+
+        if out.status.success() {
+            return serde_json::from_slice(&out.stdout).ok().map(Some);
+        }
+
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        said.contains("Branch not protected").then_some(None)
+    };
+    let mut out = Vec::new();
+
+    if let Some(rules) = get(format!("repos/{{owner}}/{{repo}}/rules/branches/{base}"))? {
+        out.extend(
+            rules
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| r["type"] == "required_status_checks")
+                .flat_map(|r| {
+                    r["parameters"]["required_status_checks"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|c| c["context"].as_str().map(String::from)),
+        );
+    }
+
+    if let Some(p) = get(format!(
+        "repos/{{owner}}/{{repo}}/branches/{base}/protection/required_status_checks"
+    ))? {
+        out.extend(
+            p["contexts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.as_str().map(String::from)),
+        );
+    }
+
+    Some(out)
 }
 
 /**
@@ -2065,10 +2159,11 @@ mod tests {
             (".github/workflows/lint.yml", lint),
             ("shipcheck.toml", config),
         ]);
-        let plan = super::plan_at(
+        let plan = super::plan_with(
             dir.path(),
             "main",
             App::Own("1".into()),
+            Some(Vec::new()),
             &mut Said::default(),
         )
         .unwrap();
@@ -2088,16 +2183,54 @@ mod tests {
         let ci = "on: [push, pull_request]\njobs:\n  lint:\n    steps:\n      - run: make lint\n  test:\n    steps:\n      - run: make test\n  release:\n    if: github.ref == 'refs/heads/main'\n    steps:\n      - run: make release\n";
         let config = "runner = \"host\"\n[host.checks]\nlint = \"make lint\"\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
-        let plan = super::plan_at(
+        let plan = super::plan_with(
             dir.path(),
             "main",
             App::Own("1".into()),
+            Some(Vec::new()),
             &mut Said::default(),
         )
         .unwrap();
         let rule = plan.ruleset.unwrap();
         assert_eq!(rule.names, ["shipcheck/lint"]);
         assert_eq!(rule.github, ["test"]);
+    }
+
+    #[test]
+    fn the_ruleset_keeps_the_required_checks_of_a_job_whose_names_init_cannot_tell() {
+        // hynek/structlog, trimmed: the test matrix's names depend on its include, so init cannot tell them
+        let ci = "on: [push, pull_request]\njobs:\n  colors:\n    steps:\n      - run: make colors\n  tests:\n    strategy:\n      matrix:\n        include:\n          - python: '3.12'\n    name: tests on ${{ matrix.python }}\n    steps:\n      - run: tox\n";
+        let config = "runner = \"host\"\n[host.checks]\ncolors = \"make colors\"\n";
+        let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
+        let required =
+            ["tests on 3.12", "tests on 3.13", "shipcheck/colors", "docs"].map(String::from);
+        let stays = [("ci.yml".to_string(), "tests".to_string(), None)];
+        let rule = ruleset_plan(
+            dir.path(),
+            config,
+            &App::Own("1".into()),
+            &stays,
+            Some(&required),
+        )
+        .unwrap();
+        assert_eq!(rule.names, ["shipcheck/colors"]);
+        // Only the checks of the job whose names init cannot tell, docs is no job of these
+        assert_eq!(rule.github, ["tests on 3.12", "tests on 3.13"]);
+        assert!(rule.notes.is_empty(), "{:?}", rule.notes);
+        // GitHub did not say, so there is no ruleset to write and the branch keeps its rules
+        let unread = ruleset_plan(dir.path(), config, &App::Own("1".into()), &stays, None);
+        assert!(unread.is_none());
+        let plan = super::plan_with(
+            dir.path(),
+            "main",
+            App::Own("1".into()),
+            None,
+            &mut Said::default(),
+        )
+        .unwrap();
+        assert!(plan.ruleset.is_none());
+        let review = plan.review(&plan.recommended());
+        assert!(review.iter().any(|l| l == KEPT_RULES), "{review:?}");
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod runner;
 pub mod secret;
 pub mod service;
 pub mod setup;
+pub mod tabs;
 pub mod templates;
 pub mod ui;
 pub mod workflow;
