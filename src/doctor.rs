@@ -93,7 +93,11 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                 )
             })
             .map_err(|e| {
-                format!("{e}. Start a Docker engine: Docker Desktop (`open -a Docker`), or `colima start`")
+                if cfg!(target_os = "macos") {
+                    format!("{e}. Start a Docker engine: Docker Desktop (`open -a Docker`), or `colima start`")
+                } else {
+                    format!("{e}. Start the Docker engine: `sudo systemctl start docker`")
+                }
             }),
     ));
 
