@@ -329,12 +329,12 @@ jobs:
           git tag -a "$VERSION" -m "$VERSION"
           git push origin "$VERSION"
 
-      # Permanent: a version can be yanked, never deleted, and it publishes the source
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo publish --locked --allow-dirty
+      # Off until the repository is public, since a crates.io version can be yanked but never deleted
+      # - name: Publish to crates.io
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      #   run: |
+      #     cargo publish --locked --allow-dirty
 
       - name: Build changelog
         env:
