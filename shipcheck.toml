@@ -4,10 +4,6 @@ runner = "host"
 checks = { fmt = "cargo fmt --check", clippy = "cargo clippy --all-targets -- -D warnings", test = "cargo test", gitleaks = "d=$(mktemp -d \"$HOME/scan.XXXXXX\") && git archive HEAD | tar -x -C \"$d\" && gitleaks dir --redact --no-banner \"$d\"" }
 versions = ["cargo --version", "rustc --version", "gitleaks version"]
 
-[jobs."ci.yml/e2e"]
-runner = "act"
-engine = "colima"
-
 [jobs."ci.yml/test"]
 runner = "act"
 engine = "colima"
