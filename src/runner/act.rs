@@ -1967,7 +1967,7 @@ cleanup() {
   done
   # act removes its volumes only when it ends by itself
   docker volume ls -q --filter "name=-$tag-" | while read -r v; do
-    case $v in act-*-env) docker volume rm "$v" ;; esac
+    case $v in act-*-"$tag"-*-env) docker volume rm "$v" ;; esac
   done
   docker network rm "$net"
 }
@@ -2923,9 +2923,10 @@ jobs:
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("docker.log");
         let docker = dir.path().join("docker");
-        // `ps` names one container, `volume ls` an act volume and one that is not, every call is logged
+        // `ps` names one container, `volume ls` an act volume, one that is not and one whose tag is out of
+        // place, as Docker's substring filter lets through. Every call is logged
         let fake = format!(
-            "#!/bin/sh\necho \"$*\" >> {}\n[ \"$1\" = ps ] && echo c1\n[ \"$1\" = volume ] && [ \"$2\" = ls ] && printf 'act-CI-t-13f69a23-0a-env\\nact-x-13f69a23-0a\\n'\nexit 0\n",
+            "#!/bin/sh\necho \"$*\" >> {}\n[ \"$1\" = ps ] && echo c1\n[ \"$1\" = volume ] && [ \"$2\" = ls ] && printf 'act-CI-t-13f69a23-0a-env\\nact-x-13f69a23-0a\\nact-13f69a23-x-env\\n'\nexit 0\n",
             log.display()
         );
         fs::write(&docker, fake).unwrap();
