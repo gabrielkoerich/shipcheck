@@ -423,12 +423,13 @@ fn step_guard(cond: &str, env: impl Fn(&str) -> Option<String>) -> Option<String
 
 /// A step, after the guard `step_guard` gives it. The guard has no `id`, so no step reads it
 fn guarded(s: Yaml, outer_env: [&Yaml; 2]) -> Vec<Yaml> {
+    // Every level's value counts, since a step's own `env` may not reach its `if:`
     let env = |name: &str| {
-        [&s["env"], outer_env[0], outer_env[1]]
+        let values: Vec<&str> = [&s["env"], outer_env[0], outer_env[1]]
             .into_iter()
-            .find(|e| !matches!(e[name], Yaml::BadValue))
-            .and_then(|e| e[name].as_str())
-            .map(String::from)
+            .filter_map(|e| e[name].as_str())
+            .collect();
+        (!values.is_empty()).then(|| values.join("\n"))
     };
     let Some(cond) = s["if"].as_str().and_then(|c| step_guard(c, env)) else {
         return vec![s];
@@ -2582,7 +2583,8 @@ jobs:
         assert_eq!(ifs.iter().filter(|(n, _)| *n == "shipcheck if").count(), 3);
         assert_eq!(steps[at("echo x=1")]["id"].as_str(), Some("o"));
 
-        // An env value that reads the PR makes the step's `if:` read it, a static one does not
+        // An env value at any level that reads the PR makes the step's `if:` read it, a static one
+        // does not, and a step's own static value hides nothing
         let wf = "on: push\nenv:\n  TOP: ${{ github.event_name == 'pull_request' }}\njobs:\n  t:\n    runs-on: ubuntu-latest\n    env:\n      IS_PR: ${{ github.event_name == 'pull_request' }}\n      X: 'false'\n      SHADOW: ${{ github.event_name == 'pull_request' }}\n    steps:\n      - if: env.IS_PR == 'true'\n        run: make pr\n      - if: env.TOP == 'true'\n        run: make top\n      - if: env.X == 'true'\n        run: make static\n      - if: env.SHADOW == 'true'\n        env:\n          SHADOW: false\n        run: make shadowed\n";
         let out = load(&Act::default().prepare(wf, "ci.yml").unwrap());
         let steps = out["jobs"]["t"]["steps"].as_vec().unwrap();
@@ -2596,10 +2598,10 @@ jobs:
         assert!(before("make pr"), "{steps:?}");
         assert!(before("make top"), "{steps:?}");
         assert!(!before("make static"), "{steps:?}");
-        assert!(!before("make shadowed"), "{steps:?}");
+        assert!(before("make shadowed"), "{steps:?}");
 
         // The workflow as it runs, which the cache key holds, carries the guards
-        assert_eq!(inject(wf, "n").unwrap().matches("shipcheck if").count(), 2);
+        assert_eq!(inject(wf, "n").unwrap().matches("shipcheck if").count(), 3);
     }
 
     #[test]
