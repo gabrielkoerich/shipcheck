@@ -120,6 +120,15 @@ pub fn profile(run_dir: &Path) -> String {
     format!("sc-{}", &id[..12])
 }
 
+/// VMs that run at once, one per 16 GB of memory, since each VM takes 8 and the Mac keeps the rest
+fn vm_slots() -> u64 {
+    let gb = first_line("sysctl", &["-n", "hw.memsize"])
+        .ok()
+        .and_then(|b| b.parse::<u64>().ok())
+        .map_or(0, |b| b >> 30);
+    (gb / 16).max(1)
+}
+
 fn first_line(program: &str, args: &[&str]) -> Result<String, String> {
     let out = clean_env(&mut Command::new(program))
         .args(args)
@@ -212,17 +221,13 @@ fn leftovers() -> Vec<String> {
         .append(true)
         .open(crate::run::home().join("locks").join("colima.lock"));
 
-    let Ok(mut lock) = lock else {
+    let Ok(lock) = lock else {
         return Vec::new();
     };
 
     if lock.try_lock().is_err() {
         return Vec::new();
     }
-
-    // A run waiting on the lock names who holds it
-    let _ = lock.set_len(0);
-    let _ = write!(lock, "{}", std::process::id());
 
     let listed = profiles();
     let mut done = Vec::new();
@@ -316,7 +321,7 @@ impl Engine for Colima {
     }
 
     fn run(&self, act: &Act, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
-        // The job's time starts now, waiting for the one VM too
+        // The job's time starts now, waiting for a VM slot too
         let deadline = Instant::now() + request.timeout;
         let run_dir = request.run_dir;
         let isolated = act::isolated(request, &act::run_tag(run_dir), false)?;
@@ -337,23 +342,42 @@ impl Engine for Colima {
 
         let home = crate::run::home().join("locks");
         fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-        // Opened without truncating, so a waiter reads the holder's pid
-        let mut one_vm = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(home.join("colima.lock"))
-            .map_err(|e| e.to_string())?;
+        let open = |name: String| {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(home.join(name))
+                .map_err(|e| e.to_string())
+        };
+        let profile = profile(run_dir);
+        // Held until this profile's VM is deleted, so a retry never starts it while it still goes
+        let named = open(format!("colima-{profile}.lock"))?;
+        // Shared by every colima job, so the leftover cleanup, which takes it alone, waits for all
+        let jobs = open("colima.lock".into())?;
+        let mut slot = None;
 
-        while one_vm.try_lock().is_err() {
+        while slot.is_none() {
+            if named.try_lock().is_ok() && jobs.try_lock_shared().is_ok() {
+                slot = (0..vm_slots())
+                    .map(|i| open(format!("colima-vm-{i}.lock")))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .find(|f| f.try_lock().is_ok());
+            }
+
+            if slot.is_some() {
+                break;
+            }
+
+            let _ = jobs.unlock();
+            let _ = named.unlock();
+
             if Instant::now() > deadline {
-                let holder = fs::read_to_string(home.join("colima.lock")).unwrap_or_default();
                 fs::write(
                     log_path,
                     format!(
-                        "shipcheck: timed out waiting for another colima job's VM, held by shipcheck pid {}, or its cleanup\n",
-                        holder.trim()
+                        "shipcheck: timed out waiting for another colima job's VM, all {} in use, or its cleanup\n",
+                        vm_slots()
                     ),
                 )
                 .map_err(|e| e.to_string())?;
@@ -363,19 +387,19 @@ impl Engine for Colima {
             std::thread::sleep(Duration::from_millis(500));
         }
 
-        one_vm.set_len(0).map_err(|e| e.to_string())?;
-        write!(one_vm, "{}", std::process::id()).map_err(|e| e.to_string())?;
+        let slot = slot.expect("a VM slot");
 
         fs::write(request.workflow, &isolated).map_err(|e| e.to_string())?;
         let args = act_args(request, act.labels(request.file));
-        let profile = profile(run_dir);
         let secrets = crate::secret::read(&crate::run::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         let dry = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         let status = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-        let cpus =
-            std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1).max(2));
+        // Split between the VMs that may run at once, since each compile in an 8 GB VM takes memory
+        let cpus = std::thread::available_parallelism().map_or(2, |n| {
+            (n.get().saturating_sub(1) as u64 / vm_slots()).max(2)
+        });
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
         let context = docker_context();
 
@@ -385,7 +409,7 @@ impl Engine for Colima {
         let fds: Vec<_> = request
             .slot_lock
             .into_iter()
-            .chain([std::os::fd::AsRawFd::as_raw_fd(&one_vm)])
+            .chain([&named, &jobs, &slot].map(std::os::fd::AsRawFd::as_raw_fd))
             .collect();
         let held = super::inherit(&mut reaper, fds);
         let record = records().join(&profile);
@@ -477,7 +501,7 @@ impl Engine for Colima {
         let _ = reaper.wait();
 
         // `--activate=false` keeps the context, still one that colima switched to this VM goes back
-        if let Some(before) = context
+        if let Some(before) = context.filter(|c| !c.starts_with("colima-sc-"))
             && docker_context().is_some_and(|now| now == format!("colima-{profile}"))
         {
             let _ = Command::new("docker")
