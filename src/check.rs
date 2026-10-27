@@ -671,15 +671,17 @@ mod tests {
             job_names(&jobs(&[(HOST, &["test"])]))[0].2,
             "shipcheck/test"
         );
-        // A host check and a job of the same name in one run both get a prefix
-        let names: Vec<String> =
-            job_names(&jobs(&[(HOST, &["test"]), ("ci.yml", &["test", "e2e"])]))
-                .into_iter()
-                .map(|(_, _, n)| n)
-                .collect();
+        // A host check never shares a job's name, `run::expected_jobs` refuses that config
+        let names: Vec<String> = job_names(&jobs(&[
+            (HOST, &["test-macos"]),
+            ("ci.yml", &["test", "e2e"]),
+        ]))
+        .into_iter()
+        .map(|(_, _, n)| n)
+        .collect();
         assert_eq!(
             names,
-            ["shipcheck/e2e", "shipcheck/ci/test", "shipcheck/host/test"]
+            ["shipcheck/e2e", "shipcheck/test", "shipcheck/test-macos"]
         );
         // Shared stems take the whole file name, so every name stays unique
         let names: Vec<String> = job_names(&jobs(&[

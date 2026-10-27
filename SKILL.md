@@ -15,7 +15,7 @@ There are two modes. With `runner = "host"`, which `shipcheck init` writes when 
 - `runner = "host"` takes that job out of a listed workflow, and the `[host.checks]` entry of the same id runs in its place.
 - `engine = "colima"` runs that act job on a Colima VM of its own, with its own Docker and kernel, for a job that runs Docker or needs a Linux kernel feature. The VM reaches this machine's loopback and the internet, so use it only for code you trust.
 
-`shipcheck run --job <name>` picks the host check when a host check and an act job share the name. `--job ci.yml/e2e` picks the job of one workflow.
+A host check and an act job may not share a name, since both would post as `shipcheck/<name>`. The run exits 2 and names the two: rename the host check, for example `test` to `test-macos`. `--job ci.yml/e2e` picks the job of one workflow.
 
 Docs: https://shipcheck.run/llms.txt
 
