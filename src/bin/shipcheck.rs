@@ -188,6 +188,12 @@ enum Cmd {
         #[arg(long, default_value = "token", value_name = "machine")]
         name: String,
     },
+    /// Let this repository's checks with sandbox = false run outside the sandbox on this machine
+    Trust {
+        /// Stop trusting it, so those checks run in the sandbox again
+        #[arg(long)]
+        remove: bool,
+    },
     /// Remove what shipcheck keeps for this repository
     Clean {
         /// For every repository, and the stored results, logs and daemon too
@@ -349,6 +355,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         Cmd::Logout { all: a } => {
             all = a;
             "logout"
+        }
+        Cmd::Trust { remove: r } => {
+            all = r;
+            "trust"
         }
         Cmd::Clean { all: a } => {
             all = a;
@@ -777,6 +787,21 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
 
                 background::start(&cwd, &plan, &base, &branch, post, "hook-push", false);
+            }
+
+            Ok(ExitCode::SUCCESS)
+        }
+        "trust" => {
+            let origin = shipcheck::trust::set(&toplevel(&cwd)?, !all)?;
+
+            if all {
+                println!(
+                    "{origin} is no longer trusted: its checks with sandbox = false run in the sandbox"
+                );
+            } else {
+                println!(
+                    "trusted {origin}: its checks with sandbox = false run outside the sandbox on this machine, with your full access"
+                );
             }
 
             Ok(ExitCode::SUCCESS)

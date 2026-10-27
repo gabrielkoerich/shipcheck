@@ -10,7 +10,7 @@ shipcheck runs a branch's code on your machine and treats every job as untrusted
 
 - act mode runs each job in a Docker container with its own checkout, no Docker socket, no host environment or GitHub token, and no network by default.
 - Host mode runs each check as your user in an OS sandbox, `sandbox-exec` on macOS or bubblewrap on Linux. A check writes only its own clone, a new home and the repository's tool caches, reads the system and your toolchains but not the rest of your home, and has your network. Use it only for your own and your agents' work.
-- A host check written as `[host.checks.<name>]` with `sandbox = false` on main runs outside the sandbox, with your full access to your home, its keys and tokens. Any branch's code runs that way in it, so use it only on a repository where you trust every author `daemon_authors` lists. doctor and every run name such checks.
+- A host check written as `[host.checks.<name>]` with `sandbox = false` on main runs outside the sandbox only after you run `shipcheck trust` in that repository on this machine. Then any branch's code runs in it with your full access to your home, its keys and tokens, so trust only a repository where you trust every author `daemon_authors` lists. Until then it runs in the sandbox, and doctor and every run say so.
 - The daemon runs only PRs that you, or a login `daemon_authors` on `main` lists, opened and pushed, and never a fork's.
 - The shipcheck App has Checks: write, Pull requests: write and Metadata: read. It cannot read or change your code.
 - The hosted service keeps a SHA-256 hash of each machine token with your GitHub user id, login and machine name. It keeps no copy of the checks or comments it posts.

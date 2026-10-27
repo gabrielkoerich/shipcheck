@@ -20,5 +20,6 @@ pub mod service;
 pub mod setup;
 pub mod tabs;
 pub mod templates;
+pub mod trust;
 pub mod ui;
 pub mod workflow;
