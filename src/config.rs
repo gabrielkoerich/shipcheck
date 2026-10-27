@@ -48,7 +48,7 @@ pub struct RepoConfig {
     pub team: Team,
 }
 
-/// What a team on a paid plan sends to the service, all off by default. Only `records` does anything yet
+/// What a team sends to the shipcheck service, all off by default. Only `records` does anything yet
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Team {
