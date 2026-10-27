@@ -291,6 +291,13 @@ fn cycle(
                 "reason": "head_changed_on_github",
             });
             record::keep(repo, &record::event(repo, "rerun", fields));
+
+            if !prs.iter().any(|p| p.sha == *old)
+                && let Err(e) = cancel_replaced(sender, old)
+            {
+                println!("{repo}#{}: {e}", pr.number);
+            }
+
             heads.insert(key, pr.sha.clone());
         }
     }
@@ -651,6 +658,26 @@ fn decide(existing: &Checks, local: bool, result: bool, may_run: bool, cutoff: &
     } else {
         Action::Queue
     }
+}
+
+/// Completes what a replaced head left queued or running, as Actions cancels a superseded run
+fn cancel_replaced(remote: &dyn Remote, sha: &str) -> Result<(), String> {
+    for (name, c) in remote.find_checks(sha)? {
+        if c.status == "completed" {
+            continue;
+        }
+
+        let body = serde_json::json!({
+            "name": name,
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "cancelled",
+            "output": {"title": "replaced", "summary": "A newer commit replaced this one.", "text": ""},
+        });
+        remote.send(&body, Some(c.id))?;
+    }
+
+    Ok(())
 }
 
 /// What `handle` asks of GitHub, so a test can answer it
@@ -1105,6 +1132,25 @@ mod tests {
         recheck(&mut unconfigured, &mut done, "acme/app", "tip2");
         assert_eq!(done, HashSet::from([id("acme/lib", "b")]));
         assert_eq!(unconfigured.len(), 1, "another repository's head stays");
+    }
+
+    #[test]
+    fn a_replaced_head_gets_its_unfinished_checks_cancelled_and_keeps_the_finished_ones() {
+        let mut queued = check("queued", "");
+        queued.id = 7;
+        let fake = Fake {
+            existing: Checks::from([
+                (check::NAME.to_string(), queued),
+                ("shipcheck/fmt".to_string(), check("completed", "")),
+            ]),
+            ..Default::default()
+        };
+        cancel_replaced(&fake, "abc").unwrap();
+        let sent = fake.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1, Some(7));
+        assert_eq!(sent[0].0["name"], check::NAME);
+        assert_eq!(sent[0].0["conclusion"], "cancelled");
     }
 
     #[test]
