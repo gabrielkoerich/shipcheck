@@ -2215,7 +2215,7 @@ impl Runner for Host {
         let (_dir, home) = temp_home()?;
         let base = real_dir(&cache_dir(Some(request.repo_id)).join("base"))?;
         let (cache, overlay) = if request.on_base {
-            (base, None)
+            (base.clone(), None)
         } else {
             let run = self.run_cache(request.repo_id)?;
 
@@ -2228,20 +2228,26 @@ impl Runner for Host {
                     .map_err(|e| format!("{}: {e}", run.display()))?
                     .keep();
                 let (upper, work) = (layer.join("upper"), layer.join("work"));
-                (base, Some((real_dir(&upper)?, real_dir(&work)?)))
+                (base.clone(), Some((real_dir(&upper)?, real_dir(&work)?)))
             } else {
                 (run, None)
             }
         };
         let mut writable = vec![real_dir(request.run_dir)?, home.clone()];
+        let mut readable = Vec::new();
 
         if overlay.is_none() {
             writable.push(cache.clone());
         }
 
+        // A copy still holds the absolute paths into the base that tools such as pre-commit saved
+        if cache != base {
+            readable.push(base.clone());
+        }
+
         let jail = Jail {
             writable,
-            readable: Vec::new(),
+            readable,
             cache,
             home,
             overlay,
@@ -3500,6 +3506,21 @@ mod tests {
         };
         let exit = host.run(&request, &log).unwrap().exit;
         (exit, fs::read_to_string(&log).unwrap_or_default())
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_branch_run_reads_paths_into_the_base_cache_and_cannot_write_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let base = real_dir(&cache_dir(Some(&repo_id)).join("base/xdg/pre-commit")).unwrap();
+        fs::write(base.join("hooks.yaml"), "hooks").unwrap();
+        let command = format!("cat {0}/hooks.yaml && ! touch {0}/planted", base.display());
+        let (exit, log) = branch_check(dir.path(), &repo_id, &command);
+        let planted = base.join("planted").exists();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(exit, Some(0), "{log}");
+        assert!(!planted, "a branch run wrote the base's cache");
     }
 
     #[test]
