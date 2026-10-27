@@ -259,10 +259,11 @@ pub fn parse_checks(runs: &Value) -> Checks {
 
 /**
  * Who pushed head `sha` of PR `pr`, and which source said so, None while none does. Exact sources
- * first: the PR timeline lists a force-push, such as a rebase "Update branch", at once, and a merge
- * "Update branch" is a commit GitHub signs with the clicker as author. A PR merged into the branch,
- * such as a stacked PR, names who merged it. The repository's events cover a plain push, and GitHub
- * lists them from 30 seconds to hours late
+ * first: the PR timeline lists a force-push, such as a rebase "Update branch", at once. A head a
+ * `trusted` login signed counts as theirs (`signed`). A merge "Update branch" is a commit GitHub
+ * signs with the clicker as author. A PR merged into the branch, such as a stacked PR, names who
+ * merged it. The repository's events cover a plain push, and GitHub lists them from 30 seconds to
+ * hours late
  **/
 pub fn find_pusher(
     token: &str,
@@ -270,6 +271,7 @@ pub fn find_pusher(
     pr: u64,
     branch: &str,
     sha: &str,
+    trusted: &[String],
 ) -> Result<Option<(String, &'static str)>, String> {
     let timeline = pages(
         &format!("{API}/repos/{repo}/issues/{pr}/timeline"),
@@ -283,6 +285,10 @@ pub fn find_pusher(
 
     // GitHub lists at most 250 commits of a PR
     let commits = pages(&format!("{API}/repos/{repo}/pulls/{pr}/commits"), token, 3)?;
+
+    if let Some(login) = signed(&commits, sha, trusted) {
+        return Ok(Some((login, "signature")));
+    }
 
     if let Some(login) = web_merge(&commits, sha) {
         return Ok(Some((login, "merge-commit")));
@@ -331,6 +337,21 @@ pub fn forced(timeline: &[Value], sha: &str) -> Option<String> {
         let push = e["event"] == "head_ref_force_pushed" && e["commit_id"] == sha;
         push.then(|| e["actor"]["login"].as_str().map(String::from))?
     })
+}
+
+/**
+ * The `trusted` login whose verified signature is on commit `sha`. GitHub verifies a signature only
+ * with a key on the committer's account, and the commit names its tree, so the tree is what that
+ * user signed, whoever pushed it. Never web-flow's signature: a rebase on GitHub keeps the author
+ * the commit had, and anyone can set that
+ **/
+pub fn signed(commits: &[Value], sha: &str, trusted: &[String]) -> Option<String> {
+    let c = commits.iter().find(|c| c["sha"] == sha)?;
+    let login = c["committer"]["login"].as_str()?;
+    let ok = c["commit"]["verification"]["verified"] == true
+        && login != "web-flow"
+        && trusted.iter().any(|t| t.eq_ignore_ascii_case(login));
+    ok.then(|| login.to_string())
 }
 
 /**
@@ -533,6 +554,44 @@ mod tests {
             None,
             "not a merge"
         );
+    }
+
+    #[test]
+    fn a_head_a_trusted_login_signed_is_theirs() {
+        let commit = |sha: &str, author: &str, committer: &str, verified: bool| {
+            json!({
+                "sha": sha,
+                "author": {"login": author},
+                "committer": {"login": committer},
+                "commit": {"verification": {"verified": verified, "reason": if verified { "valid" } else { "unsigned" }}},
+                "parents": [{"sha": "base"}],
+            })
+        };
+        let trusted = ["Ann".to_string(), "bob".to_string()];
+        let commits = vec![
+            commit("h", "eve", "ann", true),
+            commit("u", "ann", "ann", false),
+            commit("e", "ann", "eve", true),
+            commit("w", "ann", "web-flow", true),
+        ];
+        assert_eq!(
+            signed(&commits, "h", &trusted).as_deref(),
+            Some("ann"),
+            "the committer signed it, whoever the author email names"
+        );
+        assert_eq!(signed(&commits, "u", &trusted), None, "unsigned");
+        assert_eq!(
+            signed(&commits, "e", &trusted),
+            None,
+            "signed by a login main does not list"
+        );
+        assert_eq!(
+            signed(&commits, "w", &trusted),
+            None,
+            "GitHub signed it, and a rebase keeps any author"
+        );
+        assert_eq!(signed(&commits, "h", &[]), None);
+        assert_eq!(signed(&commits, "x", &trusted), None, "not in the PR");
     }
 
     #[test]
