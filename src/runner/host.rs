@@ -1007,6 +1007,10 @@ impl Jail {
             cmd.env("SBF_SDK_PATH", self.home.join(SBF_SDK));
         }
 
+        if let Some(sdk) = sdk_root() {
+            cmd.env("SDKROOT", sdk);
+        }
+
         // Safe: setsid is async-signal-safe and changes only this child's session
         unsafe {
             cmd.pre_exec(|| {
@@ -1054,6 +1058,26 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
     }
 
     Ok((dir, path))
+}
+
+/// The macOS SDK, found once outside the jail, so a build in it never asks xcrun to cache a lookup
+#[cfg(target_os = "macos")]
+fn sdk_root() -> Option<&'static Path> {
+    static SDK: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SDK.get_or_init(|| {
+        let out = Command::new("/usr/bin/xcrun")
+            .arg("--show-sdk-path")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        Some(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())).filter(|p| p.is_dir())
+    })
+    .as_deref()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sdk_root() -> Option<&'static Path> {
+    None
 }
 
 /// xcrun's lookup cache, in the user's temp dir whatever `TMPDIR` says, read-only to a check
@@ -1135,7 +1159,30 @@ fn shims(home: &Path) -> Result<(), String> {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
 
+    // The compilers themselves, since each `/usr/bin` shim asks xcrun, whose cache a check cannot write
+    for (name, real) in compilers() {
+        std::os::unix::fs::symlink(real, bin.join(name)).map_err(|e| e.to_string())?;
+    }
+
     Ok(())
+}
+
+/// Where `xcrun -f` finds each C compiler, asked once outside the jail
+fn compilers() -> &'static [(&'static str, PathBuf)] {
+    static FOUND: std::sync::OnceLock<Vec<(&'static str, PathBuf)>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        ["cc", "c++", "clang", "clang++"]
+            .into_iter()
+            .filter_map(|name| {
+                let out = Command::new("/usr/bin/xcrun")
+                    .args(["-f", name])
+                    .output()
+                    .ok()?;
+                let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+                (out.status.success() && path.is_file()).then_some((name, path))
+            })
+            .collect()
+    })
 }
 
 /// The prefix of `npm install -g` in the jail's home, since node's own is read-only here
@@ -3503,6 +3550,19 @@ mod tests {
             Some(0),
             "the next run saw the planted file: {next_log}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_rust_build_in_a_check_links_without_asking_xcrun_to_write_its_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let build = "cargo new -q --vcs none hello && cd hello && cargo build -q --offline";
+        let (exit, log) = branch_check(dir.path(), &repo_id, build);
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(exit, Some(0), "{log}");
+        assert!(!log.contains("couldn't create cache file"), "{log}");
     }
 
     #[test]
