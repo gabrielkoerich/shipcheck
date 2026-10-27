@@ -118,6 +118,12 @@ impl RunCopy {
 
             let dir = lock.with_extension("");
             remove_tree(&dir);
+
+            // What a check left that cannot be removed must never reach another branch's run
+            if fs::symlink_metadata(&dir).is_ok() {
+                continue;
+            }
+
             return Ok(RunCopy {
                 dir,
                 lock,
@@ -3348,6 +3354,20 @@ mod tests {
         fs::set_permissions(ro.join("m"), fs::Permissions::from_mode(0o555)).unwrap();
         remove_tree(&ro);
         assert!(!ro.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_slot_whose_old_copy_survives_removal_is_never_reused() {
+        let runs = tempfile::tempdir().unwrap();
+        let stuck = runs.path().join("run-0/planted");
+        fs::create_dir_all(stuck.parent().unwrap()).unwrap();
+        fs::write(&stuck, "x").unwrap();
+        let flag = |f: &str| Command::new("chflags").arg(f).arg(&stuck).status().unwrap();
+        assert!(flag("uchg").success());
+        let copy = RunCopy::new(runs.path());
+        flag("nouchg");
+        assert_eq!(copy.unwrap().dir, runs.path().join("run-1"));
     }
 
     #[test]
