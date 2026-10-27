@@ -280,27 +280,7 @@ fn cycle(
     merges(repo, sender, &open, heads);
     let prs = into_base(open, &entry.base);
 
-    for pr in &prs {
-        let key = (repo.to_string(), pr.number);
-
-        if let Some(old) = heads.get(&key).filter(|old| **old != pr.sha) {
-            let fields = serde_json::json!({
-                "pr": pr.number,
-                "sha": pr.sha,
-                "previous_sha": old,
-                "reason": "head_changed_on_github",
-            });
-            record::keep(repo, &record::event(repo, "rerun", fields));
-
-            if !prs.iter().any(|p| p.sha == *old)
-                && let Err(e) = cancel_replaced(sender, old)
-            {
-                println!("{repo}#{}: {e}", pr.number);
-            }
-
-            heads.insert(key, pr.sha.clone());
-        }
-    }
+    track_heads(repo, &prs, heads, sender);
 
     // Never refused: silence about who pushed it says nothing against them
     for (number, old) in abandoned(waits, repo, &prs) {
@@ -657,6 +637,37 @@ fn decide(existing: &Checks, local: bool, result: bool, may_run: bool, cutoff: &
         Action::Run
     } else {
         Action::Queue
+    }
+}
+
+/// Notes each PR's head as soon as it is seen, so a head replaced before any verdict still gets
+/// its unfinished checks cancelled
+fn track_heads(
+    repo: &str,
+    prs: &[OpenPr],
+    heads: &mut BTreeMap<(String, u64), String>,
+    remote: &dyn Remote,
+) {
+    for pr in prs {
+        let key = (repo.to_string(), pr.number);
+
+        if let Some(old) = heads.get(&key).filter(|old| **old != pr.sha) {
+            let fields = serde_json::json!({
+                "pr": pr.number,
+                "sha": pr.sha,
+                "previous_sha": old,
+                "reason": "head_changed_on_github",
+            });
+            record::keep(repo, &record::event(repo, "rerun", fields));
+
+            if !prs.iter().any(|p| p.sha == *old)
+                && let Err(e) = cancel_replaced(remote, old)
+            {
+                println!("{repo}#{}: {e}", pr.number);
+            }
+        }
+
+        heads.insert(key, pr.sha.clone());
     }
 }
 
@@ -1690,6 +1701,45 @@ mod tests {
             "the claim goes first"
         );
         assert!(fake.statuses().iter().all(|s| s == "in_progress"));
+    }
+
+    #[test]
+    fn a_head_replaced_before_any_verdict_still_gets_its_checks_cancelled() {
+        if !own_home("a_head_replaced_before_any_verdict_still_gets_its_checks_cancelled") {
+            return;
+        }
+
+        let mut queued = check("queued", "");
+        queued.id = 7;
+        let fake = Fake {
+            existing: Checks::from([(check::NAME.to_string(), queued)]),
+            ..Default::default()
+        };
+        let mut heads = BTreeMap::new();
+        track_heads(
+            "acme/app",
+            &[open_pr(5, "first", "main", "acme/app")],
+            &mut heads,
+            &fake,
+        );
+        assert!(
+            fake.sent.lock().unwrap().is_empty(),
+            "a new head cancels nothing"
+        );
+        track_heads(
+            "acme/app",
+            &[open_pr(5, "second", "main", "acme/app")],
+            &mut heads,
+            &fake,
+        );
+        let sent = fake.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            (sent[0].0["head_sha"].as_str(), sent[0].1),
+            (Some("first"), Some(7))
+        );
+        assert_eq!(sent[0].0["conclusion"], "cancelled");
+        assert_eq!(heads[&("acme/app".to_string(), 5)], "second");
     }
 
     #[test]
