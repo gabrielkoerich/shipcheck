@@ -55,6 +55,7 @@ A tree that already passed answers at once, so a run after a rebase that changed
 - In act mode, `no image for its runs-on label on this host` means a macOS or Windows job, which runs only on GitHub, or a Linux label such as `ubuntu-24.04` with no image in `[act] platforms`. Tell the owner, since it is a `shipcheck.toml` question.
 - In act mode, jobs get no network by default, so a job that needs it fails unless `shipcheck.toml` sets `network = "internet"`. Tell the owner, do not work around it.
 - A refused workflow names the setting it refused, such as a container option or a volume. The setting comes from the owner's workflow on `main`, so tell the owner.
+- `checks not posted: the shipcheck App is not installed on <repo>, fix: add <repo> to the shipcheck App: https://github.com/settings/installations (shipcheck-run, Configure)` means the run finished on this machine but the PR got no checks. `shipcheck status`, the end of `shipcheck run` and the next push print it, `shipcheck logs` ends with `posting: not posted`, `shipcheck history` shows `not posted (no App)`, and the `app` line of `shipcheck doctor` fails. Only the owner can add the repository to the App, so tell them. The line goes away after the next post that succeeds.
 
 ## Never
 

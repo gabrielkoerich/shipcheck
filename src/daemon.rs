@@ -236,8 +236,20 @@ pub fn serve(home_ok: bool) -> ! {
                 &mut unconfigured,
             );
 
-            if let Err(e) = cycle(&config, repo, entry, &senders[repo], state) {
-                eprintln!("{repo}: {e}");
+            let refused = format!("{repo} unposted");
+
+            match cycle(&config, repo, entry, &senders[repo], state) {
+                // Said once per repository, each poll gets the same answer until the App is added
+                Err(e) if background::not_installed(&e) => {
+                    if said.insert(refused) {
+                        background::remember_post(repo, Some(&e));
+                        eprintln!("{repo}: {}", background::unposted_line(repo, &e));
+                    }
+                }
+                Err(e) => eprintln!("{repo}: {e}"),
+                Ok(()) => {
+                    said.remove(&refused);
+                }
             }
         }
 
@@ -772,7 +784,22 @@ fn handle(
             let ids = existing.iter().map(|(n, c)| (n.clone(), c.id)).collect();
             rec.cache_hit = true;
             rec.first_check = Some(run::unix_now());
-            background::finish(&send, &bodies, &ids)?;
+            let secrets = run::repo_id(&plan.repo)
+                .and_then(|id| run::secret_values(&id))
+                .unwrap_or_default();
+            let logs = run::log_dir(&plan.key);
+
+            if let Err(e) = background::finish(&send, &bodies, &ids) {
+                background::remember_post(repo, Some(&e));
+                rec.post_error = Some(e.clone());
+                record::keep(
+                    repo,
+                    &record::line(repo, &plan, &result, &rec, &logs, &secrets),
+                );
+                return Err(e);
+            }
+
+            background::remember_post(repo, None);
             rec.posted_checks = true;
 
             // A fork's summary is its own code's Markdown, so only a same-repo PR gets the comment
@@ -780,10 +807,6 @@ fn handle(
                 rec.posted_comment = comment(sender, Some(&[number]), &plan, &entry.base, &result);
             }
 
-            let secrets = run::repo_id(&plan.repo)
-                .and_then(|id| run::secret_values(&id))
-                .unwrap_or_default();
-            let logs = run::log_dir(&plan.key);
             let line = record::line(repo, &plan, &result, &rec, &logs, &secrets);
             record::keep(repo, &line);
             record::share(&plan, repo, &line);
