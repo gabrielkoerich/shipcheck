@@ -364,7 +364,8 @@ pub fn post_check(
     Ok((id, res["html_url"].as_str().unwrap_or_default().to_string()))
 }
 
-/// Sends one run record to `api`, which stores it only for an account with a plan for team features
+/// Sends one run record to `api`, which stores it only for an account with a plan for team features.
+/// The repository goes in the query, so the service checks the plan before it reads the record
 pub fn post_record(api: &str, token: &str, repo: &str, record: &Value) -> Result<(), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -377,8 +378,9 @@ pub fn post_record(api: &str, token: &str, repo: &str, record: &Value) -> Result
             "POST /v1/records",
             agent
                 .post(format!("{api}/v1/records"))
+                .query("repo", repo)
                 .header("Authorization", format!("Bearer {token}"))
-                .send_json(json!({"repo": repo, "record": record})),
+                .send_json(record),
         )?,
     )?;
     Ok(())
