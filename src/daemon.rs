@@ -645,7 +645,13 @@ fn decide(existing: &Checks, local: bool, result: bool, may_run: bool, cutoff: &
 pub trait Remote: Sync {
     fn send(&self, body: &serde_json::Value, id: Option<u64>) -> Result<(u64, String), String>;
     fn find_checks(&self, sha: &str) -> Result<Checks, String>;
-    fn pusher(&self, pr: u64, branch: &str, sha: &str) -> Result<Option<(String, String)>, String>;
+    fn pusher(
+        &self,
+        pr: u64,
+        branch: &str,
+        sha: &str,
+        trusted: &[String],
+    ) -> Result<Option<(String, String)>, String>;
     fn comment(
         &self,
         prs: Option<&[u64]>,
@@ -665,8 +671,14 @@ impl Remote for Sender {
         Sender::find_checks(self, sha)
     }
 
-    fn pusher(&self, pr: u64, branch: &str, sha: &str) -> Result<Option<(String, String)>, String> {
-        Sender::pusher(self, pr, branch, sha)
+    fn pusher(
+        &self,
+        pr: u64,
+        branch: &str,
+        sha: &str,
+        trusted: &[String],
+    ) -> Result<Option<(String, String)>, String> {
+        Sender::pusher(self, pr, branch, sha, trusted)
     }
 
     fn comment(
@@ -803,7 +815,12 @@ fn handle(
                 return Ok(Some("not run, it contains a head this machine refused"));
             }
 
-            let pusher = sender.pusher(number, &pr.branch, sha)?;
+            let me = me.as_deref().unwrap_or_default();
+            let trusted: Vec<String> = std::iter::once(me.to_string())
+                .chain(plan.config.daemon_authors.iter().cloned())
+                .filter(|l| !l.is_empty())
+                .collect();
+            let pusher = sender.pusher(number, &pr.branch, sha, &trusted)?;
 
             if let Some((login, source)) = &pusher {
                 println!(
@@ -812,7 +829,6 @@ fn handle(
                 );
             }
 
-            let me = me.as_deref().unwrap_or_default();
             let verdict = pushed(
                 &pr.author,
                 pusher.as_ref().map(|(login, _)| login.as_str()),
@@ -1345,6 +1361,7 @@ mod tests {
             _pr: u64,
             _branch: &str,
             _sha: &str,
+            _trusted: &[String],
         ) -> Result<Option<(String, String)>, String> {
             Ok(self.pusher.clone().map(|l| (l, "events".to_string())))
         }

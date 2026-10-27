@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -410,14 +410,23 @@ pub struct Sender {
 }
 
 enum How {
-    Key(crate::github::App, Mutex<Option<(String, Instant)>>),
+    /// The App key, its installation token, and this machine's `shipcheck login` token if any
+    Key(
+        crate::github::App,
+        Mutex<Option<(String, Instant)>>,
+        OnceLock<Option<String>>,
+    ),
     Service(String),
 }
 
 impl Sender {
     pub fn new(repo: &str) -> Result<Self, String> {
         let how = match poster() {
-            Poster::Key => How::Key(crate::github::App::from_env()?, Mutex::new(None)),
+            Poster::Key => How::Key(
+                crate::github::App::from_env()?,
+                Mutex::new(None),
+                OnceLock::new(),
+            ),
             Poster::Service(token) => How::Service(token),
             Poster::None => return Err(NOT_SIGNED_IN.into()),
         };
@@ -450,7 +459,7 @@ impl Sender {
     pub fn send(&self, body: &Value, id: Option<u64>) -> Result<(u64, String), String> {
         match &self.how {
             How::Service(token) => post_check(token, &self.repo, body, id),
-            How::Key(app, cache) => {
+            How::Key(app, cache, _) => {
                 let token = self.installation_token(app, cache)?;
 
                 match id {
@@ -470,7 +479,7 @@ impl Sender {
                 let res = get_json(token, "/v1/pulls", &[("repo", &self.repo)])?;
                 Ok(crate::github::parse_prs(&res["pulls"]))
             }
-            How::Key(app, cache) => {
+            How::Key(app, cache, _) => {
                 crate::github::open_prs(&self.installation_token(app, cache)?, &self.repo)
             }
         }
@@ -490,7 +499,7 @@ impl Sender {
             How::Service(token) => {
                 crate::comment::post_with_service(token, &self.repo, base, sha, entry, secrets)
             }
-            How::Key(app, _) => {
+            How::Key(app, _, _) => {
                 crate::comment::post_with_app(app, &self.repo, prs, base, sha, entry, secrets)
             }
         }
@@ -500,44 +509,50 @@ impl Sender {
     pub fn pull(&self, number: u64) -> Result<Option<Value>, String> {
         match &self.how {
             How::Service(_) => Ok(None),
-            How::Key(app, cache) => {
+            How::Key(app, cache, _) => {
                 crate::github::pull(&self.installation_token(app, cache)?, &self.repo, number)
                     .map(Some)
             }
         }
     }
 
-    /// Who pushed head `sha` of PR `pr`, and the source that said so, None while none does
+    /// Who pushed head `sha` of PR `pr`, and the source that said so, None while none does.
+    /// `trusted` are the logins the daemon runs
     pub fn pusher(
         &self,
         pr: u64,
         branch: &str,
         sha: &str,
+        trusted: &[String],
     ) -> Result<Option<(String, String)>, String> {
+        let ask = |token: &str| {
+            let pr = pr.to_string();
+            let query = [
+                ("repo", self.repo.as_str()),
+                ("pr", &pr),
+                ("ref", branch),
+                ("sha", sha),
+            ];
+            get_json(token, "/v1/pusher", &query).map(|res| parse_pusher(&res))
+        };
+
         match &self.how {
-            How::Service(token) => {
-                let pr = pr.to_string();
-                let res = get_json(
-                    token,
-                    "/v1/pusher",
-                    &[
-                        ("repo", &self.repo),
-                        ("pr", &pr),
-                        ("ref", branch),
-                        ("sha", sha),
-                    ],
-                )?;
-                let source = res["source"].as_str().unwrap_or("events").to_string();
-                Ok(res["login"].as_str().map(|l| (l.to_string(), source)))
+            How::Service(token) => ask(token),
+            How::Key(app, cache, login) => {
+                // Read once, since on a Mac a read can ask the user
+                let service = login.get_or_init(machine_token).as_deref().map(ask);
+                service_first(service, || {
+                    Ok(crate::github::find_pusher(
+                        &self.installation_token(app, cache)?,
+                        &self.repo,
+                        pr,
+                        branch,
+                        sha,
+                        trusted,
+                    )?
+                    .map(|(login, source)| (login, source.to_string())))
+                })
             }
-            How::Key(app, cache) => Ok(crate::github::find_pusher(
-                &self.installation_token(app, cache)?,
-                &self.repo,
-                pr,
-                branch,
-                sha,
-            )?
-            .map(|(login, source)| (login, source.to_string()))),
         }
     }
 
@@ -548,13 +563,33 @@ impl Sender {
                 let res = get_json(token, "/v1/checks", &[("repo", &self.repo), ("sha", sha)])?;
                 Ok(crate::github::parse_checks(&res))
             }
-            How::Key(app, cache) => crate::github::find_checks(
+            How::Key(app, cache, _) => crate::github::find_checks(
                 &self.installation_token(app, cache)?,
                 &self.repo,
                 sha,
                 app.id(),
             ),
         }
+    }
+}
+
+/// The login and source of the service's `GET /v1/pusher`, None while it names no one
+fn parse_pusher(res: &Value) -> Option<(String, String)> {
+    let source = res["source"].as_str().unwrap_or("events").to_string();
+    res["login"].as_str().map(|l| (l.to_string(), source))
+}
+
+type Pusher = Result<Option<(String, String)>, String>;
+
+/**
+ * The service's pusher when it names one, else the App key's own lookup. Only the service gets
+ * GitHub's webhook, so a self-hosted daemon asks it first when this machine is signed in. Its
+ * errors stay silent, since the local lookup answers the same question
+ **/
+fn service_first(service: Option<Pusher>, local: impl FnOnce() -> Pusher) -> Pusher {
+    match service {
+        Some(Ok(Some(found))) => Ok(Some(found)),
+        _ => local(),
     }
 }
 
@@ -614,6 +649,29 @@ pub fn post_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_self_hosted_daemon_takes_the_service_pusher_first_and_falls_back_silently() {
+        let hook = parse_pusher(&json!({"login": "ann", "source": "webhook"}));
+        assert_eq!(hook, Some(("ann".into(), "webhook".into())));
+        assert_eq!(parse_pusher(&Value::Null), None, "no one yet");
+        assert_eq!(
+            parse_pusher(&json!({"login": "bob"})),
+            Some(("bob".into(), "events".into())),
+            "an older service names no source"
+        );
+
+        let local = || Ok(Some(("bob".to_string(), "signature".to_string())));
+        assert_eq!(service_first(Some(Ok(hook.clone())), local), Ok(hook));
+
+        for service in [
+            None,
+            Some(Ok(None)),
+            Some(Err("GET /v1/pusher: HTTP 403".into())),
+        ] {
+            assert_eq!(service_first(service, local), local());
+        }
+    }
 
     #[test]
     fn picks_how_to_post() {
