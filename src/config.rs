@@ -62,6 +62,8 @@ pub struct Host {
 pub struct Check {
     pub run: String,
     pub sandbox: bool,
+    /// Set by the plan when the base asks for `sandbox = false` and this machine does not trust the repository
+    pub untrusted: bool,
 }
 
 impl<'de> Deserialize<'de> for Check {
@@ -82,10 +84,11 @@ impl<'de> Deserialize<'de> for Check {
         }
 
         Ok(match Either::deserialize(d)? {
-            Either::Command(run) => Check { run, sandbox: true },
+            Either::Command(run) => Check::from(run),
             Either::Table(t) => Check {
                 run: t.run,
                 sandbox: t.sandbox,
+                untrusted: false,
             },
         })
     }
@@ -110,13 +113,18 @@ impl From<&str> for Check {
         Check {
             run: run.into(),
             sandbox: true,
+            untrusted: false,
         }
     }
 }
 
 impl From<String> for Check {
     fn from(run: String) -> Self {
-        Check { run, sandbox: true }
+        Check {
+            run,
+            sandbox: true,
+            untrusted: false,
+        }
     }
 }
 

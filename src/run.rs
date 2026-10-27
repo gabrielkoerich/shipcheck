@@ -432,6 +432,14 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
             .filter(|f| !f.is_empty()),
     );
 
+    // Only this machine can let a check out of the sandbox, never the repository alone
+    if config.host.checks.values().any(|c| !c.sandbox) && !crate::trust::trusted(&repo) {
+        for c in config.host.checks.values_mut().filter(|c| !c.sandbox) {
+            c.sandbox = true;
+            c.untrusted = true;
+        }
+    }
+
     // Hash required workflows as they run, so a change to the injection changes the key too
     let runners = Runners::new(&config, &repo);
     let act_files = config.act_files();
@@ -452,7 +460,13 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         as_run.insert(path.clone(), body);
     }
 
-    let tools = runners.identity()?;
+    let mut tools = runners.identity()?;
+
+    // So trusting a repository runs its unsandboxed checks again, rather than reuse a sandboxed result
+    for (name, _) in config.host.checks.iter().filter(|(_, c)| !c.sandbox) {
+        tools.push_str(&format!("\nunsandboxed\0{name}"));
+    }
+
     let key = cache::key(&KeyInputs {
         tree: &tree,
         config: &config_text,
@@ -1750,6 +1764,9 @@ fn run_all(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, 
  * result named [`HOST`] whose jobs are the checks. Nothing from the base is written into the clone,
  * since the commands come from the plan and no workflow runs
  **/
+/// What a run and doctor say about a `sandbox = false` check this machine does not trust
+pub const UNTRUSTED: &str = "this repository asks to run it with sandbox = false, so it runs in the sandbox here. Run `shipcheck trust` to allow it if you trust the repository";
+
 /// What a run and doctor say about a check with `sandbox = false`
 pub const UNSANDBOXED: &str = "runs outside the sandbox, as `sandbox = false` on the base says, with this user's full access to the home, its keys and tokens. For trusted repositories only";
 
@@ -1762,8 +1779,12 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
     git_cow::can_clone(&templates, &checkouts);
     let deadline = Instant::now() + Duration::from_secs(ctx.plan.config.timeout_minutes * 60);
 
-    for name in checks.iter().filter(|(_, c)| !c.sandbox).map(|(n, _)| n) {
-        say(&format!("{HOST}/{name}: {UNSANDBOXED}"));
+    for (name, c) in checks {
+        if !c.sandbox {
+            say(&format!("{HOST}/{name}: {UNSANDBOXED}"));
+        } else if c.untrusted {
+            say(&format!("{HOST}/{name}: {UNTRUSTED}"));
+        }
     }
 
     let runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {

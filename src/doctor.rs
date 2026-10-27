@@ -238,6 +238,12 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                     host = format!("{host}. {} {}", open.join(", "), crate::run::UNSANDBOXED);
                 }
 
+                let held: Vec<&str> = p.config.host.checks.iter().filter(|(_, c)| c.untrusted).map(|(n, _)| n.as_str()).collect();
+
+                if !held.is_empty() {
+                    host = format!("{host}. {}: {}", held.join(", "), crate::run::UNTRUSTED);
+                }
+
                 if p.config.acts() && p.config.hosts() {
                     let acts = jobs_line(&p.config);
                     format!("{host}, and {acts} with act")
