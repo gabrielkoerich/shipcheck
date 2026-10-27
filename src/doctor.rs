@@ -358,6 +358,14 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     }
 
     if let Ok(config) = &planned {
+        found.push(Check {
+            name: "team",
+            ok: true,
+            detail: team_line(config.team),
+        });
+    }
+
+    if let Ok(config) = &planned {
         let on_vm: Vec<String> = config
             .engines()
             .into_iter()
@@ -439,6 +447,29 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     }
 
     found
+}
+
+/// What `[team]` on the base sends. `cache` and `logs` are accepted so a later release can use them
+fn team_line(team: crate::config::Team) -> String {
+    let mut line = if team.records {
+        "records on: each full run's record goes to the service, which keeps it only when this account has a plan for team features".to_string()
+    } else {
+        "off: no run record leaves this machine".to_string()
+    };
+    let later: Vec<&str> = [("cache", team.cache), ("logs", team.logs)]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(key, _)| key)
+        .collect();
+
+    if !later.is_empty() {
+        line = format!(
+            "{line}. {} not yet: this release sends nothing for them",
+            later.join(", ")
+        );
+    }
+
+    line
 }
 
 /// The check names the base branch's rules require, read with the person's `gh`. None when gh cannot read them
@@ -545,6 +576,19 @@ fn memory_note(docker: u64, host: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn team_line_says_what_leaves_and_what_is_not_yet() {
+        use crate::config::Team;
+        assert!(team_line(Team::default()).starts_with("off"));
+        let all = team_line(Team {
+            records: true,
+            cache: true,
+            logs: true,
+        });
+        assert!(all.starts_with("records on"));
+        assert!(all.ends_with("cache, logs not yet: this release sends nothing for them"));
+    }
 
     #[test]
     fn notes_ruleset_drift() {

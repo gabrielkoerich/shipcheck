@@ -69,7 +69,7 @@ fn login_token() -> Option<String> {
 }
 
 /// The machine token: `SHIPCHECK_TOKEN`, else the `shipcheck login` token
-fn machine_token() -> Option<String> {
+pub fn machine_token() -> Option<String> {
     std::env::var("SHIPCHECK_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())
@@ -362,6 +362,26 @@ pub fn post_check(
         .as_u64()
         .ok_or("the service returned no check id")?;
     Ok((id, res["html_url"].as_str().unwrap_or_default().to_string()))
+}
+
+/// Sends one run record to `api`, which stores it only for an account with a plan for team features
+pub fn post_record(api: &str, token: &str, repo: &str, record: &Value) -> Result<(), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .into();
+    ok(
+        "POST /v1/records",
+        send(
+            "POST /v1/records",
+            agent
+                .post(format!("{api}/v1/records"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send_json(json!({"repo": repo, "record": record})),
+        )?,
+    )?;
+    Ok(())
 }
 
 fn get_json(token: &str, path: &str, query: &[(&str, &str)]) -> Result<Value, String> {
