@@ -473,7 +473,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
 
                 record.partial = true;
-                keep_record(&plan, &entry, &record, &run::partial_log_dir(&plan.key));
+                keep_record(
+                    &plan,
+                    &entry,
+                    &record,
+                    &run::partial_log_dir(&plan.key),
+                    false,
+                );
                 say(PARTIAL);
                 return Ok(code);
             }
@@ -509,7 +515,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     record.posted_checks = true;
                     record.posted_comment =
                         shipcheck::daemon::comment(sender, None, &plan, &base, entry);
-                    keep_record(&plan, entry, &record, &run::log_dir(&plan.key));
+                    keep_record(&plan, entry, &record, &run::log_dir(&plan.key), true);
                 }
 
                 let Some(entry) = posted else {
@@ -552,7 +558,9 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
             };
             let code = report(&entry, snapshot, json, false);
-            keep_record(&plan, &entry, &record, &run::log_dir(&plan.key));
+            // Like a post, an upload needs the base this repository posts from, never a fallback
+            let shares = plan.config.team.records && shipcheck::daemon::posts_from(&base, &cwd);
+            keep_record(&plan, &entry, &record, &run::log_dir(&plan.key), shares);
 
             if !explicit {
                 run::record_tested(
@@ -1112,14 +1120,19 @@ fn posting_run(
     Ok(posted)
 }
 
-/// Appends the run to this machine's records, read by `shipcheck history`. A record never fails a run
-fn keep_record(plan: &run::Plan, entry: &run::Entry, record: &Record, logs: &Path) {
+/// Appends the run to this machine's records, read by `shipcheck history`, and with `share` uploads
+/// it as `[team] records` says. A record never fails a run
+fn keep_record(plan: &run::Plan, entry: &run::Entry, record: &Record, logs: &Path, share: bool) {
     let Ok(repo) = run::repo_id(&plan.repo) else {
         return;
     };
     let secrets = run::secret_values(&repo).unwrap_or_default();
     let line = shipcheck::record::line(&repo, plan, entry, record, logs, &secrets);
     shipcheck::record::keep(&repo, &line);
+
+    if share {
+        shipcheck::record::share(plan, &repo, &line);
+    }
 }
 
 fn toplevel(cwd: &Path) -> Result<std::path::PathBuf, String> {
