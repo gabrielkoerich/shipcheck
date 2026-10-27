@@ -88,9 +88,8 @@ impl Host {
 }
 
 /**
- * One run's copy of the base cache, `runs/run-X`, beside `runs/run-X.lock`, which the run holds
- * locked while it lives. A copy whose lock another run can take is unused, as when its run died.
- * The lock is taken under a name cleanup skips, and only then linked to its `.lock` name
+ * One run's copy of the base cache, `runs/run-N`, beside `runs/run-N.lock`, which the run holds
+ * locked while it lives. A copy whose lock another run can take is unused, as when its run died
  **/
 struct RunCopy {
     dir: PathBuf,
@@ -102,39 +101,37 @@ struct RunCopy {
 impl RunCopy {
     fn new(runs: &Path) -> Result<Self, String> {
         let fail = |e: std::io::Error| format!("run cache in {}: {e}", runs.display());
-        let new = tempfile::Builder::new()
-            .prefix(".new-")
-            .tempfile_in(runs)
-            .map_err(fail)?;
 
-        if !locked(new.as_file()) {
-            return Err(format!("{}: could not lock", new.path().display()));
+        // A fixed name per slot, since cargo keys a build by its sources' absolute paths
+        for n in 0..64 {
+            let lock = runs.join(format!("run-{n}.lock"));
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&lock)
+                .map_err(fail)?;
+
+            // The lock must still be the one at that path, not one a run or cleanup removed meanwhile
+            if !locked(&file) || !same_file(&file, &lock) {
+                continue;
+            }
+
+            let dir = lock.with_extension("");
+            remove_tree(&dir);
+
+            // What a check left that cannot be removed must never reach another branch's run
+            if fs::symlink_metadata(&dir).is_ok() {
+                continue;
+            }
+
+            return Ok(RunCopy {
+                dir,
+                lock,
+                _file: file,
+            });
         }
 
-        // A hard link keeps the locked inode and, unlike a rename, never replaces another's lock
-        let lock = loop {
-            let mut bytes = [0u8; 8];
-            std::io::Read::read_exact(
-                &mut fs::File::open("/dev/urandom").map_err(fail)?,
-                &mut bytes,
-            )
-            .map_err(fail)?;
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            let lock = runs.join(format!("run-{hex}.lock"));
-
-            match fs::hard_link(new.path(), &lock) {
-                Ok(()) => break lock,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(fail(e)),
-            }
-        };
-        let (file, temp) = new.keep().map_err(|e| fail(e.error))?;
-        let _ = fs::remove_file(temp);
-        Ok(RunCopy {
-            dir: lock.with_extension(""),
-            lock,
-            _file: file,
-        })
+        Err(format!("all 64 run caches in {} are busy", runs.display()))
     }
 
     fn remove_unused(runs: &Path) {
@@ -829,6 +826,11 @@ impl Jail {
             .collect::<Result<_, String>>()?;
         // A copy of launchctl outside /bin is killed at exec, so the path is enough
         let exec = format!("(deny process-exec* (literal \"{LAUNCHCTL}\"){setuid})\n");
+        // Without its cache every `/usr/bin` shim, git and cc among them, asks xcodebuild for a second
+        let xcrun: String = xcrun_db()
+            .map(|p| quote(&p).map(|q| format!(" (literal {q})")))
+            .transpose()?
+            .unwrap_or_default();
         Ok(format!(
             "(version 1)\n(allow default)\n\
              (deny file-write*)\n\
@@ -836,7 +838,7 @@ impl Jail {
              {own}\
              (allow file-write* (literal \"/dev/ptmx\") (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
              (deny file-read-data (subpath {user}){temp})\n\
-             (allow file-read-data{readable}{writable})\n\
+             (allow file-read-data{readable}{writable}{xcrun})\n\
              (deny file-read*{hidden})\n\
              (deny file-read* (require-all (regex #\"^/dev/ttys[0-9]+$\") (require-not (extension \"com.apple.sandbox.pty\"))))\n\
              (deny network-outbound (remote unix-socket))\n\
@@ -1052,6 +1054,33 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
     }
 
     Ok((dir, path))
+}
+
+/// xcrun's lookup cache, in the user's temp dir whatever `TMPDIR` says, read-only to a check
+#[cfg(target_os = "macos")]
+fn xcrun_db() -> Option<PathBuf> {
+    let mut buf = vec![0u8; 1024];
+    // Safe: confstr writes at most `buf.len()` bytes into a buffer this function owns
+    let n = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+
+    buf.truncate(n - 1);
+    let dir = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(buf));
+    Some(resolved(dir.join("xcrun_db")))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn xcrun_db() -> Option<PathBuf> {
+    None
 }
 
 /// Where the jail's own commands go, first on `PATH`
@@ -2787,7 +2816,9 @@ mod tests {
         assert!(profile.contains(
             r#"(deny file-read* (require-all (regex #"^/dev/ttys[0-9]+$") (require-not (extension "com.apple.sandbox.pty"))))"#
         ));
-        assert!(profile.contains(&format!("(subpath \"/j/repo\") {paths})")));
+        let xcrun = xcrun_db().map_or(String::new(), |p| format!(" (literal \"{}\")", p.display()));
+        assert!(profile.contains(&format!("(subpath \"/j/repo\") {paths}{xcrun})")));
+        assert_eq!(xcrun.ends_with("/xcrun_db\")"), cfg!(target_os = "macos"));
         assert!(profile.contains("(deny network-outbound (remote unix-socket))\n"));
         assert!(profile.contains(
             r#"(allow network-outbound (remote unix-socket (subpath "/j/clone \"x\"")) (remote unix-socket (subpath "/j/home")))"#
@@ -3323,6 +3354,20 @@ mod tests {
         fs::set_permissions(ro.join("m"), fs::Permissions::from_mode(0o555)).unwrap();
         remove_tree(&ro);
         assert!(!ro.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_slot_whose_old_copy_survives_removal_is_never_reused() {
+        let runs = tempfile::tempdir().unwrap();
+        let stuck = runs.path().join("run-0/planted");
+        fs::create_dir_all(stuck.parent().unwrap()).unwrap();
+        fs::write(&stuck, "x").unwrap();
+        let flag = |f: &str| Command::new("chflags").arg(f).arg(&stuck).status().unwrap();
+        assert!(flag("uchg").success());
+        let copy = RunCopy::new(runs.path());
+        flag("nouchg");
+        assert_eq!(copy.unwrap().dir, runs.path().join("run-1"));
     }
 
     #[test]
