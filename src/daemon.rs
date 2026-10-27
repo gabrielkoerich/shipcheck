@@ -11,8 +11,11 @@ use crate::record::{self, Run};
 use crate::service::Sender;
 use crate::{check, run};
 
-// A claim older than this is a run that died, so another machine may take the PR
-const STALE_CLAIM_SECONDS: u64 = 3 * 3600;
+/// How long a run can last: each workflow's deadline, once per attempt, and 10 minutes to set up and
+/// post. A claim older than this is a run that died, so this machine may take the PR
+fn stale_after(config: &crate::config::RepoConfig) -> u64 {
+    config.timeout_minutes * 60 * (u64::from(config.retries) + 1) + 600
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -800,7 +803,7 @@ fn handle(
     let send = |body: &serde_json::Value, id| sender.send(body, id);
     let local = run::running(&plan.key) || background::running_here(repo, sha, false);
     let result = if local { None } else { run::lookup(&plan) };
-    let cutoff = check::iso(run::unix_now().saturating_sub(STALE_CLAIM_SECONDS));
+    let cutoff = check::iso(run::unix_now().saturating_sub(stale_after(&plan.config)));
 
     // A fork's code would run on this machine with its secrets, so only its own author runs it
     let me = me(config);
@@ -983,6 +986,19 @@ mod tests {
             status: status.into(),
             started_at: started_at.into(),
         }
+    }
+
+    #[test]
+    fn a_claim_goes_stale_once_every_attempt_could_have_timed_out() {
+        let mut config: crate::config::RepoConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            stale_after(&config),
+            70 * 60,
+            "30 minutes, 2 attempts, 10 to set up"
+        );
+        config.timeout_minutes = 10;
+        config.retries = 0;
+        assert_eq!(stale_after(&config), 20 * 60);
     }
 
     #[test]
