@@ -509,9 +509,28 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             });
 
             if let (Some(sender), Some(name)) = (&sender, &posts) {
-                let posted = posting_run(&plan, sender, name, &mut record, &mut |line| say(line))?;
+                let repo = run::repo_id(&plan.repo)?;
+                let posted = posting_run(&plan, sender, name, &mut record, &mut |line| say(line));
+
+                if let Err(e) = &posted
+                    && let Some(refused) = record.post_error.clone()
+                {
+                    background::remember_post(&repo, Some(&refused));
+
+                    if let Some(entry) = run::lookup(&plan) {
+                        keep_record(&plan, &entry, &record, &run::log_dir(&plan.key), false);
+                    }
+
+                    return Err(format!(
+                        "{e}\n{}",
+                        background::unposted_line(&repo, &refused)
+                    ));
+                }
+
+                let posted = posted?;
 
                 if let Some(entry) = &posted {
+                    background::remember_post(&repo, None);
                     record.posted_checks = true;
                     record.posted_comment =
                         shipcheck::daemon::comment(sender, None, &plan, &base, entry);
@@ -585,6 +604,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 ));
             }
 
+            if let Some(line) = unposted(&plan.repo) {
+                say(&line);
+            }
+
             Ok(code)
         }
         "doctor" => {
@@ -638,6 +661,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 ));
             }
 
+            if let Some(line) = unposted(&plan.repo) {
+                say(&line);
+            }
+
             match run::lookup(&plan) {
                 Some(entry) => Ok(report(&entry, snapshot, json, false)),
                 // With --json, stdout stays JSON an agent can parse, even with nothing to report
@@ -686,6 +713,16 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 print_logs(&partial)?;
             }
 
+            if let Ok(repo) = run::repo_id(&plan.repo)
+                && let Some(line) = shipcheck::record::posting(
+                    &shipcheck::record::runs(&run::home(), &repo, usize::MAX),
+                    &repo,
+                    &plan.sha,
+                )
+            {
+                println!("{line}");
+            }
+
             Ok(ExitCode::SUCCESS)
         }
         "post" => {
@@ -722,8 +759,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             let sender = Sender::new(&run::repo_id(&plan.repo)?)?;
             // Job checks go first, so a failed post leaves `shipcheck` unposted
             let bodies = check::final_bodies(&plan, &entry, true);
-            let url =
-                background::finish(&|b, id| sender.send(b, id), &bodies, &Default::default())?;
+            let repo = run::repo_id(&plan.repo)?;
+            let url = background::finish(&|b, id| sender.send(b, id), &bodies, &Default::default())
+                .inspect_err(|e| background::remember_post(&repo, Some(e)))?;
+            background::remember_post(&repo, None);
 
             println!(
                 "posted {} on {}: {url}",
@@ -732,7 +771,6 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             );
 
             let commented = shipcheck::daemon::comment(&sender, None, &plan, &base, &entry);
-            let repo = run::repo_id(&plan.repo)?;
             let fields = serde_json::json!({
                 "sha": plan.sha,
                 "tree": plan.tree,
@@ -795,6 +833,11 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
 
                 background::start(&cwd, &plan, &base, &branch, post, "hook-push", false);
+
+                // One line on the push, git shows a hook's output and the push goes on
+                if let Some(line) = unposted(&plan.repo) {
+                    eprintln!("shipcheck: {line}");
+                }
             }
 
             Ok(ExitCode::SUCCESS)
@@ -1046,6 +1089,11 @@ fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCod
     Ok(ExitCode::SUCCESS)
 }
 
+/// The line of this repository's last refused post, None once a post succeeded
+fn unposted(repo: &Path) -> Option<String> {
+    background::unposted(&run::repo_id(repo).ok()?)
+}
+
 fn current_branch(cwd: &Path) -> String {
     Command::new("git")
         .args(["symbolic-ref", "--short", "-q", "HEAD"])
@@ -1072,8 +1120,13 @@ fn posting_run(
     let first = AtomicU64::new(0);
     let cached = run::lookup(plan).filter(|e| e.passed);
     let mut hit = cached.is_some();
+    let refused = std::sync::Mutex::new(None);
     let send = |body: &serde_json::Value, id| {
-        let sent = sender.send(body, id)?;
+        let sent = sender.send(body, id).inspect_err(|e: &String| {
+            if let Ok(mut r) = refused.lock() {
+                *r = Some(e.clone());
+            }
+        })?;
 
         if body["status"] == "completed" {
             let _ =
@@ -1114,7 +1167,13 @@ fn posting_run(
         |entry| check::final_bodies(plan, entry, true),
         || background::current(&record, pid),
         &background::WAITS,
-    )?;
+    );
+    // Only a refused post is remembered, a run that could not run is not one
+    rec.post_error = posted
+        .as_ref()
+        .err()
+        .and_then(|_| refused.lock().ok()?.clone());
+    let posted = posted?;
     rec.cache_hit = hit;
     rec.first_check = Some(first.load(Ordering::Relaxed)).filter(|t| *t > 0);
     Ok(posted)

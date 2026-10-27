@@ -398,6 +398,14 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         },
     });
 
+    // The post itself refuses a repository the App cannot reach, so ask GitHub here, before a push
+    if crate::service::can_post()
+        && let Ok(repo) = run::repo_id(Path::new(&top))
+    {
+        let answer = crate::service::Sender::new(&repo).and_then(|s| s.open_prs().map(|_| ()));
+        found.push(check("app", app_line(&repo, answer)));
+    }
+
     let missing = crate::agents::notes(Path::new(&top));
     found.push(Check {
         name: "instructions",
@@ -447,6 +455,15 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     }
 
     found
+}
+
+/// Whether the App reaches `repo`, from the answer to a list of its open PRs
+fn app_line(repo: &str, answer: Result<(), String>) -> Result<String, String> {
+    match answer {
+        Ok(()) => Ok(format!("installed on {repo}, runs can post its checks")),
+        Err(e) if crate::background::not_installed(&e) => Err(crate::background::install_fix(repo)),
+        Err(e) => Err(e),
+    }
 }
 
 /// What `[team]` on the base sends. `cache` and `logs` are accepted so a later release can use them
@@ -588,6 +605,33 @@ mod tests {
         });
         assert!(all.starts_with("records on"));
         assert!(all.ends_with("cache, logs not yet: this release sends nothing for them"));
+    }
+
+    #[test]
+    fn says_how_to_add_a_repository_the_app_cannot_reach() {
+        let fix = "add acme/app to the shipcheck App: https://github.com/settings/installations (shipcheck-run, Configure)";
+
+        for answer in [
+            "GET /v1/pulls: the shipcheck App is not installed on acme/app, or you have no access to it, install it from https://github.com/apps/shipcheck-run",
+            "GET /v1/pulls: HTTP 403",
+            "the shipcheck App is not installed on acme/app",
+            "GET https://api.github.com/repos/acme/app/pulls?state=open&per_page=100: http status: 404",
+        ] {
+            assert_eq!(
+                app_line("acme/app", Err(answer.into())),
+                Err(fix.into()),
+                "{answer}"
+            );
+        }
+
+        assert_eq!(
+            app_line("acme/app", Ok(())),
+            Ok("installed on acme/app, runs can post its checks".into())
+        );
+        assert_eq!(
+            app_line("acme/app", Err("GET /v1/pulls: timeout".into())),
+            Err("GET /v1/pulls: timeout".into())
+        );
     }
 
     #[test]

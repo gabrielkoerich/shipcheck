@@ -24,6 +24,8 @@ pub struct Run {
     pub partial: bool,
     pub posted_checks: bool,
     pub posted_comment: bool,
+    /// Why a run that posts could not post its checks
+    pub post_error: Option<String>,
     /// When the first check with a result went to GitHub, in Unix seconds
     pub first_check: Option<u64>,
 }
@@ -40,6 +42,7 @@ impl Run {
             partial: false,
             posted_checks: false,
             posted_comment: false,
+            post_error: None,
             first_check: None,
         }
     }
@@ -133,6 +136,7 @@ pub fn line(
             "checks": run.posted_checks,
             "comment": run.posted_comment,
             "first_check_s": run.first_check.map(|t| t.saturating_sub(run.started)),
+            "error": run.post_error,
         },
     })
 }
@@ -300,8 +304,8 @@ pub fn runs(home: &Path, repo: &str, limit: usize) -> Vec<Value> {
 /// `shipcheck history`: one row per run, newest last
 pub fn table(runs: &[Value]) -> String {
     let mut out = format!(
-        "{:<20} {:<12} {:<4} {:<7} {:>8} {:<5} {}\n",
-        "WHEN", "COMMIT", "MODE", "RESULT", "TIME", "CACHE", "BY"
+        "{:<20} {:<12} {:<4} {:<7} {:>8} {:<5} {:<11} {}\n",
+        "WHEN", "COMMIT", "MODE", "RESULT", "TIME", "CACHE", "BY", "POSTED"
     );
 
     for r in runs {
@@ -321,7 +325,7 @@ pub fn table(runs: &[Value]) -> String {
             .replace('Z', "");
         let sha = r["sha"].as_str().unwrap_or_default();
         out.push_str(&format!(
-            "{:<20} {:<12} {:<4} {:<7} {:>7}s {:<5} {}\n",
+            "{:<20} {:<12} {:<4} {:<7} {:>7}s {:<5} {:<11} {}\n",
             when,
             &sha[..sha.len().min(12)],
             r["mode"].as_str().unwrap_or_default(),
@@ -329,10 +333,42 @@ pub fn table(runs: &[Value]) -> String {
             r["duration_s"].as_u64().unwrap_or_default(),
             if r["cache_hit"] == true { "hit" } else { "run" },
             r["trigger"].as_str().unwrap_or_default(),
+            posted_column(r),
         ));
     }
 
     out
+}
+
+/// `posted`, `not posted` with a short reason, or `-` for a run that does not post
+fn posted_column(r: &Value) -> String {
+    if r["posted"]["checks"] == true {
+        return "posted".into();
+    }
+
+    match r["posted"]["error"].as_str() {
+        Some(e) if crate::background::not_installed(e) => "not posted (no App)".into(),
+        Some(_) => "not posted (error)".into(),
+        None => "-".into(),
+    }
+}
+
+/// The `posting:` line of `shipcheck logs` for `sha`, from its last run that posted or tried to
+pub fn posting(runs: &[Value], repo: &str, sha: &str) -> Option<String> {
+    let r = runs.iter().rev().find(|r| {
+        r["sha"] == sha && (r["posted"]["checks"] == true || r["posted"]["error"].is_string())
+    })?;
+
+    if let Some(e) = r["posted"]["error"].as_str() {
+        let (reason, fix) = crate::background::reason_and_fix(repo, e);
+        return Some(format!("posting: not posted, {reason}, fix: {fix}"));
+    }
+
+    Some(format!(
+        "posting: posted at {} by {}",
+        r["finished"].as_str().unwrap_or_default(),
+        r["trigger"].as_str().unwrap_or_default()
+    ))
 }
 
 #[cfg(test)]
@@ -609,12 +645,22 @@ mod tests {
             "started": "2026-10-23T14:02:11Z", "sha": "0123456789abcdef", "mode": "act",
             "passed": true, "duration_s": 93, "cache_hit": false, "trigger": "hook-push",
         });
-        let text = table(&[row]);
+        let mut posted = row.clone();
+        posted["posted"] = json!({"checks": true, "error": null});
+        let mut refused = row.clone();
+        refused["posted"] = json!({"checks": false, "error": "POST /v1/checks: the shipcheck App is not installed on acme/app, or you have no access to it"});
+        let text = table(&[row, posted, refused.clone()]);
         let lines: Vec<_> = text.lines().collect();
         assert!(lines[0].starts_with("WHEN"));
+        assert!(lines[0].ends_with("BY          POSTED"), "{}", lines[0]);
+        let start = "2026-10-23 14:02:11  0123456789ab act  pass         93s run   hook-push  ";
+        assert_eq!(lines[1], format!("{start} -"));
+        assert_eq!(lines[2], format!("{start} posted"));
+        assert_eq!(lines[3], format!("{start} not posted (no App)"));
+
         assert_eq!(
-            lines[1],
-            "2026-10-23 14:02:11  0123456789ab act  pass         93s run   hook-push"
+            posting(&[refused], "acme/app", "0123456789abcdef").unwrap(),
+            "posting: not posted, the shipcheck App is not installed on acme/app, fix: add acme/app to the shipcheck App: https://github.com/settings/installations (shipcheck-run, Configure)"
         );
     }
 }

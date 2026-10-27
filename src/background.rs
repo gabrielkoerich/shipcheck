@@ -48,6 +48,71 @@ pub fn note(line: &str) {
     }
 }
 
+/// Whether the App cannot reach the repository: the service's 403 and the App key's 404 say it is
+/// not installed, a bare 403 or 404 means the same
+pub fn not_installed(e: &str) -> bool {
+    e.contains("not installed")
+        || [
+            "HTTP 403",
+            "HTTP 404",
+            "http status: 403",
+            "http status: 404",
+        ]
+        .iter()
+        .any(|s| e.ends_with(s))
+}
+
+/// Why a post to `repo` failed, and what fixes it
+pub fn reason_and_fix(repo: &str, e: &str) -> (String, String) {
+    if not_installed(e) {
+        return (
+            format!("the shipcheck App is not installed on {repo}"),
+            install_fix(repo),
+        );
+    }
+
+    (e.to_string(), "run `shipcheck doctor`".into())
+}
+
+pub fn install_fix(repo: &str) -> String {
+    format!(
+        "add {repo} to the shipcheck App: https://github.com/settings/installations (shipcheck-run, Configure)"
+    )
+}
+
+/// The line a failed post leaves for `status`, `run`, the pre-push hook and the daemon's log
+pub fn unposted_line(repo: &str, e: &str) -> String {
+    let (reason, fix) = reason_and_fix(repo, e);
+    format!("checks not posted: {reason}, fix: {fix}")
+}
+
+fn unposted_file(repo: &str) -> PathBuf {
+    run::home().join("background").join(repo).join("unposted")
+}
+
+/// Keeps `repo`'s last failed post until a post succeeds, `error` is None for a success
+pub fn remember_post(repo: &str, error: Option<&str>) {
+    let file = unposted_file(repo);
+
+    match error {
+        Some(e) => {
+            let _ = fs::create_dir_all(file.parent().unwrap_or(&file));
+            let _ = fs::write(&file, unposted_line(repo, e));
+        }
+        None => {
+            let _ = fs::remove_file(&file);
+        }
+    }
+}
+
+/// The line of `repo`'s last failed post, None once a post succeeded
+pub fn unposted(repo: &str) -> Option<String> {
+    fs::read_to_string(unposted_file(repo))
+        .ok()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+}
+
 /**
  * Starts a background run of the plan's commit under `name`, a branch or `pr:<n>`. With `post` it
  * posts the checks, so it starts even when the tree passed. One commit per name, like
@@ -509,6 +574,29 @@ mod tests {
         ] {
             assert!(!unknown_sha(e), "{e}");
         }
+    }
+
+    #[test]
+    fn a_post_the_app_cannot_make_says_how_to_add_the_repository() {
+        for e in [
+            "POST /v1/checks: the shipcheck App is not installed on acme/app, or you have no access to it, install it from https://github.com/apps/shipcheck-run",
+            "the shipcheck App is not installed on acme/app",
+            "GET /v1/pulls: HTTP 404",
+            "GET https://api.github.com/repos/acme/app/pulls?state=open: http status: 403",
+        ] {
+            assert_eq!(
+                unposted_line("acme/app", e),
+                "checks not posted: the shipcheck App is not installed on acme/app, fix: add acme/app to the shipcheck App: https://github.com/settings/installations (shipcheck-run, Configure)",
+                "{e}"
+            );
+        }
+
+        let other = "POST /v1/checks: acme needs write, maintain or admin on acme/app to post its check, and has read";
+        assert!(!not_installed(other));
+        assert_eq!(
+            unposted_line("acme/app", other),
+            format!("checks not posted: {other}, fix: run `shipcheck doctor`")
+        );
     }
 
     #[test]
