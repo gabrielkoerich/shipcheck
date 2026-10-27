@@ -392,7 +392,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         name: "hooks",
         ok: true,
         detail: if hooked {
-            "installed, pushes start runs in the background".into()
+            "installed, pushes to a branch other than the default start runs in the background".into()
         } else {
             "not installed. Optional: `shipcheck install` starts runs on push, or run `shipcheck run` yourself".into()
         },

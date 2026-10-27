@@ -8,7 +8,7 @@ use crate::config::Engine;
 const MARK: &str = "# Installed by `shipcheck install`";
 
 pub const PRE_PUSH: &str = r#"#!/bin/sh
-# Installed by `shipcheck install`. Starts a background run of each pushed commit, never blocks the push
+# Installed by `shipcheck install`. Starts a background run of each commit pushed to a branch other than the default, never blocks the push
 if ! command -v shipcheck >/dev/null 2>&1; then
   exit 0
 fi
@@ -17,14 +17,14 @@ zero=0000000000000000000000000000000000000000
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$local_sha" != "$zero" ]; then
-    shipcheck on-push "$local_ref" "$local_sha"
+    shipcheck on-push "$local_ref" "$local_sha" "$remote_ref"
   fi
 done
 
 exit 0
 "#;
 
-pub const HOOK_LINE: &str = "shipcheck on-push \"$local_ref\" \"$local_sha\"";
+pub const HOOK_LINE: &str = "shipcheck on-push \"$local_ref\" \"$local_sha\" \"$remote_ref\"";
 
 pub const POST_COMMIT: &str = r#"#!/bin/sh
 # Installed by `shipcheck install`. Starts a background run of each commit when shipcheck.toml lists commit in on
