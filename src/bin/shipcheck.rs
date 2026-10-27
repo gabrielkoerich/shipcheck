@@ -212,11 +212,12 @@ enum Cmd {
     /// Called by the post-commit hook
     #[command(hide = true)]
     OnCommit,
-    /// Called by the pre-push hook with the pushed ref and commit
+    /// Called by the pre-push hook with the pushed ref, its commit and the ref it updates on the remote
     #[command(hide = true)]
     OnPush {
         refname: Option<String>,
         sha: Option<String>,
+        remote_ref: Option<String>,
     },
 }
 
@@ -237,7 +238,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let mut uninstall = false;
     // Set by the hooks and the daemon on a background run that posts its checks
     let mut posts: Option<String> = None;
-    let (mut refname, mut pushed) = (String::new(), None);
+    let (mut refname, mut pushed, mut remote_ref) = (String::new(), None, None);
     let on_base = |b: Option<String>, base: &mut String, base_set: &mut bool, fetch: &mut bool| {
         // For trials: read shipcheck.toml and the workflows from another ref than the default base
         if let Some(b) = b {
@@ -372,8 +373,12 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             "daemon"
         }
         Cmd::OnCommit => "on-commit",
-        Cmd::OnPush { refname: r, sha } => {
-            (refname, pushed) = (r.unwrap_or_default(), sha);
+        Cmd::OnPush {
+            refname: r,
+            sha,
+            remote_ref: to,
+        } => {
+            (refname, pushed, remote_ref) = (r.unwrap_or_default(), sha, to);
             "on-push"
         }
     };
@@ -817,6 +822,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             let branch = refname.trim_start_matches("refs/heads/").to_string();
 
             if let Some(sha) = &pushed
+                && !pushes_to_base(remote_ref.as_deref().unwrap_or(&refname), &base)
                 && let Ok(plan) = run::plan(&cwd, sha, &base)
                 && plan.config.runs_on(Trigger::Push)
                 && !run::skip_requested(&plan)
@@ -1090,6 +1096,12 @@ fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCod
 }
 
 /// The line of this repository's last refused post, None once a post succeeded
+// The default branch gets hosted CI after each merge, so a push to it starts no run
+fn pushes_to_base(remote_ref: &str, base: &str) -> bool {
+    let branch = base.strip_prefix("origin/").unwrap_or(base);
+    remote_ref.trim_start_matches("refs/heads/") == branch
+}
+
 fn unposted(repo: &Path) -> Option<String> {
     background::unposted(&run::repo_id(repo).ok()?)
 }
@@ -1273,6 +1285,7 @@ mod tests {
         let calls: &[&[&str]] = &[
             // The hooks, setup.rs
             &["on-push", "refs/heads/feature", sha],
+            &["on-push", "refs/heads/feature", sha, "refs/heads/feature"],
             &["on-commit"],
             // The end-to-end tests
             &["run", "--no-fetch"],
@@ -1347,11 +1360,22 @@ mod tests {
                 .map(|w| {
                     w.replace("\"$local_ref\"", "refs/heads/feature")
                         .replace("\"$local_sha\"", &sha)
+                        .replace("\"$remote_ref\"", "refs/heads/feature")
                 })
                 .collect();
             let call: Vec<&str> = call.iter().map(String::as_str).collect();
             assert!(parses(&call), "hook: {line}");
         }
+    }
+
+    #[test]
+    fn a_push_to_the_base_starts_no_run() {
+        assert!(pushes_to_base("refs/heads/main", "origin/main"));
+        assert!(pushes_to_base("refs/heads/trunk", "origin/trunk"));
+        assert!(pushes_to_base("main", "main"));
+        assert!(!pushes_to_base("refs/heads/feature", "origin/main"));
+        assert!(!pushes_to_base("refs/heads/main-fix", "origin/main"));
+        assert!(!pushes_to_base("refs/tags/main", "origin/main"));
     }
 
     #[test]

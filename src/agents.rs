@@ -706,6 +706,8 @@ mod tests {
         )
         .unwrap();
         exclude.push_str(&format!("/{OLD_CODEX_RULES}\n"));
+        // git init makes info/ only when it finds its templates
+        fs::create_dir_all(root.join(".git/info")).unwrap();
         fs::write(root.join(".git/info/exclude"), format!("# mine\n{exclude}")).unwrap();
         root
     }

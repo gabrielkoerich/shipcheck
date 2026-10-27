@@ -3846,6 +3846,8 @@ mod tests {
         sh(&repo, &["config", "user.email", "t@t"]);
         sh(&repo, &["config", "commit.gpgsign", "false"]);
         sh(&repo, &["commit", "-q", "--allow-empty", "-m", "main"]);
+        // git init makes hooks/ only when it finds its templates
+        fs::create_dir_all(repo.join(".git/hooks")).unwrap();
         let hook = repo.join(".git/hooks/pre-commit");
         let ran = dir.path().join("tool-ran");
         fs::write(&hook, format!("#!/bin/sh\nhusky-tool {}\n", ran.display())).unwrap();
@@ -3880,6 +3882,8 @@ mod tests {
         fs::write(repo.join("a.txt"), "a").unwrap();
         sh(repo, &["add", "-A"]);
         sh(repo, &["commit", "-qm", "main"]);
+        // git init makes hooks/ only when it finds its templates
+        fs::create_dir_all(repo.join(".git/hooks")).unwrap();
         let hook = repo.join(".git/hooks/pre-commit");
         fs::write(
             &hook,
