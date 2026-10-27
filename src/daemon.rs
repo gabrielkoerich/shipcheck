@@ -772,10 +772,9 @@ fn handle(
                 .and_then(|id| run::secret_values(&id))
                 .unwrap_or_default();
             let logs = run::log_dir(&plan.key);
-            record::keep(
-                repo,
-                &record::line(repo, &plan, &result, &rec, &logs, &secrets),
-            );
+            let line = record::line(repo, &plan, &result, &rec, &logs, &secrets);
+            record::keep(repo, &line);
+            record::share(&plan, repo, &line);
 
             Ok(Some(if result.passed {
                 "posted success"

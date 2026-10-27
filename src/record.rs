@@ -212,6 +212,41 @@ pub fn keep(repo: &str, line: &Value) {
     }
 }
 
+/**
+ * Uploads the line when `[team] records` is on in the base's shipcheck.toml, which the plan read.
+ * The service stores it only for an account with a plan for team features. Any error or refusal is
+ * one line on stderr, the daemon's or the background run's log, and never changes the run
+ **/
+pub fn share(plan: &Plan, repo: &str, line: &Value) {
+    let shared = upload(
+        plan.config.team.records,
+        &crate::service::api(),
+        crate::service::machine_token,
+        repo,
+        line,
+    );
+
+    if let Err(e) = shared {
+        eprintln!("shipcheck: run record not uploaded: {e}");
+    }
+}
+
+// The token is read only when the switch is on, since on a Mac a read can ask the user
+fn upload(
+    on: bool,
+    api: &str,
+    token: impl FnOnce() -> Option<String>,
+    repo: &str,
+    line: &Value,
+) -> Result<(), String> {
+    if !on {
+        return Ok(());
+    }
+
+    let token = token().ok_or("no machine token, run `shipcheck login`")?;
+    crate::service::post_record(api, &token, repo, line)
+}
+
 fn rotated_path(path: &Path, n: u64) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     path.with_file_name(format!("{stem}.{n}.jsonl"))
@@ -483,6 +518,89 @@ mod tests {
             .collect();
         assert_eq!(shas, [json!("1"), json!("2")]);
         assert_eq!(runs(home.path(), "acme/app", 1)[0]["sha"], "2");
+    }
+
+    /// A service on a local port that answers every request with `status` and `body`, and counts them
+    fn service(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Read};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                count.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                let mut header = String::new();
+
+                while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                    if let Some(n) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+
+                    header.clear();
+                }
+
+                let mut request = vec![0; length];
+                reader.read_exact(&mut request).unwrap();
+                let mut stream = stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (api, seen)
+    }
+
+    #[test]
+    fn nothing_is_sent_with_the_switch_off() {
+        let (api, seen) = service("200 OK", "{}");
+        assert!(!plan().config.team.records);
+        let sent = upload(
+            plan().config.team.records,
+            &api,
+            || panic!("the token is read with the switch off"),
+            "acme/app",
+            &json!({"event": "run"}),
+        );
+        assert_eq!(sent, Ok(()));
+        // A request made would have reached the listener by now
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_refusal_changes_no_run() {
+        let (api, seen) = service(
+            "402 Payment Required",
+            r#"{"error":"this account has no plan for team features"}"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry();
+        let line = line(
+            "acme/app",
+            &plan(),
+            &entry,
+            &Run::new("daemon", 1),
+            dir.path(),
+            &[],
+        );
+        let before = (entry.passed, line.clone());
+        let sent = upload(true, &api, || Some("shc_x".into()), "acme/app", &line);
+        assert_eq!(
+            sent,
+            Err("POST /v1/records: this account has no plan for team features".into())
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!((entry.passed, line), before);
     }
 
     #[test]

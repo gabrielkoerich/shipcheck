@@ -44,6 +44,17 @@ pub struct RepoConfig {
     /// GitHub logins besides the daemon's own whose PRs it may run, for the owner to choose
     #[serde(default)]
     pub daemon_authors: Vec<String>,
+    #[serde(default)]
+    pub team: Team,
+}
+
+/// What a team sends to the shipcheck service, all off by default. Only `records` does anything yet
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Team {
+    pub records: bool,
+    pub cache: bool,
+    pub logs: bool,
 }
 
 /// The checks of `runner = "host"`, each a shell command run natively in its own clone
@@ -1111,6 +1122,16 @@ mod tests {
                 .unwrap_err()
                 .contains("\"/a b\" must be absolute")
         );
+    }
+
+    #[test]
+    fn team_is_off_by_default_and_refuses_unknown_keys() {
+        let off = RepoConfig::parse("workflows = [\"ci.yml\"]").unwrap();
+        assert_eq!(off.team, Team::default());
+        assert!(!off.team.records && !off.team.cache && !off.team.logs);
+        let on = RepoConfig::parse("workflows = [\"ci.yml\"]\n[team]\nrecords = true").unwrap();
+        assert!(on.team.records && !on.team.cache);
+        assert!(RepoConfig::parse("workflows = [\"ci.yml\"]\n[team]\nrecord = true").is_err());
     }
 
     #[test]
