@@ -1007,6 +1007,10 @@ impl Jail {
             cmd.env("SBF_SDK_PATH", self.home.join(SBF_SDK));
         }
 
+        if let Some(sdk) = sdk_root() {
+            cmd.env("SDKROOT", sdk);
+        }
+
         // Safe: setsid is async-signal-safe and changes only this child's session
         unsafe {
             cmd.pre_exec(|| {
@@ -1054,6 +1058,26 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
     }
 
     Ok((dir, path))
+}
+
+/// The macOS SDK, found once outside the jail, so a build in it never asks xcrun to cache a lookup
+#[cfg(target_os = "macos")]
+fn sdk_root() -> Option<&'static Path> {
+    static SDK: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SDK.get_or_init(|| {
+        let out = Command::new("/usr/bin/xcrun")
+            .arg("--show-sdk-path")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        Some(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())).filter(|p| p.is_dir())
+    })
+    .as_deref()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sdk_root() -> Option<&'static Path> {
+    None
 }
 
 /// xcrun's lookup cache, in the user's temp dir whatever `TMPDIR` says, read-only to a check
@@ -1135,7 +1159,30 @@ fn shims(home: &Path) -> Result<(), String> {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
 
+    // The compilers themselves, since each `/usr/bin` shim asks xcrun, whose cache a check cannot write
+    for (name, real) in compilers() {
+        std::os::unix::fs::symlink(real, bin.join(name)).map_err(|e| e.to_string())?;
+    }
+
     Ok(())
+}
+
+/// Where `xcrun -f` finds each C compiler, asked once outside the jail
+fn compilers() -> &'static [(&'static str, PathBuf)] {
+    static FOUND: std::sync::OnceLock<Vec<(&'static str, PathBuf)>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        ["cc", "c++", "clang", "clang++"]
+            .into_iter()
+            .filter_map(|name| {
+                let out = Command::new("/usr/bin/xcrun")
+                    .args(["-f", name])
+                    .output()
+                    .ok()?;
+                let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+                (out.status.success() && path.is_file()).then_some((name, path))
+            })
+            .collect()
+    })
 }
 
 /// The prefix of `npm install -g` in the jail's home, since node's own is read-only here
@@ -3422,6 +3469,119 @@ mod tests {
         assert!(
             kept,
             "a lock a live run holds, or one just made, was removed"
+        );
+    }
+
+    /// One host check as a run of a branch's tree, in a run of its own, its exit and its log
+    fn branch_check(dir: &Path, repo_id: &str, command: &str) -> (Option<i32>, String) {
+        let checks = BTreeMap::from([("probe".into(), command.into())]);
+        let host = Host::new(
+            config::Host {
+                checks,
+                ..Default::default()
+            },
+            dir,
+        );
+        let clone = tempfile::tempdir().unwrap();
+        let log = dir.join("probe.log");
+        let (needs, artifacts) = (BTreeMap::new(), dir.join("artifacts"));
+        let request = RunRequest {
+            run_dir: clone.path(),
+            file: HOST,
+            workflow: Path::new("/dev/null"),
+            job: "probe",
+            needs: &needs,
+            artifacts: &artifacts,
+            repo_id,
+            timeout: Duration::from_secs(30),
+            shard: false,
+            on_base: false,
+            slot_lock: None,
+        };
+        let exit = host.run(&request, &log).unwrap().exit;
+        (exit, fs::read_to_string(&log).unwrap_or_default())
+    }
+
+    #[test]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn consecutive_branch_runs_get_the_same_cargo_home_so_builds_stay_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        fs::create_dir_all(cache_dir(Some(&repo_id)).join("base/cargo")).unwrap();
+        let runs: Vec<_> = (0..2)
+            .map(|_| branch_check(dir.path(), &repo_id, "echo \"home=$CARGO_HOME\""))
+            .collect();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert!(runs.iter().all(|(exit, _)| *exit == Some(0)), "{runs:?}");
+        let homes: Vec<_> = runs
+            .iter()
+            .filter_map(|(_, log)| log.lines().find_map(|l| l.strip_prefix("home=")))
+            .collect();
+        assert_eq!(homes.len(), 2, "{runs:?}");
+        assert_eq!(
+            homes[0], homes[1],
+            "cargo keys a build by its sources' paths"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_file_one_run_makes_immutable_never_reaches_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        fs::create_dir_all(cache_dir(Some(&repo_id)).join("base/cargo")).unwrap();
+        let plant = "mkdir -p \"$CARGO_HOME/registry\" && touch \"$CARGO_HOME/registry/planted\" && chflags uchg \"$CARGO_HOME/registry/planted\"";
+        let (planted, log) = branch_check(dir.path(), &repo_id, plant);
+        let (next, next_log) = branch_check(
+            dir.path(),
+            &repo_id,
+            "test ! -e \"$CARGO_HOME/registry/planted\"",
+        );
+        let runs = cache_dir(Some(&repo_id)).join("runs");
+        let _ = Command::new("chflags")
+            .args(["-R", "nouchg"])
+            .arg(&runs)
+            .status();
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(planted, Some(0), "{log}");
+        assert_eq!(
+            next,
+            Some(0),
+            "the next run saw the planted file: {next_log}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_rust_build_in_a_check_links_without_asking_xcrun_to_write_its_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let build = "cargo new -q --vcs none hello && cd hello && cargo build -q --offline";
+        let (exit, log) = branch_check(dir.path(), &repo_id, build);
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(exit, Some(0), "{log}");
+        assert!(!log.contains("couldn't create cache file"), "{log}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+    fn a_check_reads_xcruns_cache_and_cannot_write_it() {
+        let Some(db) = xcrun_db().filter(|p| p.is_file()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
+        let q = db.display();
+        let command = format!("cat '{q}' > /dev/null && ! touch '{q}' 2>/dev/null");
+        let (exit, log) = branch_check(dir.path(), &repo_id, &command);
+        Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
+        assert_eq!(
+            exit,
+            Some(0),
+            "without the cache every /usr/bin shim asks xcodebuild first: {log}"
         );
     }
 
