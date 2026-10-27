@@ -9,10 +9,9 @@ on:
 permissions:
   contents: read
 
-# A newer push to main waits, so it never cancels a release halfway
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 jobs:
   test:
