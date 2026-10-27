@@ -956,6 +956,16 @@ pub fn expected_jobs(
 
     let mut jobs = act_jobs(config, &graphs)?;
 
+    // Both would post with a prefix, so a rule that requires shipcheck/<name> would wait forever
+    for name in config.host.checks.keys() {
+        if let Some((file, _)) = jobs.iter().find(|(_, ids)| ids.contains(name)) {
+            return Err(format!(
+                "host check `{name}` and job `{file}/{name}` would both post as shipcheck/{name}: rename one, for example the host check to `{name}-{}`",
+                std::env::consts::OS
+            ));
+        }
+    }
+
     if config.hosts() {
         jobs.insert(
             HOST.to_string(),
@@ -3363,6 +3373,17 @@ mod tests {
         );
         assert!(err(all).contains("every job of ci.yml is on the host runner"));
         assert!(jobs("runner = \"host\"\n[host.checks]\nt = \"x\"\n[jobs.\"ci.yml/nope\"]\nrunner = \"act\"").is_err());
+        // A host check and an act job of one name would post under one name, so the config fails
+        let clash = jobs("runner = \"host\"\n[host.checks]\nbuild = \"cargo build\"\n[jobs.\"ci.yml/build\"]\nrunner = \"act\"").unwrap_err();
+        assert_eq!(
+            clash,
+            format!(
+                "host check `build` and job `ci.yml/build` would both post as shipcheck/build: rename one, for example the host check to `build-{}`",
+                std::env::consts::OS
+            )
+        );
+        // One a job of e2e needs counts too
+        assert!(jobs("runner = \"host\"\n[host.checks]\nbuild = \"x\"\n[jobs.\"ci.yml/e2e\"]\nrunner = \"act\"").is_err());
 
         let graphs = BTreeMap::from([(
             "ci.yml".to_string(),
