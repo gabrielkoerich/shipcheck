@@ -50,6 +50,14 @@ jobs:
   # copy-on-write, and a bridge container reaches the host only at the bridge gateway
   # On arm, faster than x86 in every measured run
   e2e:
+    # e2e.rs alone takes as long as the other binaries together, so the two halves run at once
+    name: e2e (${{ matrix.group }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { group: e2e, tests: "--test e2e" }
+          - { group: rest, tests: "--test retry_e2e --test shard_e2e --test mixed_e2e --test post_step_e2e --test act_parse_e2e" }
     runs-on: ubuntu-24.04-arm
     env:
       ACT_VERSION: v0.2.89
@@ -83,7 +91,9 @@ jobs:
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid true
       - run: docker version
       - run: act --version
-      - run: cargo test --test e2e --test retry_e2e --test shard_e2e --test mixed_e2e --test post_step_e2e --test act_parse_e2e -- --ignored --nocapture
+      - env:
+          TESTS: ${{ matrix.tests }}
+        run: cargo test $TESTS -- --ignored --nocapture
 
   gitleaks:
     runs-on: ubuntu-latest
