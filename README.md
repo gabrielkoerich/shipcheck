@@ -55,7 +55,7 @@ git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path sh
 
 1. Install the binary, above.
 2. Run `shipcheck init` in a clone of the repository, on `main`. An agent or a script runs `shipcheck init --yes`. Without a terminal and without `--yes`, `init` only prints its plan.
-3. Commit the `shipcheck.toml` it writes and merge it to `main`.
+3. Commit the `shipcheck.toml` it writes and merge it to `main`. Until then there is nothing to run: `shipcheck run` exits 2, and the hooks and the daemon start nothing.
 4. Install the [shipcheck App](https://github.com/apps/shipcheck-run) on the repository. `init` prints this link.
 
 [The quickstart](https://shipcheck.run/docs/quickstart/) says what each step does. Each other clone needs `shipcheck install` once. In a terminal, `init` and `install` sign the machine in when it cannot post yet. A machine with no person at it gets a token from `shipcheck token` instead ([unattended machines](https://shipcheck.run/docs/install/#unattended-machines)).
@@ -68,7 +68,7 @@ To show that a repository's checks come from shipcheck, add this line to its REA
 [![checks: shipcheck](https://img.shields.io/badge/checks-shipcheck-1f9d55)](https://shipcheck.run)
 ```
 
-Without the App, `shipcheck run`, the result cache, the git hooks, `shipcheck status` and `shipcheck logs` still work on any repository.
+Without the App, `shipcheck run`, the result cache, the git hooks, `shipcheck status` and `shipcheck logs` still work on any repository with `shipcheck.toml` on `main`.
 
 What a green check proves and what a job can reach: [proof](https://shipcheck.run/docs/proof/), [security](https://shipcheck.run/docs/security/).
 

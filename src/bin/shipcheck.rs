@@ -443,13 +443,6 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             let what = snapshot.map_or_else(|| plan.sha[..12].to_string(), String::from);
             let tree = &plan.tree[..12];
 
-            if plan.defaults {
-                say(&format!(
-                    "no shipcheck.toml on {base}, running every workflow that runs for branches, on pull_request or push: {}. This result is not a PR check, `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main for that",
-                    plan.config.workflows.join(", ")
-                ));
-            }
-
             if snapshot.is_some() && !staged {
                 warn_untracked(&plan.repo)?;
             }
@@ -506,7 +499,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 posts = None;
             }
 
-            let sender = posts.as_ref().filter(|_| !plan.defaults).and_then(|_| {
+            let sender = posts.as_ref().and_then(|_| {
                 run::repo_id(&plan.repo)
                     .and_then(|repo| Sender::new(&repo))
                     .map_err(|e| say(&format!("{}: not posted, {e}", &plan.sha[..12])))
@@ -747,12 +740,6 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 ));
             }
 
-            if plan.defaults {
-                return Err(format!(
-                    "{base} has no shipcheck.toml, so this result ran the defaults and is not a check. Run `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main"
-                ));
-            }
-
             let entry = run::lookup(&plan).ok_or_else(|| {
                 format!(
                     "no result for tree {}, run `shipcheck run` first",
@@ -828,10 +815,9 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 && !run::skip_requested(&plan)
             {
                 // The pushed commit's checks, posted by its run, unless the result could be an agent's
-                let post =
-                    background::posts(plan.defaults, run::home_overridden(), service::can_post());
+                let post = background::posts(run::home_overridden(), service::can_post());
 
-                if !plan.defaults && !post {
+                if !post {
                     background::note(&format!(
                         "{} on {branch}: checks not posted, run `shipcheck login`, or set SHIPCHECK_APP_ID and put the key of an App of your own at app.pem in shipcheck's home",
                         &plan.sha[..12]

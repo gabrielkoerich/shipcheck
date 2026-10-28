@@ -117,6 +117,56 @@ fn on_push_runs_the_pushed_commit_and_on_commit_only_when_asked() {
     );
 }
 
+#[test]
+fn no_shipcheck_toml_on_main_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let (work, _) = clone_with_feature(tmp.path());
+    // A main with workflows that run for branches, and no shipcheck.toml
+    git(&work, &["switch", "-q", "main"]);
+    git(&work, &["rm", "-q", "shipcheck.toml"]);
+    fs::create_dir_all(work.join(".github/workflows")).unwrap();
+    fs::write(
+        work.join(".github/workflows/ci.yml"),
+        "on: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: [{run: echo pr}]\n",
+    )
+    .unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-qm", "no config"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+    git(&work, &["fetch", "-q", "origin"]);
+    git(&work, &["switch", "-q", "-C", "feature"]);
+    fs::write(work.join("b.txt"), "b").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-qm", "b"]);
+    let sha = git(&work, &["rev-parse", "HEAD"]);
+    let shipcheck = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+            .args(args)
+            .env("SHIPCHECK_HOME", &home)
+            .env("SHIPCHECK_NO_DAEMON", "1")
+            .current_dir(&work)
+            .output()
+            .unwrap()
+    };
+
+    let ran = shipcheck(&["run", "--no-fetch"]);
+    let said = String::from_utf8_lossy(&ran.stderr);
+    assert_eq!(ran.status.code(), Some(2), "{said}");
+    assert!(
+        said.contains("origin/main has no shipcheck.toml, so there is nothing to run")
+            && said.contains("`shipcheck init`"),
+        "{said}"
+    );
+
+    for args in [&["on-push", "refs/heads/feature", &sha][..], &["on-commit"]] {
+        assert!(shipcheck(args).status.success(), "{args:?}");
+    }
+
+    assert!(!home.join("runs").exists(), "a run started");
+    assert!(records(&home).is_empty(), "{}", records(&home));
+}
+
 /// A fake shipcheck service that refuses every call as the real one does for a repository the App
 /// is not on while `refuse` holds, and accepts every call after
 fn fake_service(refuse: Arc<AtomicBool>) -> String {
