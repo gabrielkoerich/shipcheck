@@ -812,7 +812,7 @@ pub fn platforms(config: &config::Act) -> BTreeMap<String, String> {
 }
 
 /// Whether act, run again as `cmd` with `--dryrun --verbose`, says the job's `if:` skips it
-fn skipped_by_if(cmd: &Command) -> bool {
+pub(super) fn skipped_by_if(cmd: &Command) -> bool {
     let mut dry = Command::new(cmd.get_program());
     dry.args(cmd.get_args())
         .args(["--dryrun", "--verbose"])

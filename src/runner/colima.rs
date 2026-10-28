@@ -19,19 +19,25 @@ use crate::cache;
  **/
 pub struct Colima;
 
-/// The VM's packages, act pinned as ci.yml pins it, and GitHub's `/home/runner`. Part of the key.
+/// The VM's packages, act pinned as ci.yml pins it, Node 24 LTS as GitHub runs actions on, and
+/// GitHub's `/home/runner`. Part of the key. Ubuntu's own nodejs is 18, which fails setup-uv
 const SETUP: &str = r#"set -eu
 apt="-o Acquire::Retries=3 -o Acquire::http::Timeout=30"
 sudo DEBIAN_FRONTEND=noninteractive apt-get $apt -qq update
-sudo DEBIAN_FRONTEND=noninteractive apt-get $apt -qq install -y --no-install-recommends build-essential nodejs pkg-config >/dev/null
+sudo DEBIAN_FRONTEND=noninteractive apt-get $apt -qq install -y --no-install-recommends build-essential pkg-config >/dev/null
 case "$(uname -m)" in
-  aarch64) a=arm64 sum=daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb ;;
-  x86_64) a=x86_64 sum=0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0 ;;
+  aarch64) a=arm64 sum=daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb
+    n=arm64 nsum=33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3 ;;
+  x86_64) a=x86_64 sum=0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0
+    n=x64 nsum=eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c ;;
   *) echo "no act build for $(uname -m)"; exit 1 ;;
 esac
 curl -fsSL --retry 3 -o /tmp/act.tgz "https://github.com/nektos/act/releases/download/v0.2.89/act_Linux_$a.tar.gz"
 echo "$sum  /tmp/act.tgz" | sha256sum -c -
 sudo tar -xzf /tmp/act.tgz -C /usr/local/bin act
+curl -fsSL --retry 3 -o /tmp/node.tgz "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-$n.tar.gz"
+echo "$nsum  /tmp/node.tgz" | sha256sum -c -
+sudo tar -xzf /tmp/node.tgz -C /usr/local --strip-components=1
 sudo mkdir -p /home/runner
 sudo chown "$(id -u):$(id -g)" /home/runner
 mkdir -p "$HOME/w" "$HOME/sc"
@@ -54,9 +60,16 @@ if listed; then
   colima delete --force --data --profile "$p" || true
   if listed; then echo "shipcheck: the VM $p a dead run left would not delete"; exit 125; fi
 fi
-colima start --profile "$p" --mount none --port-forwarder none --activate=false \
+# VZ sometimes fails to create a new VM, and a new one after a delete starts
+n=1
+until colima start --profile "$p" --mount none --port-forwarder none --activate=false \
   --ssh-config=false --ssh-agent=false --template=false --save-config=false --runtime docker \
-  --cpus "$cpus" --memory 8 || exit 125
+  --cpus "$cpus" --memory 8; do
+  [ "$n" -lt 3 ] || exit 125
+  n=$((n + 1))
+  echo "shipcheck: the VM $p did not start, deleting it for start $n of 3"
+  colima delete --force --data --profile "$p" || exit 125
+done
 vm sh -c "$SETUP" || exit 125
 # POSIX sh has no pipefail, so tar's status comes back through a file
 { (cd "$dir" && git ls-files -z > "$st.list" && printf '.git\0.github/workflows\0' >> "$st.list" &&
@@ -303,6 +316,41 @@ fn act_args(request: &RunRequest, labels: Vec<String>) -> Vec<String> {
     args
 }
 
+/**
+ * Whether act, in a dry run on the Mac, says the job's `if:` skips it, so a skipped job boots no VM.
+ * The dry run starts no container, so the image is a placeholder, and labels go to it and never to
+ * `-self-hosted`, which would set up the job on the Mac itself
+ **/
+fn skipped_by_if(act: &Act, request: &RunRequest, workflow: &str) -> bool {
+    let has_if = crate::workflow::load(workflow)
+        .is_ok_and(|root| !yaml_rust2::Yaml::Hash(root)["jobs"][request.job]["if"].is_badvalue());
+
+    if !has_if {
+        return false;
+    }
+
+    let mut cmd = Command::new("act");
+    cmd.arg("workflow_dispatch")
+        .arg("-W")
+        .arg(request.workflow)
+        .args(["-j", request.job, "--pull=false", "--no-cache-server"])
+        .args(["--container-daemon-socket", "-", "--network", "none"])
+        .args(["-s", "GITHUB_TOKEN=", "--secret-file", "/dev/null"])
+        .args(["--env-file", "/dev/null", "--var-file", "/dev/null"])
+        .args(["--input-file", "/dev/null"])
+        .current_dir(request.run_dir);
+
+    for label in act
+        .labels(request.file)
+        .into_iter()
+        .chain(["self-hosted".into(), "linux".into()])
+    {
+        cmd.arg("-P").arg(format!("{label}=shipcheck/dry-run"));
+    }
+
+    act::skipped_by_if(clean_env(&mut cmd))
+}
+
 impl Engine for Colima {
     fn name(&self) -> &'static str {
         "colima"
@@ -325,6 +373,21 @@ impl Engine for Colima {
         let deadline = Instant::now() + request.timeout;
         let run_dir = request.run_dir;
         let isolated = act::isolated(request, &act::run_tag(run_dir), false)?;
+        fs::write(request.workflow, &isolated).map_err(|e| e.to_string())?;
+
+        if skipped_by_if(act, request, &isolated) {
+            fs::write(
+                log_path,
+                "shipcheck: the job's `if:` skips it, so no VM started\n",
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(Outcome {
+                exit: Some(0),
+                skipped: true,
+                ..timed_out()
+            });
+        }
+
         let artifacts = crate::workflow::job_runs(&isolated)
             .into_iter()
             .flat_map(|j| j.steps)
@@ -388,8 +451,6 @@ impl Engine for Colima {
         }
 
         let slot = slot.expect("a VM slot");
-
-        fs::write(request.workflow, &isolated).map_err(|e| e.to_string())?;
         let args = act_args(request, act.labels(request.file));
         let secrets = crate::secret::read(&crate::run::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
@@ -742,6 +803,97 @@ mod tests {
 
                 assert!(gone(), "the hung delete's child outlived the reaper");
             }
+        }
+    }
+
+    #[test]
+    fn the_vm_gets_node_24_from_nodejs_org_and_not_ubuntus_node_18() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls.log");
+        let fakes = [
+            ("sudo", "echo \"sudo $*\" >> \"$LOG\""),
+            ("curl", "echo \"curl $*\" >> \"$LOG\""),
+            ("sha256sum", "echo \"sum $(cat)\" >> \"$LOG\""),
+            ("uname", "echo \"$ARCH\""),
+        ];
+
+        for (name, body) in fakes {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        for (arch, node) in [("aarch64", "linux-arm64"), ("x86_64", "linux-x64")] {
+            let _ = fs::remove_file(&log);
+            let out = Command::new(crate::runner::posix_sh())
+                .args(["-c", SETUP])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .env("HOME", dir.path())
+                .env("LOG", &log)
+                .env("ARCH", arch)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let calls = fs::read_to_string(&log).unwrap();
+            let apt = calls.lines().find(|l| l.contains("install")).unwrap();
+            assert!(!apt.contains("nodejs"), "{apt}");
+            let url = format!("https://nodejs.org/dist/v24.22.1/node-v24.22.1-{node}.tar.gz");
+            assert!(calls.contains(&url), "{calls}");
+            assert!(
+                calls.lines().any(|l| l.starts_with("sum ")
+                    && l.ends_with("  /tmp/node.tgz")
+                    && l.len() == 83),
+                "{calls}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vm_that_fails_to_start_is_deleted_and_started_again_up_to_three_times() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (log, count) = (dir.path().join("colima.log"), dir.path().join("starts"));
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+
+        // How many starts fail and the calls colima gets, with an ssh only once a start passed
+        for (fails, calls) in [
+            (0, "list start ssh"),
+            (2, "list start delete start delete start ssh"),
+            (3, "list start delete start delete start"),
+        ] {
+            let _ = fs::remove_file(&log);
+            let _ = fs::remove_file(&count);
+            // ssh fails, so the job stops right after the start with the same code as a failed one
+            let fake = format!(
+                "#!/bin/sh\necho \"$1\" >> {log}\ncase \"$1\" in\n  start) n=$(($(cat {count} 2>/dev/null || echo 0) + 1)); echo \"$n\" > {count}; [ \"$n\" -gt {fails} ] ;;\n  list|delete) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+                log = log.display(),
+                count = count.display()
+            );
+            fs::write(dir.path().join("colima"), fake).unwrap();
+            fs::set_permissions(dir.path().join("colima"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let out = Command::new(crate::runner::posix_sh())
+                .args([
+                    "-c", JOB, "sh", "sc-abc", "/nowhere", "wf", "secrets", "dry", "2",
+                ])
+                .arg(dir.path().join("status"))
+                .env("PATH", &path)
+                .env("SETUP", "true")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(NOT_STARTED),
+                "{fails} failed starts"
+            );
+            let got = fs::read_to_string(&log).unwrap();
+            assert_eq!(got.split_whitespace().collect::<Vec<_>>().join(" "), calls);
         }
     }
 
