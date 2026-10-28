@@ -4,6 +4,8 @@ on:
   # shipcheck checks every PR locally, so Actions minutes go only to main, after each merge
   push:
     branches: [main]
+    # A merge that changes only Markdown needs no tests and no release
+    paths-ignore: ["**/*.md"]
   workflow_dispatch: {}
 
 permissions:
