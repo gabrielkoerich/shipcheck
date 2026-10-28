@@ -361,15 +361,15 @@ jobs:
       # Before crates.io, so a refused tag leaves nothing published
       - name: Create tag
         env:
-          # Optional admin token, main requires checks that a bump commit has not run
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          # The owner's token, an admin passes main's required checks that a bump commit has not run
+          RELEASE_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -z "$RELEASE_TOKEN" ]; then
-            echo "::notice::RELEASE_TOKEN is not set, main keeps its version and only the tag is pushed"
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set, main keeps its version and only the tag is pushed"
             git tag -a "$VERSION" -m "$VERSION"
             git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
             exit 0
