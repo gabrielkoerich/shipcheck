@@ -48,16 +48,11 @@ fn keychain_accounts() -> BTreeSet<String> {
 }
 
 /**
- * What a test could leave outside its temp dirs: shipcheck's keychain accounts, shipcheck's and
- * act's Docker containers, volumes and networks, colima profiles and shipcheck's launchd jobs
+ * What a test could leave outside its temp dirs and Docker: shipcheck's keychain accounts, colima
+ * profiles and shipcheck's launchd jobs. `docker_of` finds a test's Docker resources by name
+ * instead, since tests that run at once each make their own
  **/
 pub fn outside() -> BTreeMap<&'static str, BTreeSet<String>> {
-    let ours = |names: BTreeSet<String>| -> BTreeSet<String> {
-        names
-            .into_iter()
-            .filter(|n| n.starts_with("shipcheck-") || n.starts_with("act-"))
-            .collect()
-    };
     let colima = lines("colima", &["list"])
         .iter()
         .skip(1)
@@ -72,15 +67,6 @@ pub fn outside() -> BTreeMap<&'static str, BTreeSet<String>> {
 
     BTreeMap::from([
         ("keychain accounts", keychain_accounts()),
-        (
-            "containers",
-            ours(lines("docker", &["ps", "-a", "--format", "{{.Names}}"])),
-        ),
-        ("volumes", ours(lines("docker", &["volume", "ls", "-q"]))),
-        (
-            "networks",
-            ours(lines("docker", &["network", "ls", "--format", "{{.Name}}"])),
-        ),
         ("colima profiles", colima),
         ("launchd jobs", launchd),
     ])
@@ -134,16 +120,15 @@ fn wait_for_runs(home: &Path) {
     }
 }
 
-/// Whether a host check's launchd job belongs to another shipcheck, such as the user's daemon. Its
-/// script in the temp dir names the home whose logs it writes
+/// Whether a host check's launchd job belongs to another home, the user's daemon's or a test's that
+/// runs beside this one. Its script in the temp dir names the home whose logs it writes
 fn anothers_check(label: &str, home: &Path) -> bool {
     let Some(id) = label.strip_prefix("run.shipcheck.check.") else {
         return false;
     };
+    // A job whose script is gone ended, so it is no one's leftover
     let script = std::env::temp_dir().join(format!("shipcheck-job-{id}/job.sh"));
-    let Ok(text) = std::fs::read_to_string(script) else {
-        return false;
-    };
+    let text = std::fs::read_to_string(script).unwrap_or_default();
     let real = home.canonicalize().unwrap_or_default();
 
     !text.contains(&*home.to_string_lossy())
@@ -159,45 +144,31 @@ impl Drop for WaitOnDrop {
     }
 }
 
-fn docker(args: &[&str]) {
-    let _ = Command::new("docker").args(args).output();
-}
-
 /**
- * Removes what the runs of `home` left in Docker, by name: job containers that mount a path of the
- * home and the volume act keeps beside each, act's volumes of the home's run tags, and the
- * volumes and networks named with the home's prefix. Never a prune or `shipcheck clean`
+ * What the runs of `home` left in Docker, by name: job containers that mount a path of the home
+ * and the volume act keeps beside each, act's volumes of the home's run tags, the volumes and
+ * networks named with the home's prefix, and an `act-toolcache` that `before` did not have
  **/
-pub fn remove_docker(home: &Path, before: &BTreeSet<String>) {
+fn docker_of(home: &Path, before: &BTreeSet<String>) -> Vec<(&'static str, String)> {
     let prefix = shipcheck::runner::act::prefix_of(home);
     let homes: Vec<String> = [home.to_path_buf(), home.canonicalize().unwrap_or_default()]
         .iter()
         .map(|h| h.to_string_lossy().into_owned())
         .filter(|h| !h.is_empty())
         .collect();
+    let mut found = Vec::new();
 
     for id in lines("docker", &["ps", "-aq", "--filter", "name=^act-"]) {
-        let mounts = lines(
-            "docker",
-            &[
-                "inspect",
-                "-f",
-                "{{.Name}}{{range .Mounts}} {{.Source}}{{end}}",
-                &id,
-            ],
-        );
+        let format = "{{.Name}}{{range .Mounts}} {{.Source}}{{end}}";
+        let mounts = lines("docker", &["inspect", "-f", format, &id]);
         let Some(line) = mounts.iter().next() else {
             continue;
         };
 
         if homes.iter().any(|h| line.contains(h.as_str())) {
             let name = line.split_whitespace().next().unwrap_or_default();
-            docker(&["rm", "-f", "-v", &id]);
-            docker(&[
-                "volume",
-                "rm",
-                &format!("{}-env", name.trim_start_matches('/')),
-            ]);
+            found.push(("container", id.clone()));
+            found.push(("volume", format!("{}-env", name.trim_start_matches('/'))));
         }
     }
 
@@ -211,26 +182,42 @@ pub fn remove_docker(home: &Path, before: &BTreeSet<String>) {
         let toolcache = v == "act-toolcache" && !before.contains(&v);
 
         if v.starts_with(&prefix) || act_env || toolcache {
-            docker(&["volume", "rm", &v]);
+            found.push(("volume", v));
         }
     }
 
     for n in lines("docker", &["network", "ls", "--format", "{{.Name}}"]) {
         if n.starts_with(&prefix) {
-            docker(&["network", "rm", &n]);
+            found.push(("network", n));
         }
+    }
+
+    found
+}
+
+/// Removes what `docker_of` finds, containers first, since Docker keeps what a container uses.
+/// Never a prune or `shipcheck clean`
+fn remove_docker(home: &Path, before: &BTreeSet<String>) {
+    for (kind, name) in docker_of(home, before) {
+        let args: &[&str] = match kind {
+            "container" => &["rm", "-f", "-v", &name],
+            "volume" => &["volume", "rm", &name],
+            _ => &["network", "rm", &name],
+        };
+        let _ = Command::new("docker").args(args).output();
     }
 }
 
 /**
  * Removes what the test's runs left in Docker, even when an assertion fails, and then fails the test
- * if anything `outside` lists is new. A run a hook started in the background can still hold a slot,
- * so it waits for that run first. Declare it after the temp dir, so it drops first and cleans while
- * the home still exists
+ * if `docker_of` still finds any, or anything `outside` lists is new. A run a hook started in the
+ * background can still hold a slot, so it waits for that run first. Declare it after the temp dir,
+ * so it drops first and cleans while the home still exists
  **/
 pub struct CleanOnDrop {
     home: PathBuf,
     before: BTreeMap<&'static str, BTreeSet<String>>,
+    volumes: BTreeSet<String>,
 }
 
 impl CleanOnDrop {
@@ -238,6 +225,7 @@ impl CleanOnDrop {
         Self {
             home: home.to_path_buf(),
             before: outside(),
+            volumes: lines("docker", &["volume", "ls", "-q"]),
         }
     }
 }
@@ -245,11 +233,14 @@ impl CleanOnDrop {
 impl Drop for CleanOnDrop {
     fn drop(&mut self) {
         wait_for_runs(&self.home);
-        remove_docker(&self.home, &self.before["volumes"]);
+        remove_docker(&self.home, &self.volumes);
 
-        // Only shipcheck's colima engine makes `sc-` profiles, and these are new since the test began
+        // A VM this home's runs started has a record under `colima` until it is deleted
         for vm in &outside()["colima profiles"] {
-            if vm.starts_with("sc-") && !self.before["colima profiles"].contains(vm) {
+            if vm.starts_with("sc-")
+                && !self.before["colima profiles"].contains(vm)
+                && self.home.join("colima").join(vm).exists()
+            {
                 let _ = Command::new("colima")
                     .args(["delete", "--force", vm])
                     .output();
@@ -262,6 +253,18 @@ impl Drop for CleanOnDrop {
             jobs.retain(|label| !anothers_check(label, &self.home));
         }
 
+        // The user's daemon starts and deletes VMs of its own while a test runs
+        if let Some(vms) = left.get_mut("colima profiles") {
+            vms.retain(|vm| self.home.join("colima").join(vm).exists());
+        }
+
+        left.insert(
+            "docker",
+            docker_of(&self.home, &self.volumes)
+                .into_iter()
+                .map(|(kind, name)| format!("{kind} {name}"))
+                .collect(),
+        );
         left.retain(|_, new| !new.is_empty());
 
         if std::thread::panicking() {
