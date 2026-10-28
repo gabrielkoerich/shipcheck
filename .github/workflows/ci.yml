@@ -294,6 +294,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: shipcheck-*
@@ -347,15 +348,26 @@ jobs:
       # Before crates.io, so a refused tag leaves nothing published
       - name: Create tag
         env:
+          # Optional admin token, main requires checks that a bump commit has not run
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::notice::RELEASE_TOKEN is not set, main keeps its version and only the tag is pushed"
+            git tag -a "$VERSION" -m "$VERSION"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
+            exit 0
+          fi
+
           git add Cargo.toml Cargo.lock
           # The first release computes the version the manifest already carries
           git diff --cached --quiet || git commit -m "chore: bump version to ${VERSION}"
           git tag -a "$VERSION" -m "$VERSION"
-          git push origin main "$VERSION"
+          # Atomic, so main and the tag land together or a newer main push fails both
+          git push --atomic "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main "$VERSION"
 
       # Permanent: a version can be yanked, never deleted, and it publishes the source
       - name: Publish to crates.io
