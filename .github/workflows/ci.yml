@@ -27,6 +27,9 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: "v1-rust"
+          cache-all-crates: true
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # Ubuntu's AppArmor stops bubblewrap making user namespaces. These are the install docs' commands,
@@ -55,6 +58,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: "v1-rust"
+          cache-all-crates: true
       - name: Install act
         env:
           ACT_ARCHIVE: act_Linux_arm64.tar.gz
@@ -203,6 +209,12 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: "v1-build"
+          cache-all-crates: true
+          # One matrix job builds every target, and the cache is keyed by job
+          key: ${{ matrix.target }}
       # Stamped before the build, so `shipcheck --version` is the version it ships as
       - name: Stamp the version
         env:
@@ -303,6 +315,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: "v1-build"
+          cache-all-crates: true
 
       - name: Stamp the version
         env:
