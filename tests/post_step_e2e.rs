@@ -53,7 +53,7 @@ fn an_actions_post_step_runs_with_a_home_written_with_dots() {
     // SAFETY: this is the only test in this binary
     unsafe { std::env::set_var("SHIPCHECK_HOME", &home) };
     // Declared after `tmp`, so it drops first and removes the volumes while the home still exists
-    let _volumes = common::CleanOnDrop;
+    let _volumes = common::CleanOnDrop::new(&home);
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();

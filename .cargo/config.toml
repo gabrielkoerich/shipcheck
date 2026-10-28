@@ -1,0 +1,5 @@
+# Tests never touch the user's state: secrets stay files, out of the login keychain and the Trash,
+# and a test that sets no home of its own gets one in target rather than ~/.local/state/shipcheck
+[env]
+SHIPCHECK_NO_KEYCHAIN = "1"
+SHIPCHECK_HOME = { value = "target/test-home", relative = true }

@@ -11,6 +11,11 @@ enum Step {
     ReadKeychain,
 }
 
+/// The login keychain on macOS. `SHIPCHECK_NO_KEYCHAIN` keeps secrets in files, so tests never write it
+fn keychain_on() -> bool {
+    cfg!(target_os = "macos") && std::env::var_os("SHIPCHECK_NO_KEYCHAIN").is_none()
+}
+
 fn step(keychain: bool, file_exists: bool) -> Step {
     match (keychain, file_exists) {
         (false, _) => Step::ReadFile,
@@ -77,7 +82,7 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
 
     let (account, legacy) = accounts_for(path);
 
-    match step(cfg!(target_os = "macos"), path.exists()) {
+    match step(keychain_on(), path.exists()) {
         Step::ReadFile => read_file(path),
         Step::MoveFileToKeychain => {
             let data = read_file(path)?.unwrap_or_default();
@@ -112,7 +117,7 @@ pub fn exists(path: &Path) -> bool {
     }
 
     let (account, legacy) = accounts_for(path);
-    cfg!(target_os = "macos")
+    keychain_on()
         && (keychain::exists(&account) || legacy.is_some_and(|old| keychain::exists(&old)))
 }
 
@@ -122,7 +127,7 @@ pub fn write(path: &Path, data: &[u8]) -> Result<(), String> {
         cache.get_or_insert_with(HashMap::new).remove(path);
     }
 
-    if cfg!(target_os = "macos") {
+    if keychain_on() {
         let (account, legacy) = accounts_for(path);
         keychain::set(&account, data)?;
         return legacy.map_or(Ok(()), |old| keychain::delete(&old));
@@ -141,7 +146,7 @@ pub fn remove(path: &Path) -> Result<(), String> {
         std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
     }
 
-    if cfg!(target_os = "macos") {
+    if keychain_on() {
         let (account, legacy) = accounts_for(path);
         keychain::delete(&account)?;
 
@@ -202,7 +207,7 @@ fn trash(path: &Path) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 mod keychain {
     use std::ffi::c_void;
 
@@ -343,7 +348,7 @@ mod keychain {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 mod keychain {
     pub fn get(_: &str) -> Result<Option<Vec<u8>>, String> {
         Ok(None)
@@ -359,6 +364,33 @@ mod keychain {
 
     pub fn set(_: &str, _: &[u8]) -> Result<(), String> {
         Err("no keychain on this OS".into())
+    }
+}
+
+// Unit tests keep items in memory, never in the user's login keychain
+#[cfg(test)]
+mod keychain {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    static ITEMS: Mutex<BTreeMap<String, Vec<u8>>> = Mutex::new(BTreeMap::new());
+
+    pub fn get(account: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(ITEMS.lock().unwrap().get(account).cloned())
+    }
+
+    pub fn exists(account: &str) -> bool {
+        ITEMS.lock().unwrap().contains_key(account)
+    }
+
+    pub fn delete(account: &str) -> Result<(), String> {
+        ITEMS.lock().unwrap().remove(account);
+        Ok(())
+    }
+
+    pub fn set(account: &str, data: &[u8]) -> Result<(), String> {
+        ITEMS.lock().unwrap().insert(account.into(), data.to_vec());
+        Ok(())
     }
 }
 
@@ -402,8 +434,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    #[ignore = "writes throwaway items to the login keychain"]
     fn an_item_under_its_old_name_moves_to_the_new_one() {
         let new = format!("shipcheck-test-{}-new", std::process::id());
         let old = format!("shipcheck-test-{}-old", std::process::id());

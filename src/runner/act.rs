@@ -2152,7 +2152,7 @@ pub fn home_prefix() -> String {
     prefix_of(&crate::run::home())
 }
 
-fn prefix_of(home: &Path) -> String {
+pub fn prefix_of(home: &Path) -> String {
     let hash = cache::hex(&Sha256::digest(home.to_string_lossy().as_bytes())[..3]);
     format!("shipcheck-{hash}-")
 }
@@ -2818,6 +2818,17 @@ jobs:
         assert!(act.uses_colima() && !Act::default().uses_colima());
     }
 
+    /// Removes a volume a test made, also when one of its assertions fails
+    struct OwnVolume(String);
+
+    impl Drop for OwnVolume {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .args(["volume", "rm", &self.0])
+                .output();
+        }
+    }
+
     /// Every volume name on the machine without `part`
     fn volumes_without(part: &str) -> BTreeSet<String> {
         let out = Command::new("docker")
@@ -2865,6 +2876,7 @@ jobs:
                 .args(["volume", "create", &name])
                 .output()
                 .unwrap();
+            let _own = OwnVolume(name.clone());
             assert!(made.status.success());
 
             let mut shipcheck = Command::new(std::env::current_exe().unwrap())
@@ -2906,15 +2918,7 @@ jobs:
                 std::thread::sleep(Duration::from_millis(200));
             }
 
-            let left = exists();
-
-            if left {
-                let _ = Command::new("docker")
-                    .args(["volume", "rm", &name])
-                    .output();
-            }
-
-            assert!(!left, "signal {signal} left {name}");
+            assert!(!exists(), "signal {signal} left {name}");
             assert_eq!(
                 volumes_without(&tag),
                 before,

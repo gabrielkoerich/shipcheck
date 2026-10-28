@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -90,6 +92,7 @@ fn no_vm_left() {
 fn a_colima_job_that_fails_or_times_out_fails_and_leaves_no_vm() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
+    let _clean = common::CleanOnDrop::new(&home);
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);

@@ -1,5 +1,7 @@
 //! The commands the git hooks call, through the real binary with a home of their own
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -73,6 +75,7 @@ fn clone_with_feature(tmp: &Path) -> (PathBuf, String) {
 fn on_push_runs_the_pushed_commit_and_on_commit_only_when_asked() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
+    let _runs = common::WaitOnDrop(home.clone());
     let (work, sha) = clone_with_feature(tmp.path());
 
     let shipcheck = |args: &[&str]| -> Output {
@@ -217,6 +220,7 @@ fn fake_service(refuse: Arc<AtomicBool>) -> String {
 fn a_refused_post_shows_in_status_history_logs_and_the_hook_until_a_post_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
+    let _runs = common::WaitOnDrop(home.clone());
     let (work, sha) = clone_with_feature(tmp.path());
     let refuse = Arc::new(AtomicBool::new(true));
     let api = fake_service(refuse.clone());

@@ -1,6 +1,8 @@
 //! The command line flows of the act end-to-end test that need no Docker, run in host mode through
 //! the built binary, so `cargo test` catches a broken command before it reaches main
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +92,8 @@ impl Repo {
             .current_dir(&self.work)
             .env("SHIPCHECK_HOME", &self.home)
             .env("SHIPCHECK_NO_DAEMON", "1")
+            // Host checks need no Docker, and `clean` must never reach the real one
+            .env("DOCKER_HOST", "unix:///nonexistent")
             .env_remove("SHIPCHECK_TOKEN");
         cmd
     }
@@ -433,6 +437,7 @@ fn on_commit_runs_in_the_background_and_a_newer_commit_cancels() {
     let repo = Repo::new(
         "runner = \"host\"\nretries = 0\non = [\"push\", \"commit\"]\n[host]\nchecks = { marker = \"test -f marker.txt && if [ -f slow ]; then sleep 30; fi\" }\n",
     );
+    let _runs = common::WaitOnDrop(repo.home.clone());
     let committed = |message: &str| {
         let sha = repo.commit(message);
         let (code, out) = repo.shipcheck(&["on-commit"]);

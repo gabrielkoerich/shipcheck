@@ -16,6 +16,9 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "user.email=t@t",
             "-c",
             "commit.gpgsign=false",
+            // Setup commits start no background run, the steps that test the hooks call git themselves
+            "-c",
+            "core.hooksPath=/dev/null",
         ])
         .args(args)
         .current_dir(dir)
@@ -57,8 +60,12 @@ fn runs_caches_and_tests_the_working_copy() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary that reads or writes the environment
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
+    // A hook finds shipcheck on PATH, which must be this build and never the installed one
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_shipcheck")).parent().unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
+    unsafe { std::env::set_var("PATH", &path) };
     // Declared after `tmp`, so it drops first and removes the volumes while the home still exists
-    let _volumes = common::CleanOnDrop;
+    let _volumes = common::CleanOnDrop::new(&tmp.path().join("home"));
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();
@@ -381,12 +388,15 @@ fn runs_caches_and_tests_the_working_copy() {
         background_log()
     );
     let left = Command::new("docker")
-        .args(["ps", "-aq", "--filter", "name=workflows-ci-yml-"])
+        .args(["ps", "-a", "--filter", "name=workflows-ci-yml-"])
+        .args(["--format", "{{.Names}} {{.Status}} {{.Mounts}}"])
         .output()
         .unwrap();
     assert!(
         left.stdout.is_empty(),
-        "a cancelled run must not leave its job container behind"
+        "a cancelled run must not leave its job container behind: {}{}",
+        String::from_utf8_lossy(&left.stdout),
+        background_log()
     );
 
     // The agent's run before a commit is the check: committing that tree runs nothing again
@@ -678,8 +688,8 @@ fn runs_caches_and_tests_the_working_copy() {
     );
     assert!(tail.contains("isolation.yml"), "{tail}");
     assert!(!log.contains("own-canary") && !tail.contains("own-canary"));
-    // On a Mac the run moved the secrets file into the keychain
-    assert_eq!(own.exists(), !cfg!(target_os = "macos"));
+    // `.cargo/config.toml` keeps the secrets file a file, out of the login keychain
+    assert!(own.exists());
     shipcheck::secret::remove(&own).unwrap();
     // `shipcheck logs` hands no control character from a job to the terminal
     let logs = Command::new(bin)
@@ -829,26 +839,14 @@ fn runs_caches_and_tests_the_working_copy() {
             .all(|m| m.starts_with("shipcheck-") && m.contains("-net-")),
         "an internet job ran outside its own network: {modes:?}"
     );
-    let networks = || {
-        let out = Command::new("docker")
-            .args(["network", "ls", "--format", "{{.Name}}"])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
-    let listed = networks();
+    let nets = Command::new("docker")
+        .args(["network", "ls", "--format", "{{.Name}}"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&nets.stdout);
     assert!(
         modes.iter().all(|m| !listed.lines().any(|l| l == m)),
         "a run left its network: {modes:?}"
-    );
-    // What a crashed run would leave, which clean removes below
-    let leftover = modes.first().unwrap().clone();
-    assert!(
-        Command::new("docker")
-            .args(["network", "create", "--label", "shipcheck", &leftover])
-            .status()
-            .unwrap()
-            .success()
     );
     // On Linux the server listens on the run network's gateway, on a Mac on loopback behind
     // host.docker.internal. Never on every interface or the LAN address
@@ -914,7 +912,8 @@ fn runs_caches_and_tests_the_working_copy() {
     assert_eq!(post.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&post.stderr).contains(nothing));
 
-    // clean removes this repository's warm template and slots, and --all also the results
+    // clean removes this repository's warm template and slots, and --all also the results. It never
+    // reaches the real Docker, whose removal rules the fake engine of gc's tests covers
     let home = tmp.path().join("home");
     let templates = home.join("templates");
     assert!(templates.read_dir().unwrap().next().is_some());
@@ -923,6 +922,7 @@ fn runs_caches_and_tests_the_working_copy() {
             .arg("clean")
             .args(extra)
             .env("PATH", &path)
+            .env("DOCKER_HOST", "unix:///nonexistent")
             .current_dir(&work)
             .output()
             .unwrap();
@@ -933,10 +933,6 @@ fn runs_caches_and_tests_the_working_copy() {
         );
     };
     clean(&[]);
-    assert!(
-        !networks().lines().any(|l| l == leftover),
-        "clean must remove a network a crashed run left"
-    );
     // Templates sit at templates/<owner>/<repo>. Nothing of this repository, `origin`, may be left,
     // and the other repository of this test keeps its own
     let left: Vec<_> = fs::read_dir(&templates)

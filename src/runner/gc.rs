@@ -977,6 +977,17 @@ mod tests {
         }
     }
 
+    /// Removes the volumes a test made, also when one of its assertions fails
+    struct OwnVolumes<'a>(&'a str, &'a [String]);
+
+    impl Drop for OwnVolumes<'_> {
+        fn drop(&mut self) {
+            for name in self.1 {
+                Only(self.0).remove("volume", name);
+            }
+        }
+    }
+
     /// Every volume name on the machine but this test's
     fn others(id: &str) -> BTreeSet<String> {
         let out = docker(&["volume", "ls", "-q"]).unwrap();
@@ -1003,6 +1014,7 @@ mod tests {
             format!("shipcheck-review-{id}"),
             format!("act-CI-t-{id}-0a-env"),
         ];
+        let _own = OwnVolumes(id, &names);
         create_volume(&names[0], &gone, "a/b", "/x").unwrap();
         assert!(docker(&["volume", "create", &names[1]]).is_some());
         create_volume(&names[2], &live, "a/b", "/x").unwrap();
@@ -1020,11 +1032,6 @@ mod tests {
         remove_env_volumes(&Only(id), id);
         let left = Only(id).volumes().unwrap();
         let kept = names.each_ref().map(|n| left.iter().any(|v| &v.name == n));
-
-        for name in &names {
-            Only(id).remove("volume", name);
-        }
-
         // The gone home's volume is new, so it stays a day, as a sandbox's would
         assert_eq!(kept, [true, true, true, true, false]);
         assert_eq!(

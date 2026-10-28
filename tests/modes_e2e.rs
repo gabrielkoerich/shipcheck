@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
@@ -155,18 +157,6 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
     }
 }
 
-/// Removes the Docker volumes and images of the test's home, even when an assertion fails
-struct CleanOnDrop(PathBuf);
-
-impl Drop for CleanOnDrop {
-    fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
-            .args(["clean", "--all"])
-            .env("SHIPCHECK_HOME", &self.0)
-            .output();
-    }
-}
-
 // A unique sleep, so the test finds the check's own process by its command line
 const HANG: &str = "sleep 7391";
 
@@ -279,7 +269,7 @@ cache_paths = []
 fn a_host_check_takes_a_jobs_place_in_a_listed_workflow() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let _clean = CleanOnDrop(home.clone());
+    let _clean = common::CleanOnDrop::new(&home);
     let work = repo(tmp.path(), LISTED, &[(".github/workflows/ci.yml", CI)]);
     let run = |args: &[&str]| -> (Option<i32>, serde_json::Value) {
         let out = shipcheck(&work, &home, &[&["--json"], args].concat())
@@ -365,7 +355,7 @@ fn a_host_check_takes_a_jobs_place_in_a_listed_workflow() {
 fn an_act_job_past_its_timeout_fails_and_leaves_no_container() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let _clean = CleanOnDrop(home.clone());
+    let _clean = common::CleanOnDrop::new(&home);
     let config = LISTED.replace("retries = 0\n", "retries = 0\ntimeout_minutes = 1\n");
     let work = repo(tmp.path(), &config, &[(".github/workflows/ci.yml", CI)]);
     commit(&work, &["marker.txt", "leg2.txt", "hang.txt"]);
