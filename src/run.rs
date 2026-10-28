@@ -2308,8 +2308,31 @@ fn workflow_passed(states: &BTreeMap<String, String>) -> bool {
         && states.values().any(|s| s == "success" || s == "skipped")
 }
 
-/// Runs one job in its own clone at a fixed path per slot and job, and a failure again in a new one
+/// A job shipcheck could not run gets why at the end of its log, so it has a tail like any failure
 fn run_job(
+    ctx: &Ctx,
+    file: &str,
+    job: &str,
+    needs: &BTreeMap<String, BTreeMap<String, String>>,
+    deadline: Instant,
+    artifacts: &Path,
+    tx: &mpsc::Sender<Msg>,
+) -> Result<JobRun, String> {
+    try_job(ctx, file, job, needs, deadline, artifacts, tx).inspect_err(|e| {
+        let log = ctx.logs.join(file).join(format!("{job}.log"));
+        note_error(&log, e);
+    })
+}
+
+fn note_error(log: &Path, error: &str) {
+    use std::io::Write as _;
+    let _ = log.parent().map(fs::create_dir_all);
+    let file = fs::OpenOptions::new().create(true).append(true).open(log);
+    let _ = file.and_then(|mut f| writeln!(f, "shipcheck: {error}"));
+}
+
+/// Runs one job in its own clone at a fixed path per slot and job, and a failure again in a new one
+fn try_job(
     ctx: &Ctx,
     file: &str,
     job: &str,

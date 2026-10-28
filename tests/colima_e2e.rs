@@ -46,6 +46,7 @@ jobs:
       - run: test -z \"${SHIPCHECK_CANARY:-}\" && ! env | grep -q canary-7f3a
       - run: test \"$(docker info --format '{{.Name}}')\" = \"$(hostname)\"
       - run: test ! -e \"$HOME/sc/secrets\"
+      - run: node -e 'new File([], \"f\")' && test \"$(node -p process.versions.node | cut -d. -f1)\" -ge 24
       - run: if [ -f slow.txt ]; then python3 -u -m http.server 38517 & sleep 600; fi
 ";
 
