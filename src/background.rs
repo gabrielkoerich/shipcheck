@@ -22,10 +22,10 @@ pub fn record(repo_id: &str, name: &str) -> PathBuf {
         .join(format!("{}.pid", name.replace('/', "%2F")))
 }
 
-/// Whether a push's run posts its checks: main has a `shipcheck.toml`, the results are in the
-/// default home where no agent wrote them, and this machine can post
-pub fn posts(defaults: bool, home_overridden: bool, can_post: bool) -> bool {
-    !defaults && !home_overridden && can_post
+/// Whether a push's run posts its checks: the results are in the default home where no agent
+/// wrote them, and this machine can post
+pub fn posts(home_overridden: bool, can_post: bool) -> bool {
+    !home_overridden && can_post
 }
 
 /// Whether a background run may post from this home. A moved home may hold an agent's results,
@@ -776,14 +776,10 @@ mod tests {
 
     #[test]
     fn posts_only_when_signed_in() {
-        assert!(posts(false, false, true));
-        assert!(!posts(false, false, false), "not signed in posts nothing");
+        assert!(posts(false, true));
+        assert!(!posts(false, false), "not signed in posts nothing");
         assert!(
-            !posts(true, false, true),
-            "no shipcheck.toml on main is no check"
-        );
-        assert!(
-            !posts(false, true, true),
+            !posts(true, true),
             "a moved home may hold an agent's results"
         );
     }

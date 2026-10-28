@@ -123,8 +123,6 @@ pub struct Plan {
     pub key: String,
     /// What the commit changes in CI, which did not run
     pub ci_changes: Vec<String>,
-    /// The base has no shipcheck.toml, so the plan runs the defaults, and its result is never posted
-    pub defaults: bool,
     /// The runners' identity in the key: act's version, then the host checks' tool versions
     pub tools: String,
 }
@@ -387,30 +385,12 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         }
     }
 
-    // Without the owner's file, run what GitHub runs on a PR, so an agent can start alone. Such a
-    // result is never posted as the check, which stays tied to the owner's rules
-    let (config_text, defaults) = match git_raw(&repo, &["show", &format!("{base}:{CONFIG}")]) {
-        Ok(text) => (text, false),
-        Err(_) => {
-            let on_prs: Vec<String> = workflows
-                .iter()
-                .filter(|(_, body)| workflow::runs_for_branches(&String::from_utf8_lossy(body)))
-                .map(|(path, _)| file_name(path))
-                .collect();
-
-            if on_prs.is_empty() {
-                return Err(format!(
-                    "{base_ref} has no {CONFIG} and no workflow that runs for branches. Run `shipcheck init`, or `shipcheck init --yes` from a script or an agent"
-                ));
-            }
-
-            let text = format!(
-                "# No {CONFIG} on {base_ref}: every workflow that runs for branches, on pull_request or push\n{}",
-                crate::setup::config_for(&on_prs)
-            );
-            (text.into_bytes(), true)
-        }
-    };
+    // Only the owner's file says what runs here, a job init kept on GitHub may never finish locally
+    let config_text = git_raw(&repo, &["show", &format!("{base}:{CONFIG}")]).map_err(|_| {
+        format!(
+            "{base_ref} has no {CONFIG}, so there is nothing to run. Run `shipcheck init` (`--yes` from a script or an agent) and merge {CONFIG} to main"
+        )
+    })?;
     let mut config = RepoConfig::parse(&String::from_utf8_lossy(&config_text))?;
     let files: BTreeSet<String> = workflows.keys().map(|p| file_name(p)).collect();
     config.validate(&files)?;
@@ -490,7 +470,6 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         workflows,
         key,
         ci_changes,
-        defaults,
         tools,
     })
 }
@@ -1685,7 +1664,6 @@ pub fn trial(
         config,
         workflows: BTreeMap::new(),
         ci_changes: Vec::new(),
-        defaults: false,
         tools: String::new(),
     };
     let entry = execute(&plan, None, say);
@@ -4104,7 +4082,6 @@ mod tests {
             workflows: BTreeMap::new(),
             key: "k".into(),
             ci_changes: Vec::new(),
-            defaults: false,
             tools: String::new(),
         };
         (dir, plan)
@@ -4534,7 +4511,6 @@ mod tests {
         assert_eq!(plan.sha, sh(repo, &["rev-parse", "feature"]));
         assert_eq!(String::from_utf8_lossy(&plan.config_text), main_config);
         assert_eq!(plan.config.host.checks["test"], "true");
-        assert!(!plan.defaults);
         assert_eq!(
             plan.workflows,
             BTreeMap::from([(ci.clone(), main_ci.as_bytes().to_vec())])

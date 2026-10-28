@@ -781,12 +781,15 @@ fn handle(
         );
     }
 
-    let plan = run::plan(&entry.path, sha, &entry.base)?;
-
     // The check reflects the owner's rules, so a repository with no shipcheck.toml on main gets none
-    if plan.defaults {
+    if !git(
+        entry,
+        &["cat-file", "-e", &format!("{}:shipcheck.toml", entry.base)],
+    ) {
         return Ok(Some(NO_CONFIG));
     }
+
+    let plan = run::plan(&entry.path, sha, &entry.base)?;
 
     if !plan.config.daemon {
         return Ok(Some("not checked, daemon = false on main"));
@@ -1371,7 +1374,10 @@ mod tests {
         std::fs::create_dir_all(path.join(".github/workflows")).unwrap();
         let workflow = "on: pull_request\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
         std::fs::write(path.join(".github/workflows/ci.yml"), workflow).unwrap();
-        std::fs::write(path.join("shipcheck.toml"), config).unwrap();
+        if !config.is_empty() {
+            std::fs::write(path.join("shipcheck.toml"), config).unwrap();
+        }
+
         run_git(path, &["init", "-q", "-b", "main"]);
         run_git(path, &["add", "-A"]);
         run_git(path, &["commit", "-q", "-m", "base"]);
@@ -1558,6 +1564,16 @@ mod tests {
             got,
             Ok(Some("not checked, host mode never checks a fork's PR"))
         );
+        assert!(fake.bodies().is_empty() && started.is_empty());
+    }
+
+    #[test]
+    fn no_shipcheck_toml_on_main_starts_nothing() {
+        let (dir, sha) = checkout("https://github.com/acme/app.git", "");
+        let fake = Fake::by("ann");
+        let pr = open_pr(5, &sha, "main", "acme/app");
+        let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
+        assert_eq!(got, Ok(Some(NO_CONFIG)));
         assert!(fake.bodies().is_empty() && started.is_empty());
     }
 

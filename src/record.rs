@@ -412,7 +412,6 @@ mod tests {
             workflows: BTreeMap::new(),
             key: "k".into(),
             ci_changes: Vec::new(),
-            defaults: false,
             tools: "act version 0.2.89".into(),
         }
     }

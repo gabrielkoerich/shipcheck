@@ -231,14 +231,31 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             .map(|p| {
                 let list = p.config.workflows.join(", ");
                 let checks: Vec<&str> = p.config.host.checks.keys().map(String::as_str).collect();
-                let mut host = format!("runs host checks {} on {base}, natively as this user in a sandbox", checks.join(", "));
-                let open: Vec<&str> = p.config.host.checks.iter().filter(|(_, c)| !c.sandbox).map(|(n, _)| n.as_str()).collect();
+                let mut host = format!(
+                    "runs host checks {} on {base}, natively as this user in a sandbox",
+                    checks.join(", ")
+                );
+                let open: Vec<&str> = p
+                    .config
+                    .host
+                    .checks
+                    .iter()
+                    .filter(|(_, c)| !c.sandbox)
+                    .map(|(n, _)| n.as_str())
+                    .collect();
 
                 if !open.is_empty() {
                     host = format!("{host}. {} {}", open.join(", "), crate::run::UNSANDBOXED);
                 }
 
-                let held: Vec<&str> = p.config.host.checks.iter().filter(|(_, c)| c.untrusted).map(|(n, _)| n.as_str()).collect();
+                let held: Vec<&str> = p
+                    .config
+                    .host
+                    .checks
+                    .iter()
+                    .filter(|(_, c)| c.untrusted)
+                    .map(|(n, _)| n.as_str())
+                    .collect();
 
                 if !held.is_empty() {
                     host = format!("{host}. {}: {}", held.join(", "), crate::run::UNTRUSTED);
@@ -249,10 +266,6 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                     format!("{host}, and {acts} with act")
                 } else if p.config.hosts() {
                     host
-                } else if p.defaults {
-                    format!(
-                        "not on {base}, so runs use the workflows that run for branches: {list}. For the PR check, `shipcheck init` (`--yes` from a script or an agent) and merge shipcheck.toml to main"
-                    )
                 } else if !p.config.jobs.is_empty() {
                     format!("runs {} with act on {base}", jobs_line(&p.config))
                 } else {
@@ -288,7 +301,6 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     }
 
     if let Ok(p) = &plan
-        && !p.defaults
         && let Some(required) = required_checks(cwd, base)
     {
         let jobs = run::jobs(p).unwrap_or_default();

@@ -867,8 +867,7 @@ fn runs_caches_and_tests_the_working_copy() {
         );
     }
 
-    // With no shipcheck.toml on main, an agent can still run: the workflows that run for branches run, and
-    // the result is never posted as the check
+    // With no shipcheck.toml on main there is nothing to run, so nothing runs and nothing posts
     let bare = tmp.path().join("bare.git");
     fs::create_dir(&bare).unwrap();
     git(&bare, &["init", "-q", "--bare", "-b", "main"]);
@@ -884,11 +883,6 @@ fn runs_caches_and_tests_the_working_copy() {
         "on: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: [{run: echo pr}]\n",
     )
     .unwrap();
-    fs::write(
-        fresh.join(".github/workflows/deploy.yml"),
-        "on: {push: {branches: [main]}}\njobs:\n  ship:\n    runs-on: ubuntu-latest\n    steps: [{run: exit 1}]\n",
-    )
-    .unwrap();
     git(&fresh, &["add", "-A"]);
     git(&fresh, &["commit", "-qm", "no config"]);
     git(&fresh, &["push", "-q", "origin", "main"]);
@@ -901,36 +895,24 @@ fn runs_caches_and_tests_the_working_copy() {
             .output()
             .unwrap()
     };
+    let nothing = "origin/main has no shipcheck.toml, so there is nothing to run";
     let doctor = cli(&["doctor"]);
     let said = String::from_utf8_lossy(&doctor.stdout).to_string();
-    assert!(said.contains("run for branches: pr.yml"), "{said}");
+    assert_eq!(doctor.status.code(), Some(1), "{said}");
+    assert!(said.contains(nothing), "{said}");
     let ran = cli(&["run", "--no-fetch"]);
-    let ran_out = String::from_utf8_lossy(&ran.stdout).to_string();
-    assert_eq!(ran.status.code(), Some(0), "{ran_out}");
-    assert!(
-        ran_out.contains("no shipcheck.toml on origin/main"),
-        "{ran_out}"
-    );
-    assert!(
-        !ran_out.contains("deploy.yml"),
-        "a deploy on main does not run: {ran_out}"
-    );
-    // The test's SHIPCHECK_HOME is not the default, so post refuses without --home-ok
-    let post = cli(&["post"]);
-    assert_eq!(post.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&post.stderr).contains("--home-ok"));
-    let post = cli(&["post", "--home-ok"]);
-    assert_eq!(post.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&post.stderr).contains("is the default branch"));
+    let ran_out = String::from_utf8_lossy(&ran.stderr).to_string();
+    assert_eq!(ran.status.code(), Some(2), "{ran_out}");
+    assert!(ran_out.contains(nothing), "{ran_out}");
     // Off the default branch the refusal is the missing config
     git(&fresh, &["switch", "-q", "-c", "feature"]);
     fs::write(fresh.join("note.txt"), "x").unwrap();
     git(&fresh, &["add", "-A"]);
     git(&fresh, &["commit", "-qm", "note"]);
-    assert_eq!(cli(&["run", "--no-fetch"]).status.code(), Some(0));
+    assert_eq!(cli(&["run", "--no-fetch"]).status.code(), Some(2));
     let post = cli(&["post", "--home-ok"]);
     assert_eq!(post.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&post.stderr).contains("is not a check"));
+    assert!(String::from_utf8_lossy(&post.stderr).contains(nothing));
 
     // clean removes this repository's warm template and slots, and --all also the results
     let home = tmp.path().join("home");
