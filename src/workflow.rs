@@ -384,16 +384,19 @@ fn ref_name(source: &str, uses: &str) -> Option<String> {
     })
 }
 
+/// Actions that run `docker` in their own script, which no step of the workflow shows
+const DOCKER_ACTIONS: &[&str] = &["docker/", "zizmorcore/zizmor-action@"];
+
 fn runs_docker(step: &RunStep) -> bool {
     let command = |word: &str| {
         step.run
             .split(|c: char| c.is_whitespace() || ";&|()`$".contains(c))
             .any(|w| w == word)
     };
-    step.uses
-        .as_deref()
-        .is_some_and(|u| u.starts_with("docker/"))
-        || command("docker")
+    step.uses.as_deref().is_some_and(|u| {
+        let u = u.to_lowercase();
+        DOCKER_ACTIONS.iter().any(|a| u.starts_with(a))
+    }) || command("docker")
         || command("act")
 }
 

@@ -971,20 +971,27 @@ fn act_engine(
  * only with that job. A job act cannot run keeps its reason, with why act cannot either
  **/
 pub fn place(root: &Path, machine: &Machine, d: &mut Detected) {
-    let mut files: BTreeMap<String, (String, Vec<crate::workflow::Job>)> = BTreeMap::new();
+    type File = (
+        String,
+        Vec<crate::workflow::Job>,
+        std::cell::OnceCell<Result<(), String>>,
+    );
+    let mut files: BTreeMap<String, File> = BTreeMap::new();
 
     for k in &d.github {
         files.entry(k.file.clone()).or_insert_with(|| {
             let source = fs::read_to_string(root.join(".github/workflows").join(&k.file))
                 .unwrap_or_default();
             let jobs = crate::workflow::job_runs(&source);
-            (source, jobs)
+            (source, jobs, Default::default())
         });
     }
 
     let engine = |k: &Kept| -> Result<Engine, String> {
-        let (source, jobs) = files.get(&k.file).ok_or("no workflow")?;
-        engine_of(root, source, jobs, &k.job, machine)
+        let (source, jobs, parsed) = files.get(&k.file).ok_or("no workflow")?;
+        let engine = engine_of(root, source, jobs, &k.job, machine)?;
+        parsed.get_or_init(|| act_parses(root, &k.file)).clone()?;
+        Ok(engine)
     };
     let kept = std::mem::take(&mut d.github);
     let (needs, own): (Vec<Kept>, Vec<Kept>) =
@@ -1048,13 +1055,48 @@ pub fn act_engine_for(
 ) -> Result<Engine, String> {
     let source =
         fs::read_to_string(root.join(".github/workflows").join(file)).map_err(|e| e.to_string())?;
-    engine_of(
+    let engine = engine_of(
         root,
         &source,
         &crate::workflow::job_runs(&source),
         id,
         machine,
-    )
+    )?;
+    act_parses(root, file)?;
+    Ok(engine)
+}
+
+/**
+ * Whether act parses a workflow of `root`, as every run of it would first. act checks a workflow
+ * against its own schema, which can lag GitHub's, and fails every run of one it rejects
+ **/
+#[cfg(not(test))]
+pub fn act_parses(root: &Path, file: &str) -> Result<(), String> {
+    let out = Command::new("act")
+        .arg("--list")
+        .arg("-W")
+        .arg(root.join(".github/workflows").join(file))
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("act did not start: {e}"))?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    let why = err
+        .lines()
+        .find_map(|l| l.strip_prefix("Error: "))
+        .unwrap_or("act --list failed");
+    Err(format!("act cannot parse its workflow: {why}"))
+}
+
+// Unit tests start no act, tests/act_parse_e2e.rs runs the real one
+#[cfg(test)]
+pub fn act_parses(_: &Path, _: &str) -> Result<(), String> {
+    Ok(())
 }
 
 /// The job a job was kept on GitHub for, since that job stays there and needs it
@@ -1410,7 +1452,14 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     // act runs every job of a listed workflow, and a job that runs Docker fails there every time
     let docker_job = all().any(|(_, j)| j.runs_docker);
 
-    if let Some((file, job)) = matrix.filter(|_| machine.docker && !off_linux && !docker_job) {
+    let in_act = |_: &_| {
+        machine.docker
+            && !off_linux
+            && !docker_job
+            && files.iter().all(|(f, _)| act_parses(root, f).is_ok())
+    };
+
+    if let Some((file, job)) = matrix.filter(in_act) {
         d.act = Some(format!(
             "{file}, job {} runs a matrix ({}): host mode tests only this machine's toolchain, so this repository runs in act",
             job.id.escape_debug(),
@@ -4053,6 +4102,8 @@ jobs:
             job("newissues", "", "      - uses: golangci/golangci-lint-action@v8\n        with:\n          only-new-issues: true\n"),
             job("envwrap", "", "      - run: env X=1 podman build .\n"),
             job("shellc", "", "      - run: bash -c 'docker build .'\n"),
+            // Its action.sh runs `docker run`, which the workflow never shows
+            job("zizmor", "", "      - uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1\n"),
             job("own", "", "      - run: ./scripts/service start && make check\n      - uses: some/action@v1\n"),
         ]
         .concat();
@@ -4130,6 +4181,7 @@ jobs:
             ("newissues", "golangci/golangci-lint-action@v8 reads the PR"),
             ("envwrap", "it runs podman"),
             ("shellc", "it runs docker"),
+            ("zizmor", "it runs docker"),
         ] {
             assert!(
                 why(&found, id).contains(reason),

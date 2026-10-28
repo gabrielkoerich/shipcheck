@@ -1906,6 +1906,12 @@ pub fn never_started(log: &str) -> bool {
     !log.contains("| shipcheck-start ")
 }
 
+/// Whether act refused the workflow before any job, which it does the same way every attempt
+pub fn invalid_workflow(log: &str) -> bool {
+    log.lines()
+        .any(|l| l.starts_with("Error: workflow is not valid."))
+}
+
 /// Whether a platform maps the job's `runs-on`. One that is still an expression may, so it counts
 fn runs_here(workflow: &str, job: &str, labels: &BTreeSet<String>) -> bool {
     let Ok(root) = workflow::load(workflow) else {
@@ -3344,6 +3350,9 @@ jobs:
         let ran = "[CI/a] ⭐ Run Main echo \"shipcheck-start n ${{ github.job }}\"\n\
                    [CI/a]   | shipcheck-start n a\n[CI/a]   | sh: cargo: not found\n";
         assert!(!never_started(ran));
+        assert!(!invalid_workflow(pulled) && !invalid_workflow(ran));
+        let parse = "level=info msg=\"Using docker host\"\n\nError: workflow is not valid. 'ci.yml': Line: 25 Column 1: Unknown Property cache-mode\n";
+        assert!(invalid_workflow(parse) && never_started(parse));
     }
 
     #[test]
