@@ -325,8 +325,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          # The first release computes the version the manifest already carries
+          git diff --cached --quiet || git commit -m "chore: bump version to ${VERSION}"
           git tag -a "$VERSION" -m "$VERSION"
-          git push origin "$VERSION"
+          git push origin main "$VERSION"
 
       # Permanent: a version can be yanked, never deleted, and it publishes the source
       - name: Publish to crates.io
