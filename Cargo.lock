@@ -1695,6 +1695,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "sandbox-jail"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e25da9a9db7ab44e61433f63fe758802c667012820defacc5f3cc9ec236d2685"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1794,6 +1800,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "ratatui",
+ "sandbox-jail",
  "serde",
  "serde_json",
  "sha2",

@@ -29,6 +29,7 @@ ureq = { version = "3", features = ["json"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 globset = "0.4.20"
 libc = "0.2.191"
+sandbox-jail = "0.1"
 tempfile = "3.27.0"
 cliclack = "0.5.6"
 clap = { version = "4.6.7", features = ["derive"] }

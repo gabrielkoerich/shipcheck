@@ -6,6 +6,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
+use sandbox_jail::known::{self, LAUNCHCTL};
+use sandbox_jail::{Access, Backend, Policy, Sandbox};
+
 use super::{Outcome, RunRequest, Runner};
 use crate::config;
 
@@ -49,7 +52,10 @@ impl Host {
             RunCopy::remove_unused(&runs);
             let copy = RunCopy::new(&runs)?;
 
-            if *self.overlay.get_or_init(|| overlay(&runs).is_ok()) {
+            if *self
+                .overlay
+                .get_or_init(|| sandbox_jail::overlay_supported(&runs).is_ok())
+            {
                 fs::create_dir(&copy.dir).map_err(|e| format!("{}: {e}", copy.dir.display()))?;
             } else {
                 clone_dir(&base, &copy.dir)?;
@@ -145,7 +151,8 @@ impl RunCopy {
                     .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_secs(60)))
             };
 
-            if name.starts_with(".probe-") {
+            // The crate's overlay probe, and the one older shipcheck versions made
+            if name.starts_with(".sandbox-jail-probe-") || name.starts_with(".probe-") {
                 if old() {
                     remove_tree(&path);
                 }
@@ -307,15 +314,7 @@ pub const BASE_ENV: &[&str] = &["PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "SH
 
 /// Names `[host] env` may not pass, since they carry credentials or point git at another repository
 pub fn refused_env(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper == "SSH_AUTH_SOCK"
-        || ["TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
-            .iter()
-            .any(|s| upper.contains(s))
-        || upper.ends_with("_KEY")
-        || ["AWS_", "GOOGLE_", "AZURE_", "GIT_", "SHIPCHECK_"]
-            .iter()
-            .any(|p| upper.starts_with(p))
+    known::secret_env(name) || name.to_ascii_uppercase().starts_with("SHIPCHECK_")
 }
 
 /// Whether a variable from the user's environment reaches a check: the base list and the owner's
@@ -324,23 +323,13 @@ pub fn keeps_var(name: &str, extra: &[String]) -> bool {
     (BASE_ENV.contains(&name) || extra.iter().any(|e| e == name)) && !refused_env(name)
 }
 
-const TEMP: &[&str] = &[
-    "/tmp",
-    "/private/tmp",
-    "/var/tmp",
-    "/private/var/tmp",
-    "/var/folders",
-    "/private/var/folders",
-    "/dev/shm",
-];
-
 /**
  * Whether a check may find tools in `dir`. Not in a temp dir or a git checkout, where an agent can
  * write a fake `cargo` that exits 0 and put it first on the `PATH` it runs `shipcheck run` with.
  * The user's home is not a checkout here, so a dotfiles repository leaves `~/.cargo/bin` usable
  **/
 fn trusted_dir(dir: &Path, user: &Path) -> bool {
-    let mut temp: Vec<PathBuf> = TEMP.iter().map(PathBuf::from).collect();
+    let mut temp: Vec<PathBuf> = known::TEMP_DIRS.iter().map(PathBuf::from).collect();
     temp.push(std::env::temp_dir());
     trusted_in(dir, user, &temp)
 }
@@ -396,53 +385,6 @@ fn trusted_path_in(path: &std::ffi::OsStr, user: &Path, temp: &[PathBuf]) -> std
     std::env::join_paths(kept).unwrap_or_default()
 }
 
-/**
- * Whether bwrap can lay a check's writes over the base's cache, with the upper layer in `dir`, and
- * why not. It needs bwrap 0.10 or later and a kernel that mounts overlayfs in a user namespace
- **/
-pub fn overlay(dir: &Path) -> Result<(), String> {
-    if !cfg!(target_os = "linux") {
-        return Err("only bwrap mounts an overlay".into());
-    }
-
-    let probe = tempfile::Builder::new()
-        .prefix(".probe-")
-        .tempdir_in(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .keep();
-    let [lower, upper, work] = ["lower", "upper", "work"].map(|d| probe.join(d));
-    let made = [&lower, &upper, &work]
-        .into_iter()
-        .try_for_each(fs::create_dir)
-        .map_err(|e| e.to_string());
-    let ran = made.and_then(|_| {
-        Command::new("bwrap")
-            .args(["--ro-bind", "/", "/", "--dev", "/dev", "--overlay-src"])
-            .arg(&lower)
-            .arg("--overlay")
-            .args([&upper, &work, &lower])
-            .arg("true")
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("bwrap: {e}"))
-    });
-    remove_tree(&probe);
-    let out = ran?;
-
-    if out.status.success() {
-        return Ok(());
-    }
-
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-
-    if err.contains("--overlay-src") {
-        let version = first_line("bwrap", &["--version"]).unwrap_or_else(|| "this bwrap".into());
-        return Err(format!("{version} has no --overlay-src"));
-    }
-
-    Err(format!("bwrap could not mount an overlay: {err}"))
-}
-
 /// How a branch run gets the base's cache, for doctor
 pub fn branch_cache() -> String {
     if cfg!(target_os = "macos") {
@@ -450,82 +392,26 @@ pub fn branch_cache() -> String {
             .into();
     }
 
-    let dir = cache_dir(None);
+    let overlay = real_dir(&cache_dir(None))
+        .and_then(|d| sandbox_jail::overlay_supported(&d).map_err(|e| e.to_string()));
 
-    match real_dir(&dir).and_then(|d| overlay(&d)) {
+    match overlay {
         Ok(()) => "Branch runs see the base's tool cache through an overlay, and their writes go to a layer of their own that the run removes".into(),
         Err(e) => format!("Branch runs get a copy of the base's tool cache, a full one on ext4 at about 4 s per GB, since {e}. bubblewrap 0.10 or later mounts an overlay instead, at no cost per GB"),
     }
 }
 
-fn first_line(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().next().map(|l| l.trim().to_string())
-}
-
 /// The OS sandbox host checks run in, an error naming the fix when this machine has none
 pub fn sandbox() -> Result<&'static str, String> {
-    if cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists() {
+    match Backend::detect() {
+        Ok(Backend::Seatbelt) => Ok("sandbox-exec"),
+        Ok(Backend::Bwrap) => Ok("bwrap"),
         // macOS refuses a sandbox inside a sandbox, such as an agent's, unless that one is as strict
-        static STARTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let starts = *STARTS.get_or_init(|| {
-            in_a_jail()
-                || Command::new(SANDBOX_EXEC)
-                    // One real rule, since macOS starts a nested profile that restricts nothing
-                    .args([
-                        "-p",
-                        "(version 1)(allow default)(deny file-write* (literal \"/var/empty/shipcheck\"))",
-                        "/usr/bin/true",
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success())
-        });
-
-        if !starts {
-            return Err(NESTED.into());
-        }
-
-        return Ok("sandbox-exec");
+        Err(sandbox_jail::Error::Nested) if in_a_jail() => Ok("sandbox-exec"),
+        Err(sandbox_jail::Error::Nested) => Err(NESTED.into()),
+        Err(e) => Err(format!("host mode needs an OS sandbox: {e}")),
     }
-
-    if cfg!(target_os = "linux") {
-        let ran = Command::new("bwrap")
-            .args([
-                "--ro-bind",
-                "/",
-                "/",
-                "--dev",
-                "/dev",
-                "--proc",
-                "/proc",
-                "--unshare-pid",
-                "true",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-
-        return match ran {
-            Ok(s) if s.success() => Ok("bwrap"),
-            Err(_) => Err("host mode needs bubblewrap: `sudo apt install bubblewrap` or `sudo dnf install bubblewrap`".into()),
-            Ok(_) => Err(userns_fix(
-                fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-                    .ok()
-                    .as_deref(),
-                Path::new(BWRAP_PROFILE).exists(),
-            )),
-        };
-    }
-
-    Err("host mode needs an OS sandbox: sandbox-exec on macOS or bubblewrap on Linux".into())
 }
-
-const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-
-const LAUNCHCTL: &str = "/bin/launchctl";
 
 const NESTED: &str = "the host checks' sandbox cannot start inside another sandbox, such as an agent's, so nothing ran: run shipcheck outside it, for example by exempting the `shipcheck` command in the agent's sandbox settings. A push still gets its checks from the hook's run and the daemon, which run outside it";
 
@@ -537,67 +423,21 @@ const NESTED: &str = "the host checks' sandbox cannot start inside another sandb
  **/
 #[cfg(target_os = "macos")]
 pub fn in_a_jail() -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+    use sandbox_jail::macos::{denies, sandboxed};
 
-    unsafe extern "C" {
-        fn sandbox_check(
-            pid: libc::pid_t,
-            operation: *const libc::c_char,
-            kind: libc::c_int,
-            ...
-        ) -> libc::c_int;
-    }
-    // From sandbox.h: no filter asks whether there is a sandbox at all, 1 filters by path
-    const NONE: libc::c_int = 0;
-    const PATH: libc::c_int = 1;
     let home = crate::run::user_dir();
-    let denied = |operation: &str, path: &Path| {
-        let (Ok(op), Ok(path)) = (
-            CString::new(operation),
-            CString::new(path.as_os_str().as_bytes()),
-        ) else {
-            return false;
-        };
-        // Safe: both strings outlive the call, which only reads them
-        unsafe { sandbox_check(libc::getpid(), op.as_ptr(), PATH, path.as_ptr()) == 1 }
-    };
-
-    // Safe: a null operation with no filter takes no further argument
-    let sandboxed = unsafe { sandbox_check(libc::getpid(), std::ptr::null(), NONE) } == 1;
     // A sandbox that passes these is reused only where results never post, since any can pass them
     crate::run::home_overridden()
-        && sandboxed
-        && denied("file-read-data", &home)
-        && denied("file-write-data", &home.join(".shipcheck-probe"))
-        && denied("network-outbound", &home.join(".docker/run/docker.sock"))
-        && denied("network-outbound", Path::new("/var/run/docker.sock"))
+        && sandboxed()
+        && denies("file-read-data", &home)
+        && denies("file-write-data", &home.join(".shipcheck-probe"))
+        && denies("network-outbound", &home.join(".docker/run/docker.sock"))
+        && denies("network-outbound", Path::new("/var/run/docker.sock"))
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn in_a_jail() -> bool {
     false
-}
-
-/// The AppArmor profile that lets only bwrap create user namespaces, from apparmor's extra profiles
-const BWRAP_PROFILE: &str = "/etc/apparmor.d/bwrap-userns-restrict";
-
-/**
- * Why bwrap could not make its user namespace, and the fix. Ubuntu 23.10 and later restrict
- * unprivileged user namespaces with AppArmor, and a profile for bwrap alone lifts that for it
- **/
-fn userns_fix(restricted: Option<&str>, profile: bool) -> String {
-    let load = format!("sudo apparmor_parser -r {BWRAP_PROFILE}");
-
-    match (restricted.map(str::trim), profile) {
-        (Some("1"), false) => format!(
-            "AppArmor stops bwrap from creating user namespaces. Allow bwrap alone: `sudo apt install apparmor-profiles && sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && {load}`"
-        ),
-        (Some("1"), true) => format!(
-            "AppArmor stops bwrap from creating user namespaces, and {BWRAP_PROFILE} is not loaded: `{load}`"
-        ),
-        _ => "bwrap cannot create a user namespace: check that `sysctl user.max_user_namespaces` is above 0 and bwrap is not setuid".into(),
-    }
 }
 
 /**
@@ -647,43 +487,6 @@ const TOOLCHAINS: &[&str] = &[
     ".docker/cli-plugins",
 ];
 
-/**
- * The macOS services a check may look up, all others are denied. Found by running cargo, npm, node,
- * uv, go, cc, git and curl under a profile that denies every lookup: user and group lookups, the
- * system's notifications, logging, temp dirs, the clock, DNS and proxy settings and trustd, which
- * checks TLS certificates for curl and Go. Not securityd, which holds the keychain
- **/
-const MACH_SERVICES: &[&str] = &[
-    "com.apple.system.opendirectoryd.libinfo",
-    "com.apple.system.opendirectoryd.membership",
-    "com.apple.system.notification_center",
-    "com.apple.logd",
-    "com.apple.diagnosticd",
-    "com.apple.bsd.dirhelper",
-    "com.apple.timed.xpc",
-    "com.apple.SystemConfiguration.configd",
-    "com.apple.SystemConfiguration.DNSConfiguration",
-    "com.apple.trustd",
-    "com.apple.trustd.agent",
-];
-
-/// Credentials in the user's home, hidden again in case a toolchain path above reaches one
-const SECRETS: &[&str] = &[
-    ".cargo/credentials",
-    ".cargo/credentials.toml",
-    ".cargo/config",
-    ".cargo/config.toml",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".config/pip",
-    ".config/uv",
-    ".docker/config.json",
-    ".ssh",
-    ".aws",
-    ".config/gh",
-];
-
 /// What a check may touch: it writes its clone, a home made new for each run and the repository's
 /// tool caches, and reads the system, its toolchains and `readable`
 pub struct Jail {
@@ -696,33 +499,6 @@ pub struct Jail {
     /// False for a check with `sandbox = false`, which runs with the user's own access
     pub sandboxed: bool,
 }
-
-/// The setuid binaries of the system, read once
-fn setuid() -> &'static [PathBuf] {
-    use std::os::unix::fs::PermissionsExt;
-
-    static FOUND: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    FOUND.get_or_init(|| {
-        let dirs = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/libexec"];
-        let mut found: Vec<PathBuf> = dirs
-            .iter()
-            .flat_map(|d| fs::read_dir(d).into_iter().flatten().flatten())
-            .map(|e| e.path())
-            .chain([PathBuf::from(ARD_AGENT)])
-            .filter(|p| {
-                fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o4000 != 0)
-            })
-            .map(resolved)
-            .collect();
-        found.sort();
-        found.dedup();
-        found
-    })
-}
-
-/// A setuid root binary outside the scanned dirs
-const ARD_AGENT: &str =
-    "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent";
 
 /// The path a symlink resolves to, which is what the sandbox matches, or the path when it is missing
 fn resolved(path: PathBuf) -> PathBuf {
@@ -761,167 +537,96 @@ impl Jail {
     /// Credentials hidden even inside readable paths: the user's, shipcheck's own and the App key
     fn hidden(user: &Path) -> Vec<PathBuf> {
         let home = crate::run::home();
-        let mut hidden: Vec<PathBuf> = SECRETS.iter().map(|h| user.join(h)).collect();
+        let mut hidden = known::credentials(user);
         hidden.extend(["token", "app.pem", "secrets"].map(|h| home.join(h)));
         hidden.extend(std::env::var_os("SHIPCHECK_APP_KEY_FILE").map(PathBuf::from));
         hidden.into_iter().map(resolved).collect()
     }
 
     /**
-     * The `sandbox-exec` profile. Writes only to the jail. The user's home is unreadable but for the
-     * toolchains and the jail. Unix sockets connect only in the jail and to the DNS resolver, so
-     * Docker's or an agent's socket is out of reach. Mach services only from [`MACH_SERVICES`], and
-     * no Apple events, so no copy of `open` or `osascript` reaches Launch Services or another app,
-     * which would start a process outside the sandbox. `launchctl` talks to launchd over the
-     * bootstrap port, which no sandbox rule here covers, so it may not run at all. Signals reach
-     * only the check's own processes, never the user's other ones or another check's. A pseudo-terminal
-     * only when the check opened it, which the `com.apple.sandbox.pty` extension marks, to read as
-     * to write, so the terminal shipcheck runs in is out of reach. Nothing in the temp dirs but the
-     * jail's own paths
+     * Writes only to the jail. The user's home is unreadable but for the toolchains and the jail.
+     * Unix sockets connect only in the jail and to the DNS resolver, so Docker's or an agent's socket
+     * is out of reach. Mach services only from the basic list, and no Apple events, so no copy of
+     * `open` or `osascript` reaches Launch Services or another app, which would start a process
+     * outside the sandbox. `launchctl` talks to launchd over the bootstrap port, which no sandbox rule
+     * covers, so it may not run at all. Signals reach only the check's own processes, and terminals
+     * only the ones it opened. On macOS nothing in the temp dirs but the jail's own paths, on Linux
+     * new empty `/tmp`, `/run` and `/var/tmp`, so no Unix socket of the host is in reach by path
      **/
-    fn profile(&self) -> Result<String, String> {
+    fn policy(&self, backend: Backend) -> Result<Policy, String> {
         let user = Self::user()?;
-        let quote = |p: &Path| {
-            p.to_str()
-                .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
-                .ok_or_else(|| format!("{}: not UTF-8", p.display()))
-        };
-        let subpaths = |paths: &[PathBuf]| -> Result<String, String> {
-            paths
-                .iter()
-                .map(|p| quote(p).map(|q| format!(" (subpath {q})")))
-                .collect()
-        };
-        let writable = subpaths(&self.writable)?;
-        // A `remote unix-socket` filter takes one path, so each writable dir gets its own
-        let sockets: String = self
-            .writable
-            .iter()
-            .map(|p| quote(p).map(|q| format!(" (remote unix-socket (subpath {q}))")))
-            .collect::<Result<_, String>>()?;
-        let readable = subpaths(&self.readable(&user))?;
-        let hidden = subpaths(&Self::hidden(&user))?;
-        // Writes go inside the cache, never to the directory itself, so no check swaps it for a symlink
-        let own = if self.cache != self.home && self.writable.contains(&self.cache) {
-            format!("(deny file-write* (literal {}))\n", quote(&self.cache)?)
-        } else {
-            String::new()
-        };
-        // Other checks' homes and whatever else is in the temp dirs, the jail's own paths allowed below
-        let mut temp: Vec<PathBuf> = TEMP.iter().map(PathBuf::from).collect();
-        temp.push(std::env::temp_dir());
-        let mut temp: Vec<PathBuf> = temp.into_iter().map(resolved).collect();
-        temp.sort();
-        temp.dedup();
-        let temp = subpaths(&temp)?;
-        let user = quote(&user)?;
-        let mach: String = MACH_SERVICES
-            .iter()
-            .map(|s| format!(" (global-name \"{s}\")"))
-            .collect();
-        // A setuid binary runs as root, which shipcheck cannot stop when it outlives its check
-        let setuid: String = setuid()
-            .iter()
-            .map(|p| quote(p).map(|q| format!(" (literal {q})")))
-            .collect::<Result<_, String>>()?;
-        // A copy of launchctl outside /bin is killed at exec, so the path is enough
-        let exec = format!("(deny process-exec* (literal \"{LAUNCHCTL}\"){setuid})\n");
+        let seatbelt = backend == Backend::Seatbelt;
+        let mut readable = self.readable(&user);
         // Without its cache every `/usr/bin` shim, git and cc among them, asks xcodebuild for a second
-        let xcrun: String = xcrun_db()
-            .map(|p| quote(&p).map(|q| format!(" (literal {q})")))
-            .transpose()?
-            .unwrap_or_default();
-        Ok(format!(
-            "(version 1)\n(allow default)\n\
-             (deny file-write*)\n\
-             (allow file-write*{writable} (literal \"/dev/null\") (regex #\"^/dev/fd/\"))\n\
-             {own}\
-             (allow file-write* (literal \"/dev/ptmx\") (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
-             (deny file-read-data (subpath {user}){temp})\n\
-             (allow file-read-data{readable}{writable}{xcrun})\n\
-             (deny file-read*{hidden})\n\
-             (deny file-read* (require-all (regex #\"^/dev/ttys[0-9]+$\") (require-not (extension \"com.apple.sandbox.pty\"))))\n\
-             (deny network-outbound (remote unix-socket))\n\
-             (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n\
-             (allow network-outbound{sockets})\n\
-             (deny appleevent-send)\n\
-             (deny mach-lookup)\n\
-             (allow mach-lookup{mach})\n\
-             (deny signal)\n\
-             (allow signal (target same-sandbox))\n\
-             {exec}"
-        ))
+        readable.extend(xcrun_db());
+        let mut unreadable = vec![user.clone()];
+        let (mut pinned, mut no_exec, mut scratch) = (Vec::new(), Vec::new(), Vec::new());
+
+        if seatbelt {
+            unreadable.extend(known::temp_dirs());
+
+            // Writes go inside the cache, never to the dir itself, so no check swaps it for a symlink
+            if self.cache != self.home && self.writable.contains(&self.cache) {
+                pinned.push(self.cache.clone());
+            }
+
+            // A setuid binary runs as root, which shipcheck cannot stop when it outlives its check
+            no_exec.push(PathBuf::from(LAUNCHCTL));
+            no_exec.extend(known::setuid_binaries().iter().cloned());
+        } else {
+            scratch = ["/tmp", "/run", "/var/run", "/var/tmp"]
+                .map(PathBuf::from)
+                .to_vec();
+        }
+
+        Ok(Policy {
+            writable: self.writable.clone(),
+            read_only: Vec::new(),
+            pinned,
+            unreadable,
+            readable,
+            scratch,
+            hidden: Self::hidden(&user),
+            network: true,
+            unix_sockets: Access::Only(self.writable.clone()),
+            mach_services: Access::Only(
+                known::BASIC_MACH_SERVICES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            apple_events: false,
+            own_signals: true,
+            own_terminals: true,
+            no_exec,
+            overlays: self
+                .overlay
+                .iter()
+                .map(|(upper, work)| sandbox_jail::Overlay {
+                    lower: self.cache.clone(),
+                    upper: upper.clone(),
+                    work: work.clone(),
+                })
+                .collect(),
+        })
     }
 
-    /**
-     * `bwrap` arguments. The root read-only, then new empty `/tmp`, `/var/tmp`, `/run` and user
-     * home, so no Unix socket of the host is in reach by path, then the toolchains read-only and the
-     * jail writable. The host's network, and a pid namespace and session that die with the check
-     **/
-    fn bwrap_args(&self) -> Result<Vec<std::ffi::OsString>, String> {
-        let user = Self::user()?;
-        let mut args: Vec<std::ffi::OsString> = [
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--unshare-pid",
-            "--die-with-parent",
-            "--new-session",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/run",
-        ]
-        .map(Into::into)
-        .to_vec();
+    /// What goes before the check's command: the sandbox, or `env` when it runs without one
+    fn wrapper(&self) -> Result<Vec<std::ffi::OsString>, String> {
+        let backend = match sandbox()? {
+            _ if !self.sandboxed => None,
+            // macOS refuses a sandbox inside a sandbox, and the one around this process is as strict
+            "sandbox-exec" if in_a_jail() => None,
+            "sandbox-exec" => Some(Backend::Seatbelt),
+            _ => Some(Backend::Bwrap),
+        };
 
-        // As on macOS, a check reads nothing another process left in the host's temp dirs
-        for dir in ["/var/run", "/var/tmp"] {
-            if fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
-                args.extend(["--tmpfs".into(), dir.into()]);
-            }
-        }
+        let Some(backend) = backend else {
+            return Ok(vec!["/usr/bin/env".into()]);
+        };
 
-        args.extend(["--tmpfs".into(), user.clone().into()]);
-        // systemd-resolved links /etc/resolv.conf into /run
-        let resolv = resolved(PathBuf::from("/etc/resolv.conf"));
-
-        if resolv.starts_with("/run") {
-            args.extend(["--ro-bind".into(), resolv.clone().into(), resolv.into()]);
-        }
-
-        for path in self.readable(&user) {
-            args.extend(["--ro-bind".into(), path.clone().into(), path.into()]);
-        }
-
-        for path in Self::hidden(&user) {
-            match fs::metadata(&path) {
-                Ok(m) if m.is_dir() => args.extend(["--tmpfs".into(), path.into()]),
-                Ok(_) => args.extend(["--ro-bind".into(), "/dev/null".into(), path.into()]),
-                Err(_) => {}
-            }
-        }
-
-        for path in &self.writable {
-            args.extend(["--bind".into(), path.clone().into(), path.clone().into()]);
-        }
-
-        if let Some((upper, work)) = &self.overlay {
-            args.extend([
-                "--overlay-src".into(),
-                self.cache.clone().into(),
-                "--overlay".into(),
-            ]);
-            args.extend([upper, work, &self.cache].map(|p| p.clone().into()));
-        }
-
-        // Read-only once every mount point in it exists
-        args.extend(["--remount-ro".into(), user.into()]);
-        Ok(args)
+        let sandbox = Sandbox::new(backend, self.policy(backend)?).map_err(|e| e.to_string())?;
+        Ok(sandbox.argv().to_vec())
     }
 
     /**
@@ -943,21 +648,9 @@ impl Jail {
     /// `sh -c` in the OS sandbox with the filtered environment, in a session of its own with no
     /// controlling terminal, so a timeout stops all of it and it cannot type into the terminal
     fn shell(&self, command: &str, dir: &Path, extra: &[String]) -> Result<Command, String> {
-        let mut cmd = match sandbox()? {
-            _ if !self.sandboxed => Command::new("/usr/bin/env"),
-            // macOS refuses a sandbox inside a sandbox, and the one around this process is as strict
-            "sandbox-exec" if in_a_jail() => Command::new("/usr/bin/env"),
-            "sandbox-exec" => {
-                let mut cmd = Command::new(SANDBOX_EXEC);
-                cmd.arg("-p").arg(self.profile()?);
-                cmd
-            }
-            _ => {
-                let mut cmd = Command::new("bwrap");
-                cmd.args(self.bwrap_args()?).arg("--");
-                cmd
-            }
-        };
+        let wrapper = self.wrapper()?;
+        let mut cmd = Command::new(&wrapper[0]);
+        cmd.args(&wrapper[1..]);
         let cache = |dir: &str| self.cache.join(dir);
         let base = self.path(jail_path());
         let shims = self.home.join(SHIMS);
@@ -1128,7 +821,7 @@ exec /usr/bin/mktemp -p "${TMPDIR:-/tmp}" "$@"
 fn denied_by_name(path: &std::ffi::OsStr) -> Vec<String> {
     let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
 
-    setuid()
+    known::setuid_binaries()
         .iter()
         .filter_map(|p| p.file_name()?.to_str().map(|n| (n.to_string(), p)))
         .filter(|(name, denied)| {
@@ -2359,7 +2052,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut modes = vec![false];
 
-        if overlay(dir.path()).is_ok() {
+        if sandbox_jail::overlay_supported(dir.path()).is_ok() {
             modes.push(true);
         }
 
@@ -2376,6 +2069,15 @@ mod tests {
             cache: real_dir(&dir.join("cache")).unwrap(),
             overlay: None,
             sandboxed: true,
+        }
+    }
+
+    impl Jail {
+        /// The `sandbox-exec` profile, on any OS
+        fn profile(&self) -> Result<String, String> {
+            let sandbox = Sandbox::seatbelt(self.policy(Backend::Seatbelt)?);
+            let sandbox = sandbox.map_err(|e| e.to_string())?;
+            Ok(sandbox.argv()[2].to_string_lossy().into_owned())
         }
     }
 
@@ -2869,8 +2571,8 @@ mod tests {
         assert!(profile.contains(
             r#"(deny file-read* (require-all (regex #"^/dev/ttys[0-9]+$") (require-not (extension "com.apple.sandbox.pty"))))"#
         ));
-        let xcrun = xcrun_db().map_or(String::new(), |p| format!(" (literal \"{}\")", p.display()));
-        assert!(profile.contains(&format!("(subpath \"/j/repo\") {paths}{xcrun})")));
+        let xcrun = xcrun_db().map_or(String::new(), |p| format!(" (subpath \"{}\")", p.display()));
+        assert!(profile.contains(&format!("(subpath \"/j/repo\"){xcrun} {paths})")));
         assert_eq!(xcrun.ends_with("/xcrun_db\")"), cfg!(target_os = "macos"));
         assert!(profile.contains("(deny network-outbound (remote unix-socket))\n"));
         assert!(profile.contains(
@@ -2880,7 +2582,9 @@ mod tests {
         assert!(profile.contains("(deny mach-lookup)\n(allow mach-lookup (global-name"));
         assert!(!profile.contains("SecurityServer") && !profile.contains("launchservicesd"));
         let bad = Jail {
-            writable: vec![PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]))],
+            writable: vec![PathBuf::from(std::ffi::OsString::from_vec(
+                b"/\xff".to_vec(),
+            ))],
             readable: Vec::new(),
             home: "/j".into(),
             cache: "/j".into(),
@@ -2898,42 +2602,47 @@ mod tests {
 
     #[test]
     fn bwrap_hides_the_hosts_sockets_and_home_and_binds_the_jail() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = real_dir(&dir.path().join("clone")).unwrap();
+        let home = real_dir(&dir.path().join("home")).unwrap();
         let jail = Jail {
-            writable: vec!["/j/clone".into(), "/j/home".into()],
+            writable: vec![clone.clone(), home.clone()],
             readable: Vec::new(),
-            home: "/j/home".into(),
-            cache: "/j/home".into(),
+            home: home.clone(),
+            cache: home.clone(),
             overlay: None,
             sandboxed: true,
         };
-        let args: Vec<String> = jail
-            .bwrap_args()
-            .unwrap()
+        let sandbox = Sandbox::bwrap(jail.policy(Backend::Bwrap).unwrap()).unwrap();
+        let args: Vec<String> = sandbox
+            .argv()
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let all = args.join(" ");
-        assert_eq!(args[..3], ["--ro-bind", "/", "/"]);
-        for flag in [
-            "--unshare-pid",
-            "--new-session",
-            "--tmpfs /tmp",
-            "--tmpfs /run",
-        ] {
+        assert_eq!(args[..4], ["bwrap", "--ro-bind", "/", "/"]);
+
+        for flag in ["--unshare-pid", "--new-session"] {
             assert!(all.contains(flag), "{flag}");
         }
 
-        if Path::new("/var/tmp").is_dir() && !Path::new("/var/tmp").is_symlink() {
-            assert!(all.contains("--tmpfs /var/tmp"), "{all}");
+        // New empty temp dirs, so no Unix socket of the host is in reach by path
+        for dir in ["/tmp", "/run", "/var/tmp"].map(PathBuf::from) {
+            if dir.is_dir() {
+                let dir = resolved(dir);
+                assert!(all.contains(&format!("--tmpfs {}", dir.display())), "{all}");
+            }
         }
 
         let user = resolved(crate::run::user_dir());
         assert!(all.contains(&format!("--tmpfs {}", user.display())));
         assert!(!all.contains("--share-net") && !all.contains("--unshare-net"));
-        assert!(all.ends_with(&format!(
-            "--bind /j/clone /j/clone --bind /j/home /j/home --remount-ro {}",
-            user.display()
-        )));
+
+        for path in [&clone, &home] {
+            assert!(all.contains(&format!("--bind {0} {0}", path.display())));
+        }
+
+        assert!(all.ends_with(&format!("--remount-ro {} --", user.display())));
     }
 
     #[test]
@@ -3202,22 +2911,6 @@ mod tests {
     }
 
     #[test]
-    fn names_the_apparmor_fix_for_bwrap() {
-        let missing = userns_fix(Some("1\n"), false);
-        assert!(
-            missing.contains(
-                "cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/"
-            ),
-            "{missing}"
-        );
-        assert!(missing.contains("apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict"));
-        assert!(!missing.contains("sysctl"));
-        assert!(userns_fix(Some("1"), true).contains("is not loaded"));
-        assert!(userns_fix(None, false).contains("max_user_namespaces"));
-        assert!(userns_fix(Some("0"), false).contains("max_user_namespaces"));
-    }
-
-    #[test]
     #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_branch_run_never_sees_what_another_branch_run_left_in_the_cache() {
         for overlay in modes() {
@@ -3432,8 +3125,8 @@ mod tests {
         let cache = cache_dir(Some(&repo_id));
         let runs = cache.join("runs");
         fs::create_dir_all(cache.join("base/cargo")).unwrap();
-        fs::create_dir_all(runs.join(".probe-old/lower")).unwrap();
-        fs::create_dir_all(runs.join(".probe-new/lower")).unwrap();
+        fs::create_dir_all(runs.join(".sandbox-jail-probe-old/lower")).unwrap();
+        fs::create_dir_all(runs.join(".sandbox-jail-probe-new/lower")).unwrap();
         fs::write(runs.join(".new-dead"), "").unwrap();
         fs::write(runs.join(".new-young"), "").unwrap();
         let live = fs::File::create(runs.join(".new-live")).unwrap();
@@ -3441,7 +3134,7 @@ mod tests {
         assert!(
             Command::new("touch")
                 .args(["-t", "200001010000"])
-                .arg(runs.join(".probe-old"))
+                .arg(runs.join(".sandbox-jail-probe-old"))
                 .arg(runs.join(".new-dead"))
                 .arg(runs.join(".new-live"))
                 .status()
@@ -3461,8 +3154,8 @@ mod tests {
         let gone = |p: &str| fs::symlink_metadata(cache.join(p)).is_err();
         let (branches, old, new, dead, kept) = (
             gone("branches"),
-            gone("runs/.probe-old"),
-            gone("runs/.probe-new"),
+            gone("runs/.sandbox-jail-probe-old"),
+            gone("runs/.sandbox-jail-probe-new"),
             gone("runs/.new-dead"),
             !gone("runs/.new-live") && !gone("runs/.new-young"),
         );
@@ -3963,7 +3656,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_check_cannot_run_a_setuid_binary() {
-        assert!(setuid().contains(&PathBuf::from("/bin/ps")));
+        assert!(known::setuid_binaries().contains(&PathBuf::from("/bin/ps")));
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         let jail = jail(dir.path());
@@ -4110,13 +3803,17 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn setuid_binaries_outside_the_bin_dirs_are_denied_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let no_exec = jail(dir.path()).policy(Backend::Seatbelt).unwrap().no_exec;
+
         for path in [
             "/usr/libexec/authopen",
             "/usr/libexec/security_authtrampoline",
-            ARD_AGENT,
+            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent",
+            LAUNCHCTL,
         ] {
             if Path::new(path).exists() {
-                assert!(setuid().contains(&PathBuf::from(path)), "{path}");
+                assert!(no_exec.contains(&PathBuf::from(path)), "{path}");
             }
         }
     }
