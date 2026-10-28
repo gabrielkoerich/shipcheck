@@ -2468,17 +2468,20 @@ fn try_job(
         }
 
         let failed = outcome.exit.is_some_and(|e| e != 0) && outcome.unsupported_jobs.is_empty();
+        let mut invalid = false;
 
         // A failure of Docker's, such as a pull timeout, gets attempts of its own beside `retries`
-        if failed && !host && infra_left > 0 {
+        if failed && !host {
             let log = fs::read(&log_path).map_err(|e| e.to_string())?;
+            let log = String::from_utf8_lossy(&log);
+            invalid = crate::runner::act::invalid_workflow(&log);
 
-            if crate::runner::act::never_started(&String::from_utf8_lossy(&log)) {
+            if !invalid && infra_left > 0 && crate::runner::act::never_started(&log) {
                 (infra_left, before) = (infra_left - 1, before + 1);
             }
         }
 
-        if outcome.exit == Some(0) || attempts - before > ctx.plan.config.retries {
+        if outcome.exit == Some(0) || invalid || attempts - before > ctx.plan.config.retries {
             let log = fs::read(&log_path).map_err(|e| e.to_string())?;
             return Ok(JobRun {
                 exit: outcome.exit,
