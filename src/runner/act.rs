@@ -567,16 +567,7 @@ impl Engine for Docker {
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         cmd.arg("--secret-file").arg(secrets_copy.path());
-        // Parallel act processes cloning one action into one cache corrupt it, so each job has its own
-        let actions = actions_dir(Some(request.repo_id))
-            .join(request.file)
-            .join(request.job);
-        // act 0.2.89 copies an action into the job by the path as given and runs its post step by
-        // the cleaned one, so a `..` in SHIPCHECK_HOME failed every post step
-        fs::create_dir_all(&actions).map_err(|e| format!("{}: {e}", actions.display()))?;
-        let actions = actions
-            .canonicalize()
-            .map_err(|e| format!("{}: {e}", actions.display()))?;
+        let actions = job_actions(request)?;
 
         // Offline, act still clones a missing action but no longer fetches a cached one, which
         // would fail the run when GitHub does not answer. A damaged clone fails offline, so it fetches
@@ -914,8 +905,20 @@ fn actions_dir(repo_id: Option<&str>) -> PathBuf {
     repo_id.map_or(dir.clone(), |id| dir.join(id))
 }
 
+/// The job's own action cache, since parallel act processes cloning one action into one cache
+/// corrupt it. Canonical, since act 0.2.89 runs a post step by the cleaned path, so a `..` failed it
+pub(super) fn job_actions(request: &RunRequest) -> Result<PathBuf, String> {
+    let actions = actions_dir(Some(request.repo_id))
+        .join(request.file)
+        .join(request.job);
+    fs::create_dir_all(&actions).map_err(|e| format!("{}: {e}", actions.display()))?;
+    actions
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", actions.display()))
+}
+
 /// Whether every action act cloned into `dir`, one `<uses>@<ref>` folder each, still resolves its ref
-fn cached_actions_resolve(dir: &Path) -> bool {
+pub(super) fn cached_actions_resolve(dir: &Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return true;
     };

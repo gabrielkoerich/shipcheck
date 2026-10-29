@@ -72,8 +72,8 @@ macro_rules! gone {
  **/
 const JOB: &str = concat!(
     gone!(),
-    r#"p=$1 dir=$2 wf=$3 secrets=$4 cpus=$5 st=$6
-shift 6
+    r#"p=$1 dir=$2 wf=$3 secrets=$4 cpus=$5 st=$6 actions=$7
+shift 7
 vm() { colima ssh --profile "$p" -- "$@"; }
 listed() { colima list -j 2>/dev/null | grep -q "\"name\":\"$p\""; }
 if ! gone "$p" || listed; then
@@ -96,6 +96,10 @@ vm sh -c "$SETUP" || exit 125
   COPYFILE_DISABLE=1 tar --null -T "$st.list" --no-xattrs -cf -); echo "$?" > "$st"; } |
   vm sh -c 'tar -x -C "$HOME/w"' || exit 125
 [ "$(cat "$st")" = 0 ] || exit 125
+# Writable, since a post step copies the action over its read-only git packs again. A copy that
+# fails only costs act a clone, which it makes of any action it lacks
+(cd "$actions" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - .) |
+  vm sh -c 'mkdir -p "$HOME/.cache/act" && tar -x -C "$HOME/.cache/act" && chmod -R u+w "$HOME/.cache/act"'
 vm sh -c 'cat > "$HOME/sc/job.yml"' < "$wf" || exit 125
 vm sh -c 'mkfifo -m 600 "$HOME/sc/secrets"' || exit 125
 { vm sh -c 'cat > "$HOME/sc/secrets"' < "$secrets"; vm sh -c 'rm -f "$HOME/sc/secrets"'; } &
@@ -339,17 +343,14 @@ fn act_args(request: &RunRequest, labels: Vec<String>) -> Vec<String> {
 
 /**
  * Whether act, in a dry run on the Mac, says the job's `if:` skips it, so a skipped job boots no VM.
- * The dry run starts no container, so the image is a placeholder, and labels go to it and never to
- * `-self-hosted`, which would set up the job on the Mac itself
+ * The run also fetches the job's actions into its cache on the Mac, which only act here writes and
+ * the VM gets a copy of, so a job never changes what a later one runs. The dry run starts no
+ * container, so the image is a placeholder, and labels go to it and never to `-self-hosted`, which
+ * would set up the job on the Mac itself
  **/
-fn skipped_by_if(act: &Act, request: &RunRequest, workflow: &str) -> bool {
+fn skipped_by_if(act: &Act, request: &RunRequest, workflow: &str, actions: &Path) -> bool {
     let has_if = crate::workflow::load(workflow)
         .is_ok_and(|root| !yaml_rust2::Yaml::Hash(root)["jobs"][request.job]["if"].is_badvalue());
-
-    if !has_if {
-        return false;
-    }
-
     let mut cmd = Command::new("act");
     cmd.arg("workflow_dispatch")
         .arg("-W")
@@ -359,7 +360,13 @@ fn skipped_by_if(act: &Act, request: &RunRequest, workflow: &str) -> bool {
         .args(["-s", "GITHUB_TOKEN=", "--secret-file", "/dev/null"])
         .args(["--env-file", "/dev/null", "--var-file", "/dev/null"])
         .args(["--input-file", "/dev/null"])
+        .arg("--action-cache-path")
+        .arg(actions)
         .current_dir(request.run_dir);
+
+    if act::cached_actions_resolve(actions) {
+        cmd.arg("--action-offline-mode");
+    }
 
     for label in act
         .labels(request.file)
@@ -369,7 +376,8 @@ fn skipped_by_if(act: &Act, request: &RunRequest, workflow: &str) -> bool {
         cmd.arg("-P").arg(format!("{label}=shipcheck/dry-run"));
     }
 
-    act::skipped_by_if(clean_env(&mut cmd))
+    // It runs without an `if:` too, to fill the cache
+    act::skipped_by_if(clean_env(&mut cmd)) && has_if
 }
 
 /// act's verbose dry run of the job in its VM, which says whether act skipped it
@@ -410,7 +418,9 @@ impl Engine for Colima {
         let isolated = act::isolated(request, &act::run_tag(run_dir), false)?;
         fs::write(request.workflow, &isolated).map_err(|e| e.to_string())?;
 
-        if skipped_by_if(act, request, &isolated) {
+        let actions = act::job_actions(request)?;
+
+        if skipped_by_if(act, request, &isolated, &actions) {
             fs::write(
                 log_path,
                 "shipcheck: the job's `if:` skips it, so no VM started\n",
@@ -486,7 +496,12 @@ impl Engine for Colima {
         }
 
         let slot = slot.expect("a VM slot");
-        let args = act_args(request, act.labels(request.file));
+        let mut args = act_args(request, act.labels(request.file));
+
+        // The Mac's act just fetched every action, so the VM's never asks GitHub for one it has
+        if act::cached_actions_resolve(&actions) {
+            args.push("--action-offline-mode".into());
+        }
         let secrets = crate::secret::read(&crate::run::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
@@ -534,6 +549,7 @@ impl Engine for Colima {
             .arg(secrets_copy.path())
             .arg(cpus.to_string())
             .arg(status.path())
+            .arg(&actions)
             .args(&args)
             .env("SETUP", SETUP)
             .stdin(Stdio::null())
@@ -935,6 +951,7 @@ mod tests {
             let out = Command::new(crate::runner::posix_sh())
                 .args(["-c", JOB, "sh", "sc-abc", "/nowhere", "wf", "secrets", "2"])
                 .arg(dir.path().join("status"))
+                .arg(dir.path().join("actions"))
                 .env("PATH", &path)
                 .env("COLIMA_HOME", dir.path())
                 .env("SETUP", "true")
