@@ -624,6 +624,13 @@ enum Action {
     Queue,
 }
 
+/// Whether a check went in progress before `cutoff`, as GitHub writes times
+fn overdue(existing: &Checks, cutoff: &str) -> bool {
+    existing.values().any(|c| {
+        c.status == "in_progress" && !c.started_at.is_empty() && c.started_at.as_str() < cutoff
+    })
+}
+
 /// What to do with a head that has no completed `shipcheck` check. `cutoff` is the time before
 /// which an in-progress claim is stale, as GitHub writes times
 fn decide(existing: &Checks, local: bool, result: bool, may_run: bool, cutoff: &str) -> Action {
@@ -813,8 +820,26 @@ fn handle(
     let me = me(config);
     let may_run = config.run_misses && same_repo && me.is_some();
 
-    match decide(&existing, local, result.is_some(), may_run, &cutoff) {
+    // A claim this machine's own run left when it died holds nothing, so the head runs again now
+    let claims = if !local && background::died_here(repo, sha) {
+        Checks::new()
+    } else {
+        existing.clone()
+    };
+
+    match decide(&claims, local, result.is_some(), may_run, &cutoff) {
         Action::Local => {
+            // Past the time its jobs could take the run is stuck, and once stopped the next poll runs the head
+            if overdue(&existing, &cutoff) && background::running_here(repo, sha, false) {
+                println!(
+                    "{repo}#{number}: the run of {} went past {}s, stopping it",
+                    &sha[..12],
+                    stale_after(&plan.config)
+                );
+                background::stop_here(repo, sha);
+                return Ok(None);
+            }
+
             // A run that posts marks its own checks, a mark from here could land after its result
             if !background::running_here(repo, sha, true) {
                 background::mark(&send, &existing, sha, &names, true)?;
@@ -1043,6 +1068,19 @@ mod tests {
             decide(&none, false, false, false, cutoff),
             Action::Queue,
             "a fork's PR or run_misses = false never runs"
+        );
+    }
+
+    #[test]
+    fn a_run_past_its_time_is_overdue() {
+        let cutoff = "2026-10-23T09:00:00Z";
+        let at = |status, started| Checks::from([("shipcheck".into(), check(status, started))]);
+        assert!(overdue(&at("in_progress", "2026-10-23T08:59:59Z"), cutoff));
+        assert!(!overdue(&at("in_progress", "2026-10-23T09:00:00Z"), cutoff));
+        assert!(!overdue(&at("queued", ""), cutoff));
+        assert!(
+            !overdue(&at("completed", "2026-10-23T08:00:00Z"), cutoff),
+            "a finished check is no run"
         );
     }
 

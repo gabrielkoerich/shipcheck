@@ -228,6 +228,50 @@ pub fn running_here(repo_id: &str, sha: &str, posting: bool) -> bool {
         })
 }
 
+/// The processes this machine's records list for `sha`, under any branch or PR
+fn listed_runs(repo_id: &str, sha: &str) -> Vec<String> {
+    let dir = run::home().join("background").join(repo_id);
+
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    match (fields.next(), fields.next()) {
+                        (Some(pid), Some(s)) if s == sha => Some(pid.to_string()),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Whether some run of `sha` started here and none still goes
+fn all_ended(pids: &[String], alive: impl Fn(&str) -> bool) -> bool {
+    !pids.is_empty() && !pids.iter().any(|p| alive(p))
+}
+
+/// Whether this machine ran `sha` and every such run ended, so a claim one left holds nothing
+pub fn died_here(repo_id: &str, sha: &str) -> bool {
+    all_ended(&listed_runs(repo_id, sha), our_run)
+}
+
+/// Stops the runs of `sha` that still go on this machine
+pub fn stop_here(repo_id: &str, sha: &str) {
+    for pid in listed_runs(repo_id, sha) {
+        if our_run(&pid)
+            && let Ok(pid) = pid.parse()
+        {
+            crate::runner::signal_group(pid, libc::SIGTERM);
+        }
+    }
+}
+
 /// Whether a record still lists process `pid`, which a newer commit's run removes
 pub fn listed(record: &str, pid: u32) -> bool {
     let pid = pid.to_string();
@@ -833,6 +877,17 @@ mod tests {
             fake.posts()
                 .iter()
                 .all(|(_, status, _)| status == "in_progress")
+        );
+    }
+
+    #[test]
+    fn a_claim_is_dead_only_when_every_run_of_the_head_here_ended() {
+        let alive = |pid: &str| pid == "7";
+        assert!(all_ended(&["5".into(), "6".into()], alive));
+        assert!(!all_ended(&["5".into(), "7".into()], alive));
+        assert!(
+            !all_ended(&[], alive),
+            "a head this machine never ran may be another machine's claim"
         );
     }
 
