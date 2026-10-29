@@ -17,11 +17,8 @@ fn stale_after(config: &crate::config::RepoConfig) -> u64 {
     config.timeout_minutes * 60 * (u64::from(config.retries) + 1) + 600
 }
 
-/// How long a run may make no progress before it counts as stuck. A job that prints nothing still
-/// goes until its own timeout, so the limit is longer than any one job may take
-fn quiet_after(config: &crate::config::RepoConfig) -> Duration {
-    Duration::from_secs(config.timeout_minutes * 60 + 300)
-}
+/// How long a run may make no progress, no log growing and no wait for a run slot, before it counts as stuck
+const QUIET: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -838,8 +835,7 @@ fn handle(
             // A run past the time its jobs could take, or with no progress for a while, is stuck.
             // Once it is stopped, the next poll runs the head again
             if background::running_here(repo, sha, false)
-                && (overdue(&existing, &cutoff)
-                    || background::stuck_here(repo, sha, quiet_after(&plan.config)))
+                && (overdue(&existing, &cutoff) || background::stuck_here(repo, sha, QUIET))
             {
                 println!(
                     "{repo}#{number}: the run of {} is stuck, stopping it",
@@ -1043,18 +1039,6 @@ mod tests {
         config.timeout_minutes = 10;
         config.retries = 0;
         assert_eq!(stale_after(&config), 20 * 60);
-    }
-
-    #[test]
-    fn a_quiet_run_is_stuck_only_after_a_job_could_have_timed_out() {
-        let mut config: crate::config::RepoConfig = toml::from_str("").unwrap();
-        assert_eq!(
-            quiet_after(&config),
-            Duration::from_secs(35 * 60),
-            "30 by default"
-        );
-        config.timeout_minutes = 10;
-        assert_eq!(quiet_after(&config), Duration::from_secs(15 * 60));
     }
 
     #[test]
