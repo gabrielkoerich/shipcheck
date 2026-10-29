@@ -150,8 +150,17 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("ci.yml/e2e: success"), "{text}");
     assert!(text.contains("host/test: success"), "{text}");
-    assert!(ours().is_empty(), "a VM was left: {:?}", ours());
-    assert!(walk(&home.join("colima")).is_empty(), "a record was left");
+    // The reaper deletes the VM after the result is back
+    let passed = Instant::now();
+
+    while !ours().is_empty() || !walk(&home.join("colima")).is_empty() {
+        assert!(
+            passed.elapsed() < Duration::from_secs(120),
+            "a VM or its record was left: {:?}",
+            ours()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
     // Killed while the VM runs, the reaper still deletes it
     fs::write(work.join("slow.txt"), "listen").unwrap();

@@ -72,8 +72,8 @@ macro_rules! gone {
  **/
 const JOB: &str = concat!(
     gone!(),
-    r#"p=$1 dir=$2 wf=$3 secrets=$4 dry=$5 cpus=$6 st=$7
-shift 7
+    r#"p=$1 dir=$2 wf=$3 secrets=$4 cpus=$5 st=$6
+shift 6
 vm() { colima ssh --profile "$p" -- "$@"; }
 listed() { colima list -j 2>/dev/null | grep -q "\"name\":\"$p\""; }
 if ! gone "$p" || listed; then
@@ -99,12 +99,7 @@ vm sh -c "$SETUP" || exit 125
 vm sh -c 'cat > "$HOME/sc/job.yml"' < "$wf" || exit 125
 vm sh -c 'mkfifo -m 600 "$HOME/sc/secrets"' || exit 125
 { vm sh -c 'cat > "$HOME/sc/secrets"' < "$secrets"; vm sh -c 'rm -f "$HOME/sc/secrets"'; } &
-code=0
-vm sh -c 'cd "$HOME/w" && exec act "$@" --secret-file ../sc/secrets' sh "$@" || code=$?
-if [ "$code" = 0 ]; then
-  vm sh -c 'cd "$HOME/w" && exec act "$@" --secret-file /dev/null --dryrun --verbose' sh "$@" > "$dry" 2>/dev/null || true
-fi
-exit "$code"
+vm sh -c 'cd "$HOME/w" && exec act "$@" --secret-file ../sc/secrets' sh "$@"
 "#
 );
 
@@ -377,6 +372,20 @@ fn skipped_by_if(act: &Act, request: &RunRequest, workflow: &str) -> bool {
     act::skipped_by_if(clean_env(&mut cmd))
 }
 
+/// act's verbose dry run of the job in its VM, which says whether act skipped it
+fn dry_run(profile: &str, args: &[String]) -> String {
+    clean_env(&mut Command::new("colima"))
+        .args(["ssh", "--profile", profile, "--", "sh", "-c"])
+        .arg(r#"cd "$HOME/w" && exec act "$@" --secret-file /dev/null --dryrun --verbose"#)
+        .arg("sh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
 impl Engine for Colima {
     fn name(&self) -> &'static str {
         "colima"
@@ -481,7 +490,6 @@ impl Engine for Colima {
         let secrets = crate::secret::read(&crate::run::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
-        let dry = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         let status = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         // Split between the VMs that may run at once, since each compile in an 8 GB VM takes memory
         let cpus = std::thread::available_parallelism().map_or(2, |n| {
@@ -524,7 +532,6 @@ impl Engine for Colima {
             .arg(run_dir)
             .arg(request.workflow)
             .arg(secrets_copy.path())
-            .arg(dry.path())
             .arg(cpus.to_string())
             .arg(status.path())
             .args(&args)
@@ -572,20 +579,16 @@ impl Engine for Colima {
             }
         });
 
-        let deleted = delete(&profile);
+        let log = fs::read(log_path).map(|l| String::from_utf8_lossy(&l).into_owned());
+        // Only a job that never reached its first step can be one act skipped, as on docker
+        let dry = match (&exit, &log) {
+            (Ok(Some(0)), Ok(log)) if !log.contains("shipcheck-start ") => dry_run(&profile, &args),
+            _ => String::new(),
+        };
 
-        if deleted {
-            let _ = fs::remove_file(&record);
-        }
-
-        if let Some(stdin) = reaper.stdin.as_mut()
-            && deleted
-        {
-            let _ = writeln!(stdin, "done");
-        }
-
+        // The reaper deletes the VM after the result is back, holding its locks until it is gone
         drop(reaper.stdin.take());
-        let _ = reaper.wait();
+        std::thread::spawn(move || reaper.wait());
 
         // `--activate=false` keeps the context, still one that colima switched to this VM goes back
         if let Some(before) = context.filter(|c| !c.starts_with("colima-sc-"))
@@ -605,20 +608,7 @@ impl Engine for Colima {
             ));
         }
 
-        if !deleted {
-            let mut log = fs::OpenOptions::new()
-                .append(true)
-                .open(log_path)
-                .map_err(|e| e.to_string())?;
-            let _ = writeln!(
-                log,
-                "shipcheck: could not delete the VM {profile}, a later run deletes it first"
-            );
-        }
-
-        let log =
-            String::from_utf8_lossy(&fs::read(log_path).map_err(|e| e.to_string())?).into_owned();
-        let dry = fs::read_to_string(dry.path()).unwrap_or_default();
+        let log = log.map_err(|e| e.to_string())?;
 
         Ok(Outcome {
             exit,
@@ -636,8 +626,18 @@ impl Engine for Colima {
     fn reclaim(&self, run_dir: &Path) {
         let name = profile(run_dir);
         let record = records().join(&name);
+        // A reaper still deleting the VM holds its lock, a dead run's VM has none
+        let free = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(
+                crate::run::home()
+                    .join("locks")
+                    .join(format!("colima-{name}.lock")),
+            )
+            .is_ok_and(|f| f.try_lock().is_ok());
 
-        if record.exists() && delete(&name) {
+        if record.exists() && free && delete(&name) {
             let _ = fs::remove_file(record);
         }
     }
@@ -933,9 +933,7 @@ mod tests {
             fs::set_permissions(dir.path().join("colima"), fs::Permissions::from_mode(0o755))
                 .unwrap();
             let out = Command::new(crate::runner::posix_sh())
-                .args([
-                    "-c", JOB, "sh", "sc-abc", "/nowhere", "wf", "secrets", "dry", "2",
-                ])
+                .args(["-c", JOB, "sh", "sc-abc", "/nowhere", "wf", "secrets", "2"])
                 .arg(dir.path().join("status"))
                 .env("PATH", &path)
                 .env("COLIMA_HOME", dir.path())
