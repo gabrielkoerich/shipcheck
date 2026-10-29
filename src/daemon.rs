@@ -256,6 +256,7 @@ pub fn serve(home_ok: bool) -> ! {
             }
         }
 
+        background::reap();
         std::thread::sleep(Duration::from_secs(config.interval_seconds));
     }
 }

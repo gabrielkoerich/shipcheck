@@ -129,7 +129,7 @@ fn tail_of(log: &str) -> String {
     tail
 }
 
-fn mask(mut text: String, secrets: &[String]) -> String {
+pub fn mask(mut text: String, secrets: &[String]) -> String {
     for secret in secrets {
         text = text.replace(secret.as_str(), "***");
     }
@@ -460,6 +460,22 @@ pub fn body(sha: &str, entry: &Entry, logs: Option<(&Path, &[String])>) -> Value
     }
 
     body
+}
+
+/// A failed check for a run that stopped before it had a result, with the error as its log
+pub fn errored(name: &str, sha: &str, error: &str) -> Value {
+    json!({
+        "name": name,
+        "head_sha": sha,
+        "status": "completed",
+        "conclusion": "failure",
+        "completed_at": iso(crate::run::unix_now()),
+        "output": {
+            "title": "could not run",
+            "summary": "shipcheck stopped before this commit's checks ran. The text below says why.",
+            "text": clip(error.to_string()),
+        },
+    })
 }
 
 /// Unix seconds as the UTC ISO 8601 time GitHub takes, by Howard Hinnant's days-to-civil algorithm

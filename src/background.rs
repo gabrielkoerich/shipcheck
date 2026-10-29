@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -271,6 +272,16 @@ fn our_run(pid: &str) -> bool {
     )
 }
 
+// The runs this process started, a child nobody waits on stays a zombie under a long-lived daemon
+static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+/// Waits on the runs this process started that have ended
+pub fn reap() {
+    if let Ok(mut children) = CHILDREN.lock() {
+        children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+    }
+}
+
 fn spawn(
     cwd: &Path,
     plan: &Plan,
@@ -309,7 +320,14 @@ fn spawn(
         .process_group(0)
         .spawn()
         .map_err(|e| e.to_string())?;
-    Ok(child.id())
+    let pid = child.id();
+    reap();
+
+    if let Ok(mut children) = CHILDREN.lock() {
+        children.push(child);
+    }
+
+    Ok(pid)
 }
 
 /// What a background run passes to its own binary, which the binary's tests parse
@@ -445,12 +463,27 @@ pub fn post_run(
                 .unwrap_or_default();
             (entry, ids)
         }
-        None => std::thread::scope(|s| {
-            let marks = s.spawn(|| marked(true));
-            let entry = run();
-            let ids = marks.join().unwrap_or_default();
-            entry.map(|e| (e, ids))
-        })?,
+        None => {
+            let (entry, ids) = std::thread::scope(|s| {
+                let marks = s.spawn(|| marked(true));
+                let entry = run();
+                (entry, marks.join().unwrap_or_default())
+            });
+
+            match entry {
+                Ok(entry) => (entry, ids),
+                // Left in progress, the checks would read as another machine's claim until it went stale
+                Err(e) => {
+                    if current() {
+                        let bodies: Vec<Value> =
+                            names.iter().map(|n| check::errored(n, sha, &e)).collect();
+                        let _ = retry(waits, || finish(send, &bodies, &ids));
+                    }
+
+                    return Err(e);
+                }
+            }
+        }
     };
 
     if !current() {
@@ -494,6 +527,7 @@ mod tests {
     struct Fake {
         unknown: Mutex<usize>,
         posts: Mutex<Vec<(String, String, Option<u64>)>>,
+        bodies: Mutex<Vec<Value>>,
     }
 
     impl Fake {
@@ -501,6 +535,7 @@ mod tests {
             Fake {
                 unknown: Mutex::new(unknown),
                 posts: Mutex::new(Vec::new()),
+                bodies: Mutex::new(Vec::new()),
             }
         }
 
@@ -515,6 +550,7 @@ mod tests {
                 );
             }
 
+            self.bodies.lock().unwrap().push(body.clone());
             let mut posts = self.posts.lock().unwrap();
             posts.push((
                 body["name"].as_str().unwrap().into(),
@@ -526,6 +562,10 @@ mod tests {
 
         fn posts(&self) -> Vec<(String, String, Option<u64>)> {
             self.posts.lock().unwrap().clone()
+        }
+
+        fn bodies(&self) -> Vec<Value> {
+            self.bodies.lock().unwrap().clone()
         }
     }
 
@@ -737,6 +777,81 @@ mod tests {
                 ("shipcheck".into(), "completed".into(), Some(7)),
             ]
         );
+    }
+
+    #[test]
+    fn a_run_that_could_not_run_fails_its_checks_with_the_error() {
+        let fake = Fake::new(0);
+        let got = post_run(
+            &|b, id| fake.send(b, id),
+            &|| Ok(Checks::new()),
+            &"a".repeat(40),
+            &names(),
+            None,
+            || Err("docker version failed, is a Docker engine running?".into()),
+            finals,
+            || true,
+            &[],
+        );
+        assert!(got.unwrap_err().contains("docker version failed"));
+        let posts = fake.posts();
+        assert_eq!(
+            posts[2..],
+            [
+                ("shipcheck/test".into(), "completed".into(), Some(101)),
+                ("shipcheck".into(), "completed".into(), Some(102)),
+            ],
+            "every check it marked running ends, or the daemon waits on it as a claim"
+        );
+        assert!(
+            fake.bodies()
+                .iter()
+                .filter(|b| b["status"] == "completed")
+                .all(|b| b["conclusion"] == "failure"
+                    && b["output"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("docker version failed")))
+        );
+    }
+
+    #[test]
+    fn a_replaced_run_that_could_not_run_leaves_the_checks_to_the_newer_one() {
+        let fake = Fake::new(0);
+        let got = post_run(
+            &|b, id| fake.send(b, id),
+            &|| Ok(Checks::new()),
+            &"a".repeat(40),
+            &names(),
+            None,
+            || Err("no docker".into()),
+            finals,
+            || false,
+            &[],
+        );
+        assert!(got.is_err());
+        assert!(
+            fake.posts()
+                .iter()
+                .all(|(_, status, _)| status == "in_progress")
+        );
+    }
+
+    #[test]
+    fn reap_waits_on_ended_runs() {
+        let child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        CHILDREN.lock().unwrap().push(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let listed = || CHILDREN.lock().unwrap().iter().any(|c| c.id() == pid);
+
+        while listed() {
+            assert!(std::time::Instant::now() < deadline, "true must end");
+            reap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A zombie still answers signal 0, a reaped process does not
+        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
     }
 
     #[test]

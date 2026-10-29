@@ -1113,7 +1113,9 @@ fn posting_run(
 ) -> Result<Option<run::Entry>, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    let record = background::record(&run::repo_id(&plan.repo)?, name);
+    let repo = run::repo_id(&plan.repo)?;
+    let record = background::record(&repo, name);
+    let secrets = run::secret_values(&repo).unwrap_or_default();
     let pid = std::process::id();
     let first = AtomicU64::new(0);
     let cached = run::lookup(plan).filter(|e| e.passed);
@@ -1148,7 +1150,9 @@ fn posting_run(
                     Ok(entry)
                 }
                 None => {
-                    let mut entry = run::run(plan, &mut |line| say(&run::printable(line)))?;
+                    // The error becomes the checks' log, so it gets the masking a job log gets
+                    let mut entry = run::run(plan, &mut |line| say(&run::printable(line)))
+                        .map_err(|e| check::mask(e, &secrets))?;
 
                     // A fresh pass is checked like a stored one before it is posted, and fails closed
                     if entry.passed && !run::holds(plan, &entry) {
