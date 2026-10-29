@@ -47,50 +47,87 @@ mkdir -p "$HOME/w" "$HOME/sc"
 const NOT_STARTED: i32 = 125;
 
 /**
- * `gone`, which deletes a profile's VM and then its data disk. colima makes the disk before the VM,
- * and when VZ fails to create the VM its delete ignores the missing VM and keeps the disk. colima's
- * home is `$COLIMA_HOME`, else `~/.colima` when it exists, else `~/.config/colima`
+ * colima's home is `$COLIMA_HOME`, else `~/.colima` when it exists, else `~/.config/colima`. `gone`
+ * deletes a profile's VM and then its data disk: colima makes the disk before the VM, and when VZ
+ * fails to create the VM its delete ignores the missing VM and keeps the disk. `clone` copies a
+ * stopped VM, its data disk and colima's state for it, copy-on-write where the file system can
  **/
-macro_rules! gone {
+macro_rules! vms {
     () => {
-        r#"gone() {
-  colima delete --force --data --profile "$1" || return 1
+        r#"home() {
   h=${COLIMA_HOME:-$HOME/.colima}
   [ -n "${COLIMA_HOME:-}" ] || [ -d "$h" ] || h=$HOME/.config/colima
-  LIMA_HOME=$h/_lima limactl disk delete "colima-$1"
+  echo "$h"
+}
+gone() {
+  colima delete --force --data --profile "$1" || return 1
+  LIMA_HOME=$(home)/_lima limactl disk delete "colima-$1"
+}
+start() {
+  colima start --profile "$1" --mount none --port-forwarder none --activate=false \
+    --ssh-config=false --ssh-agent=false --template=false --save-config=false --runtime docker \
+    --cpus "$2" --memory 8
+}
+clone() {
+  l=$(home)/_lima
+  LIMA_HOME=$l limactl clone "colima-$1" "colima-$2" >/dev/null 2>&1 &&
+    { cp -cR "$l/_disks/colima-$1" "$l/_disks/colima-$2" 2>/dev/null ||
+      cp -R --reflink=auto "$l/_disks/colima-$1" "$l/_disks/colima-$2"; } &&
+    sed "s/name: colima-$1\$/name: colima-$2/" "$l/colima-$2/lima.yaml" > "$l/colima-$2/lima.new" &&
+    mv "$l/colima-$2/lima.new" "$l/colima-$2/lima.yaml" &&
+    cp "$(home)/_store/colima-$1.json" "$(home)/_store/colima-$2.json"
 }
 "#
     };
 }
 
+/// Starts the base, sets it up and stops it, and deletes it when any of that fails
+const BASE: &str = concat!(
+    vms!(),
+    r#"p=$1 cpus=$2
+gone "$p" || exit 1
+start "$p" "$cpus" && colima ssh --profile "$p" -- sh -c "$SETUP" && colima stop --profile "$p" && exit 0
+gone "$p"
+exit 1
+"#
+);
+
 /**
  * Deletes the VM and disk a dead run or a failed start left at this profile, which its job could
- * have changed, then starts the VM, sets it up, and streams the checkout's tracked files as they
- * are on disk, which hold the base's workflows, with its `.git`. The tracked files are read from
- * disk, never `git archive`, which a commit's `export-subst` rewrites. act reads the secrets once
- * from a FIFO, which then goes
+ * have changed, then starts a clone of the base, or a new VM that it sets up, and streams the
+ * checkout's tracked files as they are on disk, which hold the base's workflows, with its `.git`.
+ * The tracked files are read from disk, never `git archive`, which a commit's `export-subst`
+ * rewrites. act reads the secrets once from a FIFO, which then goes
  **/
 const JOB: &str = concat!(
-    gone!(),
-    r#"p=$1 dir=$2 wf=$3 secrets=$4 cpus=$5 st=$6 actions=$7
-shift 7
+    vms!(),
+    r#"p=$1 dir=$2 wf=$3 secrets=$4 cpus=$5 st=$6 actions=$7 base=$8
+shift 8
 vm() { colima ssh --profile "$p" -- "$@"; }
 listed() { colima list -j 2>/dev/null | grep -q "\"name\":\"$p\""; }
 if ! gone "$p" || listed; then
   echo "shipcheck: the VM $p a dead run left would not delete"
   exit 125
 fi
+fresh=1
+if [ -n "$base" ]; then
+  if clone "$base" "$p"; then
+    fresh=0
+  else
+    echo "shipcheck: could not clone the VM $base, starting a new one"
+    gone "$p" || exit 125
+  fi
+fi
 # VZ sometimes fails to create a new VM, and a new one after a delete starts
 n=1
-until colima start --profile "$p" --mount none --port-forwarder none --activate=false \
-  --ssh-config=false --ssh-agent=false --template=false --save-config=false --runtime docker \
-  --cpus "$cpus" --memory 8; do
+until start "$p" "$cpus"; do
   [ "$n" -lt 3 ] || exit 125
   n=$((n + 1))
   echo "shipcheck: the VM $p did not start, deleting it for start $n of 3"
   gone "$p" || exit 125
+  fresh=1
 done
-vm sh -c "$SETUP" || exit 125
+[ "$fresh" = 0 ] || vm sh -c "$SETUP" || exit 125
 # POSIX sh has no pipefail, so tar's status comes back through a file
 { (cd "$dir" && git ls-files -z > "$st.list" && printf '.git\0.github/workflows\0' >> "$st.list" &&
   COPYFILE_DISABLE=1 tar --null -T "$st.list" --no-xattrs -cf -); echo "$?" > "$st"; } |
@@ -112,7 +149,7 @@ vm sh -c 'cd "$HOME/w" && exec act "$@" --secret-file ../sc/secrets' sh "$@"
  * never said `exited`, since after that the group id can belong to another process
  **/
 const REAPER: &str = concat!(
-    gone!(),
+    vms!(),
     r#"read -r pgid || pgid=
 read -r state || state=
 [ "$state" = done ] && exit 0
@@ -190,7 +227,7 @@ pub fn version() -> Result<String, String> {
 
 fn delete(profile: &str) -> bool {
     clean_env(&mut Command::new("sh"))
-        .args(["-c", concat!(gone!(), r#"gone "$1""#), "sh", profile])
+        .args(["-c", concat!(vms!(), r#"gone "$1""#), "sh", profile])
         .stdin(Stdio::null())
         .output()
         .is_ok_and(|o| o.status.success())
@@ -221,6 +258,69 @@ fn is_profile(name: &str) -> bool {
     })
 }
 
+/// Whether a name is one `base_name` gives, `sc-base-` and 12 lowercase hex digits
+fn is_base(name: &str) -> bool {
+    name.strip_prefix("sc-base-")
+        .is_some_and(|h| is_profile(&format!("sc-{h}")))
+}
+
+/// The base of this home for colima, lima and `SETUP` as they are now
+fn base_name() -> Option<String> {
+    let identity = Colima.identity().ok()?;
+    let home = crate::run::home();
+    let hash = cache::hex(&Sha256::digest(format!("{}\n{identity}", home.display())));
+    Some(format!("sc-base-{}", &hash[..12]))
+}
+
+/**
+ * The stopped VM each job's VM is cloned from, made once from `SETUP` and never given a job, so a
+ * clone boots already set up. Its record says `ready` only once the base stopped, so a build that
+ * died is made again. A base of an older setup goes, a clone of it falls back to a new VM
+ **/
+fn base(cpus: u64, log: &fs::File) -> Option<String> {
+    let name = base_name()?;
+    let record = records().join(&name);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::run::home().join("locks").join("colima-base.lock"))
+        .ok()?;
+    lock.lock().ok()?;
+    let listed = profiles();
+
+    for old in listed
+        .iter()
+        .filter(|n| is_base(n) && **n != name && records().join(n).exists())
+    {
+        if delete(old) {
+            let _ = fs::remove_file(records().join(old));
+        }
+    }
+
+    if listed.contains(&name) && fs::read_to_string(&record).is_ok_and(|r| r == "ready") {
+        return Some(name);
+    }
+
+    fs::create_dir_all(records()).ok()?;
+    fs::write(&record, "").ok()?;
+    let built = clean_env(&mut Command::new("sh"))
+        .args(["-c", BASE, "sh", &name, &cpus.to_string()])
+        .env("SETUP", SETUP)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().ok()?)
+        .stderr(log.try_clone().ok()?)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !built {
+        let _ = fs::remove_file(&record);
+        return None;
+    }
+
+    fs::write(&record, "ready").ok()?;
+    Some(name)
+}
+
 /// Where this home records each VM it starts until the VM is deleted
 fn records() -> std::path::PathBuf {
     crate::run::home().join("colima")
@@ -237,10 +337,10 @@ fn ours(recorded: &[String], listed: &[String]) -> Vec<String> {
 
 /**
  * Deletes the VMs this home started that are still there, while no colima job runs here, which
- * the VM lock proves. A profile another home or another tool made, such as `sc-bench`, is never
- * recorded here, so it is never touched
+ * the VM lock proves, and its bases but `keep`. A profile another home or another tool made, such
+ * as `sc-bench`, is never recorded here, so it is never touched
  **/
-fn leftovers() -> Vec<String> {
+fn leftovers(keep: Option<&str>) -> Vec<String> {
     let recorded: Vec<String> = fs::read_dir(records())
         .into_iter()
         .flatten()
@@ -270,12 +370,17 @@ fn leftovers() -> Vec<String> {
 
     // A VM colima no longer lists can still have the disk of a start that failed
     for name in recorded.iter().filter(|n| !listed.contains(*n)) {
-        if !is_profile(name) || delete(name) {
+        if !(is_profile(name) || is_base(name)) || delete(name) {
             let _ = fs::remove_file(records().join(name));
         }
     }
 
-    for name in ours(&recorded, &listed) {
+    let bases = recorded
+        .iter()
+        .filter(|n| is_base(n) && listed.contains(*n) && Some(n.as_str()) != keep)
+        .cloned();
+
+    for name in ours(&recorded, &listed).into_iter().chain(bases) {
         if delete(&name) {
             let _ = fs::remove_file(records().join(&name));
             done.push(format!("removed the colima VM {name}"));
@@ -512,6 +617,8 @@ impl Engine for Colima {
         });
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
         let context = docker_context();
+        // Without a base the job starts a new VM and sets it up
+        let base = base(cpus, &log).unwrap_or_default();
 
         // Started first, so a shipcheck killed while the VM boots still leaves no VM. It holds the
         // slot's and the VM's locks, so no new run takes either while it deletes the VM
@@ -550,6 +657,7 @@ impl Engine for Colima {
             .arg(cpus.to_string())
             .arg(status.path())
             .arg(&actions)
+            .arg(&base)
             .args(&args)
             .env("SETUP", SETUP)
             .stdin(Stdio::null())
@@ -659,11 +767,12 @@ impl Engine for Colima {
     }
 
     fn prune(&self) -> Vec<String> {
-        leftovers()
+        leftovers(base_name().as_deref())
     }
 
-    fn clean(&self, _repo_id: Option<&str>) -> Vec<String> {
-        leftovers()
+    /// The base serves every repository, so only a clean of them all deletes it
+    fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
+        leftovers(repo_id.and_then(|_| base_name()).as_deref())
     }
 }
 
@@ -925,23 +1034,45 @@ mod tests {
         .unwrap();
         fs::set_permissions(&limactl, fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Each start goes after a delete of the VM and its disk, which a failed start can leave alone
-        for (fails, calls) in [
-            (0, "delete disk list start ssh"),
+        let lima = dir.path().join("_lima");
+        fs::create_dir_all(lima.join("_disks/colima-sc-base")).unwrap();
+        fs::create_dir_all(dir.path().join("_store")).unwrap();
+        fs::write(dir.path().join("_store/colima-sc-base.json"), "{}").unwrap();
+
+        // Each start goes after a delete of the VM and its disk, which a failed start can leave
+        // alone. A clone of the base is set up already, a new VM after a failed start is not
+        for (fails, base, calls) in [
+            (0, "", "delete disk list start ssh:true"),
             (
                 2,
-                "delete disk list start delete disk start delete disk start ssh",
+                "",
+                "delete disk list start delete disk start delete disk start ssh:true",
             ),
             (
                 3,
+                "",
                 "delete disk list start delete disk start delete disk start",
+            ),
+            (0, "sc-base", "delete disk list clone start ssh:tar"),
+            (
+                1,
+                "sc-base",
+                "delete disk list clone start delete disk start ssh:true",
             ),
         ] {
             let _ = fs::remove_file(&log);
             let _ = fs::remove_file(&count);
-            // ssh fails, so the job stops right after the start with the same code as a failed one
+            let _ = fs::remove_dir_all(lima.join("_disks/colima-sc-abc"));
+            // What `limactl clone` makes, which the fake does not
+            fs::create_dir_all(lima.join("colima-sc-abc")).unwrap();
+            fs::write(
+                lima.join("colima-sc-abc/lima.yaml"),
+                "additionalDisks:\n    - name: colima-sc-base\n",
+            )
+            .unwrap();
+            // ssh says the first word it runs and fails, so the job stops with the code of a failed start
             let fake = format!(
-                "#!/bin/sh\necho \"$1\" >> {log}\ncase \"$1\" in\n  start) n=$(($(cat {count} 2>/dev/null || echo 0) + 1)); echo \"$n\" > {count}; [ \"$n\" -gt {fails} ] ;;\n  list|delete) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1\" in\n  ssh) w=$7; echo \"ssh:${{w%% *}}\" >> {log}; exit 1 ;;\nesac\necho \"$1\" >> {log}\ncase \"$1\" in\n  start) n=$(($(cat {count} 2>/dev/null || echo 0) + 1)); echo \"$n\" > {count}; [ \"$n\" -gt {fails} ] ;;\n  list|delete) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
                 log = log.display(),
                 count = count.display()
             );
@@ -952,6 +1083,7 @@ mod tests {
                 .args(["-c", JOB, "sh", "sc-abc", "/nowhere", "wf", "secrets", "2"])
                 .arg(dir.path().join("status"))
                 .arg(dir.path().join("actions"))
+                .arg(base)
                 .env("PATH", &path)
                 .env("COLIMA_HOME", dir.path())
                 .env("SETUP", "true")
@@ -965,6 +1097,28 @@ mod tests {
             );
             let got = fs::read_to_string(&log).unwrap();
             assert_eq!(got.split_whitespace().collect::<Vec<_>>().join(" "), calls);
+
+            // The clone mounts a copy of the base's data disk, never the base's own
+            if !base.is_empty() && fails == 0 {
+                let yaml = fs::read_to_string(lima.join("colima-sc-abc/lima.yaml")).unwrap();
+                assert!(yaml.contains("name: colima-sc-abc\n"), "{yaml}");
+                assert!(lima.join("_disks/colima-sc-abc").is_dir());
+                assert!(dir.path().join("_store/colima-sc-abc.json").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn a_base_is_only_a_name_base_name_gives() {
+        assert!(is_base("sc-base-0123456789ab"));
+
+        for name in [
+            "sc-base-",
+            "sc-base-0123456789AB",
+            "sc-0123456789ab",
+            "sc-base",
+        ] {
+            assert!(!is_base(name), "{name}");
         }
     }
 
@@ -986,7 +1140,7 @@ mod tests {
 
             let _ = fs::remove_file(&log);
             let mut cmd = Command::new(crate::runner::posix_sh());
-            cmd.args(["-c", concat!(gone!(), r#"gone "$1""#), "sh", "sc-abc"])
+            cmd.args(["-c", concat!(vms!(), r#"gone "$1""#), "sh", "sc-abc"])
                 .env_clear()
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .env("HOME", &home);

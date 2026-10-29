@@ -242,7 +242,12 @@ impl Drop for CleanOnDrop {
                 && self.home.join("colima").join(vm).exists()
             {
                 let _ = Command::new("colima")
-                    .args(["delete", "--force", vm])
+                    .args(["delete", "--force", "--data", vm])
+                    .output();
+                let lima = std::env::home_dir().unwrap().join(".colima/_lima");
+                let _ = Command::new("limactl")
+                    .args(["disk", "delete", &format!("colima-{vm}")])
+                    .env("LIMA_HOME", lima)
                     .output();
             }
         }

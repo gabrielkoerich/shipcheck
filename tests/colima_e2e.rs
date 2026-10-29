@@ -74,7 +74,8 @@ fn ours() -> Vec<String> {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|v| v["name"].as_str().map(String::from))
-        .filter(|n| n.starts_with("sc-"))
+        // A base stays for the next job, only a job's VM must go
+        .filter(|n| n.starts_with("sc-") && !n.starts_with("sc-base-"))
         .collect()
 }
 
@@ -122,6 +123,19 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The records of job VMs in a home, without the base's, which stays
+fn job_records(home: &Path) -> Vec<PathBuf> {
+    walk(&home.join("colima"))
+        .into_iter()
+        .filter(|p| {
+            !p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("sc-base-")
+        })
+        .collect()
+}
+
 fn shipcheck(work: &Path, home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_shipcheck"));
     cmd.args(["run", "--sha", "HEAD", "--no-fetch"])
@@ -153,7 +167,7 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
     // The reaper deletes the VM after the result is back
     let passed = Instant::now();
 
-    while !ours().is_empty() || !walk(&home.join("colima")).is_empty() {
+    while !ours().is_empty() || !job_records(&home).is_empty() {
         assert!(
             passed.elapsed() < Duration::from_secs(120),
             "a VM or its record was left: {:?}",
@@ -161,6 +175,13 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    // The base the job's VM was cloned from stays, stopped and ready for the next job
+    let bases: Vec<_> = walk(&home.join("colima"))
+        .into_iter()
+        .filter(|p| fs::read_to_string(p).is_ok_and(|r| r == "ready"))
+        .collect();
+    assert_eq!(bases.len(), 1, "{bases:?}");
 
     // Killed while the VM runs, the reaper still deletes it
     fs::write(work.join("slow.txt"), "listen").unwrap();
@@ -218,11 +239,11 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
     }
 
     // The reaper removes its record once the delete succeeds
-    while !walk(&home.join("colima")).is_empty() {
+    while !job_records(&home).is_empty() {
         assert!(
             killed.elapsed() < Duration::from_secs(130),
             "a record was left: {:?}",
-            walk(&home.join("colima"))
+            job_records(&home)
         );
         std::thread::sleep(Duration::from_millis(200));
     }
