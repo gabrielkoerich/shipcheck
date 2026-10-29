@@ -47,18 +47,38 @@ mkdir -p "$HOME/w" "$HOME/sc"
 const NOT_STARTED: i32 = 125;
 
 /**
- * Deletes a VM a dead run left at this profile, whose disk its job could have changed, then starts
- * the VM, sets it up, and streams the checkout's tracked files as they are on disk, which hold the
- * base's workflows, with its `.git`. The tracked files are read from disk, never `git archive`,
- * which a commit's `export-subst` rewrites. act reads the secrets once from a FIFO, which then goes
+ * `gone`, which deletes a profile's VM and then its data disk. colima makes the disk before the VM,
+ * and when VZ fails to create the VM its delete ignores the missing VM and keeps the disk. colima's
+ * home is `$COLIMA_HOME`, else `~/.colima` when it exists, else `~/.config/colima`
  **/
-const JOB: &str = r#"p=$1 dir=$2 wf=$3 secrets=$4 dry=$5 cpus=$6 st=$7
+macro_rules! gone {
+    () => {
+        r#"gone() {
+  colima delete --force --data --profile "$1" || return 1
+  h=${COLIMA_HOME:-$HOME/.colima}
+  [ -n "${COLIMA_HOME:-}" ] || [ -d "$h" ] || h=$HOME/.config/colima
+  LIMA_HOME=$h/_lima limactl disk delete "colima-$1"
+}
+"#
+    };
+}
+
+/**
+ * Deletes the VM and disk a dead run or a failed start left at this profile, which its job could
+ * have changed, then starts the VM, sets it up, and streams the checkout's tracked files as they
+ * are on disk, which hold the base's workflows, with its `.git`. The tracked files are read from
+ * disk, never `git archive`, which a commit's `export-subst` rewrites. act reads the secrets once
+ * from a FIFO, which then goes
+ **/
+const JOB: &str = concat!(
+    gone!(),
+    r#"p=$1 dir=$2 wf=$3 secrets=$4 dry=$5 cpus=$6 st=$7
 shift 7
 vm() { colima ssh --profile "$p" -- "$@"; }
 listed() { colima list -j 2>/dev/null | grep -q "\"name\":\"$p\""; }
-if listed; then
-  colima delete --force --data --profile "$p" || true
-  if listed; then echo "shipcheck: the VM $p a dead run left would not delete"; exit 125; fi
+if ! gone "$p" || listed; then
+  echo "shipcheck: the VM $p a dead run left would not delete"
+  exit 125
 fi
 # VZ sometimes fails to create a new VM, and a new one after a delete starts
 n=1
@@ -68,7 +88,7 @@ until colima start --profile "$p" --mount none --port-forwarder none --activate=
   [ "$n" -lt 3 ] || exit 125
   n=$((n + 1))
   echo "shipcheck: the VM $p did not start, deleting it for start $n of 3"
-  colima delete --force --data --profile "$p" || exit 125
+  gone "$p" || exit 125
 done
 vm sh -c "$SETUP" || exit 125
 # POSIX sh has no pipefail, so tar's status comes back through a file
@@ -85,13 +105,16 @@ if [ "$code" = 0 ]; then
   vm sh -c 'cd "$HOME/w" && exec act "$@" --secret-file /dev/null --dryrun --verbose' sh "$@" > "$dry" 2>/dev/null || true
 fi
 exit "$code"
-"#;
+"#
+);
 
 /**
  * Deletes the VM unless shipcheck said `done` first, and kills the job's group only when shipcheck
  * never said `exited`, since after that the group id can belong to another process
  **/
-const REAPER: &str = r#"read -r pgid || pgid=
+const REAPER: &str = concat!(
+    gone!(),
+    r#"read -r pgid || pgid=
 read -r state || state=
 [ "$state" = done ] && exit 0
 if [ "$state" = exited ]; then
@@ -102,7 +125,7 @@ fi
 # The locks this reaper holds stay out of colima's processes, which could outlive it
 closed=
 for fd in $LOCK_FDS; do closed="$closed $fd>&-"; done
-eval "colima delete --force --data --profile \"\$1\" $closed" >/dev/null 2>&1 &
+eval "gone \"\$1\" $closed" >/dev/null 2>&1 &
 d=$!
 n=0
 limit=${DELETE_SECS:-120}
@@ -113,7 +136,8 @@ else
   # Its own group, which shipcheck started it in, so colima's limactl goes too, and this reaper last
   kill -s KILL 0
 fi
-"#;
+"#
+);
 
 /// Variables colima and lima read, and shipcheck's safe git config, nothing else of this user's
 fn clean_env(cmd: &mut Command) -> &mut Command {
@@ -166,8 +190,8 @@ pub fn version() -> Result<String, String> {
 }
 
 fn delete(profile: &str) -> bool {
-    clean_env(&mut Command::new("colima"))
-        .args(["delete", "--force", "--data", "--profile", profile])
+    clean_env(&mut Command::new("sh"))
+        .args(["-c", concat!(gone!(), r#"gone "$1""#), "sh", profile])
         .stdin(Stdio::null())
         .output()
         .is_ok_and(|o| o.status.success())
@@ -245,9 +269,11 @@ fn leftovers() -> Vec<String> {
     let listed = profiles();
     let mut done = Vec::new();
 
-    // A record of a VM colima no longer lists is stale
+    // A VM colima no longer lists can still have the disk of a start that failed
     for name in recorded.iter().filter(|n| !listed.contains(*n)) {
-        let _ = fs::remove_file(records().join(name));
+        if !is_profile(name) || delete(name) {
+            let _ = fs::remove_file(records().join(name));
+        }
     }
 
     for name in ours(&recorded, &listed) {
@@ -611,7 +637,7 @@ impl Engine for Colima {
         let name = profile(run_dir);
         let record = records().join(&name);
 
-        if record.exists() && (!profiles().contains(&name) || delete(&name)) {
+        if record.exists() && delete(&name) {
             let _ = fs::remove_file(record);
         }
     }
@@ -669,13 +695,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("colima.log");
-        let colima = dir.path().join("colima");
-        fs::write(
-            &colima,
-            format!("#!/bin/sh\necho \"$*\" >> {}\n", log.display()),
-        )
-        .unwrap();
-        fs::set_permissions(&colima, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for name in ["colima", "limactl"] {
+            let fake = dir.path().join(name);
+            fs::write(
+                &fake,
+                format!("#!/bin/sh\necho \"$*\" >> {}\n", log.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
 
         // What shipcheck wrote before it died or ended, whether the VM goes, and whether the group is killed
@@ -694,6 +724,7 @@ mod tests {
             let mut reaper = Command::new(crate::runner::posix_sh())
                 .args(["-c", REAPER, "sh", "sc-abc"])
                 .env("PATH", &path)
+                .env("COLIMA_HOME", dir.path())
                 .stdin(Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -714,7 +745,7 @@ mod tests {
 
             if deleted {
                 assert_eq!(
-                    calls, "delete --force --data --profile sc-abc\n",
+                    calls, "delete --force --data --profile sc-abc\ndisk delete colima-sc-abc\n",
                     "{lines:?}"
                 );
             } else {
@@ -763,14 +794,18 @@ mod tests {
                 },
                 log = log.display()
             );
-            fs::write(dir.path().join("colima"), fake).unwrap();
-            fs::set_permissions(dir.path().join("colima"), fs::Permissions::from_mode(0o755))
-                .unwrap();
+            for name in ["colima", "limactl"] {
+                fs::write(dir.path().join(name), &fake).unwrap();
+                fs::set_permissions(dir.path().join(name), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+
             // Its own group, as shipcheck starts it, since on a hung delete it kills its group
             let mut reaper = cmd
                 .args(["-c", REAPER, "sh", "sc-abc"])
                 .arg(&record)
                 .env("PATH", &path)
+                .env("COLIMA_HOME", dir.path())
                 .env("LOCK_FDS", "9")
                 // Long enough for a quick delete on a busy machine, short for a hung one
                 .env("DELETE_SECS", if hang { "2" } else { "30" })
@@ -785,10 +820,15 @@ mod tests {
                 started.elapsed() < Duration::from_secs(10),
                 "a hung delete held the reaper"
             );
+            let disk = if hang {
+                ""
+            } else {
+                "closed disk delete colima-sc-abc\n"
+            };
             assert_eq!(
                 fs::read_to_string(&log).unwrap(),
-                "closed delete --force --data --profile sc-abc\n",
-                "colima got the lock or another argument"
+                format!("closed delete --force --data --profile sc-abc\n{disk}"),
+                "colima or limactl got the lock or another argument"
             );
             assert_eq!(record.exists(), kept, "hang {hang}");
 
@@ -861,10 +901,25 @@ mod tests {
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
 
         // How many starts fail and the calls colima gets, with an ssh only once a start passed
+        let limactl = dir.path().join("limactl");
+        fs::write(
+            &limactl,
+            format!("#!/bin/sh\necho \"$1\" >> {}\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&limactl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Each start goes after a delete of the VM and its disk, which a failed start can leave alone
         for (fails, calls) in [
-            (0, "list start ssh"),
-            (2, "list start delete start delete start ssh"),
-            (3, "list start delete start delete start"),
+            (0, "delete disk list start ssh"),
+            (
+                2,
+                "delete disk list start delete disk start delete disk start ssh",
+            ),
+            (
+                3,
+                "delete disk list start delete disk start delete disk start",
+            ),
         ] {
             let _ = fs::remove_file(&log);
             let _ = fs::remove_file(&count);
@@ -883,6 +938,7 @@ mod tests {
                 ])
                 .arg(dir.path().join("status"))
                 .env("PATH", &path)
+                .env("COLIMA_HOME", dir.path())
                 .env("SETUP", "true")
                 .stdin(Stdio::null())
                 .output()
@@ -895,6 +951,57 @@ mod tests {
             let got = fs::read_to_string(&log).unwrap();
             assert_eq!(got.split_whitespace().collect::<Vec<_>>().join(" "), calls);
         }
+    }
+
+    #[test]
+    fn a_vm_a_failed_start_never_made_still_loses_its_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, home) = (dir.path().join("bin"), dir.path().join("home"));
+        let log = dir.path().join("calls.log");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let limactl = format!("#!/bin/sh\necho \"$LIMA_HOME $*\" >> {}\n", log.display());
+        let elsewhere = dir.path().join("elsewhere");
+        let gone = |colima: &str, colima_home: Option<&Path>| {
+            for (name, body) in [("colima", colima), ("limactl", &limactl)] {
+                fs::write(bin.join(name), body).unwrap();
+                fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+
+            let _ = fs::remove_file(&log);
+            let mut cmd = Command::new(crate::runner::posix_sh());
+            cmd.args(["-c", concat!(gone!(), r#"gone "$1""#), "sh", "sc-abc"])
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("HOME", &home);
+
+            if let Some(h) = colima_home {
+                cmd.env("COLIMA_HOME", h);
+            }
+
+            let ok = cmd.status().unwrap().success();
+            (ok, fs::read_to_string(&log).unwrap_or_default())
+        };
+        // As colima 0.10.3 does, it ignores a VM that does not exist and keeps the VM's disk
+        let ignores = "#!/bin/sh\nexit 0\n";
+
+        // colima's home is $COLIMA_HOME, else ~/.colima when it exists, else ~/.config/colima
+        for (colima_home, dot, want) in [
+            (None, false, home.join(".config/colima")),
+            (None, true, home.join(".colima")),
+            (Some(elsewhere.as_path()), true, elsewhere.clone()),
+        ] {
+            if dot {
+                fs::create_dir_all(home.join(".colima")).unwrap();
+            }
+
+            let disk = format!("{}/_lima disk delete colima-sc-abc\n", want.display());
+            assert_eq!(gone(ignores, colima_home), (true, disk));
+        }
+
+        // A VM colima could not delete may still use the disk, which stays
+        assert_eq!(gone("#!/bin/sh\nexit 1\n", None), (false, String::new()));
     }
 
     #[test]
