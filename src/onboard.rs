@@ -968,9 +968,9 @@ extern "C" fn forward(sig: libc::c_int) {
     let pid = PREVIEW_CHILD.load(std::sync::atomic::Ordering::SeqCst);
 
     if pid > 0 {
-        // Safe: kill only sends a signal
+        // Safe: kill only sends a signal, to the preview's own group
         unsafe {
-            libc::kill(pid, sig);
+            libc::kill(-pid, sig);
         }
     }
 }
@@ -983,17 +983,19 @@ extern "C" fn forward(sig: libc::c_int) {
  * ended. The exit code is the preview's, or 128 plus the signal that ended it
  **/
 pub fn preview_apart(root: &Path) -> Result<u8, String> {
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
 
     let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
     let had = worktrees(root).is_some_and(|w| w.exists());
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Its own group, so a signal also reaches the git its trial runs, which writes into the scratch home
     let mut child = std::process::Command::new(exe)
         .arg("init")
         .current_dir(root)
         .env("SHIPCHECK_HOME", scratch.path())
         .env(PREVIEW, "1")
         .stdin(std::process::Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("shipcheck: {e}"))?;
     PREVIEW_CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
@@ -1016,6 +1018,7 @@ pub fn preview_apart(root: &Path) -> Result<u8, String> {
     }
 
     PREVIEW_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
+    stop_group(child.id());
     forget_worktrees(root, scratch.path(), had);
     drop(scratch);
     let status = status.map_err(|e| e.to_string())?;
@@ -1024,6 +1027,19 @@ pub fn preview_apart(root: &Path) -> Result<u8, String> {
         (None, Some(sig)) => (128 + sig).clamp(0, 255) as u8,
         _ => 1,
     })
+}
+
+/// Ends what is left of process group `pgid` and waits until it is empty, at most 10 seconds
+fn stop_group(pgid: u32) {
+    crate::runner::signal_group(pgid, libc::SIGKILL);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    // Safe: signal 0 only asks whether the group still has a process
+    while unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// The preview itself, in the process `preview_apart` starts
