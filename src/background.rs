@@ -344,8 +344,6 @@ pub fn reap() {
 
 /// How often a posting run notes its progress
 pub const BEAT: Duration = Duration::from_secs(30);
-/// How long a run may go without progress before the daemon stops it
-pub const QUIET: Duration = Duration::from_secs(15 * 60);
 
 /// Where run `pid` notes the last time it made progress
 pub fn beat_path(repo_id: &str, pid: u32) -> PathBuf {
@@ -1019,8 +1017,9 @@ mod tests {
 
     #[test]
     fn a_run_is_stuck_after_the_quiet_time() {
-        assert!(!went_quiet(1_000, 1_000 + 900, QUIET));
-        assert!(went_quiet(1_000, 1_000 + 901, QUIET));
+        let quiet = Duration::from_secs(900);
+        assert!(!went_quiet(1_000, 1_000 + 900, quiet));
+        assert!(went_quiet(1_000, 1_000 + 901, quiet));
     }
 
     #[test]
