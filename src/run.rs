@@ -1313,6 +1313,10 @@ fn max_runs() -> usize {
 }
 
 /// Waits for one of the machine's run slots, which cap how many act runs go at once
+/// Whether this process waits for a run slot, which its heartbeat counts as progress
+pub static WAITING_FOR_SLOT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
     let dir = home().join("runners");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1324,12 +1328,14 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
                 fs::File::create(dir.join(format!("{n}.lock"))).map_err(|e| e.to_string())?;
 
             if lock.try_lock().is_ok() {
+                WAITING_FOR_SLOT.store(false, std::sync::atomic::Ordering::Relaxed);
                 return Ok(lock);
             }
         }
 
         if !told {
             say("waiting for a free run slot");
+            WAITING_FOR_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
             told = true;
         }
 

@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Child, Command};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
@@ -149,7 +151,15 @@ pub fn start(
         }
     }
 
-    if let Ok(pid) = spawn(cwd, plan, base, name, post, trigger, home_ok) {
+    if let Ok(child) = spawn(cwd, plan, base, name, post, trigger, home_ok) {
+        let pid = child.id();
+        reap();
+
+        if let Ok(mut children) = CHILDREN.lock() {
+            let sha = &plan.sha[..12.min(plan.sha.len())];
+            children.push((child, format!("{repo} {name}: run of {sha}")));
+        }
+
         keep.push(format!(
             "{pid} {}{}",
             plan.sha,
@@ -227,6 +237,50 @@ pub fn running_here(repo_id: &str, sha: &str, posting: bool) -> bool {
         })
 }
 
+/// The processes this machine's records list for `sha`, under any branch or PR
+fn listed_runs(repo_id: &str, sha: &str) -> Vec<String> {
+    let dir = run::home().join("background").join(repo_id);
+
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    match (fields.next(), fields.next()) {
+                        (Some(pid), Some(s)) if s == sha => Some(pid.to_string()),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Whether some run of `sha` started here and none still goes
+fn all_ended(pids: &[String], alive: impl Fn(&str) -> bool) -> bool {
+    !pids.is_empty() && !pids.iter().any(|p| alive(p))
+}
+
+/// Whether this machine ran `sha` and every such run ended, so a claim one left holds nothing
+pub fn died_here(repo_id: &str, sha: &str) -> bool {
+    all_ended(&listed_runs(repo_id, sha), our_run)
+}
+
+/// Stops the runs of `sha` that still go on this machine
+pub fn stop_here(repo_id: &str, sha: &str) {
+    for pid in listed_runs(repo_id, sha) {
+        if our_run(&pid)
+            && let Ok(pid) = pid.parse()
+        {
+            crate::runner::signal_group(pid, libc::SIGTERM);
+        }
+    }
+}
+
 /// Whether a record still lists process `pid`, which a newer commit's run removes
 pub fn listed(record: &str, pid: u32) -> bool {
     let pid = pid.to_string();
@@ -271,6 +325,105 @@ fn our_run(pid: &str) -> bool {
     )
 }
 
+// The runs this process started with what they ran, a child nobody waits on stays a zombie under a long-lived daemon
+static CHILDREN: Mutex<Vec<(Child, String)>> = Mutex::new(Vec::new());
+
+/// Waits on the runs this process started that have ended, and says how each one ended
+pub fn reap() {
+    if let Ok(mut children) = CHILDREN.lock() {
+        children.retain_mut(|(child, what)| match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                println!("{what} ended, {status}");
+                false
+            }
+            Err(_) => false,
+        });
+    }
+}
+
+/// How often a posting run notes its progress
+pub const BEAT: Duration = Duration::from_secs(30);
+
+/// Where run `pid` notes the last time it made progress
+pub fn beat_path(repo_id: &str, pid: u32) -> PathBuf {
+    run::home()
+        .join("background")
+        .join(repo_id)
+        .join(format!("{pid}.beat"))
+}
+
+/// The newest change of any file under `dir`
+fn newest(dir: &Path) -> Option<SystemTime> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+
+            if meta.is_dir() {
+                newest(&e.path())
+            } else {
+                meta.modified().ok()
+            }
+        })
+        .max()
+}
+
+/**
+ * Notes the time in `path` at once, then every `every` while its job logs under `logs` grew or it
+ * waits for a run slot, until `done`. A thread beating on a timer would go on while the run hangs,
+ * so only progress beats. The note goes when the run ends
+ **/
+pub fn heartbeat(path: &Path, logs: &[PathBuf], done: &AtomicBool, every: Duration) {
+    let beat = || {
+        let _ = fs::write(path, run::unix_now().to_string());
+    };
+    let changed = || logs.iter().filter_map(|d| newest(d)).max();
+    let mut last = changed();
+    beat();
+
+    'run: loop {
+        let started = std::time::Instant::now();
+
+        while started.elapsed() < every {
+            if done.load(Ordering::Relaxed) {
+                break 'run;
+            }
+
+            std::thread::sleep(Duration::from_millis(20).min(every));
+        }
+
+        let now = changed();
+
+        if now != last || run::WAITING_FOR_SLOT.load(Ordering::Relaxed) {
+            last = now;
+            beat();
+        }
+    }
+
+    let _ = fs::remove_file(path);
+}
+
+/// Whether a run noted at `at` went quiet by `now`
+fn went_quiet(at: u64, now: u64, quiet: Duration) -> bool {
+    now.saturating_sub(at) > quiet.as_secs()
+}
+
+/// Whether a run of `sha` that still goes here made no progress for `quiet`. A run without a note
+/// is older than heartbeats, or just started
+pub fn stuck_here(repo_id: &str, sha: &str, quiet: Duration) -> bool {
+    let now = run::unix_now();
+
+    listed_runs(repo_id, sha)
+        .iter()
+        .filter(|pid| our_run(pid))
+        .filter_map(|pid| pid.parse().ok())
+        .filter_map(|pid| fs::read_to_string(beat_path(repo_id, pid)).ok())
+        .filter_map(|at| at.trim().parse().ok())
+        .any(|at| went_quiet(at, now, quiet))
+}
+
 fn spawn(
     cwd: &Path,
     plan: &Plan,
@@ -279,7 +432,7 @@ fn spawn(
     post: bool,
     trigger: &str,
     home_ok: bool,
-) -> Result<u32, String> {
+) -> Result<Child, String> {
     use std::os::unix::process::CommandExt;
 
     let log_dir = run::home().join("logs");
@@ -309,7 +462,7 @@ fn spawn(
         .process_group(0)
         .spawn()
         .map_err(|e| e.to_string())?;
-    Ok(child.id())
+    Ok(child)
 }
 
 /// What a background run passes to its own binary, which the binary's tests parse
@@ -445,12 +598,27 @@ pub fn post_run(
                 .unwrap_or_default();
             (entry, ids)
         }
-        None => std::thread::scope(|s| {
-            let marks = s.spawn(|| marked(true));
-            let entry = run();
-            let ids = marks.join().unwrap_or_default();
-            entry.map(|e| (e, ids))
-        })?,
+        None => {
+            let (entry, ids) = std::thread::scope(|s| {
+                let marks = s.spawn(|| marked(true));
+                let entry = run();
+                (entry, marks.join().unwrap_or_default())
+            });
+
+            match entry {
+                Ok(entry) => (entry, ids),
+                // Left in progress, the checks would read as another machine's claim until it went stale
+                Err(e) => {
+                    if current() {
+                        let bodies: Vec<Value> =
+                            names.iter().map(|n| check::errored(n, sha, &e)).collect();
+                        let _ = retry(waits, || finish(send, &bodies, &ids));
+                    }
+
+                    return Err(e);
+                }
+            }
+        }
     };
 
     if !current() {
@@ -494,6 +662,7 @@ mod tests {
     struct Fake {
         unknown: Mutex<usize>,
         posts: Mutex<Vec<(String, String, Option<u64>)>>,
+        bodies: Mutex<Vec<Value>>,
     }
 
     impl Fake {
@@ -501,6 +670,7 @@ mod tests {
             Fake {
                 unknown: Mutex::new(unknown),
                 posts: Mutex::new(Vec::new()),
+                bodies: Mutex::new(Vec::new()),
             }
         }
 
@@ -515,6 +685,7 @@ mod tests {
                 );
             }
 
+            self.bodies.lock().unwrap().push(body.clone());
             let mut posts = self.posts.lock().unwrap();
             posts.push((
                 body["name"].as_str().unwrap().into(),
@@ -526,6 +697,10 @@ mod tests {
 
         fn posts(&self) -> Vec<(String, String, Option<u64>)> {
             self.posts.lock().unwrap().clone()
+        }
+
+        fn bodies(&self) -> Vec<Value> {
+            self.bodies.lock().unwrap().clone()
         }
     }
 
@@ -737,6 +912,132 @@ mod tests {
                 ("shipcheck".into(), "completed".into(), Some(7)),
             ]
         );
+    }
+
+    #[test]
+    fn a_run_that_could_not_run_fails_its_checks_with_the_error() {
+        let fake = Fake::new(0);
+        let got = post_run(
+            &|b, id| fake.send(b, id),
+            &|| Ok(Checks::new()),
+            &"a".repeat(40),
+            &names(),
+            None,
+            || Err("docker version failed, is a Docker engine running?".into()),
+            finals,
+            || true,
+            &[],
+        );
+        assert!(got.unwrap_err().contains("docker version failed"));
+        let posts = fake.posts();
+        assert_eq!(
+            posts[2..],
+            [
+                ("shipcheck/test".into(), "completed".into(), Some(101)),
+                ("shipcheck".into(), "completed".into(), Some(102)),
+            ],
+            "every check it marked running ends, or the daemon waits on it as a claim"
+        );
+        assert!(
+            fake.bodies()
+                .iter()
+                .filter(|b| b["status"] == "completed")
+                .all(|b| b["conclusion"] == "failure"
+                    && b["output"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("docker version failed")))
+        );
+    }
+
+    #[test]
+    fn a_replaced_run_that_could_not_run_leaves_the_checks_to_the_newer_one() {
+        let fake = Fake::new(0);
+        let got = post_run(
+            &|b, id| fake.send(b, id),
+            &|| Ok(Checks::new()),
+            &"a".repeat(40),
+            &names(),
+            None,
+            || Err("no docker".into()),
+            finals,
+            || false,
+            &[],
+        );
+        assert!(got.is_err());
+        assert!(
+            fake.posts()
+                .iter()
+                .all(|(_, status, _)| status == "in_progress")
+        );
+    }
+
+    #[test]
+    fn a_claim_is_dead_only_when_every_run_of_the_head_here_ended() {
+        let alive = |pid: &str| pid == "7";
+        assert!(all_ended(&["5".into(), "6".into()], alive));
+        assert!(!all_ended(&["5".into(), "7".into()], alive));
+        assert!(
+            !all_ended(&[], alive),
+            "a head this machine never ran may be another machine's claim"
+        );
+    }
+
+    #[test]
+    fn a_run_beats_only_while_it_makes_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (beat, logs) = (dir.path().join("1.beat"), dir.path().join("logs"));
+        fs::create_dir_all(logs.join("ci.yml")).unwrap();
+        let done = AtomicBool::new(false);
+        let every = Duration::from_millis(50);
+        let wait_for = |what: &str, cond: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+            while !cond() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        std::thread::scope(|s| {
+            s.spawn(|| heartbeat(&beat, std::slice::from_ref(&logs), &done, every));
+            wait_for("the run notes its start", &|| beat.exists());
+
+            fs::remove_file(&beat).unwrap();
+            std::thread::sleep(every * 4);
+            assert!(!beat.exists(), "a run whose logs do not grow must not beat");
+
+            std::thread::sleep(Duration::from_millis(1100));
+            fs::write(logs.join("ci.yml/test.log"), "line").unwrap();
+            wait_for("a log that grew is progress", &|| beat.exists());
+
+            done.store(true, Ordering::Relaxed);
+        });
+        assert!(!beat.exists(), "the note goes when the run ends");
+    }
+
+    #[test]
+    fn a_run_is_stuck_after_the_quiet_time() {
+        let quiet = Duration::from_secs(900);
+        assert!(!went_quiet(1_000, 1_000 + 900, quiet));
+        assert!(went_quiet(1_000, 1_000 + 901, quiet));
+    }
+
+    #[test]
+    fn reap_waits_on_ended_runs() {
+        let child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        CHILDREN.lock().unwrap().push((child, "test run".into()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let listed = || CHILDREN.lock().unwrap().iter().any(|(c, _)| c.id() == pid);
+
+        while listed() {
+            assert!(std::time::Instant::now() < deadline, "true must end");
+            reap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A zombie still answers signal 0, a reaped process does not
+        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
     }
 
     #[test]

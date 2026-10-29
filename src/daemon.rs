@@ -17,6 +17,9 @@ fn stale_after(config: &crate::config::RepoConfig) -> u64 {
     config.timeout_minutes * 60 * (u64::from(config.retries) + 1) + 600
 }
 
+/// How long a run may make no progress, no log growing and no wait for a run slot, before it counts as stuck
+const QUIET: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -256,6 +259,7 @@ pub fn serve(home_ok: bool) -> ! {
             }
         }
 
+        background::reap();
         std::thread::sleep(Duration::from_secs(config.interval_seconds));
     }
 }
@@ -623,6 +627,13 @@ enum Action {
     Queue,
 }
 
+/// Whether a check went in progress before `cutoff`, as GitHub writes times
+fn overdue(existing: &Checks, cutoff: &str) -> bool {
+    existing.values().any(|c| {
+        c.status == "in_progress" && !c.started_at.is_empty() && c.started_at.as_str() < cutoff
+    })
+}
+
 /// What to do with a head that has no completed `shipcheck` check. `cutoff` is the time before
 /// which an in-progress claim is stale, as GitHub writes times
 fn decide(existing: &Checks, local: bool, result: bool, may_run: bool, cutoff: &str) -> Action {
@@ -812,8 +823,28 @@ fn handle(
     let me = me(config);
     let may_run = config.run_misses && same_repo && me.is_some();
 
-    match decide(&existing, local, result.is_some(), may_run, &cutoff) {
+    // A claim this machine's own run left when it died holds nothing, so the head runs again now
+    let claims = if !local && background::died_here(repo, sha) {
+        Checks::new()
+    } else {
+        existing.clone()
+    };
+
+    match decide(&claims, local, result.is_some(), may_run, &cutoff) {
         Action::Local => {
+            // A run past the time its jobs could take, or with no progress for a while, is stuck.
+            // Once it is stopped, the next poll runs the head again
+            if background::running_here(repo, sha, false)
+                && (overdue(&existing, &cutoff) || background::stuck_here(repo, sha, QUIET))
+            {
+                println!(
+                    "{repo}#{number}: the run of {} is stuck, stopping it",
+                    &sha[..12]
+                );
+                background::stop_here(repo, sha);
+                return Ok(None);
+            }
+
             // A run that posts marks its own checks, a mark from here could land after its result
             if !background::running_here(repo, sha, true) {
                 background::mark(&send, &existing, sha, &names, true)?;
@@ -950,7 +981,13 @@ fn handle(
                 &sha[..12]
             );
             note(repo, "rerun", pr, "no_result_for_tree");
-            start(&plan, &format!("pr:{number}"));
+            // The branch's record, as the hook writes it, so a push and the daemon never run two heads of one PR at once
+            let name = if pr.branch.is_empty() {
+                format!("pr:{number}")
+            } else {
+                pr.branch.clone()
+            };
+            start(&plan, &name);
             Ok(None)
         }
         Action::Queue => {
@@ -1042,6 +1079,19 @@ mod tests {
             decide(&none, false, false, false, cutoff),
             Action::Queue,
             "a fork's PR or run_misses = false never runs"
+        );
+    }
+
+    #[test]
+    fn a_run_past_its_time_is_overdue() {
+        let cutoff = "2026-10-23T09:00:00Z";
+        let at = |status, started| Checks::from([("shipcheck".into(), check(status, started))]);
+        assert!(overdue(&at("in_progress", "2026-10-23T08:59:59Z"), cutoff));
+        assert!(!overdue(&at("in_progress", "2026-10-23T09:00:00Z"), cutoff));
+        assert!(!overdue(&at("queued", ""), cutoff));
+        assert!(
+            !overdue(&at("completed", "2026-10-23T08:00:00Z"), cutoff),
+            "a finished check is no run"
         );
     }
 
@@ -1726,7 +1776,11 @@ mod tests {
         let pr = open_pr(5, &sha, "main", "acme/app");
         let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
         assert_eq!(got, Ok(None));
-        assert_eq!(started, vec!["pr:5"]);
+        assert_eq!(
+            started,
+            vec!["fix"],
+            "the branch's record, which a push to it shares, so the newer head stops the older"
+        );
         assert_eq!(
             fake.bodies()[0]["name"],
             check::NAME,
