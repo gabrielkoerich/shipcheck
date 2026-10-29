@@ -27,13 +27,15 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-// Passes only with marker.txt, and with hang.txt outlives its five-minute timeout, which counts the VM's boot
+// Passes only with marker.txt, and with hang.txt outlives its five-minute timeout, which counts the VM's boot.
+// A job on the VM starts in an empty workspace, as on GitHub, so it checks out first
 const CI: &str = "\
 on: [push, pull_request]
 jobs:
   e2e:
     runs-on: ubuntu-24.04-arm
     steps:
+      - uses: actions/checkout@v4
       - run: test -f marker.txt
       - run: if [ -f hang.txt ]; then sleep 900; fi
 ";
@@ -58,7 +60,8 @@ fn ours() -> Vec<String> {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|v| v["name"].as_str().map(String::from))
-        .filter(|n| n.starts_with("sc-"))
+        // A base stays for the next job, only a job's VM must go
+        .filter(|n| n.starts_with("sc-") && !n.starts_with("sc-base-"))
         .collect()
 }
 
