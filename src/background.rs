@@ -4,7 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
@@ -150,7 +151,15 @@ pub fn start(
         }
     }
 
-    if let Ok(pid) = spawn(cwd, plan, base, name, post, trigger, home_ok) {
+    if let Ok(child) = spawn(cwd, plan, base, name, post, trigger, home_ok) {
+        let pid = child.id();
+        reap();
+
+        if let Ok(mut children) = CHILDREN.lock() {
+            let sha = &plan.sha[..12.min(plan.sha.len())];
+            children.push((child, format!("{repo} {name}: run of {sha}")));
+        }
+
         keep.push(format!(
             "{pid} {}{}",
             plan.sha,
@@ -316,14 +325,105 @@ fn our_run(pid: &str) -> bool {
     )
 }
 
-// The runs this process started, a child nobody waits on stays a zombie under a long-lived daemon
-static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+// The runs this process started with what they ran, a child nobody waits on stays a zombie under a long-lived daemon
+static CHILDREN: Mutex<Vec<(Child, String)>> = Mutex::new(Vec::new());
 
-/// Waits on the runs this process started that have ended
+/// Waits on the runs this process started that have ended, and says how each one ended
 pub fn reap() {
     if let Ok(mut children) = CHILDREN.lock() {
-        children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        children.retain_mut(|(child, what)| match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                println!("{what} ended, {status}");
+                false
+            }
+            Err(_) => false,
+        });
     }
+}
+
+/// How often a posting run notes its progress
+pub const BEAT: Duration = Duration::from_secs(30);
+/// How long a run may go without progress before the daemon stops it
+pub const QUIET: Duration = Duration::from_secs(15 * 60);
+
+/// Where run `pid` notes the last time it made progress
+pub fn beat_path(repo_id: &str, pid: u32) -> PathBuf {
+    run::home()
+        .join("background")
+        .join(repo_id)
+        .join(format!("{pid}.beat"))
+}
+
+/// The newest change of any file under `dir`
+fn newest(dir: &Path) -> Option<SystemTime> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+
+            if meta.is_dir() {
+                newest(&e.path())
+            } else {
+                meta.modified().ok()
+            }
+        })
+        .max()
+}
+
+/**
+ * Notes the time in `path` at once, then every `every` while its job logs under `logs` grew or it
+ * waits for a run slot, until `done`. A thread beating on a timer would go on while the run hangs,
+ * so only progress beats. The note goes when the run ends
+ **/
+pub fn heartbeat(path: &Path, logs: &[PathBuf], done: &AtomicBool, every: Duration) {
+    let beat = || {
+        let _ = fs::write(path, run::unix_now().to_string());
+    };
+    let changed = || logs.iter().filter_map(|d| newest(d)).max();
+    let mut last = changed();
+    beat();
+
+    'run: loop {
+        let started = std::time::Instant::now();
+
+        while started.elapsed() < every {
+            if done.load(Ordering::Relaxed) {
+                break 'run;
+            }
+
+            std::thread::sleep(Duration::from_millis(20).min(every));
+        }
+
+        let now = changed();
+
+        if now != last || run::WAITING_FOR_SLOT.load(Ordering::Relaxed) {
+            last = now;
+            beat();
+        }
+    }
+
+    let _ = fs::remove_file(path);
+}
+
+/// Whether a run noted at `at` went quiet by `now`
+fn went_quiet(at: u64, now: u64, quiet: Duration) -> bool {
+    now.saturating_sub(at) > quiet.as_secs()
+}
+
+/// Whether a run of `sha` that still goes here made no progress for `quiet`. A run without a note
+/// is older than heartbeats, or just started
+pub fn stuck_here(repo_id: &str, sha: &str, quiet: Duration) -> bool {
+    let now = run::unix_now();
+
+    listed_runs(repo_id, sha)
+        .iter()
+        .filter(|pid| our_run(pid))
+        .filter_map(|pid| pid.parse().ok())
+        .filter_map(|pid| fs::read_to_string(beat_path(repo_id, pid)).ok())
+        .filter_map(|at| at.trim().parse().ok())
+        .any(|at| went_quiet(at, now, quiet))
 }
 
 fn spawn(
@@ -334,7 +434,7 @@ fn spawn(
     post: bool,
     trigger: &str,
     home_ok: bool,
-) -> Result<u32, String> {
+) -> Result<Child, String> {
     use std::os::unix::process::CommandExt;
 
     let log_dir = run::home().join("logs");
@@ -364,14 +464,7 @@ fn spawn(
         .process_group(0)
         .spawn()
         .map_err(|e| e.to_string())?;
-    let pid = child.id();
-    reap();
-
-    if let Ok(mut children) = CHILDREN.lock() {
-        children.push(child);
-    }
-
-    Ok(pid)
+    Ok(child)
 }
 
 /// What a background run passes to its own binary, which the binary's tests parse
@@ -892,12 +985,51 @@ mod tests {
     }
 
     #[test]
+    fn a_run_beats_only_while_it_makes_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (beat, logs) = (dir.path().join("1.beat"), dir.path().join("logs"));
+        fs::create_dir_all(logs.join("ci.yml")).unwrap();
+        let done = AtomicBool::new(false);
+        let every = Duration::from_millis(50);
+        let wait_for = |what: &str, cond: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+            while !cond() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        std::thread::scope(|s| {
+            s.spawn(|| heartbeat(&beat, std::slice::from_ref(&logs), &done, every));
+            wait_for("the run notes its start", &|| beat.exists());
+
+            fs::remove_file(&beat).unwrap();
+            std::thread::sleep(every * 4);
+            assert!(!beat.exists(), "a run whose logs do not grow must not beat");
+
+            std::thread::sleep(Duration::from_millis(1100));
+            fs::write(logs.join("ci.yml/test.log"), "line").unwrap();
+            wait_for("a log that grew is progress", &|| beat.exists());
+
+            done.store(true, Ordering::Relaxed);
+        });
+        assert!(!beat.exists(), "the note goes when the run ends");
+    }
+
+    #[test]
+    fn a_run_is_stuck_after_the_quiet_time() {
+        assert!(!went_quiet(1_000, 1_000 + 900, QUIET));
+        assert!(went_quiet(1_000, 1_000 + 901, QUIET));
+    }
+
+    #[test]
     fn reap_waits_on_ended_runs() {
         let child = Command::new("true").spawn().unwrap();
         let pid = child.id();
-        CHILDREN.lock().unwrap().push(child);
+        CHILDREN.lock().unwrap().push((child, "test run".into()));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let listed = || CHILDREN.lock().unwrap().iter().any(|c| c.id() == pid);
+        let listed = || CHILDREN.lock().unwrap().iter().any(|(c, _)| c.id() == pid);
 
         while listed() {
             assert!(std::time::Instant::now() < deadline, "true must end");

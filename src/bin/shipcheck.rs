@@ -1135,41 +1135,50 @@ fn posting_run(
 
         Ok(sent)
     };
-    let posted = background::post_run(
-        &send,
-        &|| sender.find_checks(&plan.sha),
-        &plan.sha,
-        &check::names(plan),
-        cached,
-        || {
-            let _key = run::lock_key(&plan.key)?;
+    // The daemon stops a run whose notes stop, which only progress writes
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let beat = background::beat_path(&repo, pid);
+    let logs = [run::log_dir(&plan.key), run::partial_log_dir(&plan.key)];
+    let posted = std::thread::scope(|s| {
+        s.spawn(|| background::heartbeat(&beat, &logs, &done, background::BEAT));
+        let posted = background::post_run(
+            &send,
+            &|| sender.find_checks(&plan.sha),
+            &plan.sha,
+            &check::names(plan),
+            cached,
+            || {
+                let _key = run::lock_key(&plan.key)?;
 
-            match run::lookup(plan).filter(|e| e.passed) {
-                Some(entry) => {
-                    hit = true;
-                    Ok(entry)
-                }
-                None => {
-                    // The error becomes the checks' log, so it gets the masking a job log gets
-                    let mut entry = run::run(plan, &mut |line| say(&run::printable(line)))
-                        .map_err(|e| check::mask(e, &secrets))?;
-
-                    // A fresh pass is checked like a stored one before it is posted, and fails closed
-                    if entry.passed && !run::holds(plan, &entry) {
-                        say(
-                            "the run's tree, base or logs do not match its result, posting a failure",
-                        );
-                        run::fail_closed(&mut entry);
+                match run::lookup(plan).filter(|e| e.passed) {
+                    Some(entry) => {
+                        hit = true;
+                        Ok(entry)
                     }
+                    None => {
+                        // The error becomes the checks' log, so it gets the masking a job log gets
+                        let mut entry = run::run(plan, &mut |line| say(&run::printable(line)))
+                            .map_err(|e| check::mask(e, &secrets))?;
 
-                    Ok(entry)
+                        // A fresh pass is checked like a stored one before it is posted, and fails closed
+                        if entry.passed && !run::holds(plan, &entry) {
+                            say(
+                                "the run's tree, base or logs do not match its result, posting a failure",
+                            );
+                            run::fail_closed(&mut entry);
+                        }
+
+                        Ok(entry)
+                    }
                 }
-            }
-        },
-        |entry| check::final_bodies(plan, entry, true),
-        || background::current(&record, pid),
-        &background::WAITS,
-    );
+            },
+            |entry| check::final_bodies(plan, entry, true),
+            || background::current(&record, pid),
+            &background::WAITS,
+        );
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        posted
+    });
     // Only a refused post is remembered, a run that could not run is not one
     rec.post_error = posted
         .as_ref()

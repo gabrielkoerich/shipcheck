@@ -829,12 +829,15 @@ fn handle(
 
     match decide(&claims, local, result.is_some(), may_run, &cutoff) {
         Action::Local => {
-            // Past the time its jobs could take the run is stuck, and once stopped the next poll runs the head
-            if overdue(&existing, &cutoff) && background::running_here(repo, sha, false) {
+            // A run past the time its jobs could take, or with no progress for a while, is stuck.
+            // Once it is stopped, the next poll runs the head again
+            if background::running_here(repo, sha, false)
+                && (overdue(&existing, &cutoff)
+                    || background::stuck_here(repo, sha, background::QUIET))
+            {
                 println!(
-                    "{repo}#{number}: the run of {} went past {}s, stopping it",
-                    &sha[..12],
-                    stale_after(&plan.config)
+                    "{repo}#{number}: the run of {} is stuck, stopping it",
+                    &sha[..12]
                 );
                 background::stop_here(repo, sha);
                 return Ok(None);
