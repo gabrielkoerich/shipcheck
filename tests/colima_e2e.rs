@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -136,6 +138,7 @@ fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
     let tmp = tempfile::tempdir().unwrap();
     let work = repo(tmp.path());
     let home = tmp.path().join("home");
+    let _clean = common::CleanOnDrop::new(&home);
     let before = profiles();
 
     let out = shipcheck(&work, &home).output().unwrap();

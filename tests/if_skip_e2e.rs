@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -101,6 +103,7 @@ fn a_skip_passes_only_when_github_skips_the_job_on_every_pr() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
+    let _clean = common::CleanOnDrop::new(&tmp.path().join("home"));
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();

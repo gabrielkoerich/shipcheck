@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -104,6 +106,7 @@ fn a_step_act_skips_fails_the_job_when_a_pr_may_run_it() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
+    let _clean = common::CleanOnDrop::new(&tmp.path().join("home"));
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();

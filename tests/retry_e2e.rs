@@ -46,7 +46,7 @@ fn every_retry_sees_its_own_checkout() {
     // SAFETY: this is the only test in this binary
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
     // Declared after `tmp`, so it drops first and removes the volumes while the home still exists
-    let _volumes = common::CleanOnDrop;
+    let _volumes = common::CleanOnDrop::new(&tmp.path().join("home"));
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();

@@ -3208,7 +3208,11 @@ mod tests {
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         let base = real_dir(&cache_dir(Some(&repo_id)).join("base/xdg/pre-commit")).unwrap();
         fs::write(base.join("hooks.yaml"), "hooks").unwrap();
-        let command = format!("cat {0}/hooks.yaml && ! touch {0}/planted", base.display());
+        // Under bwrap's overlay the touch succeeds in the run's own layer, so only the base on disk counts
+        let command = format!(
+            "cat {0}/hooks.yaml && {{ touch {0}/planted; true; }}",
+            base.display()
+        );
         let (exit, log) = branch_check(dir.path(), &repo_id, &command);
         let planted = base.join("planted").exists();
         Host::new(config::Host::default(), dir.path()).clean(Some(&repo_id));
@@ -3732,6 +3736,29 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
     fn a_check_cannot_reach_launchd_jobs() {
+        /// Boots out the test's launchd job, also when an assertion fails
+        struct BootOut(String);
+
+        impl Drop for BootOut {
+            fn drop(&mut self) {
+                let launchctl = |a: &str| {
+                    Command::new(LAUNCHCTL)
+                        .args([a, self.0.as_str()])
+                        .output()
+                        .is_ok_and(|o| o.status.success())
+                };
+
+                // A bootout can fail while launchd still stops the job, so it tries until the job is gone
+                for _ in 0..50 {
+                    if !launchctl("bootout") && !launchctl("print") {
+                        break;
+                    }
+
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         // Safe: getuid cannot fail
         let uid = unsafe { libc::getuid() };
@@ -3752,6 +3779,7 @@ mod tests {
                 .status
                 .success()
         );
+        let job = BootOut(target.clone());
         let log = dir.path().join("log");
         let jail = jail(dir.path());
 
@@ -3771,18 +3799,7 @@ mod tests {
         }
 
         let loaded = launchctl(&["print", &target]).status.success();
-
-        // A bootout can fail while launchd still stops the job, so it tries until the job is gone
-        for _ in 0..50 {
-            if !launchctl(&["bootout", &target]).status.success()
-                && !launchctl(&["print", &target]).status.success()
-            {
-                break;
-            }
-
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
+        drop(job);
         assert!(loaded, "a check booted out the test's job");
         assert!(
             !launchctl(&["print", &target]).status.success(),

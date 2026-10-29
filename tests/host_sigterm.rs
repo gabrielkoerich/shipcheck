@@ -39,6 +39,19 @@ fn wait_for<T>(what: &str, within: Duration, mut f: impl FnMut() -> Option<T>) -
     }
 }
 
+/// Stops the test's run, which reaps its check, also when an assertion fails first
+struct Stop(std::process::Child);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        if self.0.try_wait().is_ok_and(|s| s.is_none()) {
+            // Safe: the run is this test's own child, not yet reaped
+            unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
+            let _ = self.0.wait();
+        }
+    }
+}
+
 /// The one reap record a running check has: its coalition, its launchd job and its record file
 fn record(home: &Path) -> Option<(u64, String, PathBuf)> {
     let entry = fs::read_dir(home.join("reap")).ok()?.flatten().next()?;
@@ -79,12 +92,14 @@ fn a_stopped_run_reaps_its_running_check_at_once() {
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "feature"]);
 
-    let mut run = Command::new(env!("CARGO_BIN_EXE_shipcheck"))
-        .args(["run", "--no-fetch"])
-        .current_dir(&work)
-        .env("SHIPCHECK_HOME", &home)
-        .spawn()
-        .unwrap();
+    let mut run = Stop(
+        Command::new(env!("CARGO_BIN_EXE_shipcheck"))
+            .args(["run", "--no-fetch"])
+            .current_dir(&work)
+            .env("SHIPCHECK_HOME", &home)
+            .spawn()
+            .unwrap(),
+    );
     let (coal, target, file) = wait_for("reap record", Duration::from_secs(120), || record(&home));
     let members = wait_for("check processes", Duration::from_secs(30), || {
         let m = shipcheck::runner::host::coalition_members(coal);
@@ -93,11 +108,11 @@ fn a_stopped_run_reaps_its_running_check_at_once() {
 
     // Safe: the run is this test's own child
     assert_eq!(
-        unsafe { libc::kill(run.id() as libc::pid_t, libc::SIGTERM) },
+        unsafe { libc::kill(run.0.id() as libc::pid_t, libc::SIGTERM) },
         0
     );
     let status = wait_for("run exit", Duration::from_secs(10), || {
-        run.try_wait().unwrap()
+        run.0.try_wait().unwrap()
     });
     assert!(!status.success());
     wait_for("empty coalition", Duration::from_secs(5), || {

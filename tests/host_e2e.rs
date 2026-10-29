@@ -31,6 +31,15 @@ fn git(dir: &Path, args: &[&str]) -> String {
 // token stays out, `marker` only on a tree that has marker.txt. `jail` writes in its clone and its
 // home, and tries the user's real home and a path outside the clone, which the test checks stay empty.
 // On Linux /tmp is the sandbox's own, so a write there succeeds and lands nowhere
+/// Removes a canary a check wrote outside the sandbox, also when the assertion about it fails
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 fn config(cow: bool, canaries: &[&Path]) -> String {
     let deps = if cow { "test -f" } else { "test ! -e" };
     let escapes: String = canaries
@@ -73,6 +82,7 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     fs::create_dir_all(&home).unwrap();
     let cow = git_cow::can_clone(&home, &home);
     let real_home = run::user_dir().join(format!(".shipcheck-canary-{}", std::process::id()));
+    let _canary = RemoveOnDrop(real_home.clone());
     let outside = tmp.path().join("outside");
     fs::write(
         work.join("shipcheck.toml"),
