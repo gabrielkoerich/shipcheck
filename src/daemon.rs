@@ -985,7 +985,13 @@ fn handle(
                 &sha[..12]
             );
             note(repo, "rerun", pr, "no_result_for_tree");
-            start(&plan, &format!("pr:{number}"));
+            // The branch's record, as the hook writes it, so a push and the daemon never run two heads of one PR at once
+            let name = if pr.branch.is_empty() {
+                format!("pr:{number}")
+            } else {
+                pr.branch.clone()
+            };
+            start(&plan, &name);
             Ok(None)
         }
         Action::Queue => {
@@ -1786,7 +1792,11 @@ mod tests {
         let pr = open_pr(5, &sha, "main", "acme/app");
         let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
         assert_eq!(got, Ok(None));
-        assert_eq!(started, vec!["pr:5"]);
+        assert_eq!(
+            started,
+            vec!["fix"],
+            "the branch's record, which a push to it shares, so the newer head stops the older"
+        );
         assert_eq!(
             fake.bodies()[0]["name"],
             check::NAME,
