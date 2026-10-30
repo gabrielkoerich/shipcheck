@@ -3,3 +3,9 @@
 [env]
 SHIPCHECK_NO_KEYCHAIN = "1"
 SHIPCHECK_HOME = { value = "target/test-home", relative = true }
+# Tests stay offline: ureq, gh and git send every request to a port nothing listens on, and only
+# the fake servers on loopback answer. The engines start act and colima with an environment of their own
+HTTPS_PROXY = { value = "http://127.0.0.1:9", force = true }
+HTTP_PROXY = { value = "http://127.0.0.1:9", force = true }
+ALL_PROXY = { value = "http://127.0.0.1:9", force = true }
+NO_PROXY = { value = "127.0.0.1,localhost,::1", force = true }
