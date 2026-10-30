@@ -211,6 +211,7 @@ pub fn fetch_base(cwd: &Path, base: &str) -> bool {
     };
 
     Command::new("git")
+        .args(crate::daemon::fetch_options())
         .args(["fetch", "-q", "origin", branch])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
