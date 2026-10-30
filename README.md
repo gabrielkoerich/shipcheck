@@ -51,7 +51,7 @@ git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path sh
 |---|---|---|
 | git | Always | shipcheck reads commits, trees and `main` from your clone |
 | An OS sandbox | Host mode | macOS has `sandbox-exec`. On Linux, install bubblewrap |
-| A running Docker engine | act mode, also with `engine = "colima"` | act runs each job in a container. Docker Desktop 4.44.3 or later, with runc 1.2.8, 1.3.3 or later. Docker Desktop is recommended, and shipcheck's own tests run on it. act jobs have also run with OrbStack or colima as the Docker engine, with the limits the install docs list |
+| A running Docker engine | act mode, also with `engine = "colima"` | act runs each job in a container. Docker Desktop 4.44.3 or later, with runc 1.2.8, 1.3.3 or later. Docker Desktop is recommended. After each merge to `main`, shipcheck's act end-to-end tests run in CI on GitHub's Ubuntu runners with Docker Engine, and this repository's `shipcheck/test` check runs on a colima VM. act jobs have also run with Docker Desktop, OrbStack or colima as the Docker engine, with the limits the install docs list |
 | [act](https://github.com/nektos/act) 0.2.86 or later | act mode | Runs the workflows. `brew install act` |
 | colima and lima | `engine = "colima"` | Each such job runs in a VM of its own, with Docker inside the VM. `brew install colima` |
 | A copy-on-write filesystem | Recommended | APFS on macOS, btrfs or XFS on Linux, so a warm checkout costs no disk. On other filesystems shipcheck falls back to a plain git worktree |
@@ -87,7 +87,7 @@ What a green check proves and what a job can reach: [proof](https://shipcheck.ru
 
 ## Releases
 
-Every merge to `main` that changes more than Markdown files is a release. CI builds and signs the binaries, publishes the crate and updates the Homebrew tap.
+Every merge to `main` is a release, unless it changes only Markdown files or every commit since the last tag starts with `chore:` or `docs:`. CI builds and signs the binaries, publishes the crate and updates the Homebrew tap.
 
 ## License
 
