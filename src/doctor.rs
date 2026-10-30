@@ -135,7 +135,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         name: "post",
         ok: true,
         detail: match crate::service::poster() {
-            Poster::Key => "`shipcheck post` uses this machine's App key".into(),
+            Poster::Key => "`shipcheck post` uses a key on this machine instead of `shipcheck login`".into(),
             Poster::Service(_) => format!(
                 "`shipcheck post` goes through {} with {}",
                 crate::service::api(),

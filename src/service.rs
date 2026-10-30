@@ -401,7 +401,7 @@ fn get_json(token: &str, path: &str, query: &[(&str, &str)]) -> Result<Value, St
     )
 }
 
-pub const NOT_SIGNED_IN: &str = "nothing to post the check with: run `shipcheck login`, or set SHIPCHECK_APP_ID and put the key of an App of your own at app.pem in shipcheck's home";
+pub const NOT_SIGNED_IN: &str = "nothing to post the check with: run `shipcheck login`, or set SHIPCHECK_TOKEN from `shipcheck token`";
 
 /// Reads and writes shipcheck's checks on one repository, with what `poster` finds
 pub struct Sender {

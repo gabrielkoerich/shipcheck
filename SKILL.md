@@ -7,15 +7,17 @@ description: Run a repository's CI checks locally with shipcheck and read the re
 
 shipcheck runs the checks that `shipcheck.toml` names on this machine, for your working copy or a commit, and keeps the result for that git tree. The PR's required checks, one per job such as `shipcheck/test`, come from that result, so a passing local run is what lets the PR merge.
 
-There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the jobs of the workflows listed in `workflows`, each in its own container. With `runner = "host"` and no `[jobs]` table, `workflows` must be empty, or the run exits 2. A job then runs under act through a `[jobs]` table with `runner = "act"`, below.
+There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the default, the checks are the jobs of the workflows listed in `workflows`, each in its own container. With `runner = "host"` and no `[jobs]` table, `workflows` must be empty, or the run exits 2. A job then runs under act through a `[jobs]` table with `runner = "act"`, below. A repository without `.github/workflows` uses host mode.
 
 `runner` sets the mode of every job. A `[jobs."<file>/<job>"]` table changes it for one job, in the same run and under the same `shipcheck` check:
 
 - `runner = "act"` runs that job, and the jobs it needs, under act beside the host checks.
 - `runner = "host"` takes that job out of a listed workflow, and the `[host.checks]` entry of the same id runs in its place.
-- `engine = "colima"` runs that act job on a Colima VM of its own, with its own Docker and kernel, for a job that runs Docker or needs a Linux kernel feature. The VM reaches this machine's loopback and the internet, so use it only for code you trust.
+- `engine = "colima"` runs that act job on a Colima VM of its own, with its own Docker and kernel, for a job that runs Docker or needs a Linux kernel feature. Each job's VM is a clone of a base VM shipcheck set up once, and shipcheck deletes it after the result. This machine fetches the job's actions. The VM reaches this machine's loopback and the internet, so use it only for code you trust.
 
 A host check and an act job may not share a name, since both would post as `shipcheck/<name>`. The run exits 2 and names the two: rename the host check, for example `test` to `test-macos`. `--job ci.yml/e2e` picks the job of one workflow.
+
+In this file, `main` is the remote's default branch.
 
 Docs: https://shipcheck.run/llms.txt
 
@@ -90,8 +92,8 @@ shipcheck install
 
 It installs the git hooks, starts the daemon, and on a terminal signs the machine in when it cannot post yet, with a code a person enters at github.com/login/device. When it says not signed in, ask the human to run `shipcheck login`.
 
-A machine with no person at it, such as a VM, gets a token instead. A person runs `shipcheck token --name <machine>` on their own machine and sets the output as `SHIPCHECK_TOKEN` on the agent's machine. `shipcheck logout` there, or `shipcheck logout --all` anywhere, revokes it.
+A machine with no person at it, such as a VM, gets a token instead. A person runs `shipcheck token --name <machine>` on their own machine and sets the output as `SHIPCHECK_TOKEN` on the agent's machine. `shipcheck logout` there, or `shipcheck logout --all` anywhere, revokes it. `logout` revokes only shipcheck machine tokens, `--all` every one of the GitHub user's.
 
-Once signed in, each push posts its checks, and `shipcheck post` posts the stored result of `HEAD`, or of the commit you name. It refuses the tip of the default branch. `shipcheck doctor` says whether posting works. On macOS a keychain error after an upgrade means the new binary needs access: ask the human to run `shipcheck doctor` at the Mac and choose Always Allow.
+Checks post only through the [shipcheck App](https://github.com/apps/shipcheck-run) and the hosted service. Once signed in, each push posts its checks, and `shipcheck post` posts the stored result of `HEAD`, or of the commit you name. It refuses the tip of the default branch. `shipcheck doctor` says whether posting works. On macOS a keychain error after an upgrade means the new binary needs access: ask the human to run `shipcheck doctor` at the Mac and choose Always Allow.
 
 Settings: https://shipcheck.run/docs/config.md
