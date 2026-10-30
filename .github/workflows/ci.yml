@@ -16,7 +16,7 @@ env:
   RUST_VERSION: 1.99.1
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
