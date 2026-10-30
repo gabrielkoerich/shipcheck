@@ -51,7 +51,7 @@ git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path sh
 |---|---|---|
 | git | Always | shipcheck reads commits, trees and `main` from your clone |
 | An OS sandbox | Host mode | macOS has `sandbox-exec`. On Linux, install bubblewrap |
-| Docker | act mode | act runs each job in a container. Docker Desktop is recommended. OrbStack and colima are tested, with limits in the install docs |
+| Docker | act mode | act runs each job in a container. Docker Desktop is recommended, and shipcheck's own tests run on it. act jobs have also run with OrbStack or colima as the Docker engine, with the limits the install docs list |
 | [act](https://github.com/nektos/act) 0.2.86 or later | act mode | Runs the workflows. `brew install act` |
 | A copy-on-write filesystem | Recommended | APFS on macOS, btrfs or XFS on Linux, so a warm checkout costs no disk. On other filesystems shipcheck falls back to a plain git worktree |
 
