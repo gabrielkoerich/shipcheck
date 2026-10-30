@@ -85,7 +85,7 @@ fn env_token_set() -> bool {
 /// Who posts the checks, named without the secret, or None when this machine cannot post
 pub fn identity() -> Option<&'static str> {
     match poster() {
-        Poster::Key => Some("this machine's own App key"),
+        Poster::Key => Some("a key on this machine"),
         Poster::Service(_) if env_token_set() => Some("the SHIPCHECK_TOKEN machine token"),
         Poster::Service(_) => Some("the `shipcheck login` token"),
         Poster::None => None,

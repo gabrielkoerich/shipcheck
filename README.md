@@ -64,7 +64,7 @@ git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path sh
 
 [The quickstart](https://shipcheck.run/docs/quickstart/) says what each step does. Each other clone needs `shipcheck install` once. In a terminal, `init` and `install` sign the machine in when it cannot post yet. A machine with no person at it gets a token from `shipcheck token` instead, set as `SHIPCHECK_TOKEN` ([unattended machines](https://shipcheck.run/docs/install/#unattended-machines)). `shipcheck logout` revokes this machine's shipcheck token, and `shipcheck logout --all` revokes every shipcheck token of your GitHub user. It never touches a GitHub token.
 
-shipcheck then posts one check per job, such as `shipcheck/test`, as Actions does. Those are the checks branch protection requires. A `shipcheck` check beside them sums up the run. shipcheck posts only through the [shipcheck App](https://github.com/apps/shipcheck-run) and the hosted service, with the token from `shipcheck login`.
+shipcheck then posts one check per job, such as `shipcheck/test`, as Actions does. Those are the checks branch protection requires. A `shipcheck` check beside them sums up the run. shipcheck posts only through the [shipcheck App](https://github.com/apps/shipcheck-run) and the hosted service, with the machine token from `shipcheck login` or `shipcheck token`.
 
 To show that a repository's checks come from shipcheck, add this line to its README:
 
