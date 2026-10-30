@@ -6,8 +6,8 @@ Your agent already ran the tests. shipcheck runs your repository's checks on you
 
 It has two modes:
 
-- Host mode, which `shipcheck init` writes when it finds your checks, runs the commands of your workflow jobs, such as `cargo test` or `npm test`, natively in an OS sandbox. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run.
-- act mode, the default without `runner`, runs your GitHub Actions workflows in containers with act. It is the mode closest to GitHub's CI.
+- Host mode, which `shipcheck init` writes when it finds your checks, runs the commands of your workflow jobs, such as `cargo test` or `npm test`, natively in an OS sandbox, with no Docker. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run.
+- act mode, the default without `runner`, runs your GitHub Actions workflows in containers with act, on a running Docker engine. It is the mode closest to GitHub's CI.
 
 A repository without `.github/workflows` runs in host mode: set `runner = "host"` and list its commands under `[host.checks]` in `shipcheck.toml`.
 
@@ -51,8 +51,9 @@ git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path sh
 |---|---|---|
 | git | Always | shipcheck reads commits, trees and `main` from your clone |
 | An OS sandbox | Host mode | macOS has `sandbox-exec`. On Linux, install bubblewrap |
-| Docker | act mode | act runs each job in a container. Docker Desktop is recommended, and shipcheck's own tests run on it. act jobs have also run with OrbStack or colima as the Docker engine, with the limits the install docs list |
+| A running Docker engine | act mode, also with `engine = "colima"` | act runs each job in a container. Docker Desktop 4.44.3 or later, with runc 1.2.8, 1.3.3 or later. Docker Desktop is recommended, and shipcheck's own tests run on it. act jobs have also run with OrbStack or colima as the Docker engine, with the limits the install docs list |
 | [act](https://github.com/nektos/act) 0.2.86 or later | act mode | Runs the workflows. `brew install act` |
+| colima and lima | `engine = "colima"` | Each such job runs in a VM of its own, with Docker inside the VM. `brew install colima` |
 | A copy-on-write filesystem | Recommended | APFS on macOS, btrfs or XFS on Linux, so a warm checkout costs no disk. On other filesystems shipcheck falls back to a plain git worktree |
 
 ## Set up a repository
