@@ -1,6 +1,6 @@
 [package]
 name = "shipcheck"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 description = "Run your CI checks locally, cache the result by git tree, and post it as the PR's required checks"
 license = "MIT"
