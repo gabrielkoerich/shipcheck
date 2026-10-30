@@ -289,7 +289,28 @@ fn cycle(
 ) -> Result<(), String> {
     let base_branch = entry.base.strip_prefix("origin/").unwrap_or(&entry.base);
     let open = sender.open_prs()?;
-    merges(repo, sender, &open, heads);
+    let merged = merges(repo, sender, &open, heads, base_branch);
+
+    // A merge moved the base, whose tip gets checks of its own, the ones a status badge reads
+    if merged && git(entry, &["fetch", "-q", "origin", base_branch]) {
+        let start = |plan: &run::Plan, name: &str| {
+            background::start(
+                &entry.path,
+                plan,
+                &entry.base,
+                name,
+                true,
+                "daemon",
+                config.home_ok,
+            )
+        };
+
+        match handle_main(config, entry, sender, &start) {
+            Ok(verdict) => println!("{repo} {base_branch}: {verdict}"),
+            Err(e) => eprintln!("{repo} {base_branch}: {e}"),
+        }
+    }
+
     let prs = into_base(open, &entry.base);
 
     track_heads(repo, &prs, heads, sender);
@@ -438,12 +459,15 @@ fn abandoned(
 
 /// Records `pr_merged` for each PR the daemon checked that left the open list merged, one GET each.
 /// The hosted service reads no closed PR, so through it the daemon only forgets them
+/// Records the PRs that left the open list, and says whether one of them merged into `base_branch`
 fn merges(
     repo: &str,
     sender: &Sender,
     open: &[OpenPr],
     heads: &mut BTreeMap<(String, u64), String>,
-) {
+    base_branch: &str,
+) -> bool {
+    let mut into_base = false;
     let gone: Vec<(String, u64)> = heads
         .keys()
         .filter(|(r, n)| r == repo && !open.iter().any(|pr| pr.number == *n))
@@ -471,6 +495,7 @@ fn merges(
         let sha = heads.remove(&key).unwrap_or_default();
 
         if pr["merged_at"].is_string() {
+            into_base |= pr["base"]["ref"] == base_branch;
             let fields = serde_json::json!({
                 "pr": key.1,
                 "sha": sha,
@@ -482,6 +507,69 @@ fn merges(
             record::keep(repo, &record::event(repo, "pr_merged", fields));
         }
     }
+
+    into_base
+}
+
+/**
+ * Checks the base's tip after a merge, for the badge and anyone who reads main's checks. The base
+ * moves only through PRs whose heads were checked, so no pusher is asked, and a tree that passed as
+ * a PR head posts from the cache at once. A `[skip ci]` commit, such as a release bump, gets none
+ **/
+fn handle_main(
+    config: &DaemonConfig,
+    entry: &RepoEntry,
+    sender: &impl Remote,
+    start: &dyn Fn(&run::Plan, &str),
+) -> Result<&'static str, String> {
+    let tip = base_tip(entry);
+
+    if tip.is_empty() {
+        return Err(format!("could not read {}", entry.base));
+    }
+
+    if sender
+        .find_checks(&tip)?
+        .get(check::NAME)
+        .is_some_and(|c| c.status == "completed")
+    {
+        return Ok("already checked");
+    }
+
+    let message = Command::new("git")
+        .arg("-C")
+        .arg(&entry.path)
+        .args(["log", "-1", "--format=%B", &tip])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    if message.contains("[skip ci]") {
+        return Ok("not checked, [skip ci]");
+    }
+
+    if !git(
+        entry,
+        &["cat-file", "-e", &format!("{}:shipcheck.toml", entry.base)],
+    ) {
+        return Ok(NO_CONFIG);
+    }
+
+    let plan = run::plan(&entry.path, &tip, &entry.base)?;
+
+    if !plan.config.daemon {
+        return Ok("not checked, daemon = false on main");
+    }
+
+    if !config.run_misses && run::lookup(&plan).is_none() {
+        return Ok("not run, run_misses is off");
+    }
+
+    start(
+        &plan,
+        entry.base.strip_prefix("origin/").unwrap_or(&entry.base),
+    );
+    Ok("checking its tip")
 }
 
 /// A daemon event about one head, such as a rerun or a skip, with its reason
@@ -1607,6 +1695,65 @@ mod tests {
         let (got, started) = run_handle(&fake, "acme/app", Path::new("/nonexistent"), &pr);
         assert_eq!(got, Ok(Some("already checked")));
         assert!(fake.bodies().is_empty() && started.is_empty());
+    }
+
+    /// `handle_main` on the checkout at `path`, with the names of the runs it started
+    fn run_main(fake: &Fake, path: &Path) -> (Result<&'static str, String>, Vec<String>) {
+        let config = DaemonConfig {
+            interval_seconds: 10,
+            run_misses: true,
+            login: Some("ann".into()),
+            repos: BTreeMap::new(),
+            home_ok: false,
+        };
+        let entry = RepoEntry {
+            path: path.to_path_buf(),
+            base: "origin/main".into(),
+        };
+        let started = Mutex::new(Vec::new());
+        let start = |_: &run::Plan, name: &str| started.lock().unwrap().push(name.to_string());
+        let got = handle_main(&config, &entry, fake, &start);
+        (got, started.into_inner().unwrap())
+    }
+
+    #[test]
+    fn a_merge_checks_the_tip_of_main_unless_it_has_checks_or_skips_ci() {
+        let (dir, _) = checkout("https://github.com/acme/app.git", HOST);
+        let (got, started) = run_main(&Fake::default(), dir.path());
+        assert_eq!(got, Ok("checking its tip"));
+        assert_eq!(started, ["main"]);
+
+        let mut checked = Fake::default();
+        checked
+            .existing
+            .insert(check::NAME.into(), check("completed", ""));
+        let (got, started) = run_main(&checked, dir.path());
+        assert_eq!(got, Ok("already checked"));
+        assert!(started.is_empty());
+
+        // A release bump on main carries the skip-CI marker
+        run_git(
+            dir.path(),
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "chore: bump [skip ci]",
+            ],
+        );
+        run_git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        let (got, started) = run_main(&Fake::default(), dir.path());
+        assert_eq!(got, Ok("not checked, [skip ci]"));
+        assert!(started.is_empty());
+
+        let (bare, _) = checkout("https://github.com/acme/app.git", "");
+        let (got, started) = run_main(&Fake::default(), bare.path());
+        assert_eq!(got, Ok(NO_CONFIG));
+        assert!(started.is_empty());
     }
 
     #[test]
