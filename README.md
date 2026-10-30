@@ -4,6 +4,8 @@
 
 Your agent already ran the tests. shipcheck runs your repository's checks on your machine, keeps the result for that exact git tree, and posts the required checks, one per job, from its GitHub App. A PR whose tree was already tested gets its checks in under a second.
 
+![An agent runs shipcheck run, commits the tree that passed, and its run becomes the PR's required checks](assets/shipcheck-agent.gif)
+
 It has two modes:
 
 - Host mode, which `shipcheck init` writes when it finds your checks, runs the commands of your workflow jobs, such as `cargo test` or `npm test`, natively in an OS sandbox, with no Docker. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run.
