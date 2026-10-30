@@ -5,16 +5,15 @@ use std::process::Command;
 use serde_json::Value;
 
 /// The marker version doctor compares, raised when the block's text changes
-pub const BLOCK_VERSION: &str = "v3";
+pub const BLOCK_VERSION: &str = "v4";
 const START: &str = "<!-- shipcheck:start";
 const END: &str = "<!-- shipcheck:end -->";
 
 // Blank lines inside the markers, which prettier and oxfmt add, so a format check passes on init's commit
-pub const BLOCK: &str = "<!-- shipcheck:start v3 -->
+pub const BLOCK: &str = "<!-- shipcheck:start v4 -->
 
 ## Tests and commits
 
-- Work on a branch, never on the default branch: `git switch -c <branch>`. Then `shipcheck run`, `shipcheck commit`, push, and open a PR. The PR carries the checks.
 - Do not run the test commands (`pytest`, `cargo test`, `npm test`, `go test`, `just test` and the like). Run `shipcheck run`. It runs this repository's CI on your working copy, and its result is the PR's required check.
 - Commit with `shipcheck commit -m \"<subject>\"`, never `git commit`. It commits every file, exactly the tree that passed.
 - Work in small steps: one change, `shipcheck run`, `shipcheck commit`. Delete scratch files first, because every file is committed.
@@ -509,9 +508,9 @@ mod tests {
 
         // A block from before the blank lines is rewritten, and doctor sees no drift in it
         let tight =
-            "<!-- shipcheck:start v3 -->\n## Tests and commits\n\n- old\n<!-- shipcheck:end -->\n";
+            "<!-- shipcheck:start v4 -->\n## Tests and commits\n\n- old\n<!-- shipcheck:end -->\n";
         assert_eq!(merge_block(Some(tight)).unwrap(), format!("{BLOCK}\n"));
-        assert!(BLOCK.starts_with("<!-- shipcheck:start v3 -->\n\n## "));
+        assert!(BLOCK.starts_with("<!-- shipcheck:start v4 -->\n\n## "));
         assert!(BLOCK.ends_with(".txt\n\n<!-- shipcheck:end -->"));
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.md"), tight).unwrap();
@@ -544,7 +543,7 @@ mod tests {
         assert!(read(&root.join("GEMINI.md")).starts_with(START));
         assert_eq!(read(&root.join("CLAUDE.md")), "@AGENTS.md\n");
         assert!(
-            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v3")
+            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v4")
         );
         assert_eq!(read(&root.join(".gemini/settings.json")), "{}");
         assert!(!root.join(".github").exists());

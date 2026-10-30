@@ -21,7 +21,7 @@ Docs: https://shipcheck.run/llms.txt
 
 ## The rule
 
-Do not run the project's test commands yourself. Work on a branch: `git switch -c <branch>`. Run `shipcheck run`, and when it passes, `shipcheck commit -m <message>`. `shipcheck commit` and `shipcheck post` refuse on the default branch, since PRs carry the checks. `shipcheck run` works anywhere. Work in small steps and commit each one. Every commit is then a tested tree and gets its check at once, with no second run.
+Do not run the project's test commands yourself. Run `shipcheck run`, and when it passes, `shipcheck commit -m <message>`. `shipcheck commit` and `shipcheck post` refuse on the default branch, since PRs carry the checks. `shipcheck run` works anywhere. Work in small steps and commit each one. Every commit is then a tested tree and gets its check at once, with no second run.
 
 ## Each step
 
