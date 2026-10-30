@@ -35,6 +35,51 @@ pub struct DaemonConfig {
     /// A person's `--home-ok` on the daemon, passed on to the runs it starts
     #[serde(skip)]
     pub home_ok: bool,
+    /// How shipcheck's own fetches reach a GitHub remote, `https` to skip an SSH key that asks for a touch
+    #[serde(default, skip_serializing_if = "Fetch::is_origin")]
+    pub fetch: Fetch,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum Fetch {
+    /// The remote's URL as the person set it up
+    #[default]
+    Origin,
+    /// HTTPS with git's credential helper, such as `gh auth git-credential`
+    Https,
+}
+
+impl Fetch {
+    fn is_origin(&self) -> bool {
+        *self == Fetch::Origin
+    }
+
+    /// The `-c` options that send a fetch of a GitHub SSH URL over HTTPS. Remotes, pushes and the
+    /// person's own git stay as they are
+    fn options(self) -> Vec<String> {
+        if self == Fetch::Origin {
+            return Vec::new();
+        }
+
+        ["git@github.com:", "ssh://git@github.com/"]
+            .iter()
+            .flat_map(|from| {
+                [
+                    "-c".to_string(),
+                    format!("url.https://github.com/.insteadOf={from}"),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// The options for every fetch and `ls-remote` shipcheck runs, from `fetch` in daemon.toml
+pub fn fetch_options() -> Vec<String> {
+    DaemonConfig::load()
+        .map(|c| c.fetch)
+        .unwrap_or_default()
+        .options()
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -371,9 +416,16 @@ fn discover(config: &DaemonConfig, seen: &mut HashSet<PathBuf>) -> Vec<String> {
 }
 
 fn git(entry: &RepoEntry, args: &[&str]) -> bool {
+    let remote = if args.first() == Some(&"fetch") {
+        fetch_options()
+    } else {
+        Vec::new()
+    };
+
     Command::new("git")
         .arg("-C")
         .arg(&entry.path)
+        .args(remote)
         .args(args)
         // A service has no terminal, so a credential prompt would hang the daemon
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1756,6 +1808,7 @@ mod tests {
             login: Some("ann".into()),
             repos: BTreeMap::new(),
             home_ok: false,
+            fetch: Fetch::Origin,
         };
         let entry = RepoEntry {
             path: path.to_path_buf(),
@@ -1799,6 +1852,42 @@ mod tests {
     }
 
     #[test]
+    fn fetch_https_reaches_a_github_ssh_remote_over_https_and_origin_leaves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        let url = |fetch: Fetch, remote: &str| {
+            let _ = Command::new("git")
+                .args(["remote", "remove", "origin"])
+                .current_dir(dir.path())
+                .output();
+            run_git(dir.path(), &["remote", "add", "origin", remote]);
+            let mut args: Vec<String> = fetch.options();
+            args.extend(["ls-remote", "--get-url", "origin"].map(String::from));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_git(dir.path(), &args)
+        };
+
+        for remote in [
+            "git@github.com:acme/app.git",
+            "ssh://git@github.com/acme/app.git",
+        ] {
+            assert_eq!(url(Fetch::Https, remote), "https://github.com/acme/app.git");
+            assert_eq!(url(Fetch::Origin, remote), remote);
+        }
+
+        // Another host keeps its own URL
+        assert_eq!(
+            url(Fetch::Https, "git@gitlab.com:acme/app.git"),
+            "git@gitlab.com:acme/app.git"
+        );
+
+        let config: DaemonConfig = toml::from_str("fetch = \"https\"").unwrap();
+        assert_eq!(config.fetch, Fetch::Https);
+        let written = toml::to_string(&toml::from_str::<DaemonConfig>("").unwrap()).unwrap();
+        assert!(!written.contains("fetch"), "{written}");
+    }
+
+    #[test]
     fn only_an_unwatched_clone_with_a_shipcheck_toml_is_a_candidate() {
         let root = tempfile::tempdir().unwrap();
         let clone = |name: &str, config: bool| {
@@ -1832,6 +1921,7 @@ mod tests {
                 },
             )]),
             home_ok: false,
+            fetch: Fetch::Origin,
         };
         let mut seen = HashSet::new();
         let found = candidates(&config, &mut seen);
@@ -1847,6 +1937,7 @@ mod tests {
             login: Some("ann".into()),
             repos: BTreeMap::new(),
             home_ok: false,
+            fetch: Fetch::Origin,
         };
         let entry = RepoEntry {
             path: path.to_path_buf(),

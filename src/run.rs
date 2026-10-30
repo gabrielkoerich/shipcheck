@@ -650,6 +650,7 @@ fn remote_default(repo: &Path) -> Option<(String, String)> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .args(crate::daemon::fetch_options())
         .args(["ls-remote", "--symref", "origin", "HEAD"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
