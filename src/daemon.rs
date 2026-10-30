@@ -206,6 +206,9 @@ pub fn serve(home_ok: bool) -> ! {
     let mut waits: BTreeMap<(String, u64), String> = BTreeMap::new();
     // The heads checked while the base had no shipcheck.toml, with the base's tip then
     let mut unconfigured: HashMap<(String, String), String> = HashMap::new();
+    // The clones already looked at, and when to look for new ones
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut next_look = Instant::now();
 
     loop {
         let config = match DaemonConfig::load() {
@@ -216,6 +219,15 @@ pub fn serve(home_ok: bool) -> ! {
                 continue;
             }
         };
+
+        // A repository it adds is in daemon.toml, which the next poll reads
+        if Instant::now() >= next_look {
+            for line in discover(&config, &mut seen) {
+                println!("{line}");
+            }
+
+            next_look = Instant::now() + DISCOVER_EVERY;
+        }
 
         if config.run_misses && me(&config).is_none() && said.insert(String::new()) {
             eprintln!(
@@ -267,6 +279,95 @@ pub fn serve(home_ok: bool) -> ! {
         background::reap();
         std::thread::sleep(Duration::from_secs(config.interval_seconds));
     }
+}
+
+/// How often the daemon looks for clones of repositories it does not watch yet
+const DISCOVER_EVERY: Duration = Duration::from_secs(300);
+
+/**
+ * The clones next to the checkouts the daemon watches, not watched and not looked at before, whose
+ * local refs show a shipcheck.toml. The hint only picks which remotes to ask, so a folder of many
+ * repositories costs no request each. A worktree is skipped, its main checkout is the one to add
+ **/
+fn candidates(config: &DaemonConfig, seen: &mut HashSet<PathBuf>) -> Vec<(PathBuf, String)> {
+    let mut watched: HashSet<String> = config.repos.keys().cloned().collect();
+    let roots: std::collections::BTreeSet<PathBuf> = config
+        .repos
+        .values()
+        .filter_map(|e| e.path.parent().map(Path::to_path_buf))
+        .collect();
+    let mut found = Vec::new();
+
+    for root in roots {
+        let Ok(dirs) = std::fs::read_dir(&root) else {
+            continue;
+        };
+
+        for dir in dirs.flatten().map(|d| d.path()) {
+            if !dir.join(".git").is_dir() || !seen.insert(dir.clone()) {
+                continue;
+            }
+
+            let Ok(repo) = run::repo_id(&dir) else {
+                continue;
+            };
+
+            let hint = ["refs/remotes/origin/HEAD", "refs/remotes/origin/main"]
+                .iter()
+                .any(|r| {
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&dir)
+                        .args(["cat-file", "-e", &format!("{r}:shipcheck.toml")])
+                        .output()
+                        .is_ok_and(|o| o.status.success())
+                });
+
+            if hint && watched.insert(repo.clone()) {
+                found.push((dir, repo));
+            }
+        }
+    }
+
+    found
+}
+
+/**
+ * Watches the candidates whose default branch, as the remote names it, has a shipcheck.toml and
+ * whose repository the App can read, so installing the App on a cloned repository is enough
+ **/
+fn discover(config: &DaemonConfig, seen: &mut HashSet<PathBuf>) -> Vec<String> {
+    let mut said = Vec::new();
+
+    for (dir, repo) in candidates(config, seen) {
+        let Some(base) = run::remote_base(&dir) else {
+            continue;
+        };
+        let entry = RepoEntry {
+            path: dir.clone(),
+            base: base.clone(),
+        };
+        let branch = base.strip_prefix("origin/").unwrap_or(&base);
+
+        if !git(&entry, &["fetch", "-q", "origin", branch])
+            || !git(
+                &entry,
+                &["cat-file", "-e", &format!("{base}:shipcheck.toml")],
+            )
+        {
+            continue;
+        }
+
+        if Sender::new(&repo).and_then(|s| s.open_prs()).is_err() {
+            continue;
+        }
+
+        if DaemonConfig::add(&repo, &dir, &base).is_ok() {
+            said.push(format!("{repo}: found at {}, watching it", dir.display()));
+        }
+    }
+
+    said
 }
 
 fn git(entry: &RepoEntry, args: &[&str]) -> bool {
@@ -1695,6 +1796,47 @@ mod tests {
         let (got, started) = run_handle(&fake, "acme/app", Path::new("/nonexistent"), &pr);
         assert_eq!(got, Ok(Some("already checked")));
         assert!(fake.bodies().is_empty() && started.is_empty());
+    }
+
+    #[test]
+    fn only_an_unwatched_clone_with_a_shipcheck_toml_is_a_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let clone = |name: &str, config: bool| {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            if config {
+                std::fs::write(path.join("shipcheck.toml"), HOST).unwrap();
+            }
+            std::fs::write(path.join("README"), name).unwrap();
+            run_git(&path, &["init", "-q", "-b", "main"]);
+            run_git(&path, &["add", "-A"]);
+            run_git(&path, &["commit", "-q", "-m", "base"]);
+            let url = format!("https://github.com/acme/{name}.git");
+            run_git(&path, &["remote", "add", "origin", &url]);
+            run_git(&path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            path
+        };
+        let watched = clone("watched", true);
+        let wanted = clone("wanted", true);
+        clone("plain", false);
+        run_git(&wanted, &["worktree", "add", "-q", "../wanted-tree"]);
+        let config = DaemonConfig {
+            interval_seconds: 10,
+            run_misses: true,
+            login: None,
+            repos: BTreeMap::from([(
+                "acme/watched".to_string(),
+                RepoEntry {
+                    path: watched,
+                    base: "origin/main".into(),
+                },
+            )]),
+            home_ok: false,
+        };
+        let mut seen = HashSet::new();
+        let found = candidates(&config, &mut seen);
+        assert_eq!(found, [(wanted, "acme/wanted".to_string())]);
+        assert!(candidates(&config, &mut seen).is_empty(), "asked twice");
     }
 
     /// `handle_main` on the checkout at `path`, with the names of the runs it started
