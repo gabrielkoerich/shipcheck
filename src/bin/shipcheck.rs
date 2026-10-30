@@ -819,7 +819,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
                 if !post {
                     background::note(&format!(
-                        "{} on {branch}: checks not posted, run `shipcheck login`, or set SHIPCHECK_APP_ID and put the key of an App of your own at app.pem in shipcheck's home",
+                        "{} on {branch}: checks not posted, run `shipcheck login`, or set SHIPCHECK_TOKEN from `shipcheck token`",
                         &plan.sha[..12]
                     ));
                 }

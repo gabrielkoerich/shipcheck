@@ -877,9 +877,12 @@ pub fn apply(
             install_url()
         )),
         App::Own(id) => next.push(format!(
-            "SHIPCHECK_APP_ID is {id}: install that App on this repository from its settings on GitHub"
+            "Install the App this machine posts with ({id}) on this repository from its settings on GitHub"
         )),
-        App::NotPublic => next.push("The hosted shipcheck App is not public yet. Until it is, the check needs an App of your own: set SHIPCHECK_APP_ID and put its key at app.pem in shipcheck's home (https://shipcheck.run/docs/install/#what-works-without-the-github-app)".into()),
+        App::NotPublic => next.push(format!(
+            "GitHub did not answer for the shipcheck App. Install it on this repository: {}",
+            install_url()
+        )),
     }
 
     if let Some(rule) = &plan.ruleset {

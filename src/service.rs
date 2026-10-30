@@ -85,7 +85,7 @@ fn env_token_set() -> bool {
 /// Who posts the checks, named without the secret, or None when this machine cannot post
 pub fn identity() -> Option<&'static str> {
     match poster() {
-        Poster::Key => Some("this machine's own App key"),
+        Poster::Key => Some("a key on this machine"),
         Poster::Service(_) if env_token_set() => Some("the SHIPCHECK_TOKEN machine token"),
         Poster::Service(_) => Some("the `shipcheck login` token"),
         Poster::None => None,
@@ -401,7 +401,7 @@ fn get_json(token: &str, path: &str, query: &[(&str, &str)]) -> Result<Value, St
     )
 }
 
-pub const NOT_SIGNED_IN: &str = "nothing to post the check with: run `shipcheck login`, or set SHIPCHECK_APP_ID and put the key of an App of your own at app.pem in shipcheck's home";
+pub const NOT_SIGNED_IN: &str = "nothing to post the check with: run `shipcheck login`, or set SHIPCHECK_TOKEN from `shipcheck token`";
 
 /// Reads and writes shipcheck's checks on one repository, with what `poster` finds
 pub struct Sender {

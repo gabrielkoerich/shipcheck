@@ -6,8 +6,10 @@ Your agent already ran the tests. shipcheck runs your repository's checks on you
 
 It has two modes:
 
-- Host mode, which `shipcheck init` writes when it finds your checks, runs the commands of your workflow jobs, such as `cargo test` or `npm test`, natively in an OS sandbox. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run.
-- act mode, the default without `runner`, runs your GitHub Actions workflows in containers with act. It is the mode closest to GitHub's CI.
+- Host mode, which `shipcheck init` writes when it finds your checks, runs the commands of your workflow jobs, such as `cargo test` or `npm test`, natively in an OS sandbox, with no Docker. On a machine set up like production, with the same tools, dependencies, OS and system libraries, that tests the code where it will run.
+- act mode, the default without `runner`, runs your GitHub Actions workflows in containers with act, on a running Docker engine. It is the mode closest to GitHub's CI.
+
+A repository without `.github/workflows` runs in host mode: set `runner = "host"` and list its commands under `[host.checks]` in `shipcheck.toml`.
 
 `runner` is the mode of every job, and a `[jobs]` table moves one job to the other mode in the same run, such as a `ci.yml/e2e` job that needs Docker under act beside the host checks.
 
@@ -29,13 +31,15 @@ Or with the install script:
 curl -fsSL https://shipcheck.run/install.sh | sh
 ```
 
-Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same signed release binary, no Rust needed:
+Or with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), which downloads the same release binary, no Rust needed:
 
 ```sh
 cargo binstall shipcheck
 ```
 
-Or build it from source with cargo, Rust 1.89 or later: from crates.io, from this repository, or from a clone. A build gets a new signature each time, so macOS asks once per keychain item after it:
+Homebrew, the install script and cargo-binstall install the release binary. On macOS it is signed with a Developer ID and notarized, and its signature stays the same across upgrades.
+
+Or build it from source with cargo, Rust 1.89 or later: from crates.io, from this repository, or from a clone. A build is not signed or notarized. Each build gets a new signature, so macOS asks once per keychain item after it:
 
 ```sh
 cargo install shipcheck
@@ -47,20 +51,21 @@ git clone https://github.com/gabrielkoerich/shipcheck && cargo install --path sh
 |---|---|---|
 | git | Always | shipcheck reads commits, trees and `main` from your clone |
 | An OS sandbox | Host mode | macOS has `sandbox-exec`. On Linux, install bubblewrap |
-| Docker | act mode | act runs each job in a container. Docker Desktop is recommended. OrbStack and colima are tested, with limits in the install docs |
+| A running Docker engine | act mode, also with `engine = "colima"` | act runs each job in a container. Docker Desktop 4.44.3 or later, with runc 1.2.8, 1.3.3 or later. Docker Desktop is recommended. After each merge to `main`, shipcheck's act end-to-end tests run in CI on GitHub's Ubuntu runners with Docker Engine, and this repository's `shipcheck/test` check runs on a colima VM. act jobs have also run with Docker Desktop, OrbStack or colima as the Docker engine, with the limits the install docs list |
 | [act](https://github.com/nektos/act) 0.2.86 or later | act mode | Runs the workflows. `brew install act` |
+| colima and lima | `engine = "colima"` | Each such job runs in a VM of its own, with Docker inside the VM. `brew install colima` |
 | A copy-on-write filesystem | Recommended | APFS on macOS, btrfs or XFS on Linux, so a warm checkout costs no disk. On other filesystems shipcheck falls back to a plain git worktree |
 
 ## Set up a repository
 
 1. Install the binary, above.
 2. Run `shipcheck init` in a clone of the repository, on `main`. An agent or a script runs `shipcheck init --yes`. Without a terminal and without `--yes`, `init` only prints its plan.
-3. Commit the `shipcheck.toml` it writes and merge it to `main`. Until then there is nothing to run: `shipcheck run` exits 2, and the hooks and the daemon start nothing.
+3. Commit the `shipcheck.toml` it writes and merge it to `main`. Here and below, `main` is the remote's default branch. Until then there is nothing to run: `shipcheck run` exits 2, and the hooks and the daemon start nothing.
 4. Install the [shipcheck App](https://github.com/apps/shipcheck-run) on the repository. `init` prints this link.
 
-[The quickstart](https://shipcheck.run/docs/quickstart/) says what each step does. Each other clone needs `shipcheck install` once. In a terminal, `init` and `install` sign the machine in when it cannot post yet. A machine with no person at it gets a token from `shipcheck token` instead ([unattended machines](https://shipcheck.run/docs/install/#unattended-machines)).
+[The quickstart](https://shipcheck.run/docs/quickstart/) says what each step does. Each other clone needs `shipcheck install` once. In a terminal, `init` and `install` sign the machine in when it cannot post yet. A machine with no person at it gets a token from `shipcheck token` instead, set as `SHIPCHECK_TOKEN` ([unattended machines](https://shipcheck.run/docs/install/#unattended-machines)). `shipcheck logout` revokes this machine's shipcheck token, and `shipcheck logout --all` revokes every shipcheck token of your GitHub user. It never touches a GitHub token.
 
-shipcheck then posts one check per job, such as `shipcheck/test`, as Actions does. Those are the checks branch protection requires. A `shipcheck` check beside them sums up the run. A team can post from [its own App](https://shipcheck.run/docs/install/#your-own-app) instead.
+shipcheck then posts one check per job, such as `shipcheck/test`, as Actions does. Those are the checks branch protection requires. A `shipcheck` check beside them sums up the run. shipcheck posts only through the [shipcheck App](https://github.com/apps/shipcheck-run) and the hosted service, with the machine token from `shipcheck login` or `shipcheck token`.
 
 To show that a repository's checks come from shipcheck, add this line to its README:
 
@@ -79,6 +84,10 @@ What a green check proves and what a job can reach: [proof](https://shipcheck.ru
 | `src/` | The `shipcheck` CLI and daemon |
 | `tests/` | Integration and end-to-end tests |
 | `Formula/` | The Homebrew formula template, filled in by the `release` job of `ci.yml` |
+
+## Releases
+
+Every merge to `main` is a release, unless it changes only Markdown files or every commit since the last tag starts with `chore:` or `docs:`. CI builds and signs the binaries, publishes the crate and updates the Homebrew tap.
 
 ## License
 

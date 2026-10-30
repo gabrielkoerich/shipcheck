@@ -7,15 +7,29 @@ description: Run a repository's CI checks locally with shipcheck and read the re
 
 shipcheck runs the checks that `shipcheck.toml` names on this machine, for your working copy or a commit, and keeps the result for that git tree. The PR's required checks, one per job such as `shipcheck/test`, come from that result, so a passing local run is what lets the PR merge.
 
-There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox. With `runner = "act"`, the checks are the jobs of the workflows listed in `workflows`, each in its own container. With `runner = "host"` and no `[jobs]` table, `workflows` must be empty, or the run exits 2. A job then runs under act through a `[jobs]` table with `runner = "act"`, below.
+## Install
+
+- macOS: `brew install gabrielkoerich/tap/shipcheck`. It also installs act, git and the Docker client.
+- Linux, or without Homebrew: `curl -fsSL https://shipcheck.run/install.sh | sh`. It installs to `~/.local/bin`, and `SHIPCHECK_INSTALL_DIR` changes the folder.
+- With cargo: `cargo binstall shipcheck`.
+
+All three install the release binary, which on macOS is signed and notarized. Host mode needs no Docker. act mode needs act 0.2.86 or later and a running Docker engine: Docker Desktop 4.44.3 or later, OrbStack, or colima as the Docker engine, with runc 1.2.8, 1.3.3 or later. `engine = "colima"` needs colima and lima on top of that.
+
+Then run `shipcheck doctor`. On a new machine or repository, it prints what is missing and the command that fixes it. Follow it until it exits 0.
+
+## Modes
+
+There are two modes. With `runner = "host"`, which `shipcheck init` writes when it finds checks, the checks are the owner's commands under `[host.checks]`, each in its own clone inside an OS sandbox, with no Docker. With `runner = "act"`, the default, the checks are the jobs of the workflows listed in `workflows`, each in its own container on this machine's Docker engine. With `runner = "host"` and no `[jobs]` table, `workflows` must be empty, or the run exits 2. A job then runs under act through a `[jobs]` table with `runner = "act"`, below. A repository without `.github/workflows` uses host mode.
 
 `runner` sets the mode of every job. A `[jobs."<file>/<job>"]` table changes it for one job, in the same run and under the same `shipcheck` check:
 
 - `runner = "act"` runs that job, and the jobs it needs, under act beside the host checks.
 - `runner = "host"` takes that job out of a listed workflow, and the `[host.checks]` entry of the same id runs in its place.
-- `engine = "colima"` runs that act job on a Colima VM of its own, with its own Docker and kernel, for a job that runs Docker or needs a Linux kernel feature. The VM reaches this machine's loopback and the internet, so use it only for code you trust.
+- `engine = "colima"` runs that act job on a Colima VM of its own, with its own Docker and kernel, for a job that runs Docker or needs a Linux kernel feature. Each job's VM is a clone of a base VM shipcheck set up once, and shipcheck deletes it after the result. It needs colima, lima and act on the Mac, and a running Docker engine there too, since shipcheck checks Docker before any act job, colima ones included. The job's steps run on the VM's own Docker. This machine fetches the job's actions. The VM reaches this machine's loopback and the internet, so use it only for code you trust. shipcheck's own repository sets `engine = "colima"` for its `ci.yml/test` job, so every shipcheck PR's `shipcheck/test` check comes from a colima VM. Its end-to-end tests against real VMs run by hand on a Mac with colima. They check that a job runs in a VM of its own with its own Docker, sees none of the Mac's files, none of shipcheck's environment and no secrets file, and that the VM is deleted after it. They also check that no port of the VM reaches the Mac's loopback, that a killed run's VM is still deleted, that the base VM and other colima profiles stay, that a failing or timed-out job leaves no VM, and that a job its `if:` skips boots no VM. This engine is apart from colima as the Docker engine behind act jobs, which runs each job in a container like Docker Desktop.
 
 A host check and an act job may not share a name, since both would post as `shipcheck/<name>`. The run exits 2 and names the two: rename the host check, for example `test` to `test-macos`. `--job ci.yml/e2e` picks the job of one workflow.
+
+In this file, `main` is the remote's default branch.
 
 Docs: https://shipcheck.run/llms.txt
 
@@ -24,8 +38,6 @@ Docs: https://shipcheck.run/llms.txt
 Do not run the project's test commands yourself. Run `shipcheck run`, and when it passes, `shipcheck commit -m <message>`. `shipcheck commit` and `shipcheck post` refuse on the default branch, since PRs carry the checks. `shipcheck run` works anywhere. Work in small steps and commit each one. Every commit is then a tested tree and gets its check at once, with no second run.
 
 ## Each step
-
-On a new machine or repository, run `shipcheck doctor` first. It prints what is missing and the command that fixes it. Follow it until it exits 0.
 
 1. Run `shipcheck run` before you commit. It tests the working copy: tracked edits and every untracked file that is not gitignored. When it passes, `shipcheck commit -m <message>` commits exactly the tree that ran.
 2. To commit only part of your work, stage it and run `shipcheck run --staged`, then `shipcheck commit -m <message>`, which commits the index as it ran. `shipcheck status` says whether the working copy and the index already have a result.
@@ -52,7 +64,7 @@ A tree that already passed answers at once, so a run after a rebase that changed
 - Fix, then run `shipcheck run --job <id>` as often as you need. In act mode it runs only that job and the jobs it `needs`, and in host mode only that check, so you see the result in seconds. `--workflow <file>` runs every job of one workflow, and both flags repeat. A partial run is never the check: it stores no result, and `shipcheck commit` refuses after it, even with `--allow-failed`. Its output ends with `partial run: not the check`. When the job passes, run one full `shipcheck run`, then `shipcheck commit -m <message>`. `shipcheck logs` prints the last partial run's logs after the full ones.
 - In host mode, `--workflow` is an error, since host mode runs checks, not workflows.
 - A job state such as `failure, allowed by continue-on-error` does not fail the workflow.
-- In act mode, `failure, act skipped it by its if:` means act skipped a job whose `if:` may hold on a PR. act runs a PR's checks as `workflow_dispatch`, so only GitHub can tell. A skip stands only when the `if:` is false on every PR: `false`, a push event, one branch or a tag. A job that needs a skipped job and whose `if:` uses `always()`, `failure()` or `cancelled()` fails the same way. A step act skips by an `if:` that reads the event, the ref, the actor or `vars`, directly or through an `env.` value, fails its job the same way, with `act skipped the step '<name>' by its if:` from the `shipcheck if` step before it. Steps false on every PR, and `failure()` or `cancelled()` steps, are left alone. The fix is in the workflow on `main`, so tell the owner: keep the job on GitHub, or make the `if:` false on every PR.
+- In act mode, ``failure, act skipped it by its `if:`, which may hold on a PR, and only GitHub can tell`` means act skipped a job whose `if:` may hold on a PR. act runs a PR's checks as `workflow_dispatch`, so only GitHub can tell. A skip stands only when the `if:` is false on every PR: `false`, a push event, one branch or a tag. A job that needs a skipped job and whose `if:` uses `always()`, `failure()` or `cancelled()` fails the same way. A step act skips by an `if:` that reads the event, the ref, the actor or `vars`, directly or through an `env.` value, fails its job the same way, with `act skipped the step '<name>' by its if:` from the `shipcheck if` step before it. Steps false on every PR, and `failure()` or `cancelled()` steps, are left alone. The fix is in the workflow on `main`, so tell the owner: keep the job on GitHub, or make the `if:` false on every PR.
 - In host mode, `Operation not permitted` or `Permission denied` on a path outside the clone, in your home, or on a socket means the test reached outside the sandbox. Fix the test to use its working directory, `$HOME` or `$TMPDIR`. If a toolchain in your home cannot be read, tell the owner. Never ask for `sandbox = false` to get past a denial, and never run `shipcheck trust`: together they run the check with the user's full access, so both are the owner's choice for a check that needs a system service, such as the iOS simulator.
 - In act mode, `no image for its runs-on label on this host` means a macOS or Windows job, which runs only on GitHub, or a Linux label such as `ubuntu-24.04` with no image in `[act] platforms`. Tell the owner, since it is a `shipcheck.toml` question.
 - In act mode, jobs get no network by default, so a job that needs it fails unless `shipcheck.toml` sets `network = "internet"`. Tell the owner, do not work around it.
@@ -90,8 +102,8 @@ shipcheck install
 
 It installs the git hooks, starts the daemon, and on a terminal signs the machine in when it cannot post yet, with a code a person enters at github.com/login/device. When it says not signed in, ask the human to run `shipcheck login`.
 
-A machine with no person at it, such as a VM, gets a token instead. A person runs `shipcheck token --name <machine>` on their own machine and sets the output as `SHIPCHECK_TOKEN` on the agent's machine. `shipcheck logout` there, or `shipcheck logout --all` anywhere, revokes it.
+A machine with no person at it, such as a VM, gets a token instead. A person runs `shipcheck token --name <machine>` on their own machine and sets the output as `SHIPCHECK_TOKEN` on the agent's machine. `shipcheck logout` there, or `shipcheck logout --all` anywhere, revokes it. `logout` revokes this machine's shipcheck token, and `--all` revokes every shipcheck machine token of that GitHub user. Neither revokes a GitHub token.
 
-Once signed in, each push posts its checks, and `shipcheck post` posts the stored result of `HEAD`, or of the commit you name. It refuses the tip of the default branch. `shipcheck doctor` says whether posting works. On macOS a keychain error after an upgrade means the new binary needs access: ask the human to run `shipcheck doctor` at the Mac and choose Always Allow.
+Checks post only through the [shipcheck App](https://github.com/apps/shipcheck-run) and the hosted service. Once signed in, each push posts its checks, and `shipcheck post` posts the stored result of `HEAD`, or of the commit you name. It refuses the tip of the default branch. `shipcheck doctor` says whether posting works. On macOS a keychain error after an upgrade means the new binary needs access: ask the human to run `shipcheck doctor` at the Mac and choose Always Allow.
 
 Settings: https://shipcheck.run/docs/config.md
