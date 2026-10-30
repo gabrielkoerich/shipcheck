@@ -142,6 +142,11 @@ pub fn known_base(repo: &Path) -> Option<String> {
         .or_else(|| run::remote_base(repo))
 }
 
+/// Whether the daemon watches this checkout, so it sees a PR head that was pushed from elsewhere
+pub fn registered(repo: &Path) -> bool {
+    entry_in(&DaemonConfig::path(), repo).is_some()
+}
+
 /// The daemon's entry for this repository, when it names this checkout and not another clone
 fn entry_in(file: &Path, repo: &Path) -> Option<RepoEntry> {
     let checkout = |p: &Path| crate::autostart::main_checkout(p).canonicalize().ok();

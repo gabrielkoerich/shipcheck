@@ -410,6 +410,14 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         },
     });
 
+    if let Some(gap) = crate::setup::install_gap(Path::new(&top)) {
+        found.push(Check {
+            name: "install",
+            ok: false,
+            detail: gap,
+        });
+    }
+
     // The post itself refuses a repository the App cannot reach, so ask GitHub here, before a push
     if crate::service::can_post()
         && let Ok(repo) = run::repo_id(Path::new(&top))

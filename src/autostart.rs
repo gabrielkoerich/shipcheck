@@ -119,6 +119,17 @@ fn wanted_on_main(root: &Path) -> bool {
         return true;
     };
 
+    main_config(root, &base).is_none_or(|c| c.daemon)
+}
+
+/// Whether the base branch has a `shipcheck.toml` that leaves the daemon on, so the daemon has work here
+pub(crate) fn daemon_on_main(root: &Path) -> bool {
+    crate::daemon::known_base(root)
+        .and_then(|base| main_config(root, &base))
+        .is_some_and(|c| c.daemon)
+}
+
+fn main_config(root: &Path, base: &str) -> Option<RepoConfig> {
     Command::new("git")
         .args(["show", &format!("{base}:shipcheck.toml")])
         .current_dir(root)
@@ -126,7 +137,6 @@ fn wanted_on_main(root: &Path) -> bool {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| toml::from_str::<RepoConfig>(&String::from_utf8_lossy(&o.stdout)).ok())
-        .is_none_or(|c| c.daemon)
 }
 
 /// Adds the repository to the daemon and installs or updates the service. Never fails, one line

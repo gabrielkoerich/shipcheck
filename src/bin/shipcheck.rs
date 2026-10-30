@@ -410,6 +410,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
     match name {
         "run" => {
+            if let Some(gap) = setup::install_gap(&cwd) {
+                eprintln!("{}", Style::stderr().yellow(&format!("warning: {gap}")));
+            }
+
             if fetch && !background::fetch_base(&cwd, &base) {
                 return Err(format!(
                     "git fetch of {base} failed, use --no-fetch to run against the local {base}"
@@ -1059,6 +1063,10 @@ fn warn_untracked(repo: &Path) -> Result<(), String> {
 /// Commits the tree the last run tested, `git_args` being the message and `--no-verify` for git
 fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCode, String> {
     let repo = toplevel(cwd)?;
+
+    if let Some(gap) = setup::install_gap(&repo) {
+        eprintln!("{}", Style::stderr().yellow(&format!("warning: {gap}")));
+    }
 
     // Plain `git commit` still works on it, the hooks never block git
     if let Some(branch) = run::on_default_branch(

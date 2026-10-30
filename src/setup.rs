@@ -3014,6 +3014,58 @@ pub fn install(root: &Path) -> Result<String, String> {
     Ok(done.join("\n"))
 }
 
+/**
+ * What `shipcheck install` would fix in this clone, which `run`, `commit` and `doctor` say: no daemon
+ * entry, so a head pushed from elsewhere, such as a rebase on GitHub, gets no run, or hooks an older
+ * install wrote. Nothing under a moved home or SHIPCHECK_NO_DAEMON, where install leaves the daemon
+ **/
+pub fn install_gap(root: &Path) -> Option<String> {
+    if crate::run::home_overridden()
+        || std::env::var_os("SHIPCHECK_NO_DAEMON").is_some_and(|v| v == "1")
+    {
+        return None;
+    }
+
+    let unregistered = !crate::daemon::registered(root) && crate::autostart::daemon_on_main(root);
+    let name = crate::run::repo_id(root)
+        .ok()
+        .and_then(|id| id.rsplit('/').next().map(String::from))
+        .unwrap_or_else(|| "this repository".into());
+    gap_line(&name, unregistered, stale_hooks(root))
+}
+
+fn gap_line(name: &str, unregistered: bool, stale: bool) -> Option<String> {
+    let what = match (unregistered, stale) {
+        (true, true) => "is not registered with the daemon and has hooks an older shipcheck wrote",
+        (true, false) => {
+            "is not registered with the daemon, so a PR pushed from elsewhere gets no run"
+        }
+        (false, true) => "has hooks an older shipcheck wrote",
+        (false, false) => return None,
+    };
+    Some(format!("{name} {what}, run `shipcheck install` to fix"))
+}
+
+/// Whether a hook shipcheck wrote differs from the one this version writes, a foreign hook never does
+fn stale_hooks(root: &Path) -> bool {
+    let dir = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    )
+    .unwrap_or_default();
+
+    if dir.is_empty() {
+        return false;
+    }
+
+    [("pre-push", PRE_PUSH), ("post-commit", POST_COMMIT)]
+        .iter()
+        .any(|(file, script)| {
+            fs::read_to_string(Path::new(&dir).join(file))
+                .is_ok_and(|hook| hook.contains(MARK) && hook != *script)
+        })
+}
+
 fn write_hook(hook: &Path, script: &str, line: &str) -> Result<String, String> {
     if let Ok(existing) = fs::read_to_string(hook)
         && !existing.contains(MARK)
@@ -5519,6 +5571,58 @@ jobs:
         assert!(PRE_PUSH.starts_with("#!/bin/sh\n"));
         assert!(PRE_PUSH.contains(MARK));
         assert!(PRE_PUSH.contains(HOOK_LINE));
+    }
+
+    #[test]
+    fn hooks_an_older_install_wrote_are_stale_and_foreign_ones_never() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        assert!(!stale_hooks(root), "no hooks at all are not stale");
+
+        fs::write(hooks.join("pre-push"), PRE_PUSH).unwrap();
+        fs::write(hooks.join("post-commit"), POST_COMMIT).unwrap();
+        assert!(!stale_hooks(root), "the hooks this version writes");
+
+        // The pre-push of 2026-10-22, before it passed the remote ref
+        let old = PRE_PUSH.replace(" \"$remote_ref\"", "");
+        fs::write(hooks.join("pre-push"), &old).unwrap();
+        assert!(stale_hooks(root));
+
+        fs::write(
+            hooks.join("pre-push"),
+            "#!/bin/sh\nexec lefthook run pre-push\n",
+        )
+        .unwrap();
+        assert!(!stale_hooks(root), "another hook manager's hook");
+        assert!(!stale_hooks(&root.join("nowhere")), "outside a repository");
+    }
+
+    #[test]
+    fn the_install_gap_names_the_repository_and_the_fix() {
+        assert_eq!(gap_line("homelab", false, false), None);
+        assert_eq!(
+            gap_line("homelab", true, false).unwrap(),
+            "homelab is not registered with the daemon, so a PR pushed from elsewhere gets no run, run `shipcheck install` to fix"
+        );
+        assert_eq!(
+            gap_line("homelab", false, true).unwrap(),
+            "homelab has hooks an older shipcheck wrote, run `shipcheck install` to fix"
+        );
+        assert!(
+            gap_line("homelab", true, true)
+                .unwrap()
+                .contains("not registered with the daemon and has hooks")
+        );
     }
 
     // Alamofire's ci.yml, and the other ways a workflow picks an Xcode
