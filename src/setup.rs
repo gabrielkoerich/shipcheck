@@ -3036,11 +3036,11 @@ pub fn install_gap(root: &Path) -> Option<String> {
 
 fn gap_line(name: &str, unregistered: bool, stale: bool) -> Option<String> {
     let what = match (unregistered, stale) {
-        (true, true) => "is not registered with the daemon and has hooks an older shipcheck wrote",
+        (true, true) => "is not registered with the daemon and has outdated hooks",
         (true, false) => {
             "is not registered with the daemon, so a PR pushed from elsewhere gets no run"
         }
-        (false, true) => "has hooks an older shipcheck wrote",
+        (false, true) => "has outdated hooks",
         (false, false) => return None,
     };
     Some(format!("{name} {what}, run `shipcheck install` to fix"))
@@ -5616,12 +5616,12 @@ jobs:
         );
         assert_eq!(
             gap_line("homelab", false, true).unwrap(),
-            "homelab has hooks an older shipcheck wrote, run `shipcheck install` to fix"
+            "homelab has outdated hooks, run `shipcheck install` to fix"
         );
         assert!(
             gap_line("homelab", true, true)
                 .unwrap()
-                .contains("not registered with the daemon and has hooks")
+                .contains("not registered with the daemon and has outdated hooks")
         );
     }
 
