@@ -761,10 +761,11 @@ pub fn commit(
             git_commit.env("PATH", path);
         }
 
-        // From the caller's directory, so a relative `-F` file is found
+        // From the caller's directory, so a relative `-F` file is found. Agents commit unattended, so
+        // a signing prompt from a key agent would only stall them
         let status = git_commit
             .current_dir(cwd)
-            .arg("commit")
+            .args(["-c", "commit.gpgsign=false", "commit"])
             .args(git_args)
             .env("GIT_INDEX_FILE", &temp)
             .status()
@@ -3901,6 +3902,29 @@ mod tests {
         commit(&repo, &tested, &["-m".into(), "a".into()], false).unwrap();
         assert!(ran.exists(), "the hook found its tool on the caller's PATH");
         assert!(!faked.exists(), "git came from the trusted PATH");
+    }
+
+    #[test]
+    fn commit_never_signs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        sh(repo, &["init", "-q", "-b", "main"]);
+        sh(repo, &["config", "user.name", "t"]);
+        sh(repo, &["config", "user.email", "t@t"]);
+        sh(repo, &["commit", "-q", "--allow-empty", "-m", "main"]);
+        sh(repo, &["config", "commit.gpgsign", "true"]);
+        // A signer that always fails, as a locked key agent does
+        sh(repo, &["config", "gpg.program", "false"]);
+        fs::write(repo.join("a.txt"), "a").unwrap();
+        let wc = snapshot(repo, false).unwrap().unwrap();
+        let tested = Tested {
+            tree: sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
+            staged: false,
+            passed: true,
+            partial: false,
+        };
+
+        commit(repo, &tested, &["-m".into(), "a".into()], false).unwrap();
     }
 
     #[test]
