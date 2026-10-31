@@ -874,6 +874,22 @@ enum Action {
 }
 
 /// Whether a check went in progress before `cutoff`, as GitHub writes times
+/// Fails every check of a run the daemon stopped, so no later poll runs that head again
+fn fail_stuck(
+    send: &background::Send,
+    existing: &Checks,
+    names: &[String],
+    sha: &str,
+    why: &str,
+) -> Result<(), String> {
+    let why = format!(
+        "The run {why}, so the daemon stopped it. `shipcheck logs` on that machine shows where it hung"
+    );
+    let bodies: Vec<_> = names.iter().map(|n| check::errored(n, sha, &why)).collect();
+    let ids = existing.iter().map(|(n, c)| (n.clone(), c.id)).collect();
+    background::finish(send, &bodies, &ids).map(|_| ())
+}
+
 fn overdue(existing: &Checks, cutoff: &str) -> bool {
     existing.values().any(|c| {
         c.status == "in_progress" && !c.started_at.is_empty() && c.started_at.as_str() < cutoff
@@ -1079,16 +1095,28 @@ fn handle(
     match decide(&claims, local, result.is_some(), may_run, &cutoff) {
         Action::Local => {
             // A run past the time its jobs could take, or with no progress for a while, is stuck.
-            // Once it is stopped, the next poll runs the head again
-            if background::running_here(repo, sha, false)
-                && (overdue(&existing, &cutoff) || background::stuck_here(repo, sha, QUIET))
-            {
-                println!(
-                    "{repo}#{number}: the run of {} is stuck, stopping it",
-                    &sha[..12]
-                );
-                background::stop_here(repo, sha);
-                return Ok(None);
+            // It fails, a run again would hang the same way, and a new push runs the PR again
+            if background::running_here(repo, sha, false) {
+                let why = if overdue(&existing, &cutoff) {
+                    Some("ran past the time its jobs could take".to_string())
+                } else if background::stuck_here(repo, sha, QUIET) {
+                    Some(format!(
+                        "made no progress for {} minutes",
+                        QUIET.as_secs() / 60
+                    ))
+                } else {
+                    None
+                };
+
+                if let Some(why) = why {
+                    println!(
+                        "{repo}#{number}: the run of {} {why}, failing it",
+                        &sha[..12]
+                    );
+                    background::stop_here(repo, sha);
+                    fail_stuck(&send, &existing, &names, sha, &why)?;
+                    return Ok(None);
+                }
             }
 
             // A run that posts marks its own checks, a mark from here could land after its result
@@ -1838,6 +1866,49 @@ mod tests {
             .filter(|v| v["event"] == "skipped")
             .map(|v| v["reason"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn a_stuck_run_fails_its_checks_and_the_head_never_runs_again() {
+        let mut fake = Fake::by("ann");
+        let names = vec!["shipcheck/test".to_string(), check::NAME.to_string()];
+
+        for name in &names {
+            let mut c = check("in_progress", "2026-10-31T15:00:00Z");
+            c.id = if name == check::NAME { 1 } else { 2 };
+            fake.existing.insert(name.clone(), c);
+        }
+
+        let send = |b: &Value, id| fake.send(b, id);
+        fail_stuck(
+            &send,
+            &fake.existing,
+            &names,
+            "abc",
+            "made no progress for 15 minutes",
+        )
+        .unwrap();
+        let bodies = fake.bodies();
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+
+        for body in &bodies {
+            assert_eq!(body["status"], "completed");
+            assert_eq!(body["conclusion"], "failure");
+            assert!(
+                body["output"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("made no progress")
+            );
+        }
+
+        // The next poll sees the failed checks GitHub now holds and starts nothing
+        let mut next = Fake::by("ann");
+        next.existing = fake.find_checks("abc").unwrap();
+        let pr = open_pr(5, "abc", "main", "acme/app");
+        let (got, started) = run_handle(&next, "acme/app", Path::new("/nonexistent"), &pr);
+        assert_eq!(got, Ok(Some("already checked")));
+        assert!(next.bodies().is_empty() && started.is_empty());
     }
 
     #[test]
