@@ -1180,6 +1180,7 @@ fn posting_run(
                     }
                 }
             },
+            &run::HAS_SLOT,
             |entry| check::final_bodies(plan, entry, true),
             || background::current(&record, pid),
             &background::WAITS,
