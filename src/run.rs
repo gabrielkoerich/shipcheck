@@ -1319,6 +1319,9 @@ fn max_runs() -> usize {
 pub static WAITING_FOR_SLOT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether this process holds a run slot, so its checks may show it running
+pub static HAS_SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
     let dir = home().join("runners");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1331,6 +1334,7 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
 
             if lock.try_lock().is_ok() {
                 WAITING_FOR_SLOT.store(false, std::sync::atomic::Ordering::Relaxed);
+                HAS_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Ok(lock);
             }
         }

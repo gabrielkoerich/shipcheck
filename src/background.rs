@@ -556,9 +556,11 @@ pub fn finish(
 
 /**
  * A run that posts its checks, as a push's or the daemon's background run does. Without a cached
- * result, it marks every check in progress as soon as GitHub has the commit, while `run` goes. Then
- * it completes them with `finals`, unless `current` says a newer commit replaced this one, and
- * returns None. A failed mark is only a line, the result still posts
+ * result, it marks every check queued as soon as GitHub has the commit, while `run` goes, and in
+ * progress once `slot` says the run holds a run slot, so a run that waits shows no start time the
+ * daemon would count against it. Then it completes them with `finals`, unless `current` says a
+ * newer commit replaced this one, and returns None. A failed mark is only a line, the result still
+ * posts
  **/
 #[allow(clippy::too_many_arguments)]
 pub fn post_run(
@@ -568,6 +570,7 @@ pub fn post_run(
     names: &[String],
     cached: Option<Entry>,
     run: impl FnOnce() -> Result<Entry, String>,
+    slot: &AtomicBool,
     finals: impl FnOnce(&Entry) -> Vec<Value>,
     current: impl FnOnce() -> bool,
     waits: &[u64],
@@ -583,8 +586,24 @@ pub fn post_run(
         checks.retain(|_, c| c.status != "completed");
         Ok(checks)
     };
-    let marked = |running: bool| {
-        retry(waits, || mark(send, &open()?, sha, names, running)).unwrap_or_else(|e| {
+    let marked = |running: bool, queued: &BTreeMap<String, u64>| {
+        let found = || -> Result<Checks, String> {
+            let mut checks = open()?;
+
+            // Without the read endpoint the queued checks are found nowhere else, so they are updated in place
+            for (name, id) in queued {
+                checks
+                    .entry(name.clone())
+                    .or_insert_with(|| crate::github::Check {
+                        id: *id,
+                        status: "queued".into(),
+                        started_at: String::new(),
+                    });
+            }
+
+            Ok(checks)
+        };
+        retry(waits, || mark(send, &found()?, sha, names, running)).unwrap_or_else(|e| {
             eprintln!(
                 "{}: could not mark the checks: {e}",
                 &sha[..sha.len().min(12)]
@@ -600,9 +619,29 @@ pub fn post_run(
             (entry, ids)
         }
         None => {
+            let ended = AtomicBool::new(false);
             let (entry, ids) = std::thread::scope(|s| {
-                let marks = s.spawn(|| marked(true));
+                let marks = s.spawn(|| {
+                    let none = BTreeMap::new();
+
+                    if slot.load(Ordering::Relaxed) {
+                        return marked(true, &none);
+                    }
+
+                    let queued = marked(false, &none);
+
+                    while !slot.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+
+                    if slot.load(Ordering::Relaxed) {
+                        marked(true, &queued)
+                    } else {
+                        queued
+                    }
+                });
                 let entry = run();
+                ended.store(true, Ordering::Relaxed);
                 (entry, marks.join().unwrap_or_default())
             });
 
@@ -785,6 +824,7 @@ mod tests {
             &names(),
             None,
             || Ok(entry()),
+            &AtomicBool::new(true),
             finals,
             || true,
             &[0, 0, 0],
@@ -843,6 +883,7 @@ mod tests {
             &names(),
             None,
             || Ok(entry()),
+            &AtomicBool::new(true),
             finals,
             || true,
             &[],
@@ -860,6 +901,55 @@ mod tests {
     }
 
     #[test]
+    fn a_run_waiting_for_a_slot_shows_queued_until_it_has_one() {
+        let fake = Fake::new(0);
+        let slot = AtomicBool::new(false);
+        post_run(
+            &|b, id| fake.send(b, id),
+            &|| Err("GET /v1/checks: no route GET /v1/checks".into()),
+            &"a".repeat(40),
+            &names(),
+            None,
+            || {
+                while fake.posts().len() < 2 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                slot.store(true, Ordering::Relaxed);
+
+                while fake.posts().len() < 4 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                Ok(entry())
+            },
+            &slot,
+            finals,
+            || true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            fake.posts(),
+            vec![
+                ("shipcheck/test".into(), "queued".into(), None),
+                ("shipcheck".into(), "queued".into(), None),
+                ("shipcheck/test".into(), "in_progress".into(), Some(101)),
+                ("shipcheck".into(), "in_progress".into(), Some(102)),
+                ("shipcheck/test".into(), "completed".into(), Some(101)),
+                ("shipcheck".into(), "completed".into(), Some(102)),
+            ],
+            "the checks start once the run has a slot, and the same runs go from queued to completed"
+        );
+        let started = fake.bodies()[2]["started_at"].as_str().map(str::to_owned);
+        assert!(fake.bodies()[0].get("started_at").is_none());
+        assert!(
+            started.is_some(),
+            "the start time is the slot's, not the queue's"
+        );
+    }
+
+    #[test]
     fn marks_without_the_read_endpoint() {
         let fake = Fake::new(0);
         post_run(
@@ -869,6 +959,7 @@ mod tests {
             &names(),
             None,
             || Ok(entry()),
+            &AtomicBool::new(true),
             finals,
             || true,
             &[],
@@ -901,6 +992,7 @@ mod tests {
             &names(),
             Some(entry()),
             || panic!("a cached result must not run"),
+            &AtomicBool::new(true),
             finals,
             || true,
             &[],
@@ -925,6 +1017,7 @@ mod tests {
             &names(),
             None,
             || Err("docker version failed, is a Docker engine running?".into()),
+            &AtomicBool::new(true),
             finals,
             || true,
             &[],
@@ -960,6 +1053,7 @@ mod tests {
             &names(),
             None,
             || Err("no docker".into()),
+            &AtomicBool::new(true),
             finals,
             || false,
             &[],
@@ -1051,6 +1145,7 @@ mod tests {
             &names(),
             None,
             || Ok(entry()),
+            &AtomicBool::new(true),
             finals,
             || false,
             &[],
