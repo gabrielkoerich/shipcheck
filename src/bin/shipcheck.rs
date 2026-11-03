@@ -1189,6 +1189,7 @@ fn posting_run(
             |entry| check::final_bodies(plan, entry, true),
             || background::current(&record, pid),
             &background::WAITS,
+            Some(&|job: &run::JobDone| check::job_body(plan, job)),
         );
         done.store(true, Ordering::Relaxed);
         posted
