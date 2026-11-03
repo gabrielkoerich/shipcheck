@@ -553,9 +553,8 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(report(&entry, snapshot, json, false));
             }
 
-            let _key = run::lock_key(&plan.key)?;
-            // Only a pass is reused, a cached failure runs again so a flaky one cannot stick
-            let entry = match run::lookup(&plan).filter(|e| e.passed) {
+            let (_key, waited) = run::lock_tree(&plan.key)?;
+            let entry = match run::reusable(&plan, waited) {
                 // A `paths` skip is never stored, so it is no cached result
                 Some(entry) if entry.skipped.is_some() => {
                     say(&format!("tested {what}, tree {tree}: nothing ran"));
@@ -563,8 +562,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
                 Some(entry) => {
                     record.cache_hit = true;
+                    let how = if entry.passed {
+                        "cached result"
+                    } else {
+                        "result of the run of this tree it waited for, which failed,"
+                    };
                     say(&format!(
-                        "tested {what}, tree {tree}: cached result in {:.1?}",
+                        "tested {what}, tree {tree}: {how} in {:.1?}",
                         started.elapsed()
                     ));
                     entry
@@ -1155,23 +1159,24 @@ fn posting_run(
             &plan.sha,
             &check::names(plan),
             cached,
-            || {
+            |jobs| {
                 // Another process running this tree is this commit's run, so its checks show running
                 if run::running(&plan.key) {
                     run::HAS_SLOT.store(true, Ordering::Relaxed);
                 }
 
-                let _key = run::lock_key(&plan.key)?;
+                let (_key, waited) = run::lock_tree(&plan.key)?;
 
-                match run::lookup(plan).filter(|e| e.passed) {
+                match run::reusable(plan, waited) {
                     Some(entry) => {
                         hit = true;
                         Ok(entry)
                     }
                     None => {
                         // The error becomes the checks' log, so it gets the masking a job log gets
-                        let mut entry = run::run(plan, &mut |line| say(&run::printable(line)))
-                            .map_err(|e| check::mask(e, &secrets))?;
+                        let mut entry =
+                            run::run_reporting(plan, &mut |line| say(&run::printable(line)), jobs)
+                                .map_err(|e| check::mask(e, &secrets))?;
 
                         // A fresh pass is checked like a stored one before it is posted, and fails closed
                         if entry.passed && !run::holds(plan, &entry) {
