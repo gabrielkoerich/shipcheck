@@ -1159,7 +1159,7 @@ fn posting_run(
             &plan.sha,
             &check::names(plan),
             cached,
-            || {
+            |jobs| {
                 // Another process running this tree is this commit's run, so its checks show running
                 if run::running(&plan.key) {
                     run::HAS_SLOT.store(true, Ordering::Relaxed);
@@ -1174,8 +1174,9 @@ fn posting_run(
                     }
                     None => {
                         // The error becomes the checks' log, so it gets the masking a job log gets
-                        let mut entry = run::run(plan, &mut |line| say(&run::printable(line)))
-                            .map_err(|e| check::mask(e, &secrets))?;
+                        let mut entry =
+                            run::run_reporting(plan, &mut |line| say(&run::printable(line)), jobs)
+                                .map_err(|e| check::mask(e, &secrets))?;
 
                         // A fresh pass is checked like a stored one before it is posted, and fails closed
                         if entry.passed && !run::holds(plan, &entry) {

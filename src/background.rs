@@ -572,7 +572,7 @@ pub fn post_run(
     sha: &str,
     names: &[String],
     cached: Option<Entry>,
-    run: impl FnOnce() -> Result<Entry, String>,
+    run: impl FnOnce(Option<&mpsc::Sender<crate::run::JobDone>>) -> Result<Entry, String>,
     slot: &AtomicBool,
     finals: impl FnOnce(&Entry) -> Vec<Value>,
     current: impl FnOnce() -> bool,
@@ -651,37 +651,41 @@ pub fn post_run(
                         queued
                     }
                 });
-                // Joined before the final post, so no early post lands after it
-                let poster = early.map(|early| {
-                    let (tx, rx) = mpsc::channel();
-                    crate::run::report_jobs(Some(tx));
-                    let (known, kept, ended) = (&known, &kept, &ended);
-                    s.spawn(move || {
-                        for done in rx {
-                            let Some(body) = early(&done) else {
-                                continue;
-                            };
+                // The run's own channel, joined before the final post so no early post lands after it
+                let (jobs, poster) = match early {
+                    Some(early) => {
+                        let (tx, rx) = mpsc::channel();
+                        let (known, kept, ended) = (&known, &kept, &ended);
+                        let poster = s.spawn(move || {
+                            for done in rx {
+                                let Some(body) = early(&done) else {
+                                    continue;
+                                };
 
-                            // A job can end before the marks have their ids, which come first
-                            while !kept.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(50));
+                                // A job can end before the marks have their ids, which come first
+                                while !kept.load(Ordering::Relaxed)
+                                    && !ended.load(Ordering::Relaxed)
+                                {
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+
+                                let ids = known.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+                                // A check the marks have not made yet waits for the final post
+                                if body["name"].as_str().is_some_and(|n| ids.contains_key(n)) {
+                                    let _ = finish(send, &[body], &ids);
+                                }
                             }
-
-                            let ids = known.lock().unwrap_or_else(|e| e.into_inner()).clone();
-
-                            // A check the marks have not made yet waits for the final post
-                            if body["name"].as_str().is_some_and(|n| ids.contains_key(n)) {
-                                let _ = finish(send, &[body], &ids);
-                            }
-                        }
-                    })
-                });
-                let entry = run();
+                        });
+                        (Some(tx), Some(poster))
+                    }
+                    None => (None, None),
+                };
+                let entry = run(jobs.as_ref());
                 ended.store(true, Ordering::Relaxed);
+                drop(jobs);
 
-                // Only the run that set the sender clears it, another one's goes on
                 if let Some(poster) = poster {
-                    crate::run::report_jobs(None);
                     let _ = poster.join();
                 }
 
@@ -802,7 +806,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || {
+            |jobs| {
                 // The marks go first, a job ending before them waits for the final post
                 for _ in 0..100 {
                     if fake.posts().len() >= 2 {
@@ -810,7 +814,12 @@ mod tests {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                crate::run::job_done("host", "test", "success", [1, 2]);
+                let _ = jobs.unwrap().send(crate::run::JobDone {
+                    file: "host".into(),
+                    job: "test".into(),
+                    state: "success".into(),
+                    times: [1, 2],
+                });
                 // The early post lands while the run still goes
                 for _ in 0..100 {
                     if fake.posts().len() >= 3 {
@@ -925,7 +934,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || Ok(entry()),
+            |_| Ok(entry()),
             &AtomicBool::new(true),
             finals,
             || true,
@@ -985,7 +994,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || Ok(entry()),
+            |_| Ok(entry()),
             &AtomicBool::new(true),
             finals,
             || true,
@@ -1014,7 +1023,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || {
+            |_| {
                 while fake.posts().len() < 2 {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1063,7 +1072,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || Ok(entry()),
+            |_| Ok(entry()),
             &AtomicBool::new(true),
             finals,
             || true,
@@ -1097,7 +1106,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             Some(entry()),
-            || panic!("a cached result must not run"),
+            |_| panic!("a cached result must not run"),
             &AtomicBool::new(true),
             finals,
             || true,
@@ -1123,7 +1132,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || Err("docker version failed, is a Docker engine running?".into()),
+            |_| Err("docker version failed, is a Docker engine running?".into()),
             &AtomicBool::new(true),
             finals,
             || true,
@@ -1160,7 +1169,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || Err("no docker".into()),
+            |_| Err("no docker".into()),
             &AtomicBool::new(true),
             finals,
             || false,
@@ -1253,7 +1262,7 @@ mod tests {
             &"a".repeat(40),
             &names(),
             None,
-            || Ok(entry()),
+            |_| Ok(entry()),
             &AtomicBool::new(true),
             finals,
             || false,

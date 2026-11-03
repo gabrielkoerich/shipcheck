@@ -1340,15 +1340,9 @@ pub struct JobDone {
     pub times: [u64; 2],
 }
 
-static JOB_DONE: Mutex<Option<mpsc::Sender<JobDone>>> = Mutex::new(None);
-
-/// Where this process's runs send each job as it ends, none to stop
-pub fn report_jobs(to: Option<mpsc::Sender<JobDone>>) {
-    *JOB_DONE.lock().unwrap_or_else(|e| e.into_inner()) = to;
-}
-
-pub(crate) fn job_done(file: &str, job: &str, state: &str, times: [u64; 2]) {
-    if let Some(tx) = JOB_DONE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+/// Sends a job that ended to the run's poster, when the run has one
+fn job_done(ctx: &Ctx, file: &str, job: &str, state: &str, times: [u64; 2]) {
+    if let Some(tx) = ctx.jobs {
         let _ = tx.send(JobDone {
             file: file.to_string(),
             job: job.to_string(),
@@ -1482,7 +1476,16 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
 /// Runs every required workflow of the plan, each job in its own copy-on-write clone, and caches
 /// the result
 pub fn run(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
-    let entry = execute(plan, None, say)?;
+    run_reporting(plan, say, None)
+}
+
+/// [`run`], sending each job to `jobs` as it ends, so its check can complete before the others
+pub fn run_reporting(
+    plan: &Plan,
+    say: &mut dyn FnMut(&str),
+    jobs: Option<&mpsc::Sender<JobDone>>,
+) -> Result<Entry, String> {
+    let entry = execute(plan, None, say, jobs)?;
 
     // Docker or the sandbox failed before the code ran, or a clone was wrong, so there is no verdict to keep
     if entry.could_not_run() || entry.wrong_tree() {
@@ -1504,7 +1507,7 @@ pub fn run_partial(
     workflows: &[String],
     say: &mut dyn FnMut(&str),
 ) -> Result<Entry, String> {
-    execute(plan, Some((jobs, workflows)), say)
+    execute(plan, Some((jobs, workflows)), say, None)
 }
 
 /// The jobs to run per workflow file: every job of each named workflow, each job whose id or
@@ -1636,7 +1639,12 @@ pub fn partial_log_dir(key: &str) -> PathBuf {
 
 type Selection<'a> = Option<(&'a [String], &'a [String])>;
 
-fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
+fn execute(
+    plan: &Plan,
+    only: Selection,
+    say: &mut dyn FnMut(&str),
+    jobs: Option<&mpsc::Sender<JobDone>>,
+) -> Result<Entry, String> {
     let _runner = claim_runner(say)?;
     let home = home();
     // Results, logs, secrets and the App key live here, other users of the machine read none of it
@@ -1736,6 +1744,7 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
         nonce: &nonce,
         logs,
         slots: &slots,
+        jobs,
         only: only.as_ref(),
         base_tree: std::sync::OnceLock::new(),
     };
@@ -1806,7 +1815,7 @@ pub fn trial(
         ci_changes: Vec::new(),
         tools: String::new(),
     };
-    let entry = execute(&plan, None, say);
+    let entry = execute(&plan, None, say, None);
     let logs = log_dir(&plan.key);
     let read = |name: &str| {
         let log = fs::read(logs.join(HOST).join(format!("{name}.log"))).unwrap_or_default();
@@ -1924,7 +1933,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
 
     for (name, (_, time)) in &kept {
         say(&format!("{HOST}/{name}: passed on this tree already, kept"));
-        job_done(HOST, name, "success", *time);
+        job_done(ctx, HOST, name, "success", *time);
     }
 
     let mut runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {
@@ -1943,7 +1952,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
                     let start = unix_now();
                     let run = run_job(ctx, HOST, name, &none, deadline, &unused, &tx);
                     let time = [start, unix_now()];
-                    job_done(HOST, name, host_state(&run), time);
+                    job_done(ctx, HOST, name, host_state(&run), time);
                     (name.clone(), run, time)
                 })
             })
@@ -2168,6 +2177,8 @@ struct Ctx<'a> {
     only: Option<&'a BTreeMap<String, BTreeSet<String>>>,
     /// The tree of the remote's default branch, asked once by the first host check
     base_tree: std::sync::OnceLock<Option<String>>,
+    /// Where each job goes as it ends, for a run that posts its checks
+    jobs: Option<&'a mpsc::Sender<JobDone>>,
 }
 
 enum Msg {
@@ -2344,6 +2355,7 @@ fn run_workflow(
                     };
                     say(&format!("{file}/{job}: {state}"));
                     job_done(
+                        ctx,
                         file,
                         &job,
                         &state,
