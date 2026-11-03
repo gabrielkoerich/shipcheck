@@ -968,7 +968,6 @@ mod tests {
                     .map(|(j, s)| (j.to_string(), s.to_string()))
                     .collect::<BTreeMap<_, _>>(),
                 passed: false,
-                kept: BTreeMap::new(),
                 shards: BTreeMap::from([(
                     "lint".to_string(),
                     ShardRun {

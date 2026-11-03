@@ -35,7 +35,7 @@ env = ["FLAKY_PASS"]
 "#;
 
 #[test]
-fn a_rerun_keeps_the_checks_that_passed_on_the_branch_last_failed_result() {
+fn a_rerun_of_a_failed_tree_keeps_the_checks_that_passed() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary, and it sets the environment before any thread
     unsafe {
@@ -62,27 +62,22 @@ fn a_rerun_keeps_the_checks_that_passed_on_the_branch_last_failed_result() {
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "feature"]);
 
-    let run = |work: &Path| {
-        let plan = run::plan(work, "HEAD", "origin/main").unwrap();
-        let mut lines = Vec::new();
-        let entry = run::run(&plan, &mut |l| lines.push(l.to_string())).unwrap();
-        eprintln!("{}", lines.join("\n"));
-        (plan, entry, lines)
-    };
-    let commit = |work: &Path, body: &str| {
-        fs::write(work.join("a.txt"), body).unwrap();
-        git(work, &["add", "-A"]);
-        git(work, &["commit", "-q", "-m", body]);
-    };
-
-    let (a, first, _) = run(&work);
+    let plan = run::plan(&work, "feature", "origin/main").unwrap();
+    let first = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
     assert!(!first.passed, "{first:?}");
     assert_eq!(first.workflows[0].jobs["ok"], "success");
     assert_eq!(first.workflows[0].jobs["flaky"], "failure");
 
-    // The same tree again keeps what passed on it and runs what failed
-    let (_, again, lines) = run(&work);
-    assert!(!again.passed);
+    // SAFETY: no thread of this test runs while it changes the environment
+    unsafe {
+        std::env::set_var("FLAKY_PASS", "1");
+    }
+
+    let plan = run::plan(&work, "feature", "origin/main").unwrap();
+    let mut lines = Vec::new();
+    let second = run::run(&plan, &mut |l| lines.push(l.to_string())).unwrap();
+    eprintln!("{}", lines.join("\n"));
+    assert!(second.passed, "{second:?}");
     assert!(
         lines
             .iter()
@@ -90,26 +85,5 @@ fn a_rerun_keeps_the_checks_that_passed_on_the_branch_last_failed_result() {
     );
     assert!(!lines.iter().any(|l| l.starts_with("host/ok: running")));
     assert!(lines.iter().any(|l| l.starts_with("host/flaky: running")));
-
-    // A new tree of the branch keeps the checks that passed on the last one, only the failed one runs
-    // SAFETY: no thread of this test runs while it changes the environment
-    unsafe {
-        std::env::set_var("FLAKY_PASS", "1");
-    }
-    commit(&work, "b");
-    let (b, second, lines) = run(&work);
-    assert!(second.passed, "{second:?}");
-    let kept = format!("host/ok: passed on tree {}, kept", &a.tree[..12]);
-    assert!(lines.contains(&kept), "{lines:?}");
-    assert!(!lines.iter().any(|l| l.starts_with("host/ok: running")));
-    assert!(lines.iter().any(|l| l.starts_with("host/flaky: running")));
-    assert_eq!(second.workflows[0].kept["ok"], a.tree);
-    assert!(run::lookup(&b).is_some_and(|e| e.passed));
-
-    // After a pass, a new tree runs every check
-    commit(&work, "c");
-    let (_, third, lines) = run(&work);
-    assert!(third.passed);
-    assert!(lines.iter().any(|l| l.starts_with("host/ok: running")));
-    assert!(third.workflows[0].kept.is_empty());
+    assert!(run::lookup(&plan).is_some_and(|e| e.passed));
 }

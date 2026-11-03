@@ -250,7 +250,6 @@ mod tests {
                     .collect(),
                 passed: jobs.iter().all(|(_, s, _)| *s == "success"),
                 shards: BTreeMap::new(),
-                kept: BTreeMap::new(),
                 times: BTreeMap::new(),
                 summaries: jobs
                     .iter()
