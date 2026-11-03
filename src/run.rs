@@ -1568,10 +1568,10 @@ pub fn run_reporting(
  * tree, and runs the rest. Only when `keep_passed` on main allows it, since a change that breaks a
  * kept check then passes
  **/
-pub fn run_failed(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
+pub fn run_only_failed(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, String> {
     if !plan.config.keep_passed {
         return Err(
-            "--failed needs `keep_passed = true` in shipcheck.toml on main, run `shipcheck run` for every check".into(),
+            "--only-failed needs `keep_passed = true` in shipcheck.toml on main, run `shipcheck run` for every check".into(),
         );
     }
 
@@ -4613,7 +4613,7 @@ mod tests {
     fn failed_needs_keep_passed_on_main() {
         let (_dir, plan) =
             plan_after(|repo| fs::write(repo.join("src/lib.rs"), "fn b() {}").unwrap());
-        let err = run_failed(&plan, &mut |_| {}).unwrap_err();
+        let err = run_only_failed(&plan, &mut |_| {}).unwrap_err();
         assert!(err.contains("keep_passed = true"), "{err}");
     }
 

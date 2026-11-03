@@ -68,7 +68,7 @@ fn a_rerun_keeps_the_checks_that_passed_on_the_branch_last_failed_result() {
         let mut lines = Vec::new();
         let mut say = |l: &str| lines.push(l.to_string());
         let entry = if failed {
-            run::run_failed(&plan, &mut say)
+            run::run_only_failed(&plan, &mut say)
         } else {
             run::run(&plan, &mut say)
         };
@@ -109,7 +109,7 @@ fn a_rerun_keeps_the_checks_that_passed_on_the_branch_last_failed_result() {
     assert!(lines.iter().any(|l| l.starts_with("host/ok: running")));
     assert!(full.workflows[0].kept.is_empty());
 
-    // --failed on the next tree keeps what passed on the branch's last failed result
+    // --only-failed on the next tree keeps what passed on the branch's last failed result
     // SAFETY: no thread of this test runs while it changes the environment
     unsafe {
         std::env::remove_var("FLAKY_PASS");
@@ -131,7 +131,7 @@ fn a_rerun_keeps_the_checks_that_passed_on_the_branch_last_failed_result() {
     assert_eq!(second.workflows[0].kept["ok"], a2.tree);
     assert!(run::lookup(&b).is_some_and(|e| e.passed));
 
-    // After a pass, --failed on a new tree keeps nothing and runs every check
+    // After a pass, --only-failed on a new tree keeps nothing and runs every check
     commit(&work, "c");
     let (_, third, lines) = go(&work, true);
     assert!(third.passed);

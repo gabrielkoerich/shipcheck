@@ -89,7 +89,7 @@ enum Cmd {
         /// Keep what passed in this branch's last failed result and run only the rest, when
         /// `keep_passed = true` in shipcheck.toml on main allows it
         #[arg(long, conflicts_with_all = ["jobs", "workflows", "background"])]
-        failed: bool,
+        only_failed: bool,
         /// Print the result as JSON on stdout
         #[arg(long)]
         json: bool,
@@ -237,7 +237,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let mut home_ok = false;
     let mut yes = false;
     let (mut jobs, mut workflows) = (Vec::new(), Vec::new());
-    let (mut json, mut failed) = (false, false);
+    let (mut json, mut only_failed) = (false, false);
     let mut limit = 20;
     let mut uninstall = false;
     // Set by the hooks and the daemon on a background run that posts its checks
@@ -301,13 +301,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             base: b,
             jobs: j,
             workflows: w,
-            failed: f,
+            only_failed: f,
             json: js,
             background,
             home_ok: h,
             rev: r,
         } => {
-            failed = f;
+            only_failed = f;
             at(sha.or(r), &mut rev, &mut explicit);
             home_ok = h;
             staged = st;
@@ -581,8 +581,8 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
                 None => {
                     let say = &mut |line: &str| say(&run::printable(line));
-                    let entry = if failed {
-                        run::run_failed(&plan, say)?
+                    let entry = if only_failed {
+                        run::run_only_failed(&plan, say)?
                     } else {
                         run::run(&plan, say)?
                     };
