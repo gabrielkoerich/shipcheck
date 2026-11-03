@@ -1119,7 +1119,7 @@ fn posting_run(
     rec: &mut Record,
     say: &mut dyn FnMut(&str),
 ) -> Result<Option<run::Entry>, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let repo = run::repo_id(&plan.repo)?;
     let record = background::record(&repo, name);
@@ -1144,7 +1144,7 @@ fn posting_run(
         Ok(sent)
     };
     // The daemon stops a run whose notes stop, which only progress writes
-    let done = std::sync::atomic::AtomicBool::new(false);
+    let done = AtomicBool::new(false);
     let beat = background::beat_path(&repo, pid);
     let logs = [run::log_dir(&plan.key), run::partial_log_dir(&plan.key)];
     let posted = std::thread::scope(|s| {
@@ -1156,6 +1156,11 @@ fn posting_run(
             &check::names(plan),
             cached,
             || {
+                // Another process running this tree is this commit's run, so its checks show running
+                if run::running(&plan.key) {
+                    run::HAS_SLOT.store(true, Ordering::Relaxed);
+                }
+
                 let _key = run::lock_key(&plan.key)?;
 
                 match run::lookup(plan).filter(|e| e.passed) {
@@ -1185,7 +1190,7 @@ fn posting_run(
             || background::current(&record, pid),
             &background::WAITS,
         );
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        done.store(true, Ordering::Relaxed);
         posted
     });
     // Only a refused post is remembered, a run that could not run is not one
