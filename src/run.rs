@@ -1381,7 +1381,7 @@ fn queue_step(dir: &Path, ticket: &Ticket, slots: usize) -> Result<QueueStep, St
         let path = queue.join(name);
 
         // A ticket nobody holds belongs to a run that is gone
-        match fs::File::open(&path) {
+        match fs::OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) if f.try_lock().is_ok() => {
                 let _ = fs::remove_file(&path);
             }
@@ -3130,12 +3130,22 @@ mod tests {
             QueueStep::Slot(lock) => Ok(lock),
             QueueStep::Ahead(n) => Err(n),
         };
+        // A child another test forks holds a dropped lock until it execs, so a slot can free a moment late
+        let eventually = |t: &Ticket| {
+            (0..100).find_map(|_| {
+                let got = slot(t).ok();
+                if got.is_none() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                got
+            })
+        };
 
         // A run the hooks started came first, `shipcheck run` still goes ahead of it
         let hook = Ticket::take(&queue, 1).unwrap();
         let agent = Ticket::take(&queue, 0).unwrap();
         assert_eq!(slot(&hook).err(), Some(1));
-        let held = slot(&agent).unwrap();
+        let held = eventually(&agent).unwrap();
         drop(agent);
         // At the head, but the one slot is busy
         assert_eq!(slot(&hook).err(), Some(0));
@@ -3144,7 +3154,7 @@ mod tests {
         // A ticket nobody holds is a run that died, and goes
         let gone = queue.join(format!("0-{:024}-1", 0));
         fs::write(&gone, "").unwrap();
-        assert!(slot(&hook).is_ok());
+        assert!(eventually(&hook).is_some());
         assert!(!gone.exists());
         let path = hook.path.clone();
         drop(hook);
