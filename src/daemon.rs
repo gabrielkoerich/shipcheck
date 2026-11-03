@@ -2127,6 +2127,7 @@ mod tests {
                 jobs: BTreeMap::from([("test".into(), "failure".into())]),
                 passed: false,
                 shards: BTreeMap::new(),
+                kept: BTreeMap::new(),
                 times: BTreeMap::new(),
                 summaries: BTreeMap::new(),
             }],
