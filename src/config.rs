@@ -17,7 +17,7 @@ pub struct RepoConfig {
     pub timeout_minutes: u64,
     #[serde(default = "one")]
     pub retries: u32,
-    /// The most jobs one run starts at once. Unset: host CPUs minus 1, capped by Docker's CPUs and memory
+    /// The most jobs and host checks one run starts at once. Unset: no cap, every job starts when its needs pass
     #[serde(default)]
     pub max_parallel: Option<usize>,
     #[serde(default)]
@@ -473,19 +473,6 @@ impl Act {
     }
 }
 
-/// Memory a job is given in the `max_parallel` cap. flask's jobs peaked at 0.38 GiB, and one job of a Python app
-/// at 2.2 GiB still fits beside light ones
-pub const JOB_MEMORY: u64 = 1 << 30;
-
-fn default_parallel(host: usize, engine: Option<(u32, u64)>) -> usize {
-    let cpus = host.saturating_sub(1);
-    let Some((engine_cpus, memory)) = engine else {
-        return cpus.max(1);
-    };
-    let by_memory = usize::try_from(memory / JOB_MEMORY).unwrap_or(usize::MAX);
-    cpus.min(engine_cpus as usize).min(by_memory).max(1)
-}
-
 impl RepoConfig {
     fn job_runner(&self, job: &Job) -> RunnerKind {
         job.runner.unwrap_or(self.runner)
@@ -650,13 +637,9 @@ impl RepoConfig {
         Ok(config)
     }
 
-    /// `max_parallel`, or one job per CPU the engine and the host share, one host CPU left free,
-    /// at most one per [`JOB_MEMORY`] of the engine's memory. `engine` is from `docker info`
-    pub fn max_parallel(&self, engine: Option<(u32, u64)>) -> usize {
-        let host = std::thread::available_parallelism().map_or(1, |n| n.get());
+    /// The cap on jobs at once, none when `max_parallel` is unset
+    pub fn max_parallel(&self) -> Option<usize> {
         self.max_parallel
-            .unwrap_or_else(|| default_parallel(host, engine))
-            .max(1)
     }
 
     pub fn runs_on(&self, trigger: Trigger) -> bool {
@@ -823,20 +806,9 @@ mod tests {
     }
 
     #[test]
-    fn parallel_jobs_leave_one_host_cpu_and_fit_the_engine() {
-        let ample = 64 << 30;
-        assert_eq!(default_parallel(14, Some((14, ample))), 13);
-        assert_eq!(default_parallel(14, Some((8, ample))), 8);
-        assert_eq!(default_parallel(4, Some((4, ample))), 3);
-        assert_eq!(default_parallel(1, Some((1, ample))), 1);
-        assert_eq!(default_parallel(14, None), 13);
-        // Docker Desktop at 16 GB reports 15.6 GiB, room for 15 jobs, so the CPUs decide
-        assert_eq!(default_parallel(14, Some((14, 16_745_295_872))), 13);
-        // Its default 8 GB reports 7.75 GiB
-        assert_eq!(default_parallel(14, Some((14, 8_321_499_136))), 7);
-        assert_eq!(default_parallel(14, Some((14, 1 << 30))), 1);
+    fn max_parallel_caps_only_when_set() {
         let fixed = RepoConfig::parse("workflows = [\"ci.yml\"]\nmax_parallel = 3").unwrap();
-        assert_eq!(fixed.max_parallel(Some((14, ample))), 3);
+        assert_eq!(fixed.max_parallel(), Some(3));
     }
 
     fn workflows(files: &[&str]) -> BTreeSet<String> {
@@ -851,7 +823,7 @@ mod tests {
         assert!(cfg.paths.is_empty());
         assert_eq!(cfg.timeout_minutes, 30);
         assert_eq!(cfg.retries, 1);
-        assert!(cfg.max_parallel(None) >= 1);
+        assert_eq!(cfg.max_parallel(), None);
         assert!(cfg.path_filter().unwrap().is_none());
     }
 

@@ -1322,7 +1322,13 @@ pub static WAITING_FOR_SLOT: std::sync::atomic::AtomicBool =
 /// Whether this process holds a run slot, so its checks may show it running
 pub static HAS_SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
+/// A run slot for a run the hooks or the daemon started, none for `shipcheck run`, which an agent waits on
+fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<Option<fs::File>, String> {
+    if std::env::var_os("SHIPCHECK_TRIGGER").is_none() {
+        HAS_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+
     let dir = home().join("runners");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut told = false;
@@ -1335,7 +1341,7 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
             if lock.try_lock().is_ok() {
                 WAITING_FOR_SLOT.store(false, std::sync::atomic::Ordering::Relaxed);
                 HAS_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Ok(lock);
+                return Ok(Some(lock));
             }
         }
 
@@ -1511,6 +1517,7 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     let home = home();
     // Results, logs, secrets and the App key live here, other users of the machine read none of it
     let private = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700);
+    fs::create_dir_all(&home).map_err(|e| format!("{}: {e}", home.display()))?;
     fs::set_permissions(&home, private).map_err(|e| format!("{}: {e}", home.display()))?;
     exclude_from_backup(&home);
     let id = repo_id(&plan.repo)?;
@@ -1592,10 +1599,7 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     } else {
         log_dir(&plan.key)
     };
-    let slots = Slots::new(
-        plan.config
-            .max_parallel(crate::runner::act::engine_resources()),
-    );
+    let slots = Slots::new(plan.config.max_parallel());
     let ctx = Ctx {
         slot_lock: std::os::fd::AsRawFd::as_raw_fd(&_slot),
         plan,
@@ -1916,16 +1920,16 @@ fn remove_checkouts(plan: &Plan, runners: &Runners, slot: &Path) {
 /// Ends the state of a failed job with `continue-on-error: true`, which does not fail the workflow
 pub const ALLOWED: &str = ", allowed by continue-on-error";
 
-/// The job slots of one run, so all its workflows together start at most `max_parallel` jobs
+/// The job slots of one run, so all its workflows together start at most `max_parallel` jobs, any number when unset
 struct Slots {
     free: std::sync::Mutex<usize>,
     freed: std::sync::Condvar,
 }
 
 impl Slots {
-    fn new(count: usize) -> Self {
+    fn new(count: Option<usize>) -> Self {
         Slots {
-            free: std::sync::Mutex::new(count.max(1)),
+            free: std::sync::Mutex::new(count.map_or(usize::MAX, |n| n.max(1))),
             freed: std::sync::Condvar::new(),
         }
     }
