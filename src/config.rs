@@ -28,7 +28,7 @@ pub struct RepoConfig {
     /// Which jobs' log tails go into their checks, which are public on a public repository
     #[serde(default)]
     pub logs: Logs,
-    /// Splits a pytest step into parallel shards in the job's container, off unless set
+    /// Splits a job's pytest step or a host check's pytest command into parallel shards, off unless set
     #[serde(default)]
     pub shard_tests: ShardTests,
     #[serde(default)]
@@ -139,7 +139,7 @@ impl From<String> for Check {
     }
 }
 
-/// `shard_tests = true` for as many shards as the container has CPUs, at most 6, or a fixed number
+/// `shard_tests = true` for as many shards as the container or host has CPUs, at most 6, or a fixed number
 #[derive(Debug, Deserialize, PartialEq, Clone, Copy)]
 #[serde(untagged)]
 pub enum ShardTests {
@@ -621,7 +621,7 @@ impl RepoConfig {
         if !config.acts() {
             let table: toml::Table =
                 toml::from_str(text).map_err(|e| format!("shipcheck.toml: {e}"))?;
-            let set: Vec<&str> = ["shard_tests", "network", "act"]
+            let set: Vec<&str> = ["network", "act"]
                 .into_iter()
                 .filter(|k| table.contains_key(*k))
                 .collect();
@@ -879,11 +879,7 @@ mod tests {
         );
         assert!(err("").contains("workflows is empty"));
 
-        for act_only in [
-            "shard_tests = true",
-            "network = \"none\"",
-            "[act]\ncache_paths = []",
-        ] {
+        for act_only in ["network = \"none\"", "[act]\ncache_paths = []"] {
             let text = format!("runner = \"host\"\n{act_only}\n[host]\nchecks = {{ t = \"x\" }}");
             assert!(
                 RepoConfig::parse(&text)

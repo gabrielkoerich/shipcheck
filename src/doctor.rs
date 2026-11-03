@@ -277,7 +277,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     if let Ok(p) = &plan
         && !p.config.shard_tests.enabled()
     {
-        let shardable: Vec<String> = p
+        let mut shardable: Vec<String> = p
             .workflows
             .iter()
             .filter(|(path, body)| {
@@ -287,13 +287,21 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             })
             .map(|(path, _)| path.rsplit('/').next().unwrap_or(path).to_string())
             .collect();
+        shardable.extend(
+            p.config
+                .host
+                .checks
+                .iter()
+                .filter(|(_, c)| runner::shard::shard_command(c, "").is_some())
+                .map(|(name, _)| format!("host check {name}")),
+        );
 
         if !shardable.is_empty() {
             found.push(Check {
                 name: "shard_tests",
                 ok: true,
                 detail: format!(
-                    "off. {} has a pytest step that `shard_tests = true` in shipcheck.toml would split into parallel shards",
+                    "off. {} has a pytest command that `shard_tests = true` in shipcheck.toml would split into parallel shards",
                     shardable.join(", ")
                 ),
             });

@@ -1829,7 +1829,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
 
     let (mut states, mut times) = (BTreeMap::new(), BTreeMap::new());
     let (mut exit, mut attempts, mut log) = (Some(0), 0, String::new());
-    let mut summaries = BTreeMap::new();
+    let (mut summaries, mut shards) = (BTreeMap::new(), BTreeMap::new());
 
     for (name, run, time) in runs {
         times.insert(name.clone(), time);
@@ -1837,6 +1837,10 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
             Ok(run) => {
                 attempts = attempts.max(run.attempts);
                 log.push_str(&run.log);
+
+                if let Some(info) = run.shard {
+                    shards.insert(name.clone(), info);
+                }
 
                 if !run.summary.is_empty() {
                     summaries.insert(name.clone(), run.summary);
@@ -1876,7 +1880,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
         log_sha256: cache::hex(&Sha256::digest(log.as_bytes())),
         jobs: states,
         passed,
-        shards: BTreeMap::new(),
+        shards,
         times,
         summaries,
     })

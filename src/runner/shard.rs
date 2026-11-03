@@ -50,7 +50,12 @@ pub fn pytest_line(step: &Hash, default_shell: Option<&str>) -> Option<String> {
         return None;
     }
 
-    let line = step.get(&key("run"))?.as_str()?.trim();
+    pytest_command(step.get(&key("run"))?.as_str()?)
+}
+
+/// `line` trimmed when it is one plain pytest command shipcheck can shard, or None
+pub fn pytest_command(line: &str) -> Option<String> {
+    let line = line.trim();
 
     if line.contains('\n') || line.contains([';', '&', '|', '<', '>', '$', '`', '(', ')', '\\']) {
         return None;
@@ -129,7 +134,7 @@ pub fn shard_steps(jobs: &mut Hash, root_shell: Option<&str>, shards: ShardTests
         };
         step.insert(key("name"), key(&format!("{name} (shipcheck: {count})")));
         step.insert(key("shell"), key("bash"));
-        step.insert(key("run"), Yaml::String(wrapper(line)));
+        step.insert(key("run"), Yaml::String(wrapper(line, "$GITHUB_WORKSPACE")));
     }
 }
 
@@ -148,16 +153,16 @@ pub fn shardable(source: &str) -> bool {
 
 /**
  * Runs the line once per shard in the background, prints each shard's output in order, then a
- * summary. The host writes the plugin and the shard count into `.git` only for a sharded attempt,
- * without them the line runs as it is. The plugin's digest is in the script, so a new plugin changes
- * the cache key, and the count is not, so the key does not depend on the machine
+ * summary. The host writes the plugin and the shard count into `.git` under `root` only for a
+ * sharded attempt, without them the line runs as it is. The plugin's digest is in the script, so a
+ * new plugin changes the cache key, and the count is not, so the key does not depend on the machine
  **/
-fn wrapper(line: &str) -> String {
+fn wrapper(line: &str, root: &str) -> String {
     let plugin = &cache::hex(&Sha256::digest(PLUGIN))[..16];
     format!(
         r#"set +e
 # shipcheck shard plugin {plugin}
-plugin="$GITHUB_WORKSPACE/.git/{PLUGIN_DIR}"
+plugin="{root}/.git/{PLUGIN_DIR}"
 n=$(cat "$plugin/shards" 2>/dev/null)
 case "$n" in
   ''|*[!0-9]*)
@@ -165,7 +170,7 @@ case "$n" in
     exit $?
     ;;
 esac
-out="$GITHUB_WORKSPACE/.git/{REPORT_DIR}"
+out="{root}/.git/{REPORT_DIR}"
 mkdir -p "$out"
 for i in $(seq 0 $((n - 1))); do
   (
@@ -197,6 +202,53 @@ done
 exit $code
 "#
     )
+}
+
+/// Where a host check's wrapper script goes, beside the plugin in the clone's own `.git`
+pub const HOST_SCRIPT: &str = "run.sh";
+
+/**
+ * A host check with its one pytest segment of a `&&` chain run by the wrapper at `script`, or None
+ * when no segment or more than one is shardable. Every other byte of the check stays as written
+ **/
+pub fn shard_command(check: &str, script: &str) -> Option<String> {
+    let parts: Vec<&str> = check.split("&&").collect();
+    let found: Vec<usize> = (0..parts.len())
+        .filter(|&i| pytest_command(parts[i]).is_some())
+        .collect();
+    let [at] = found.as_slice() else {
+        return None;
+    };
+    let mut out: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+    let lead = &parts[*at][..parts[*at].len() - parts[*at].trim_start().len()];
+    let trail = &parts[*at][parts[*at].trim_end().len()..];
+    out[*at] = format!("{lead}bash '{script}'{trail}");
+    Some(out.join("&&"))
+}
+
+/**
+ * Writes the plugin, the shard count and the wrapper of `check`'s pytest segment into the clone at
+ * `run_dir`, and returns the command to run. None when the check has no one pytest segment, or the
+ * clone's path cannot go in the script as it is
+ **/
+pub fn write_host(run_dir: &Path, check: &str, n: u32) -> Result<Option<String>, String> {
+    let root = run_dir.to_string_lossy();
+
+    if root.contains(['"', '\'', '$', '`', '\\', '\n']) {
+        return Ok(None);
+    }
+
+    let script = run_dir.join(".git").join(PLUGIN_DIR).join(HOST_SCRIPT);
+    let Some(command) = shard_command(check, &script.to_string_lossy()) else {
+        return Ok(None);
+    };
+    let line = check
+        .split("&&")
+        .find_map(pytest_command)
+        .ok_or("no pytest segment")?;
+    write_plugin(run_dir, n)?;
+    fs::write(&script, wrapper(&line, &root)).map_err(|e| e.to_string())?;
+    Ok(Some(command))
 }
 
 /// Memory one shard of a suite with heavy imports can take
@@ -633,6 +685,66 @@ mod tests {
         let git_link = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(dir.path().join(".git"), git_link.path().join(".git")).unwrap();
         assert_eq!(read_reports(git_link.path(), 1), [None]);
+    }
+
+    #[test]
+    fn shards_the_one_pytest_segment_of_a_host_check() {
+        let s = "/r/.git/shipcheck-plugin/run.sh";
+        assert_eq!(
+            shard_command(
+                "uv sync --all-groups && uv run basedpyright && uv run pytest -v",
+                s
+            )
+            .as_deref(),
+            Some(
+                "uv sync --all-groups && uv run basedpyright && bash '/r/.git/shipcheck-plugin/run.sh'"
+            )
+        );
+        assert_eq!(
+            shard_command("pytest -q", s).as_deref(),
+            Some("bash '/r/.git/shipcheck-plugin/run.sh'")
+        );
+        // Bytes around the segment stay, quotes included
+        assert_eq!(
+            shard_command("echo \"a&&b\" &&  pytest  && coverage report", s).as_deref(),
+            Some("echo \"a&&b\" &&  bash '/r/.git/shipcheck-plugin/run.sh'  && coverage report")
+        );
+
+        for none in [
+            "cargo test",
+            "pytest a && pytest b",
+            "pytest -n 4",
+            "pytest | tee out",
+            "uv sync; pytest",
+            "",
+        ] {
+            assert_eq!(shard_command(none, s), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn writes_the_host_wrapper_into_the_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let command = write_host(dir.path(), "uv sync && uv run pytest -q", 3)
+            .unwrap()
+            .unwrap();
+        let plugin = dir.path().join(".git").join(PLUGIN_DIR);
+        assert!(command.starts_with("uv sync && bash '"));
+        assert!(command.contains(&*plugin.join(HOST_SCRIPT).to_string_lossy()));
+        assert_eq!(fs::read_to_string(plugin.join("shards")).unwrap(), "3");
+        let script = fs::read_to_string(plugin.join(HOST_SCRIPT)).unwrap();
+        assert!(script.contains(&format!(
+            "plugin=\"{}/.git/{PLUGIN_DIR}\"",
+            dir.path().display()
+        )));
+        assert!(script.contains("\n    uv run pytest -q\n    exit $?\n"));
+        assert!(!script.contains("GITHUB_WORKSPACE"));
+        assert_eq!(write_host(dir.path(), "cargo test", 3).unwrap(), None);
+
+        let odd = tempfile::Builder::new().prefix("a$b").tempdir().unwrap();
+        fs::create_dir(odd.path().join(".git")).unwrap();
+        assert_eq!(write_host(odd.path(), "pytest", 2).unwrap(), None);
     }
 
     #[test]
