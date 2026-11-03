@@ -700,6 +700,8 @@ impl Jail {
         // Tests of the jail read it, since macOS refuses a sandbox inside a sandbox
         if self.sandboxed {
             cmd.env("SHIPCHECK_JAIL", "1");
+            // libgit2's TLS on macOS needs securityd, which holds the keychain and the jail denies. git does not
+            cmd.env("CARGO_NET_GIT_FETCH_WITH_CLI", "true");
         }
 
         if self.home.join(SBF_SDK).is_dir() {
@@ -2107,6 +2109,10 @@ mod tests {
         let cmd = open.shell("true", dir.path(), &[]).unwrap();
         assert_eq!(cmd.get_program(), "/usr/bin/env");
         assert!(!cmd.get_envs().any(|(k, _)| k == "SHIPCHECK_JAIL"));
+        assert!(
+            !cmd.get_envs()
+                .any(|(k, _)| k == "CARGO_NET_GIT_FETCH_WITH_CLI")
+        );
 
         let file = outside.path().join("written");
         let status = open
@@ -2144,6 +2150,7 @@ mod tests {
             env("BUNDLE_PATH"),
             jail.cache.join("bundle").to_string_lossy()
         );
+        assert_eq!(env("CARGO_NET_GIT_FETCH_WITH_CLI"), "true");
         assert_eq!(env("GEM_HOME"), jail.home.join(".gem").to_string_lossy());
         // Last, so a gem's command never shadows a tool of the user's
         let gem_bin = format!(":{}", jail.home.join(".gem/bin").display());
