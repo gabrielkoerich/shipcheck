@@ -196,9 +196,10 @@ impl Runners {
                         .with_engines(config.engines()),
                 ) as Box<dyn Runner>
             }),
-            host: config
-                .hosts()
-                .then(|| Box::new(host::Host::new(config.host.clone(), repo)) as Box<dyn Runner>),
+            host: config.hosts().then(|| {
+                Box::new(host::Host::new(config.host.clone(), repo).with_shards(config.shard_tests))
+                    as Box<dyn Runner>
+            }),
         }
     }
 

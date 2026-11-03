@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use sandbox_jail::known::{self, LAUNCHCTL};
 use sandbox_jail::{Access, Backend, Policy, Sandbox};
 
-use super::{Outcome, RunRequest, Runner};
+use super::{Outcome, RunRequest, Runner, shard};
 use crate::config;
 
 /// The one "workflow" of a host run, its jobs are the checks
@@ -24,6 +24,7 @@ pub struct Host {
     copy: std::sync::OnceLock<Result<RunCopy, String>>,
     /// Whether checks of another tree see the base's cache through an overlay instead of a copy
     overlay: std::sync::OnceLock<bool>,
+    shards: config::ShardTests,
 }
 
 impl Host {
@@ -33,7 +34,12 @@ impl Host {
             repo: repo.to_path_buf(),
             copy: std::sync::OnceLock::new(),
             overlay: std::sync::OnceLock::new(),
+            shards: config::ShardTests::default(),
         }
+    }
+
+    pub fn with_shards(self, shards: config::ShardTests) -> Self {
+        Host { shards, ..self }
     }
 
     /**
@@ -1946,8 +1952,19 @@ impl Runner for Host {
             overlay,
             sandboxed: command.sandbox,
         };
+        // As many shards as this machine's CPUs allow, since host checks share them with nothing else
+        let shards = (request.shard && self.shards.enabled())
+            .then(|| {
+                let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+                shard::count(self.shards, Some((cpus as u32, u64::MAX)))
+            })
+            .filter(|n| *n > 0);
+        let sharded = match shards {
+            Some(n) => shard::write_host(request.run_dir, command, n)?.map(|c| (n, c)),
+            None => None,
+        };
         let exit = run_command(
-            command,
+            sharded.as_ref().map_or(&**command, |(_, c)| c.as_str()),
             request.run_dir,
             &jail,
             &self.config.env,
@@ -1958,7 +1975,7 @@ impl Runner for Host {
             exit,
             unsupported_jobs: Vec::new(),
             outputs: BTreeMap::new(),
-            shards: None,
+            shards: sharded.map(|(n, _)| n),
             summary: read_summary(&jail.home),
             skipped: false,
         })
