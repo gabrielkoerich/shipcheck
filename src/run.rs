@@ -1306,15 +1306,16 @@ pub fn running(key: &str) -> bool {
         .is_ok_and(|lock| lock.try_lock().is_err())
 }
 
+/// The machine's run slots: `SHIPCHECK_MAX_RUNS`, or a sixth of the CPUs, since three brain runs on
+/// 14 CPUs left none idle and failed its timing tests
 fn max_runs() -> usize {
     std::env::var("SHIPCHECK_MAX_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() / 4))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() / 6))
         .max(1)
 }
 
-/// Waits for one of the machine's run slots, which cap how many act runs go at once
 /// Whether this process waits for a run slot, which its heartbeat counts as progress
 pub static WAITING_FOR_SLOT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1322,33 +1323,115 @@ pub static WAITING_FOR_SLOT: std::sync::atomic::AtomicBool =
 /// Whether this process holds a run slot, so its checks may show it running
 pub static HAS_SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// A run slot for a run the hooks or the daemon started, none for `shipcheck run`, which an agent waits on
-fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<Option<fs::File>, String> {
-    if std::env::var_os("SHIPCHECK_TRIGGER").is_none() {
-        HAS_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
-        return Ok(None);
+/// A run's place in the queue for a machine run slot, a file it holds locked and removes when it goes
+struct Ticket {
+    path: PathBuf,
+    _lock: fs::File,
+}
+
+impl Ticket {
+    /**
+     * Named `<priority>-<arrival>-<pid>`, so the names sort into the queue's order. It is locked under
+     * a temporary name and renamed into the queue, so no other run sees it unlocked and removes it
+     **/
+    fn take(queue: &Path, priority: u8) -> Result<Ticket, String> {
+        fs::create_dir_all(queue).map_err(|e| format!("{}: {e}", queue.display()))?;
+        let at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!("{priority}-{at:024}-{}", std::process::id());
+        let temp = queue.join(format!(".{name}"));
+        let lock = fs::File::create(&temp).map_err(|e| format!("{}: {e}", temp.display()))?;
+        lock.try_lock()
+            .map_err(|e| format!("{}: {e}", temp.display()))?;
+        let path = queue.join(name);
+        fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Ticket { path, _lock: lock })
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// What one look at the queue found: a slot to hold, or how many live runs are ahead
+enum QueueStep {
+    Slot(fs::File),
+    Ahead(usize),
+}
+
+/**
+ * The live tickets ahead of `ticket`, removing those of runs that died. Only the head takes a slot,
+ * so slots go out in the queue's order
+ **/
+fn queue_step(dir: &Path, ticket: &Ticket, slots: usize) -> Result<QueueStep, String> {
+    let queue = dir.join("queue");
+    let mine = ticket.path.file_name().unwrap_or_default();
+    let mut names: Vec<_> = fs::read_dir(&queue)
+        .map_err(|e| format!("{}: {e}", queue.display()))?
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| !n.to_string_lossy().starts_with('.'))
+        .collect();
+    names.sort();
+    let mut ahead = 0;
+
+    for name in names.iter().take_while(|n| n.as_os_str() < mine) {
+        let path = queue.join(name);
+
+        // A ticket nobody holds belongs to a run that is gone
+        match fs::File::open(&path) {
+            Ok(f) if f.try_lock().is_ok() => {
+                let _ = fs::remove_file(&path);
+            }
+            Ok(_) => ahead += 1,
+            Err(_) => {}
+        }
     }
 
+    if ahead > 0 {
+        return Ok(QueueStep::Ahead(ahead));
+    }
+
+    for n in 0..slots {
+        let lock = fs::File::create(dir.join(format!("{n}.lock"))).map_err(|e| e.to_string())?;
+
+        if lock.try_lock().is_ok() {
+            return Ok(QueueStep::Slot(lock));
+        }
+    }
+
+    Ok(QueueStep::Ahead(0))
+}
+
+/**
+ * Waits in the machine's queue for a run slot. `shipcheck run`, which an agent waits on, goes ahead
+ * of the runs the hooks and the daemon start, and each kind goes in the order it came
+ **/
+fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
     let dir = home().join("runners");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut told = false;
+    let priority = u8::from(std::env::var_os("SHIPCHECK_TRIGGER").is_some());
+    let ticket = Ticket::take(&dir.join("queue"), priority)?;
+    let mut told = None;
 
     loop {
-        for n in 0..max_runs() {
-            let lock =
-                fs::File::create(dir.join(format!("{n}.lock"))).map_err(|e| e.to_string())?;
-
-            if lock.try_lock().is_ok() {
+        match queue_step(&dir, &ticket, max_runs())? {
+            QueueStep::Slot(lock) => {
                 WAITING_FOR_SLOT.store(false, std::sync::atomic::Ordering::Relaxed);
                 HAS_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Ok(Some(lock));
+                return Ok(lock);
             }
-        }
-
-        if !told {
-            say("waiting for a free run slot");
-            WAITING_FOR_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
-            told = true;
+            QueueStep::Ahead(ahead) => {
+                if told != Some(ahead) {
+                    say(&match ahead {
+                        0 => "queued for a run slot, every slot is busy".to_string(),
+                        n => format!("queued for a run slot, {n} ahead"),
+                    });
+                    WAITING_FOR_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
+                    told = Some(ahead);
+                }
+            }
         }
 
         std::thread::sleep(Duration::from_millis(500));
@@ -3038,6 +3121,35 @@ fn glob_locks(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_queue_gives_slots_in_order_and_skips_gone_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("queue");
+        let slot = |t: &Ticket| match queue_step(dir.path(), t, 1).unwrap() {
+            QueueStep::Slot(lock) => Ok(lock),
+            QueueStep::Ahead(n) => Err(n),
+        };
+
+        // A run the hooks started came first, `shipcheck run` still goes ahead of it
+        let hook = Ticket::take(&queue, 1).unwrap();
+        let agent = Ticket::take(&queue, 0).unwrap();
+        assert_eq!(slot(&hook).err(), Some(1));
+        let held = slot(&agent).unwrap();
+        drop(agent);
+        // At the head, but the one slot is busy
+        assert_eq!(slot(&hook).err(), Some(0));
+        drop(held);
+
+        // A ticket nobody holds is a run that died, and goes
+        let gone = queue.join(format!("0-{:024}-1", 0));
+        fs::write(&gone, "").unwrap();
+        assert!(slot(&hook).is_ok());
+        assert!(!gone.exists());
+        let path = hook.path.clone();
+        drop(hook);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn job_picks_host_checks() {
