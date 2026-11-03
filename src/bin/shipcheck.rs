@@ -86,6 +86,10 @@ enum Cmd {
         /// Run only the jobs of this workflow, a partial run
         #[arg(long = "workflow", value_name = "file")]
         workflows: Vec<String>,
+        /// Keep what passed in this branch's last failed result and run only the rest, when
+        /// `keep_passed = true` in shipcheck.toml on main allows it
+        #[arg(long, conflicts_with_all = ["jobs", "workflows", "background"])]
+        failed: bool,
         /// Print the result as JSON on stdout
         #[arg(long)]
         json: bool,
@@ -233,7 +237,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let mut home_ok = false;
     let mut yes = false;
     let (mut jobs, mut workflows) = (Vec::new(), Vec::new());
-    let mut json = false;
+    let (mut json, mut failed) = (false, false);
     let mut limit = 20;
     let mut uninstall = false;
     // Set by the hooks and the daemon on a background run that posts its checks
@@ -297,11 +301,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             base: b,
             jobs: j,
             workflows: w,
+            failed: f,
             json: js,
             background,
             home_ok: h,
             rev: r,
         } => {
+            failed = f;
             at(sha.or(r), &mut rev, &mut explicit);
             home_ok = h;
             staged = st;
@@ -574,7 +580,12 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     entry
                 }
                 None => {
-                    let entry = run::run(&plan, &mut |line| say(&run::printable(line)))?;
+                    let say = &mut |line: &str| say(&run::printable(line));
+                    let entry = if failed {
+                        run::run_failed(&plan, say)?
+                    } else {
+                        run::run(&plan, say)?
+                    };
                     say(&format!(
                         "tested {what}, tree {tree}: ran in {:.1?}",
                         started.elapsed()

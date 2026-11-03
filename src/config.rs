@@ -31,6 +31,10 @@ pub struct RepoConfig {
     /// Splits a job's pytest step or a host check's pytest command into parallel shards, off unless set
     #[serde(default)]
     pub shard_tests: ShardTests,
+    /// Lets `shipcheck run --failed` keep the checks that passed in the branch's last failed result on a
+    /// new tree. A change that breaks a kept check then passes, so it is off unless the owner sets it
+    #[serde(default)]
+    pub keep_passed: bool,
     #[serde(default)]
     pub act: Act,
     #[serde(default)]
@@ -823,6 +827,7 @@ mod tests {
         assert!(cfg.paths.is_empty());
         assert_eq!(cfg.timeout_minutes, 30);
         assert_eq!(cfg.retries, 1);
+        assert!(!cfg.keep_passed);
         assert_eq!(cfg.max_parallel(), None);
         assert!(cfg.path_filter().unwrap().is_none());
     }
