@@ -677,10 +677,11 @@ pub fn post_run(
                     })
                 });
                 let entry = run();
-                crate::run::report_jobs(None);
                 ended.store(true, Ordering::Relaxed);
 
+                // Only the run that set the sender clears it, another one's goes on
                 if let Some(poster) = poster {
+                    crate::run::report_jobs(None);
                     let _ = poster.join();
                 }
 

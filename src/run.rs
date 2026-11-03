@@ -1297,6 +1297,21 @@ pub fn lock_key(key: &str) -> Result<fs::File, String> {
     Ok(lock)
 }
 
+/**
+ * Takes the tree's lock, and when another run held it, the time this one began to wait. A result
+ * stored after that is the one this run waited for, see [`reusable`]
+ **/
+pub fn lock_tree(key: &str) -> Result<(fs::File, Option<u64>), String> {
+    let waited = running(key).then(unix_now);
+    Ok((lock_key(key)?, waited))
+}
+
+/// A stored pass, or any result a run stored while this one waited for it, so a failure that just
+/// ran is not run again at once. A failure found later runs again, so a flaky one cannot stick
+pub fn reusable(plan: &Plan, waited: Option<u64>) -> Option<Entry> {
+    lookup(plan).filter(|e| e.passed || waited.is_some_and(|t| e.finished_unix >= t))
+}
+
 /// Whether a run of this key is going right now on this machine, without waiting for it
 pub fn running(key: &str) -> bool {
     let path = home().join("locks").join(format!("{key}.lock"));
@@ -1900,13 +1915,26 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
         }
     }
 
-    let runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {
+    // A full run of a tree that failed keeps the checks that passed on it, only the others run again
+    let kept = if ctx.only.is_none() {
+        kept_checks(ctx)
+    } else {
+        BTreeMap::new()
+    };
+
+    for (name, (_, time)) in &kept {
+        say(&format!("{HOST}/{name}: passed on this tree already, kept"));
+        job_done(HOST, name, "success", *time);
+    }
+
+    let mut runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<Msg>();
         let handles: Vec<_> = checks
             .keys()
             .filter(|name| {
                 ctx.only
                     .is_none_or(|o| o.get(HOST).is_some_and(|picked| picked.contains(*name)))
+                    && !kept.contains_key(*name)
             })
             .map(|name| {
                 let tx = tx.clone();
@@ -1937,6 +1965,11 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
             })
             .collect()
     });
+    runs.extend(
+        kept.into_iter()
+            .map(|(name, (run, time))| (name, Ok(run), time)),
+    );
+    runs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let (mut states, mut times) = (BTreeMap::new(), BTreeMap::new());
     let (mut exit, mut attempts, mut log) = (Some(0), 0, String::new());
@@ -1992,6 +2025,43 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
         times,
         summaries,
     })
+}
+
+/**
+ * The host checks that passed in this tree's stored result when that result failed, rebuilt from
+ * its logs and times. A pass from a run of the same key is a pass, only a failure runs again
+ **/
+fn kept_checks(ctx: &Ctx) -> BTreeMap<String, (JobRun, [u64; 2])> {
+    let Some(stored) = cached(&ctx.plan.key).filter(|e| !e.passed && holds(ctx.plan, e)) else {
+        return BTreeMap::new();
+    };
+    let Some(wf) = stored.workflows.into_iter().find(|w| w.file == HOST) else {
+        return BTreeMap::new();
+    };
+
+    wf.jobs
+        .iter()
+        .filter(|(name, state)| {
+            *state == "success" && ctx.plan.config.host.checks.contains_key(*name)
+        })
+        .filter_map(|(name, _)| {
+            let log = fs::read_to_string(ctx.logs.join(HOST).join(format!("{name}.log"))).ok()?;
+            let run = JobRun {
+                exit: Some(0),
+                skipped: false,
+                attempts: 1,
+                outputs: BTreeMap::new(),
+                unsupported: Vec::new(),
+                log,
+                shard: wf.shards.get(name).cloned(),
+                summary: wf.summaries.get(name).cloned().unwrap_or_default(),
+            };
+            Some((
+                name.clone(),
+                (run, wf.times.get(name).copied().unwrap_or_default()),
+            ))
+        })
+        .collect()
 }
 
 /// A host check's state from how its run ended
