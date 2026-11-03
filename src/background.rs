@@ -3,8 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -625,9 +625,10 @@ pub fn post_run(
         None => {
             let ended = AtomicBool::new(false);
             // The ids the marks got, so a job that ends completes its own check at once
-            let known = std::sync::Mutex::new(BTreeMap::new());
+            let (known, kept) = (Mutex::new(BTreeMap::new()), AtomicBool::new(false));
             let keep = |ids: BTreeMap<String, u64>| {
                 *known.lock().unwrap_or_else(|e| e.into_inner()) = ids.clone();
+                kept.store(true, Ordering::Relaxed);
                 ids
             };
             let (entry, ids) = std::thread::scope(|s| {
@@ -652,14 +653,20 @@ pub fn post_run(
                 });
                 // Joined before the final post, so no early post lands after it
                 let poster = early.map(|early| {
-                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (tx, rx) = mpsc::channel();
                     crate::run::report_jobs(Some(tx));
-                    let known = &known;
+                    let (known, kept, ended) = (&known, &kept, &ended);
                     s.spawn(move || {
                         for done in rx {
                             let Some(body) = early(&done) else {
                                 continue;
                             };
+
+                            // A job can end before the marks have their ids, which come first
+                            while !kept.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+
                             let ids = known.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
                             // A check the marks have not made yet waits for the final post

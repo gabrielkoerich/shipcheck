@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -635,7 +635,7 @@ pub fn remote_base_sha(repo: &Path) -> Option<String> {
 /// The remote's default branch and its commit, asked once per process for each checkout and URL
 fn remote_head(repo: &Path) -> Option<(String, String)> {
     type Asked = BTreeMap<(PathBuf, String), Option<(String, String)>>;
-    static ASKED: std::sync::Mutex<Asked> = std::sync::Mutex::new(BTreeMap::new());
+    static ASKED: Mutex<Asked> = Mutex::new(BTreeMap::new());
     let url = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
     let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
     asked
@@ -1325,7 +1325,7 @@ pub struct JobDone {
     pub times: [u64; 2],
 }
 
-static JOB_DONE: std::sync::Mutex<Option<mpsc::Sender<JobDone>>> = std::sync::Mutex::new(None);
+static JOB_DONE: Mutex<Option<mpsc::Sender<JobDone>>> = Mutex::new(None);
 
 /// Where this process's runs send each job as it ends, none to stop
 pub fn report_jobs(to: Option<mpsc::Sender<JobDone>>) {
@@ -2046,14 +2046,14 @@ pub const ALLOWED: &str = ", allowed by continue-on-error";
 
 /// The job slots of one run, so all its workflows together start at most `max_parallel` jobs, any number when unset
 struct Slots {
-    free: std::sync::Mutex<usize>,
+    free: Mutex<usize>,
     freed: std::sync::Condvar,
 }
 
 impl Slots {
     fn new(count: Option<usize>) -> Self {
         Slots {
-            free: std::sync::Mutex::new(count.map_or(usize::MAX, |n| n.max(1))),
+            free: Mutex::new(count.map_or(usize::MAX, |n| n.max(1))),
             freed: std::sync::Condvar::new(),
         }
     }
