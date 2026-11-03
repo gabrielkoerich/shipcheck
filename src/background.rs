@@ -3,8 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -513,6 +513,9 @@ pub type Send<'a> = dyn Fn(&Value, Option<u64>) -> Result<(u64, String), String>
 /// Reads shipcheck's latest check run per name on the commit
 pub type Find<'a> = dyn Fn() -> Result<Checks, String> + Sync + 'a;
 
+/// The check of one job that ended, posted while the run goes on
+pub type Early<'a> = dyn Fn(&crate::run::JobDone) -> Option<Value> + Sync + 'a;
+
 /// Shows each named check without a result: in_progress while a run goes, queued while none does.
 /// Returns the id of every named check
 pub fn mark(
@@ -574,6 +577,7 @@ pub fn post_run(
     finals: impl FnOnce(&Entry) -> Vec<Value>,
     current: impl FnOnce() -> bool,
     waits: &[u64],
+    early: Option<&Early>,
 ) -> Result<Option<Entry>, String> {
     // A service without the read endpoint, or a list GitHub refuses, means creating new runs
     let found = || match find() {
@@ -620,28 +624,66 @@ pub fn post_run(
         }
         None => {
             let ended = AtomicBool::new(false);
+            // The ids the marks got, so a job that ends completes its own check at once
+            let (known, kept) = (Mutex::new(BTreeMap::new()), AtomicBool::new(false));
+            let keep = |ids: BTreeMap<String, u64>| {
+                *known.lock().unwrap_or_else(|e| e.into_inner()) = ids.clone();
+                kept.store(true, Ordering::Relaxed);
+                ids
+            };
             let (entry, ids) = std::thread::scope(|s| {
                 let marks = s.spawn(|| {
                     let none = BTreeMap::new();
 
                     if slot.load(Ordering::Relaxed) {
-                        return marked(true, &none);
+                        return keep(marked(true, &none));
                     }
 
-                    let queued = marked(false, &none);
+                    let queued = keep(marked(false, &none));
 
                     while !slot.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(200));
                     }
 
                     if slot.load(Ordering::Relaxed) {
-                        marked(true, &queued)
+                        keep(marked(true, &queued))
                     } else {
                         queued
                     }
                 });
+                // Joined before the final post, so no early post lands after it
+                let poster = early.map(|early| {
+                    let (tx, rx) = mpsc::channel();
+                    crate::run::report_jobs(Some(tx));
+                    let (known, kept, ended) = (&known, &kept, &ended);
+                    s.spawn(move || {
+                        for done in rx {
+                            let Some(body) = early(&done) else {
+                                continue;
+                            };
+
+                            // A job can end before the marks have their ids, which come first
+                            while !kept.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+
+                            let ids = known.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+                            // A check the marks have not made yet waits for the final post
+                            if body["name"].as_str().is_some_and(|n| ids.contains_key(n)) {
+                                let _ = finish(send, &[body], &ids);
+                            }
+                        }
+                    })
+                });
                 let entry = run();
+                crate::run::report_jobs(None);
                 ended.store(true, Ordering::Relaxed);
+
+                if let Some(poster) = poster {
+                    let _ = poster.join();
+                }
+
                 (entry, marks.join().unwrap_or_default())
             });
 
@@ -745,6 +787,65 @@ mod tests {
     }
 
     #[test]
+    fn a_job_that_ends_completes_its_check_before_the_run_does() {
+        let fake = Fake::new(0);
+        let slot = AtomicBool::new(true);
+        let early = |done: &crate::run::JobDone| {
+            Some(
+                json!({"name": format!("shipcheck/{}", done.job), "status": "completed", "conclusion": done.state}),
+            )
+        };
+        let got = post_run(
+            &|b, id| fake.send(b, id),
+            &|| Ok(Checks::new()),
+            &"a".repeat(40),
+            &names(),
+            None,
+            || {
+                // The marks go first, a job ending before them waits for the final post
+                for _ in 0..100 {
+                    if fake.posts().len() >= 2 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                crate::run::job_done("host", "test", "success", [1, 2]);
+                // The early post lands while the run still goes
+                for _ in 0..100 {
+                    if fake.posts().len() >= 3 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(fake.posts().len(), 3, "{:?}", fake.posts());
+                Ok(entry())
+            },
+            &slot,
+            finals,
+            || true,
+            &[],
+            Some(&early),
+        )
+        .unwrap();
+        assert!(got.is_some());
+        let posts = fake.posts();
+        let test_id = posts[0].2.or(Some(101));
+        assert_eq!(
+            posts[2],
+            ("shipcheck/test".into(), "completed".into(), test_id)
+        );
+        assert_eq!(fake.bodies()[2]["conclusion"], "success");
+        // The final post completes every check again, after the early one
+        assert_eq!(
+            &posts[3..],
+            &[
+                ("shipcheck/test".into(), "completed".into(), test_id),
+                ("shipcheck".into(), "completed".into(), Some(102)),
+            ]
+        );
+    }
+
+    #[test]
     fn a_newer_commit_stops_the_older_runs_and_one_run_per_commit_goes() {
         let alive = |pid: &str| pid != "9";
         let record = "11 aaa\n12 bbb post\n9 ccc\n";
@@ -828,6 +929,7 @@ mod tests {
             finals,
             || true,
             &[0, 0, 0],
+            None,
         )
         .unwrap();
         assert!(got.is_some());
@@ -887,6 +989,7 @@ mod tests {
             finals,
             || true,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -927,6 +1030,7 @@ mod tests {
             finals,
             || true,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -963,6 +1067,7 @@ mod tests {
             finals,
             || true,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -996,6 +1101,7 @@ mod tests {
             finals,
             || true,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1021,6 +1127,7 @@ mod tests {
             finals,
             || true,
             &[],
+            None,
         );
         assert!(got.unwrap_err().contains("docker version failed"));
         let posts = fake.posts();
@@ -1057,6 +1164,7 @@ mod tests {
             finals,
             || false,
             &[],
+            None,
         );
         assert!(got.is_err());
         assert!(
@@ -1149,6 +1257,7 @@ mod tests {
             finals,
             || false,
             &[],
+            None,
         )
         .unwrap();
         assert!(got.is_none());

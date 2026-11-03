@@ -365,6 +365,44 @@ pub fn final_bodies(plan: &crate::run::Plan, entry: &Entry, with_logs: bool) -> 
     bodies
 }
 
+/**
+ * The check of one job that ended while its run goes on, built as [`final_bodies`] builds it from a
+ * result of that job alone. The final post replaces it, so a run that fails closed still fails it
+ **/
+pub fn job_body(plan: &crate::run::Plan, done: &crate::run::JobDone) -> Option<Value> {
+    use crate::run;
+
+    let dir = run::log_dir(&plan.key);
+    let secrets = run::repo_id(&plan.repo).and_then(|id| run::secret_values(&id));
+    let logs = secrets.as_ref().ok().map(|s| (dir.as_path(), s.as_slice()));
+    let all = plan.config.logs == crate::config::Logs::All;
+    let jobs = Jobs::from([(done.file.clone(), BTreeSet::from([done.job.clone()]))]);
+    let entry = Entry {
+        key: plan.key.clone(),
+        sha: plan.sha.clone(),
+        tree: plan.tree.clone(),
+        base: plan.base.clone(),
+        passed: conclusion(&done.state) != "failure",
+        workflows: vec![run::WorkflowResult {
+            file: done.file.clone(),
+            exit: None,
+            attempts: 0,
+            log_sha256: String::new(),
+            jobs: BTreeMap::from([(done.job.clone(), done.state.clone())]),
+            passed: conclusion(&done.state) != "failure",
+            shards: BTreeMap::new(),
+            times: BTreeMap::from([(done.job.clone(), done.times)]),
+            summaries: BTreeMap::new(),
+        }],
+        finished_unix: done.times[1],
+        skipped: None,
+        ci_changes: Vec::new(),
+    };
+    job_bodies(&plan.sha, &jobs, &entry, logs, all)
+        .into_iter()
+        .next()
+}
+
 /// A job state as a check conclusion: an allowed failure is `neutral`, which passes a required check
 fn conclusion(state: &str) -> &'static str {
     match state {

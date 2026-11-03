@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -635,7 +635,7 @@ pub fn remote_base_sha(repo: &Path) -> Option<String> {
 /// The remote's default branch and its commit, asked once per process for each checkout and URL
 fn remote_head(repo: &Path) -> Option<(String, String)> {
     type Asked = BTreeMap<(PathBuf, String), Option<(String, String)>>;
-    static ASKED: std::sync::Mutex<Asked> = std::sync::Mutex::new(BTreeMap::new());
+    static ASKED: Mutex<Asked> = Mutex::new(BTreeMap::new());
     let url = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
     let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
     asked
@@ -1317,6 +1317,32 @@ fn max_runs() -> usize {
         .max(1)
 }
 
+/// A job that ended, sent while the run goes on so its check can complete before the others
+pub struct JobDone {
+    pub file: String,
+    pub job: String,
+    pub state: String,
+    pub times: [u64; 2],
+}
+
+static JOB_DONE: Mutex<Option<mpsc::Sender<JobDone>>> = Mutex::new(None);
+
+/// Where this process's runs send each job as it ends, none to stop
+pub fn report_jobs(to: Option<mpsc::Sender<JobDone>>) {
+    *JOB_DONE.lock().unwrap_or_else(|e| e.into_inner()) = to;
+}
+
+pub(crate) fn job_done(file: &str, job: &str, state: &str, times: [u64; 2]) {
+    if let Some(tx) = JOB_DONE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let _ = tx.send(JobDone {
+            file: file.to_string(),
+            job: job.to_string(),
+            state: state.to_string(),
+            times,
+        });
+    }
+}
+
 /// Whether this process waits for a run slot, which its heartbeat counts as progress
 pub static WAITING_FOR_SLOT: AtomicBool = AtomicBool::new(false);
 
@@ -1888,7 +1914,9 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
                     let (none, unused) = (BTreeMap::new(), ctx.slot.join(HOST));
                     let start = unix_now();
                     let run = run_job(ctx, HOST, name, &none, deadline, &unused, &tx);
-                    (name.clone(), run, [start, unix_now()])
+                    let time = [start, unix_now()];
+                    job_done(HOST, name, host_state(&run), time);
+                    (name.clone(), run, time)
                 })
             })
             .collect();
@@ -1916,6 +1944,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
 
     for (name, run, time) in runs {
         times.insert(name.clone(), time);
+        let state = host_state(&run);
         let state = match run {
             Ok(run) => {
                 attempts = attempts.max(run.attempts);
@@ -1933,16 +1962,12 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
                     exit = run.exit;
                 }
 
-                match run.exit {
-                    Some(0) => "success",
-                    None => "timed out",
-                    Some(_) => "failure",
-                }
+                state
             }
             Err(e) => {
                 exit = exit.and(Some(1));
                 say(&format!("{HOST}/{name}: {e}"));
-                error_state(&e)
+                state
             }
         };
         say(&format!("{HOST}/{name}: {state}"));
@@ -1967,6 +1992,18 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
         times,
         summaries,
     })
+}
+
+/// A host check's state from how its run ended
+fn host_state(run: &Result<JobRun, String>) -> &'static str {
+    match run {
+        Ok(run) => match run.exit {
+            Some(0) => "success",
+            None => "timed out",
+            Some(_) => "failure",
+        },
+        Err(e) => error_state(e),
+    }
 }
 
 /// Removes the checkouts and containers a crashed run left in this slot
@@ -2009,14 +2046,14 @@ pub const ALLOWED: &str = ", allowed by continue-on-error";
 
 /// The job slots of one run, so all its workflows together start at most `max_parallel` jobs, any number when unset
 struct Slots {
-    free: std::sync::Mutex<usize>,
+    free: Mutex<usize>,
     freed: std::sync::Condvar,
 }
 
 impl Slots {
     fn new(count: Option<usize>) -> Self {
         Slots {
-            free: std::sync::Mutex::new(count.map_or(usize::MAX, |n| n.max(1))),
+            free: Mutex::new(count.map_or(usize::MAX, |n| n.max(1))),
             freed: std::sync::Condvar::new(),
         }
     }
@@ -2236,6 +2273,12 @@ fn run_workflow(
                         }
                     };
                     say(&format!("{file}/{job}: {state}"));
+                    job_done(
+                        file,
+                        &job,
+                        &state,
+                        times.get(&job).copied().unwrap_or_default(),
+                    );
                     states.insert(job, state);
                 }
                 Err(_) => break,
