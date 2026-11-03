@@ -651,7 +651,7 @@ impl RepoConfig {
     }
 
     /// `max_parallel`, or one job per CPU the engine and the host share, one host CPU left free,
-    /// at most one per [`JOB_MEMORY`] of the engine's memory. `engine` is from `docker info`
+    /// at most one per [`JOB_MEMORY`] of the engine's memory. `engine` is from `docker info`, none without act jobs
     pub fn max_parallel(&self, engine: Option<(u32, u64)>) -> usize {
         let host = std::thread::available_parallelism().map_or(1, |n| n.get());
         self.max_parallel

@@ -1592,10 +1592,13 @@ fn execute(plan: &Plan, only: Selection, say: &mut dyn FnMut(&str)) -> Result<En
     } else {
         log_dir(&plan.key)
     };
-    let slots = Slots::new(
-        plan.config
-            .max_parallel(crate::runner::act::engine_resources()),
-    );
+    // Host checks never use Docker, so its CPUs and memory cap only a run with act jobs
+    let engine = plan
+        .config
+        .acts()
+        .then(crate::runner::act::engine_resources)
+        .flatten();
+    let slots = Slots::new(plan.config.max_parallel(engine));
     let ctx = Ctx {
         slot_lock: std::os::fd::AsRawFd::as_raw_fd(&_slot),
         plan,
