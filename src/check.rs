@@ -314,6 +314,10 @@ pub fn job_bodies(
             }
             _ => String::new(),
         };
+        // A job kept from the branch's last result says which tree it passed on
+        let kept = wf
+            .and_then(|w| w.kept.get(&job))
+            .map_or(String::new(), |t| format!(", kept from tree `{t}`"));
         let mut body = json!({
             "name": name,
             "head_sha": sha,
@@ -321,7 +325,7 @@ pub fn job_bodies(
             "conclusion": conclusion,
             "output": {
                 "title": state,
-                "summary": format!("`{job}` of {}: {state}, tree `{}`", self::name(&file), entry.tree),
+                "summary": format!("`{job}` of {}: {state}, tree `{}`{}", self::name(&file), entry.tree, kept),
                 "text": clip(text),
             },
         });
@@ -391,6 +395,7 @@ pub fn job_body(plan: &crate::run::Plan, done: &crate::run::JobDone) -> Option<V
             jobs: BTreeMap::from([(done.job.clone(), done.state.clone())]),
             passed: conclusion(&done.state) != "failure",
             shards: BTreeMap::new(),
+            kept: BTreeMap::new(),
             times: BTreeMap::from([(done.job.clone(), done.times)]),
             summaries: BTreeMap::new(),
         }],
@@ -559,6 +564,7 @@ mod tests {
                     if passed { "success" } else { "failure" }.into(),
                 )]),
                 passed,
+                kept: BTreeMap::new(),
                 shards: BTreeMap::from([(
                     "test".into(),
                     ShardRun {

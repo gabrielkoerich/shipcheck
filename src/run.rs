@@ -50,6 +50,9 @@ pub struct WorkflowResult {
     /// When each job that ran started and ended, in Unix seconds. Entries from before have none
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub times: BTreeMap<String, [u64; 2]>,
+    /// The jobs kept from the branch's last result, by the tree they passed on
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kept: BTreeMap<String, String>,
     /// What each job wrote to `$GITHUB_STEP_SUMMARY`, for the PR comment. Entries from before have none
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub summaries: BTreeMap<String, String>,
@@ -126,6 +129,10 @@ pub struct Plan {
     pub ci_changes: Vec<String>,
     /// The runners' identity in the key: act's version, then the host checks' tool versions
     pub tools: String,
+    /// The branch the run is for, from the hooks and the daemon or the checkout, none when detached
+    pub branch: Option<String>,
+    /// The key with no tree: two runs with the same one differ only in the code they test
+    pub inputs: String,
 }
 
 /// Config every git process shipcheck starts gets, since git checks out a branch's tree on the host
@@ -448,16 +455,24 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         tools.push_str(&format!("\nunsandboxed\0{name}"));
     }
 
-    let key = cache::key(&KeyInputs {
-        tree: &tree,
-        config: &config_text,
-        workflows: &as_run,
-        runner_kind: runners.kind(),
-        checks: &config.host.checks,
-        runner_version: &tools,
-        shipcheck_version: env!("CARGO_PKG_VERSION"),
-        platforms: &crate::runner::act::platforms(&config.act),
-    });
+    let platforms = crate::runner::act::platforms(&config.act);
+    let inputs = |tree: &str| {
+        cache::key(&KeyInputs {
+            tree,
+            config: &config_text,
+            workflows: &as_run,
+            runner_kind: runners.kind(),
+            checks: &config.host.checks,
+            runner_version: &tools,
+            shipcheck_version: env!("CARGO_PKG_VERSION"),
+            platforms: &platforms,
+        })
+    };
+    let (key, inputs) = (inputs(&tree), inputs(""));
+    let branch = std::env::var("SHIPCHECK_BRANCH")
+        .ok()
+        .or_else(|| git(&repo, &["symbolic-ref", "--short", "-q", "HEAD"]).ok())
+        .filter(|b| !b.is_empty());
 
     let ci_changes = ci_changes(&repo, &base, &sha)?;
 
@@ -472,6 +487,8 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
         key,
         ci_changes,
         tools,
+        branch,
+        inputs,
     })
 }
 
@@ -1162,11 +1179,65 @@ pub fn holds(plan: &Plan, entry: &Entry) -> bool {
         .args(["merge-base", "--is-ancestor", &entry.base, &plan.base])
         .status()
         .is_ok_and(|s| s.success());
-    let logs = entry.workflows.iter().all(|wf| {
+    entry.tree == plan.tree && on_base && logs_hold(entry)
+}
+
+/// Whether the logs a result names are still the ones it hashed
+fn logs_hold(entry: &Entry) -> bool {
+    entry.workflows.iter().all(|wf| {
         fs::read(log_dir(&entry.key).join(format!("{}.log", wf.file)))
             .is_ok_and(|log| cache::hex(&Sha256::digest(&log)) == wf.log_sha256)
-    });
-    entry.tree == plan.tree && on_base && logs
+    })
+}
+
+/// A failed result whose passed checks and jobs a full run keeps, and where its logs are
+struct Previous {
+    entry: Entry,
+    logs: PathBuf,
+}
+
+/// Where a branch's last full result is named, so its next tree knows what already passed
+fn branch_link(plan: &Plan) -> Option<PathBuf> {
+    let branch = plan.branch.as_ref()?;
+    let id = repo_id(&plan.repo).ok()?;
+    let name = cache::hex(&Sha256::digest(branch.as_bytes()));
+    Some(home().join("branches").join(id).join(name))
+}
+
+/**
+ * This tree's own failed result, or the branch's last one when it failed and only its tree differs,
+ * the same base config, commands, workflows, versions and images. Its passes are kept, the rest runs
+ **/
+fn previous(plan: &Plan) -> Option<Previous> {
+    if let Some(entry) = cached(&plan.key).filter(|e| !e.passed && holds(plan, e)) {
+        return Some(Previous {
+            entry,
+            logs: log_dir(&plan.key),
+        });
+    }
+
+    let link: serde_json::Value =
+        serde_json::from_slice(&fs::read(branch_link(plan)?).ok()?).ok()?;
+    let key = link["key"].as_str()?;
+
+    if link["inputs"].as_str() != Some(plan.inputs.as_str()) || key == plan.key {
+        return None;
+    }
+
+    let entry = cached(key).filter(|e| !e.passed && e.skipped.is_none() && logs_hold(e))?;
+    Some(Previous {
+        entry,
+        logs: log_dir(key),
+    })
+}
+
+/// Names this result as the branch's last, for the next tree's run
+fn link_branch(plan: &Plan) {
+    if let Some(path) = branch_link(plan) {
+        let body = serde_json::json!({"key": plan.key, "inputs": plan.inputs, "tree": plan.tree});
+        let _ = path.parent().map(fs::create_dir_all);
+        let _ = fs::write(path, body.to_string());
+    }
 }
 
 /**
@@ -1496,6 +1567,7 @@ pub fn run_reporting(
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?;
     fs::write(cache_dir.join(format!("{}.json", plan.key)), json).map_err(|e| e.to_string())?;
+    link_branch(plan);
     Ok(entry)
 }
 
@@ -1745,6 +1817,7 @@ fn execute(
         logs,
         slots: &slots,
         jobs,
+        previous: if only.is_none() { previous(plan) } else { None },
         only: only.as_ref(),
         base_tree: std::sync::OnceLock::new(),
     };
@@ -1814,6 +1887,8 @@ pub fn trial(
         workflows: BTreeMap::new(),
         ci_changes: Vec::new(),
         tools: String::new(),
+        branch: None,
+        inputs: String::new(),
     };
     let entry = execute(&plan, None, say, None);
     let logs = log_dir(&plan.key);
@@ -1932,9 +2007,13 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
     };
 
     for (name, (_, time)) in &kept {
-        say(&format!("{HOST}/{name}: passed on this tree already, kept"));
+        say(&kept_line(ctx, HOST, name));
         job_done(ctx, HOST, name, "success", *time);
     }
+
+    let kept_trees: BTreeMap<String, String> = kept_from(ctx)
+        .map(|tree| kept.keys().map(|n| (n.clone(), tree.to_string())).collect())
+        .unwrap_or_default();
 
     let mut runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<Msg>();
@@ -2031,20 +2110,21 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
         jobs: states,
         passed,
         shards,
+        kept: kept_trees,
         times,
         summaries,
     })
 }
 
 /**
- * The host checks that passed in this tree's stored result when that result failed, rebuilt from
- * its logs and times. A pass from a run of the same key is a pass, only a failure runs again
+ * The host checks that passed in the failed result this full run keeps, with their logs copied into
+ * this run. A pass from a run of the same inputs is kept, a failure always runs again
  **/
 fn kept_checks(ctx: &Ctx) -> BTreeMap<String, (JobRun, [u64; 2])> {
-    let Some(stored) = cached(&ctx.plan.key).filter(|e| !e.passed && holds(ctx.plan, e)) else {
+    let Some(prev) = &ctx.previous else {
         return BTreeMap::new();
     };
-    let Some(wf) = stored.workflows.into_iter().find(|w| w.file == HOST) else {
+    let Some(wf) = prev.entry.workflows.iter().find(|w| w.file == HOST) else {
         return BTreeMap::new();
     };
 
@@ -2054,7 +2134,7 @@ fn kept_checks(ctx: &Ctx) -> BTreeMap<String, (JobRun, [u64; 2])> {
             *state == "success" && ctx.plan.config.host.checks.contains_key(*name)
         })
         .filter_map(|(name, _)| {
-            let log = fs::read_to_string(ctx.logs.join(HOST).join(format!("{name}.log"))).ok()?;
+            let log = keep_log(ctx, &prev.logs, HOST, name)?;
             let run = JobRun {
                 exit: Some(0),
                 skipped: false,
@@ -2071,6 +2151,70 @@ fn kept_checks(ctx: &Ctx) -> BTreeMap<String, (JobRun, [u64; 2])> {
             ))
         })
         .collect()
+}
+
+/// A kept job's log from the result it passed in, copied into this run's logs
+fn keep_log(ctx: &Ctx, from: &Path, file: &str, job: &str) -> Option<String> {
+    let name = format!("{job}.log");
+    let log = fs::read_to_string(from.join(file).join(&name)).ok()?;
+
+    if from != ctx.logs {
+        fs::create_dir_all(ctx.logs.join(file)).ok()?;
+        fs::write(ctx.logs.join(file).join(&name), &log).ok()?;
+    }
+
+    Some(log)
+}
+
+/**
+ * The jobs of a workflow a run keeps from an earlier result's states: each that passed, unless a job
+ * that runs again needs it, since a kept job's outputs are not stored
+ **/
+fn keep_jobs(graph: &[(String, Vec<String>)], states: &BTreeMap<String, String>) -> Vec<String> {
+    let mut again: BTreeSet<&str> = graph
+        .iter()
+        .filter(|(job, _)| states.get(job).is_none_or(|s| s != "success"))
+        .map(|(job, _)| job.as_str())
+        .collect();
+    let mut grew = true;
+
+    while grew {
+        grew = false;
+
+        for (job, needs) in graph {
+            if again.contains(job.as_str()) {
+                for need in needs {
+                    grew |= again.insert(need.as_str());
+                }
+            }
+        }
+    }
+
+    graph
+        .iter()
+        .map(|(job, _)| job)
+        .filter(|job| !again.contains(job.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The tree a kept job passed on, when it is another tree than this run's
+fn kept_from<'a>(ctx: &'a Ctx) -> Option<&'a str> {
+    ctx.previous
+        .as_ref()
+        .map(|p| p.entry.tree.as_str())
+        .filter(|t| *t != ctx.plan.tree)
+}
+
+/// What a run says about a job it kept
+fn kept_line(ctx: &Ctx, file: &str, job: &str) -> String {
+    match kept_from(ctx) {
+        Some(tree) => format!(
+            "{file}/{job}: passed on tree {}, kept",
+            &tree[..12.min(tree.len())]
+        ),
+        None => format!("{file}/{job}: passed on this tree already, kept"),
+    }
 }
 
 /// A host check's state from how its run ended
@@ -2179,6 +2323,8 @@ struct Ctx<'a> {
     base_tree: std::sync::OnceLock<Option<String>>,
     /// Where each job goes as it ends, for a run that posts its checks
     jobs: Option<&'a mpsc::Sender<JobDone>>,
+    /// The failed result whose passes this full run keeps
+    previous: Option<Previous>,
 }
 
 enum Msg {
@@ -2247,7 +2393,44 @@ fn run_workflow(
     let mut logs = Vec::new();
     let mut shards = BTreeMap::new();
     let mut summaries = BTreeMap::new();
+    let mut kept = BTreeMap::new();
     let (mut attempts, mut exit, mut running) = (0, Some(0), 0);
+    let before = ctx.previous.as_ref().and_then(|p| {
+        p.entry
+            .workflows
+            .iter()
+            .find(|w| w.file == file)
+            .map(|w| (p, w))
+    });
+
+    // Jobs that passed in the result this run keeps start as done, the loop below runs the rest
+    if let Some((prev, wf)) = before {
+        for job in keep_jobs(&graph, &wf.jobs) {
+            let Some(log) = keep_log(ctx, &prev.logs, file, &job) else {
+                continue;
+            };
+            let time = wf.times.get(&job).copied().unwrap_or_default();
+            say(&kept_line(ctx, file, &job));
+            job_done(ctx, file, &job, "success", time);
+            logs.push(log);
+            times.insert(job.clone(), time);
+
+            if let Some(summary) = wf.summaries.get(&job) {
+                summaries.insert(job.clone(), summary.clone());
+            }
+
+            if let Some(info) = wf.shards.get(&job) {
+                shards.insert(job.clone(), info.clone());
+            }
+
+            if let Some(tree) = kept_from(ctx) {
+                kept.insert(job.clone(), tree.to_string());
+            }
+
+            states.insert(job.clone(), "success".to_string());
+            started.insert(job);
+        }
+    }
 
     std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<Msg>();
@@ -2390,6 +2573,7 @@ fn run_workflow(
         jobs: states,
         passed,
         shards,
+        kept,
         times,
         summaries,
     })
@@ -3246,6 +3430,49 @@ fn glob_locks(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_passed_jobs_that_no_job_running_again_needs() {
+        let graph: Vec<(String, Vec<String>)> = [
+            ("build", vec![]),
+            ("test", vec!["build"]),
+            ("lint", vec![]),
+            ("docs", vec!["lint"]),
+            ("deploy", vec!["test"]),
+        ]
+        .into_iter()
+        .map(|(j, n)| (j.to_string(), n.into_iter().map(String::from).collect()))
+        .collect();
+        let states = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(j, s)| (j.to_string(), s.to_string()))
+                .collect()
+        };
+
+        // A failed job runs again with everything it needs, the rest that passed is kept
+        let failed = states(&[
+            ("build", "success"),
+            ("test", "failure"),
+            ("lint", "success"),
+            ("docs", "success"),
+            ("deploy", "not run, a job it needs failed"),
+        ]);
+        assert_eq!(keep_jobs(&graph, &failed), ["lint", "docs"]);
+        let all = states(&[
+            ("build", "success"),
+            ("test", "success"),
+            ("lint", "success"),
+            ("docs", "success"),
+            ("deploy", "success"),
+        ]);
+        assert_eq!(keep_jobs(&graph, &all).len(), 5);
+        // A job the earlier result never had runs
+        assert_eq!(
+            keep_jobs(&graph, &states(&[("lint", "success")])),
+            Vec::<String>::new()
+        );
+    }
 
     #[test]
     fn the_queue_gives_slots_in_order_and_skips_gone_runs() {
@@ -4376,6 +4603,8 @@ mod tests {
             key: "k".into(),
             ci_changes: Vec::new(),
             tools: String::new(),
+            branch: None,
+            inputs: String::new(),
         };
         (dir, plan)
     }
