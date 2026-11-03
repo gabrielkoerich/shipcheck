@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1317,11 +1318,10 @@ fn max_runs() -> usize {
 }
 
 /// Whether this process waits for a run slot, which its heartbeat counts as progress
-pub static WAITING_FOR_SLOT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static WAITING_FOR_SLOT: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process holds a run slot, so its checks may show it running
-pub static HAS_SLOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static HAS_SLOT: AtomicBool = AtomicBool::new(false);
 
 /// A run's place in the queue for a machine run slot, a file it holds locked and removes when it goes
 struct Ticket {
@@ -1418,8 +1418,8 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
     loop {
         match queue_step(&dir, &ticket, max_runs())? {
             QueueStep::Slot(lock) => {
-                WAITING_FOR_SLOT.store(false, std::sync::atomic::Ordering::Relaxed);
-                HAS_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
+                WAITING_FOR_SLOT.store(false, Ordering::Relaxed);
+                HAS_SLOT.store(true, Ordering::Relaxed);
                 return Ok(lock);
             }
             QueueStep::Ahead(ahead) => {
@@ -1428,7 +1428,7 @@ fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
                         0 => "queued for a run slot, every slot is busy".to_string(),
                         n => format!("queued for a run slot, {n} ahead"),
                     });
-                    WAITING_FOR_SLOT.store(true, std::sync::atomic::Ordering::Relaxed);
+                    WAITING_FOR_SLOT.store(true, Ordering::Relaxed);
                     told = Some(ahead);
                 }
             }
