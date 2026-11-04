@@ -413,6 +413,8 @@ mod tests {
             key: "k".into(),
             ci_changes: Vec::new(),
             tools: "act version 0.2.89".into(),
+            branch: None,
+            inputs: String::new(),
         }
     }
 
@@ -431,6 +433,7 @@ mod tests {
                 jobs: [("test".to_string(), "failure".to_string())].into(),
                 passed: false,
                 shards: BTreeMap::new(),
+                kept: BTreeMap::new(),
                 times: [("test".to_string(), [1_700_000_000, 1_700_000_042])].into(),
                 summaries: [("test".to_string(), "summary text".to_string())].into(),
             }],
