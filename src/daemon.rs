@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -254,6 +257,13 @@ pub fn serve(home_ok: bool) -> ! {
     // The clones already looked at, and when to look for new ones
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut next_look = Instant::now();
+    // Whether each repository's PR events socket is open, and the repositories an event named
+    let mut live: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut woken: HashSet<String> = HashSet::new();
+    // When each repository was last read, and the ones with a head still to settle
+    let mut polled: HashMap<String, Instant> = HashMap::new();
+    let mut unsettled: HashSet<String> = HashSet::new();
 
     loop {
         let config = match DaemonConfig::load() {
@@ -284,6 +294,12 @@ pub fn serve(home_ok: bool) -> ! {
             if !senders.contains_key(repo) {
                 match Sender::new(repo) {
                     Ok(sender) => {
+                        if sender.streams() {
+                            let open = Arc::new(AtomicBool::new(false));
+                            listen(repo.clone(), tx.clone(), Arc::clone(&open));
+                            live.insert(repo.clone(), open);
+                        }
+
                         senders.insert(repo.clone(), sender);
                     }
                     Err(e) => {
@@ -295,6 +311,21 @@ pub fn serve(home_ok: bool) -> ! {
                     }
                 }
             }
+
+            let streaming = live.get(repo).is_some_and(|l| l.load(Ordering::Relaxed));
+            let every = if streaming && !unsettled.contains(repo) {
+                STREAMED_POLL
+            } else {
+                Duration::from_secs(config.interval_seconds)
+            };
+            let due = polled.get(repo).is_none_or(|at| at.elapsed() >= every);
+
+            if !woken.remove(repo) && !due {
+                continue;
+            }
+
+            polled.insert(repo.clone(), Instant::now());
+            unsettled.insert(repo.clone());
 
             let state = (
                 &mut done,
@@ -315,15 +346,69 @@ pub fn serve(home_ok: bool) -> ! {
                     }
                 }
                 Err(e) => eprintln!("{repo}: {e}"),
-                Ok(()) => {
+                Ok(settled) => {
                     said.remove(&refused);
+
+                    if settled {
+                        unsettled.remove(repo);
+                    }
                 }
             }
         }
 
         background::reap();
-        std::thread::sleep(Duration::from_secs(config.interval_seconds));
+
+        // A PR event ends the wait early, and the ones that came with it are read in the same pass
+        if let Ok(repo) = rx.recv_timeout(Duration::from_secs(config.interval_seconds)) {
+            woken.insert(repo);
+            woken.extend(rx.try_iter());
+        }
     }
+}
+
+/// How often a repository whose PR events socket is open and whose heads all settled is read anyway,
+/// for an event the socket missed
+const STREAMED_POLL: Duration = Duration::from_secs(300);
+
+/**
+ * Keeps `repo`'s PR events socket open on a thread of its own, and sends `repo` on `tx` for each
+ * event and each time the socket opens, since events can be missed while it is down. A socket that
+ * fails waits before it connects again, from 10 seconds up to 10 minutes, and says each new error once
+ **/
+fn listen(repo: String, tx: mpsc::Sender<String>, open: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut wait = Duration::from_secs(10);
+        let mut last = String::new();
+
+        loop {
+            let opened = || {
+                open.store(true, Ordering::Relaxed);
+                let _ = tx.send(repo.clone());
+            };
+            let wake = || {
+                let _ = tx.send(repo.clone());
+            };
+            let started = Instant::now();
+            let got = Sender::new(&repo).and_then(|s| s.listen(&opened, &wake));
+            open.store(false, Ordering::Relaxed);
+
+            if started.elapsed() > STREAMED_POLL {
+                wait = Duration::from_secs(10);
+            }
+
+            match got {
+                Err(e) if e != last => {
+                    eprintln!("{repo}: {e}, reading the PRs every interval_seconds");
+                    last = e;
+                }
+                Err(_) => {}
+                Ok(()) => last.clear(),
+            }
+
+            std::thread::sleep(wait);
+            wait = (wait * 2).min(Duration::from_secs(600));
+        }
+    });
 }
 
 /// How often the daemon looks for clones of repositories it does not watch yet
@@ -439,7 +524,7 @@ fn cycle(
     entry: &RepoEntry,
     sender: &Sender,
     (done, waiting, heads, waits, unconfigured): State,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let base_branch = entry.base.strip_prefix("origin/").unwrap_or(&entry.base);
     let open = sender.open_prs()?;
     let merged = merges(repo, sender, &open, heads, base_branch);
@@ -484,7 +569,7 @@ fn cycle(
         .iter()
         .all(|pr| done.contains(&id(pr)) && !unconfigured.contains_key(&id(pr)))
     {
-        return Ok(());
+        return Ok(true);
     }
 
     if !git(entry, &["fetch", "-q", "origin", base_branch]) {
@@ -495,6 +580,7 @@ fn cycle(
 
     let tip = base_tip(entry);
     recheck(unconfigured, done, repo, &tip);
+    let ids: Vec<(String, String)> = prs.iter().map(id).collect();
 
     for pr in prs {
         let id = (repo.to_string(), pr.sha.clone());
@@ -540,7 +626,7 @@ fn cycle(
         }
     }
 
-    Ok(())
+    Ok(ids.iter().all(|id| done.contains(id)))
 }
 
 /// The PRs into `base`, as `origin/main` or `main`

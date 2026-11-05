@@ -1,10 +1,13 @@
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{ErrorKind, IsTerminal};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
 
 const DEFAULT_API: &str = "https://api.shipcheck.run";
 
@@ -556,6 +559,61 @@ impl Sender {
         }
     }
 
+    /// Whether the service hears this repository's PR events. An App key's webhook goes to that App
+    pub fn streams(&self) -> bool {
+        matches!(self.how, How::Service(_))
+    }
+
+    /**
+     * Holds the service's `GET /v1/events` socket open and calls `wake` on each PR event, until the
+     * socket closes or fails. `opened` runs once it connects. A ping goes out after each quiet
+     * `PING`, since a proxy drops a silent socket, and a socket that answers none is dropped
+     **/
+    pub fn listen(&self, opened: &dyn Fn(), wake: &dyn Fn()) -> Result<(), String> {
+        let How::Service(token) = &self.how else {
+            return Err("an App key gets no PR events from the service".into());
+        };
+        let url = format!("{}/v1/events?repo={}", api(), self.repo).replacen("http", "ws", 1);
+        let mut req = url
+            .into_client_request()
+            .map_err(|e| format!("GET /v1/events: {e}"))?;
+        let bearer = format!("Bearer {token}")
+            .parse()
+            .map_err(|_| "the machine token is not a valid header".to_string())?;
+        req.headers_mut().insert("Authorization", bearer);
+        let (mut socket, _) = tungstenite::connect(req).map_err(|e| refused_stream(&e))?;
+        quiet_after(&socket, PING).map_err(|e| format!("GET /v1/events: {e}"))?;
+        opened();
+        let mut heard = Instant::now();
+
+        loop {
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    heard = Instant::now();
+
+                    if text.as_str() != "pong" {
+                        wake();
+                    }
+                }
+                Ok(Message::Close(_)) => return Ok(()),
+                Ok(_) => heard = Instant::now(),
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    if heard.elapsed() > PING * 3 {
+                        return Err("GET /v1/events: no answer to three pings".into());
+                    }
+
+                    socket
+                        .send(Message::text("ping"))
+                        .map_err(|e| format!("GET /v1/events: {e}"))?;
+                }
+                Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+                Err(e) => return Err(format!("GET /v1/events: {e}")),
+            }
+        }
+    }
+
     /// shipcheck's latest check run per name on `sha`
     pub fn find_checks(&self, sha: &str) -> Result<crate::github::Checks, String> {
         match &self.how {
@@ -570,6 +628,38 @@ impl Sender {
                 app.id(),
             ),
         }
+    }
+}
+
+/// How long the events socket may be silent before the daemon pings, under the 100 seconds Cloudflare allows
+const PING: Duration = Duration::from_secs(30);
+
+/// A read on `socket` returns after `after` with no data, so the reader can ping
+fn quiet_after(
+    socket: &WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    after: Duration,
+) -> std::io::Result<()> {
+    match socket.get_ref() {
+        MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(after)),
+        MaybeTlsStream::Rustls(s) => s.get_ref().set_read_timeout(Some(after)),
+        _ => Ok(()),
+    }
+}
+
+/// The service's own error for a refused socket, as its JSON body says it
+fn refused_stream(e: &tungstenite::Error) -> String {
+    let tungstenite::Error::Http(res) = e else {
+        return format!("GET /v1/events: {e}");
+    };
+    let body: Value = res
+        .body()
+        .as_deref()
+        .and_then(|b| serde_json::from_slice(b).ok())
+        .unwrap_or(Value::Null);
+
+    match body["error"].as_str() {
+        Some(error) => format!("GET /v1/events: {error}"),
+        None => format!("GET /v1/events: HTTP {}", res.status().as_u16()),
     }
 }
 
