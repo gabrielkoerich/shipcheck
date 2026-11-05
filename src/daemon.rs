@@ -313,14 +313,10 @@ pub fn serve(home_ok: bool) -> ! {
             }
 
             let streaming = live.get(repo).is_some_and(|l| l.load(Ordering::Relaxed));
-            let every = if streaming && !unsettled.contains(repo) {
-                STREAMED_POLL
-            } else {
-                Duration::from_secs(config.interval_seconds)
-            };
-            let due = polled.get(repo).is_none_or(|at| at.elapsed() >= every);
+            let since = polled.get(repo).map(Instant::elapsed);
+            let interval = Duration::from_secs(config.interval_seconds);
 
-            if !woken.remove(repo) && !due {
+            if !woken.remove(repo) && !due(streaming, !unsettled.contains(repo), since, interval) {
                 continue;
             }
 
@@ -377,7 +373,7 @@ const STREAMED_POLL: Duration = Duration::from_secs(300);
  **/
 fn listen(repo: String, tx: mpsc::Sender<String>, open: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let mut wait = Duration::from_secs(10);
+        let mut wait = FIRST_RETRY / 2;
         let mut last = String::new();
 
         loop {
@@ -392,9 +388,7 @@ fn listen(repo: String, tx: mpsc::Sender<String>, open: Arc<AtomicBool>) {
             let got = Sender::new(&repo).and_then(|s| s.listen(&opened, &wake));
             open.store(false, Ordering::Relaxed);
 
-            if started.elapsed() > STREAMED_POLL {
-                wait = Duration::from_secs(10);
-            }
+            wait = backoff(wait, started.elapsed());
 
             match got {
                 Err(e) if e != last => {
@@ -406,10 +400,31 @@ fn listen(repo: String, tx: mpsc::Sender<String>, open: Arc<AtomicBool>) {
             }
 
             std::thread::sleep(wait);
-            wait = (wait * 2).min(Duration::from_secs(600));
         }
     });
 }
+
+/// Whether a repository no event named is read now, `since` its last read
+fn due(streaming: bool, settled: bool, since: Option<Duration>, interval: Duration) -> bool {
+    let every = if streaming && settled {
+        STREAMED_POLL
+    } else {
+        interval
+    };
+    since.is_none_or(|since| since >= every)
+}
+
+/// How long to wait before the events socket connects again, after one that stayed open `lasted`
+fn backoff(wait: Duration, lasted: Duration) -> Duration {
+    if lasted > STREAMED_POLL {
+        return FIRST_RETRY;
+    }
+
+    (wait * 2).min(LAST_RETRY)
+}
+
+const FIRST_RETRY: Duration = Duration::from_secs(10);
+const LAST_RETRY: Duration = Duration::from_secs(600);
 
 /// How often the daemon looks for clones of repositories it does not watch yet
 const DISCOVER_EVERY: Duration = Duration::from_secs(300);
@@ -2156,6 +2171,33 @@ mod tests {
         let (got, started) = run_main(&Fake::default(), bare.path());
         assert_eq!(got, Ok(NO_CONFIG));
         assert!(started.is_empty());
+    }
+
+    #[test]
+    fn a_repository_whose_events_socket_is_open_and_settled_is_read_every_five_minutes() {
+        let ten = Duration::from_secs(10);
+        let s = Duration::from_secs;
+        assert!(due(true, true, None, ten), "never read yet");
+        assert!(!due(true, true, Some(s(60)), ten));
+        assert!(due(true, true, Some(s(300)), ten));
+        // A head waiting, such as for its pusher, or no socket, polls as before
+        assert!(due(true, false, Some(ten), ten));
+        assert!(!due(true, false, Some(s(9)), ten));
+        assert!(due(false, true, Some(ten), ten));
+    }
+
+    #[test]
+    fn a_failed_events_socket_waits_longer_each_time_and_a_socket_that_lasted_starts_over() {
+        let s = Duration::from_secs;
+        let mut wait = FIRST_RETRY / 2;
+        let waits: Vec<u64> = (0..8)
+            .map(|_| {
+                wait = backoff(wait, s(1));
+                wait.as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [10, 20, 40, 80, 160, 320, 600, 600]);
+        assert_eq!(backoff(s(600), s(301)), FIRST_RETRY);
     }
 
     #[test]

@@ -574,44 +574,7 @@ impl Sender {
             return Err("an App key gets no PR events from the service".into());
         };
         let url = format!("{}/v1/events?repo={}", api(), self.repo).replacen("http", "ws", 1);
-        let mut req = url
-            .into_client_request()
-            .map_err(|e| format!("GET /v1/events: {e}"))?;
-        let bearer = format!("Bearer {token}")
-            .parse()
-            .map_err(|_| "the machine token is not a valid header".to_string())?;
-        req.headers_mut().insert("Authorization", bearer);
-        let (mut socket, _) = tungstenite::connect(req).map_err(|e| refused_stream(&e))?;
-        quiet_after(&socket, PING).map_err(|e| format!("GET /v1/events: {e}"))?;
-        opened();
-        let mut heard = Instant::now();
-
-        loop {
-            match socket.read() {
-                Ok(Message::Text(text)) => {
-                    heard = Instant::now();
-
-                    if text.as_str() != "pong" {
-                        wake();
-                    }
-                }
-                Ok(Message::Close(_)) => return Ok(()),
-                Ok(_) => heard = Instant::now(),
-                Err(tungstenite::Error::Io(e))
-                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
-                    if heard.elapsed() > PING * 3 {
-                        return Err("GET /v1/events: no answer to three pings".into());
-                    }
-
-                    socket
-                        .send(Message::text("ping"))
-                        .map_err(|e| format!("GET /v1/events: {e}"))?;
-                }
-                Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
-                Err(e) => return Err(format!("GET /v1/events: {e}")),
-            }
-        }
+        stream(&url, token, PING, opened, wake)
     }
 
     /// shipcheck's latest check run per name on `sha`
@@ -627,6 +590,54 @@ impl Sender {
                 sha,
                 app.id(),
             ),
+        }
+    }
+}
+
+/// The events socket at `url`, as `Sender::listen` holds it, pinging after each quiet `ping`
+fn stream(
+    url: &str,
+    token: &str,
+    ping: Duration,
+    opened: &dyn Fn(),
+    wake: &dyn Fn(),
+) -> Result<(), String> {
+    let mut req = url
+        .into_client_request()
+        .map_err(|e| format!("GET /v1/events: {e}"))?;
+    let bearer = format!("Bearer {token}")
+        .parse()
+        .map_err(|_| "the machine token is not a valid header".to_string())?;
+    req.headers_mut().insert("Authorization", bearer);
+    let (mut socket, _) = tungstenite::connect(req).map_err(|e| refused_stream(&e))?;
+    quiet_after(&socket, ping).map_err(|e| format!("GET /v1/events: {e}"))?;
+    opened();
+    let mut heard = Instant::now();
+
+    loop {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                heard = Instant::now();
+
+                if text.as_str() != "pong" {
+                    wake();
+                }
+            }
+            Ok(Message::Close(_)) => return Ok(()),
+            Ok(_) => heard = Instant::now(),
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                if heard.elapsed() > ping * 3 {
+                    return Err("GET /v1/events: no answer to three pings".into());
+                }
+
+                socket
+                    .send(Message::text("ping"))
+                    .map_err(|e| format!("GET /v1/events: {e}"))?;
+            }
+            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+            Err(e) => return Err(format!("GET /v1/events: {e}")),
         }
     }
 }
@@ -739,6 +750,135 @@ pub fn post_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A service on localhost that runs `serve` on the first connection, and its `ws://` URL
+    fn events_server(
+        serve: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "ws://{}/v1/events?repo=ann/web",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || serve(listener.accept().unwrap().0));
+        (url, server)
+    }
+
+    /// The socket after the handshake, with the Authorization header the client sent
+    // The callback's error type is tungstenite's
+    #[allow(clippy::result_large_err)]
+    fn accept(tcp: std::net::TcpStream) -> (WebSocket<std::net::TcpStream>, String) {
+        let auth = Mutex::new(String::new());
+        let socket =
+            tungstenite::accept_hdr(tcp, |req: &tungstenite::handshake::server::Request, res| {
+                let got = req
+                    .headers()
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                *auth.lock().unwrap() = got.to_string();
+                Ok(res)
+            })
+            .unwrap();
+        (socket, auth.into_inner().unwrap())
+    }
+
+    #[test]
+    fn the_events_socket_wakes_on_each_event_pings_when_quiet_and_ends_on_close() {
+        let (url, server) = events_server(|tcp| {
+            let (mut ws, auth) = accept(tcp);
+            assert_eq!(auth, "Bearer shc_t");
+            ws.send(Message::text(r#"{"pr":3,"action":"synchronize"}"#))
+                .unwrap();
+            ws.send(Message::text("pong")).unwrap();
+            ws.send(Message::text(r#"{"pr":4,"action":"closed"}"#))
+                .unwrap();
+
+            // Nothing more until the client pings
+            loop {
+                if let Message::Text(t) = ws.read().unwrap() {
+                    assert_eq!(t.as_str(), "ping");
+                    break;
+                }
+            }
+
+            ws.close(None).unwrap();
+            while ws.read().is_ok() {}
+        });
+        let opened = AtomicUsize::new(0);
+        let woken = AtomicUsize::new(0);
+        let got = stream(
+            &url,
+            "shc_t",
+            Duration::from_millis(100),
+            &|| {
+                opened.fetch_add(1, Ordering::Relaxed);
+            },
+            &|| {
+                woken.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        server.join().unwrap();
+        assert_eq!(got, Ok(()));
+        assert_eq!(opened.load(Ordering::Relaxed), 1);
+        assert_eq!(woken.load(Ordering::Relaxed), 2, "a pong wakes no one");
+    }
+
+    #[test]
+    fn a_silent_events_socket_is_dropped_after_three_pings() {
+        let (url, server) = events_server(|tcp| {
+            let (mut ws, _) = accept(tcp);
+            // Reads the pings and answers none
+            while ws.read().is_ok() {}
+        });
+        let started = Instant::now();
+        let got = stream(&url, "shc_t", Duration::from_millis(50), &|| {}, &|| {});
+        assert_eq!(
+            got,
+            Err("GET /v1/events: no answer to three pings".to_string())
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(got);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_events_socket_says_the_services_error_and_never_opens() {
+        let refuse = |status: &'static str, body: &'static str| {
+            events_server(move |mut tcp| {
+                let mut buf = [0u8; 4096];
+                let _ = tcp.read(&mut buf).unwrap();
+                write!(
+                    tcp,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            })
+        };
+        let opened = AtomicUsize::new(0);
+        let open = || {
+            opened.fetch_add(1, Ordering::Relaxed);
+        };
+
+        let (url, server) = refuse("403 Forbidden", r#"{"error":"ann needs write on ann/web"}"#);
+        let got = stream(&url, "shc_t", PING, &open, &|| {});
+        server.join().unwrap();
+        assert_eq!(
+            got,
+            Err("GET /v1/events: ann needs write on ann/web".to_string())
+        );
+
+        let (url, server) = refuse("404 Not Found", "not json");
+        let got = stream(&url, "shc_t", PING, &open, &|| {});
+        server.join().unwrap();
+        assert_eq!(got, Err("GET /v1/events: HTTP 404".to_string()));
+        assert_eq!(opened.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn a_self_hosted_daemon_takes_the_service_pusher_first_and_falls_back_silently() {
