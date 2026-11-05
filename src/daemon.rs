@@ -610,12 +610,11 @@ fn abandoned(
         .collect()
 }
 
-/// Records `pr_merged` for each PR the daemon checked that left the open list merged, one GET each.
-/// The hosted service reads no closed PR, so through it the daemon only forgets them
-/// Records the PRs that left the open list, and says whether one of them merged into `base_branch`
+/// Records `pr_merged` for each PR the daemon checked that left the open list merged, one GET each,
+/// and says whether one of them may have merged into `base_branch`
 fn merges(
     repo: &str,
-    sender: &Sender,
+    sender: &impl Remote,
     open: &[OpenPr],
     heads: &mut BTreeMap<(String, u64), String>,
     base_branch: &str,
@@ -630,8 +629,11 @@ fn merges(
     for key in gone {
         let pr = match sender.pull(key.1) {
             Ok(Some(pr)) => pr,
+            // The hosted service reads no closed PR, so any PR that left may have merged. A tip that
+            // has its check costs one read
             Ok(None) => {
                 heads.remove(&key);
+                into_base = true;
                 continue;
             }
             Err(e) => {
@@ -971,6 +973,7 @@ fn cancel_replaced(remote: &dyn Remote, sha: &str) -> Result<(), String> {
 pub trait Remote: Sync {
     fn send(&self, body: &serde_json::Value, id: Option<u64>) -> Result<(u64, String), String>;
     fn find_checks(&self, sha: &str) -> Result<Checks, String>;
+    fn pull(&self, number: u64) -> Result<Option<serde_json::Value>, String>;
     fn pusher(
         &self,
         pr: u64,
@@ -995,6 +998,10 @@ impl Remote for Sender {
 
     fn find_checks(&self, sha: &str) -> Result<Checks, String> {
         Sender::find_checks(self, sha)
+    }
+
+    fn pull(&self, number: u64) -> Result<Option<serde_json::Value>, String> {
+        Sender::pull(self, number)
     }
 
     fn pusher(
@@ -1753,6 +1760,7 @@ mod tests {
         existing: Checks,
         pusher: Option<String>,
         rival: Option<u64>,
+        pull: Option<Value>,
         sent: Mutex<Vec<(Value, Option<u64>)>>,
     }
 
@@ -1780,6 +1788,10 @@ mod tests {
             }
 
             Ok(found)
+        }
+
+        fn pull(&self, _number: u64) -> Result<Option<Value>, String> {
+            Ok(self.pull.clone())
         }
 
         fn pusher(
@@ -2058,6 +2070,73 @@ mod tests {
         let (got, started) = run_main(&Fake::default(), bare.path());
         assert_eq!(got, Ok(NO_CONFIG));
         assert!(started.is_empty());
+    }
+
+    #[test]
+    fn a_pr_that_left_checks_the_tip_when_only_github_can_say_it_merged() {
+        // A merge writes a `pr_merged` record
+        if !own_home("a_pr_that_left_checks_the_tip_when_only_github_can_say_it_merged") {
+            return;
+        }
+
+        let open = [open_pr(2, "b", "main", "acme/app")];
+        let heads = |n: u64| {
+            BTreeMap::from([
+                (("acme/app".to_string(), n), "a".to_string()),
+                (("acme/app".to_string(), 2), "b".to_string()),
+            ])
+        };
+
+        // Through the service, which reads no closed PR
+        let mut left = heads(1);
+        assert!(merges(
+            "acme/app",
+            &Fake::default(),
+            &open,
+            &mut left,
+            "main"
+        ));
+        assert_eq!(left.len(), 1, "the PR that left is forgotten");
+
+        let closed = |merged: bool, base: &str| Fake {
+            pull: Some(serde_json::json!({
+                "state": "closed",
+                "merged_at": if merged { Value::from("2026-11-05T00:00:00Z") } else { Value::Null },
+                "base": {"ref": base},
+            })),
+            ..Fake::default()
+        };
+        assert!(merges(
+            "acme/app",
+            &closed(true, "main"),
+            &open,
+            &mut heads(1),
+            "main"
+        ));
+        assert!(!merges(
+            "acme/app",
+            &closed(false, "main"),
+            &open,
+            &mut heads(1),
+            "main"
+        ));
+        assert!(!merges(
+            "acme/app",
+            &closed(true, "dev"),
+            &open,
+            &mut heads(1),
+            "main"
+        ));
+
+        let mut still = heads(2);
+        assert!(!merges(
+            "acme/app",
+            &Fake::default(),
+            &open,
+            &mut still,
+            "main"
+        ));
+        assert_eq!(still.len(), 1);
     }
 
     #[test]
