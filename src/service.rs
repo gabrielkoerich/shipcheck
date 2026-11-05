@@ -1,10 +1,13 @@
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{ErrorKind, IsTerminal};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
 
 const DEFAULT_API: &str = "https://api.shipcheck.run";
 
@@ -556,6 +559,24 @@ impl Sender {
         }
     }
 
+    /// Whether the service hears this repository's PR events. An App key's webhook goes to that App
+    pub fn streams(&self) -> bool {
+        matches!(self.how, How::Service(_))
+    }
+
+    /**
+     * Holds the service's `GET /v1/events` socket open and calls `wake` on each PR event, until the
+     * socket closes or fails. `opened` runs once it connects. A ping goes out after each quiet
+     * `PING`, since a proxy drops a silent socket, and a socket that answers none is dropped
+     **/
+    pub fn listen(&self, opened: &dyn Fn(), wake: &dyn Fn()) -> Result<(), String> {
+        let How::Service(token) = &self.how else {
+            return Err("an App key gets no PR events from the service".into());
+        };
+        let url = format!("{}/v1/events?repo={}", api(), self.repo).replacen("http", "ws", 1);
+        stream(&url, token, PING, opened, wake)
+    }
+
     /// shipcheck's latest check run per name on `sha`
     pub fn find_checks(&self, sha: &str) -> Result<crate::github::Checks, String> {
         match &self.how {
@@ -570,6 +591,86 @@ impl Sender {
                 app.id(),
             ),
         }
+    }
+}
+
+/// The events socket at `url`, as `Sender::listen` holds it, pinging after each quiet `ping`
+fn stream(
+    url: &str,
+    token: &str,
+    ping: Duration,
+    opened: &dyn Fn(),
+    wake: &dyn Fn(),
+) -> Result<(), String> {
+    let mut req = url
+        .into_client_request()
+        .map_err(|e| format!("GET /v1/events: {e}"))?;
+    let bearer = format!("Bearer {token}")
+        .parse()
+        .map_err(|_| "the machine token is not a valid header".to_string())?;
+    req.headers_mut().insert("Authorization", bearer);
+    let (mut socket, _) = tungstenite::connect(req).map_err(|e| refused_stream(&e))?;
+    quiet_after(&socket, ping).map_err(|e| format!("GET /v1/events: {e}"))?;
+    opened();
+    let mut heard = Instant::now();
+
+    loop {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                heard = Instant::now();
+
+                if text.as_str() != "pong" {
+                    wake();
+                }
+            }
+            Ok(Message::Close(_)) => return Ok(()),
+            Ok(_) => heard = Instant::now(),
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                if heard.elapsed() > ping * 3 {
+                    return Err("GET /v1/events: no answer to three pings".into());
+                }
+
+                socket
+                    .send(Message::text("ping"))
+                    .map_err(|e| format!("GET /v1/events: {e}"))?;
+            }
+            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+            Err(e) => return Err(format!("GET /v1/events: {e}")),
+        }
+    }
+}
+
+/// How long the events socket may be silent before the daemon pings, under the 100 seconds Cloudflare allows
+const PING: Duration = Duration::from_secs(30);
+
+/// A read on `socket` returns after `after` with no data, so the reader can ping
+fn quiet_after(
+    socket: &WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+    after: Duration,
+) -> std::io::Result<()> {
+    match socket.get_ref() {
+        MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(after)),
+        MaybeTlsStream::Rustls(s) => s.get_ref().set_read_timeout(Some(after)),
+        _ => Ok(()),
+    }
+}
+
+/// The service's own error for a refused socket, as its JSON body says it
+fn refused_stream(e: &tungstenite::Error) -> String {
+    let tungstenite::Error::Http(res) = e else {
+        return format!("GET /v1/events: {e}");
+    };
+    let body: Value = res
+        .body()
+        .as_deref()
+        .and_then(|b| serde_json::from_slice(b).ok())
+        .unwrap_or(Value::Null);
+
+    match body["error"].as_str() {
+        Some(error) => format!("GET /v1/events: {error}"),
+        None => format!("GET /v1/events: HTTP {}", res.status().as_u16()),
     }
 }
 
@@ -649,6 +750,135 @@ pub fn post_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A service on localhost that runs `serve` on the first connection, and its `ws://` URL
+    fn events_server(
+        serve: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "ws://{}/v1/events?repo=ann/web",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || serve(listener.accept().unwrap().0));
+        (url, server)
+    }
+
+    /// The socket after the handshake, with the Authorization header the client sent
+    // The callback's error type is tungstenite's
+    #[allow(clippy::result_large_err)]
+    fn accept(tcp: std::net::TcpStream) -> (WebSocket<std::net::TcpStream>, String) {
+        let auth = Mutex::new(String::new());
+        let socket =
+            tungstenite::accept_hdr(tcp, |req: &tungstenite::handshake::server::Request, res| {
+                let got = req
+                    .headers()
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                *auth.lock().unwrap() = got.to_string();
+                Ok(res)
+            })
+            .unwrap();
+        (socket, auth.into_inner().unwrap())
+    }
+
+    #[test]
+    fn the_events_socket_wakes_on_each_event_pings_when_quiet_and_ends_on_close() {
+        let (url, server) = events_server(|tcp| {
+            let (mut ws, auth) = accept(tcp);
+            assert_eq!(auth, "Bearer shc_t");
+            ws.send(Message::text(r#"{"pr":3,"action":"synchronize"}"#))
+                .unwrap();
+            ws.send(Message::text("pong")).unwrap();
+            ws.send(Message::text(r#"{"pr":4,"action":"closed"}"#))
+                .unwrap();
+
+            // Nothing more until the client pings
+            loop {
+                if let Message::Text(t) = ws.read().unwrap() {
+                    assert_eq!(t.as_str(), "ping");
+                    break;
+                }
+            }
+
+            ws.close(None).unwrap();
+            while ws.read().is_ok() {}
+        });
+        let opened = AtomicUsize::new(0);
+        let woken = AtomicUsize::new(0);
+        let got = stream(
+            &url,
+            "shc_t",
+            Duration::from_millis(100),
+            &|| {
+                opened.fetch_add(1, Ordering::Relaxed);
+            },
+            &|| {
+                woken.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        server.join().unwrap();
+        assert_eq!(got, Ok(()));
+        assert_eq!(opened.load(Ordering::Relaxed), 1);
+        assert_eq!(woken.load(Ordering::Relaxed), 2, "a pong wakes no one");
+    }
+
+    #[test]
+    fn a_silent_events_socket_is_dropped_after_three_pings() {
+        let (url, server) = events_server(|tcp| {
+            let (mut ws, _) = accept(tcp);
+            // Reads the pings and answers none
+            while ws.read().is_ok() {}
+        });
+        let started = Instant::now();
+        let got = stream(&url, "shc_t", Duration::from_millis(50), &|| {}, &|| {});
+        assert_eq!(
+            got,
+            Err("GET /v1/events: no answer to three pings".to_string())
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(got);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_events_socket_says_the_services_error_and_never_opens() {
+        let refuse = |status: &'static str, body: &'static str| {
+            events_server(move |mut tcp| {
+                let mut buf = [0u8; 4096];
+                let _ = tcp.read(&mut buf).unwrap();
+                write!(
+                    tcp,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            })
+        };
+        let opened = AtomicUsize::new(0);
+        let open = || {
+            opened.fetch_add(1, Ordering::Relaxed);
+        };
+
+        let (url, server) = refuse("403 Forbidden", r#"{"error":"ann needs write on ann/web"}"#);
+        let got = stream(&url, "shc_t", PING, &open, &|| {});
+        server.join().unwrap();
+        assert_eq!(
+            got,
+            Err("GET /v1/events: ann needs write on ann/web".to_string())
+        );
+
+        let (url, server) = refuse("404 Not Found", "not json");
+        let got = stream(&url, "shc_t", PING, &open, &|| {});
+        server.join().unwrap();
+        assert_eq!(got, Err("GET /v1/events: HTTP 404".to_string()));
+        assert_eq!(opened.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn a_self_hosted_daemon_takes_the_service_pusher_first_and_falls_back_silently() {
