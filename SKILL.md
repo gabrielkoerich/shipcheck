@@ -47,7 +47,7 @@ Do not run the project's test commands yourself. Run `shipcheck run`, and when i
 |---|---|---|
 | 0 | Every check passed, or nothing under `paths` changed | `shipcheck commit -m <message>`, push when the work is done |
 | 1 | A check failed | Read the failed check, step, tests and output it printed, fix the code, run again (below) |
-| 2 | shipcheck could not run | Read the message. Often `shipcheck.toml` on `main` is missing or invalid, the OS sandbox is missing in host mode, or Docker is not running or failed to start a job in act mode. The code did not run, so do not change it: fix the machine, `shipcheck doctor` helps, then run again |
+| 2 | shipcheck could not run | Read the message. Often `shipcheck.toml` on `main` is missing or invalid, the OS sandbox is missing in host mode, or Docker is not running or failed to start a job in act mode. The code did not run, so do not change it: fix the machine, `shipcheck doctor` helps, then run again. If you cannot fix it, do not stop: commit with `git commit` and push as usual. The PR waits for its checks until shipcheck runs |
 
 With no `shipcheck.toml` on `main` there is nothing to run. `shipcheck run` exits 2 and says so, and the hooks and the daemon start nothing. The fix is `shipcheck init`, then merge `shipcheck.toml` to `main`, which the owner does.
 

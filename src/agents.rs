@@ -5,19 +5,19 @@ use std::process::Command;
 use serde_json::Value;
 
 /// The marker version doctor compares, raised when the block's text changes
-pub const BLOCK_VERSION: &str = "v4";
+pub const BLOCK_VERSION: &str = "v5";
 const START: &str = "<!-- shipcheck:start";
 const END: &str = "<!-- shipcheck:end -->";
 
 // Blank lines inside the markers, which prettier and oxfmt add, so a format check passes on init's commit
-pub const BLOCK: &str = "<!-- shipcheck:start v4 -->
+pub const BLOCK: &str = "<!-- shipcheck:start v5 -->
 
 ## Tests and commits
 
 - Do not run the test commands (`pytest`, `cargo test`, `npm test`, `go test`, `just test` and the like). Run `shipcheck run`. It runs this repository's CI on your working copy, and its result is the PR's required check.
 - Commit with `shipcheck commit -m \"<subject>\"`, never `git commit`. It commits every file, exactly the tree that passed.
 - Work in small steps: one change, `shipcheck run`, `shipcheck commit`. Delete scratch files first, because every file is committed.
-- Exit 1: read `shipcheck logs`, fix, then `shipcheck run --job <id>` for the failed job as often as needed. A partial run is never the check, so finish with one full `shipcheck run`, then `shipcheck commit`. Exit 2: shipcheck could not run, so run `shipcheck doctor` and follow it.
+- Exit 1: read `shipcheck logs`, fix, then `shipcheck run --job <id>` for the failed job as often as needed. A partial run is never the check, so finish with one full `shipcheck run`, then `shipcheck commit`. Exit 2: shipcheck could not run, and your code did not run. Run `shipcheck doctor` and follow it. If that does not fix it, do not stop: commit with `git commit` and push as usual, and the PR waits for its checks until shipcheck runs.
 - If `shipcheck` is not on PATH, run the project's tests and commit with git.
 - Never edit `.github/workflows/` or `shipcheck.toml` to get a pass. Details: https://shipcheck.run/llms.txt
 
@@ -508,9 +508,9 @@ mod tests {
 
         // A block from before the blank lines is rewritten, and doctor sees no drift in it
         let tight =
-            "<!-- shipcheck:start v4 -->\n## Tests and commits\n\n- old\n<!-- shipcheck:end -->\n";
+            "<!-- shipcheck:start v5 -->\n## Tests and commits\n\n- old\n<!-- shipcheck:end -->\n";
         assert_eq!(merge_block(Some(tight)).unwrap(), format!("{BLOCK}\n"));
-        assert!(BLOCK.starts_with("<!-- shipcheck:start v4 -->\n\n## "));
+        assert!(BLOCK.starts_with("<!-- shipcheck:start v5 -->\n\n## "));
         assert!(BLOCK.ends_with(".txt\n\n<!-- shipcheck:end -->"));
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.md"), tight).unwrap();
@@ -543,7 +543,7 @@ mod tests {
         assert!(read(&root.join("GEMINI.md")).starts_with(START));
         assert_eq!(read(&root.join("CLAUDE.md")), "@AGENTS.md\n");
         assert!(
-            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v4")
+            read(&root.join(".claude/CLAUDE.md")).starts_with("# Mine\n\n<!-- shipcheck:start v5")
         );
         assert_eq!(read(&root.join(".gemini/settings.json")), "{}");
         assert!(!root.join(".github").exists());
