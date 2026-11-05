@@ -657,7 +657,8 @@ fn quiet_after(
     }
 }
 
-/// The service's own error for a refused socket, as its JSON body says it
+/// The service's own error for a refused socket, as its JSON body says it. tungstenite keeps only the
+/// body that came with the headers, so a late body gives the status alone
 fn refused_stream(e: &tungstenite::Error) -> String {
     let tungstenite::Error::Http(res) = e else {
         return format!("GET /v1/events: {e}");
@@ -852,12 +853,14 @@ mod tests {
             events_server(move |mut tcp| {
                 let mut buf = [0u8; 4096];
                 let _ = tcp.read(&mut buf).unwrap();
-                write!(
-                    tcp,
+                // One write, since the client keeps only the body that came with the headers
+                let res = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
-                )
-                .unwrap();
+                );
+                tcp.write_all(res.as_bytes()).unwrap();
+                // Held until the client hangs up, so no reset can drop the response
+                while tcp.read(&mut buf).is_ok_and(|n| n > 0) {}
             })
         };
         let opened = AtomicUsize::new(0);
