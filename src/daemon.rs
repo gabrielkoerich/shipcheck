@@ -263,6 +263,9 @@ pub fn serve(home_ok: bool) -> ! {
     let mut woken: HashSet<String> = HashSet::new();
     // When each repository was last read, and the ones with a head still to settle
     let mut polled: HashMap<String, Instant> = HashMap::new();
+    // The base tip each repository was last checked at, and when the base was last fetched to look
+    let mut tips: HashMap<String, String> = HashMap::new();
+    let mut looked: HashMap<String, Instant> = HashMap::new();
     let mut unsettled: HashSet<String> = HashSet::new();
 
     loop {
@@ -323,6 +326,15 @@ pub fn serve(home_ok: bool) -> ! {
             polled.insert(repo.clone(), Instant::now());
             unsettled.insert(repo.clone());
 
+            // A push straight to the base, such as a release bump, comes with no PR to say so
+            let look = looked
+                .get(repo)
+                .is_none_or(|at| at.elapsed() >= STREAMED_POLL);
+
+            if look {
+                looked.insert(repo.clone(), Instant::now());
+            }
+
             let state = (
                 &mut done,
                 &mut waiting,
@@ -333,7 +345,7 @@ pub fn serve(home_ok: bool) -> ! {
 
             let refused = format!("{repo} unposted");
 
-            match cycle(&config, repo, entry, &senders[repo], state) {
+            match cycle(&config, repo, entry, &senders[repo], state, look, &mut tips) {
                 // Said once per repository, each poll gets the same answer until the App is added
                 Err(e) if background::not_installed(&e) => {
                     if said.insert(refused) {
@@ -539,13 +551,18 @@ fn cycle(
     entry: &RepoEntry,
     sender: &Sender,
     (done, waiting, heads, waits, unconfigured): State,
+    look: bool,
+    tips: &mut HashMap<String, String>,
 ) -> Result<bool, String> {
     let base_branch = entry.base.strip_prefix("origin/").unwrap_or(&entry.base);
     let open = sender.open_prs()?;
     let merged = merges(repo, sender, &open, heads, base_branch);
 
-    // A merge moved the base, whose tip gets checks of its own, the ones a status badge reads
-    if merged && git(entry, &["fetch", "-q", "origin", base_branch]) {
+    // A merge or a push moved the base, whose tip gets checks of its own, the ones a status badge reads
+    if (merged || look)
+        && git(entry, &["fetch", "-q", "origin", base_branch])
+        && (merged || tips.get(repo) != Some(&base_tip(entry)))
+    {
         let start = |plan: &run::Plan, name: &str| {
             background::start(
                 &entry.path,
@@ -559,7 +576,10 @@ fn cycle(
         };
 
         match handle_main(config, entry, sender, &start) {
-            Ok(verdict) => println!("{repo} {base_branch}: {verdict}"),
+            Ok(verdict) => {
+                println!("{repo} {base_branch}: {verdict}");
+                tips.insert(repo.to_string(), base_tip(entry));
+            }
             Err(e) => eprintln!("{repo} {base_branch}: {e}"),
         }
     }
@@ -768,9 +788,10 @@ fn merges(
 }
 
 /**
- * Checks the base's tip after a merge, for the badge and anyone who reads main's checks. The base
- * moves only through PRs whose heads were checked, so no pusher is asked, and a tree that passed as
- * a PR head posts from the cache at once. A `[skip ci]` commit, such as a release bump, gets none
+ * Checks the base's tip after it moves, for the badge and anyone who reads main's checks. Only
+ * people who can push to the base move it, so no pusher is asked, and a tree that passed as a PR head
+ * posts from the cache at once. A `[skip ci]` commit, such as a release bump, is checked too, since
+ * it is the tip the badge reads and shipcheck pushes nothing that could loop
  **/
 fn handle_main(
     config: &DaemonConfig,
@@ -790,18 +811,6 @@ fn handle_main(
         .is_some_and(|c| c.status == "completed")
     {
         return Ok("already checked");
-    }
-
-    let message = Command::new("git")
-        .arg("-C")
-        .arg(&entry.path)
-        .args(["log", "-1", "--format=%B", &tip])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-
-    if message.contains("[skip ci]") {
-        return Ok("not checked, [skip ci]");
     }
 
     if !git(
@@ -2134,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_checks_the_tip_of_main_unless_it_has_checks_or_skips_ci() {
+    fn a_merge_checks_the_tip_of_main_unless_it_has_checks() {
         let (dir, _) = checkout("https://github.com/acme/app.git", HOST);
         let (got, started) = run_main(&Fake::default(), dir.path());
         assert_eq!(got, Ok("checking its tip"));
@@ -2164,8 +2173,8 @@ mod tests {
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
         );
         let (got, started) = run_main(&Fake::default(), dir.path());
-        assert_eq!(got, Ok("not checked, [skip ci]"));
-        assert!(started.is_empty());
+        assert_eq!(got, Ok("checking its tip"), "the tip a badge reads");
+        assert_eq!(started, ["main"]);
 
         let (bare, _) = checkout("https://github.com/acme/app.git", "");
         let (got, started) = run_main(&Fake::default(), bare.path());
