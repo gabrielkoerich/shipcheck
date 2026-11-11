@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod github;
 pub mod java;
 pub mod onboard;
+pub mod queue;
 pub mod record;
 pub mod report;
 pub mod ruby;

@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::{self, KeyInputs};
 use crate::config::{RepoConfig, RunnerKind};
+use crate::queue;
 use crate::runner::host::{self as host_runner, HOST};
 use crate::runner::shard::{self, Rejected, ShardRun};
 use crate::runner::{RunRequest, Runner, Runners};
@@ -1442,9 +1443,10 @@ struct Ticket {
 impl Ticket {
     /**
      * Named `<priority>-<arrival>-<pid>`, so the names sort into the queue's order. It is locked under
-     * a temporary name and renamed into the queue, so no other run sees it unlocked and removes it
+     * a temporary name and renamed into the queue, so no other run sees it unlocked and removes it.
+     * It holds what `shipcheck queue` prints of the run
      **/
-    fn take(queue: &Path, priority: u8) -> Result<Ticket, String> {
+    fn take(queue: &Path, priority: u8, run: &queue::Run) -> Result<Ticket, String> {
         fs::create_dir_all(queue).map_err(|e| format!("{}: {e}", queue.display()))?;
         let at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1453,6 +1455,8 @@ impl Ticket {
         let temp = queue.join(format!(".{name}"));
         let lock = fs::File::create(&temp).map_err(|e| format!("{}: {e}", temp.display()))?;
         lock.try_lock()
+            .map_err(|e| format!("{}: {e}", temp.display()))?;
+        fs::write(&temp, serde_json::json!(run).to_string())
             .map_err(|e| format!("{}: {e}", temp.display()))?;
         let path = queue.join(name);
         fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1468,7 +1472,7 @@ impl Drop for Ticket {
 
 /// What one look at the queue found: a slot to hold, or how many live runs are ahead
 enum QueueStep {
-    Slot(fs::File),
+    Slot(fs::File, usize),
     Ahead(usize),
 }
 
@@ -1508,7 +1512,7 @@ fn queue_step(dir: &Path, ticket: &Ticket, slots: usize) -> Result<QueueStep, St
         let lock = fs::File::create(dir.join(format!("{n}.lock"))).map_err(|e| e.to_string())?;
 
         if lock.try_lock().is_ok() {
-            return Ok(QueueStep::Slot(lock));
+            return Ok(QueueStep::Slot(lock, n));
         }
     }
 
@@ -1519,24 +1523,45 @@ fn queue_step(dir: &Path, ticket: &Ticket, slots: usize) -> Result<QueueStep, St
  * Waits in the machine's queue for a run slot. `shipcheck run`, which an agent waits on, goes ahead
  * of the runs the hooks and the daemon start, and each kind goes in the order it came
  **/
-fn claim_runner(say: &mut dyn FnMut(&str)) -> Result<fs::File, String> {
+fn claim_runner(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<(fs::File, queue::Note), String> {
     let dir = home().join("runners");
-    let priority = u8::from(std::env::var_os("SHIPCHECK_TRIGGER").is_some());
-    let ticket = Ticket::take(&dir.join("queue"), priority)?;
+    let trigger = std::env::var("SHIPCHECK_TRIGGER").ok();
+    let priority = u8::from(trigger.is_some());
+    let run = queue::Run {
+        repo: repo_id(&plan.repo).unwrap_or_default(),
+        path: plan.repo.display().to_string(),
+        branch: plan.branch.clone(),
+        sha: plan.sha.clone(),
+        trigger: trigger.unwrap_or_else(|| "cli".into()),
+        pid: std::process::id(),
+        queued_unix: unix_now(),
+        ..queue::Run::default()
+    };
+    let ticket = Ticket::take(&dir.join("queue"), priority, &run)?;
     let mut told = None;
 
     loop {
         match queue_step(&dir, &ticket, max_runs())? {
-            QueueStep::Slot(lock) => {
+            QueueStep::Slot(lock, n) => {
                 WAITING_FOR_SLOT.store(false, Ordering::Relaxed);
                 HAS_SLOT.store(true, Ordering::Relaxed);
-                return Ok(lock);
+                let now = unix_now();
+
+                if told.is_some() {
+                    say(&format!(
+                        "started after {}s in the queue",
+                        now.saturating_sub(run.queued_unix)
+                    ));
+                }
+
+                return Ok((lock, queue::Note::start(&dir, n, run, now)));
             }
             QueueStep::Ahead(ahead) => {
                 if told != Some(ahead) {
                     say(&match ahead {
-                        0 => "queued for a run slot, every slot is busy".to_string(),
-                        n => format!("queued for a run slot, {n} ahead"),
+                        0 => "queued for a run slot, every slot is busy (position 1)".to_string(),
+                        1 => "queued behind 1 run (position 2)".to_string(),
+                        n => format!("queued behind {n} runs (position {})", n + 1),
                     });
                     WAITING_FOR_SLOT.store(true, Ordering::Relaxed);
                     told = Some(ahead);
@@ -1746,7 +1771,7 @@ fn execute(
     jobs: Option<&mpsc::Sender<JobDone>>,
     keep: bool,
 ) -> Result<Entry, String> {
-    let _runner = claim_runner(say)?;
+    let (_runner, note) = claim_runner(plan, say)?;
     let home = home();
     // Results, logs, secrets and the App key live here, other users of the machine read none of it
     let private = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700);
@@ -1834,6 +1859,7 @@ fn execute(
     };
     let slots = Slots::new(plan.config.max_parallel());
     let ctx = Ctx {
+        note: &note,
         slot_lock: std::os::fd::AsRawFd::as_raw_fd(&_slot),
         plan,
         runners: &runners,
@@ -2337,6 +2363,8 @@ impl Drop for SlotGuard<'_> {
 }
 
 struct Ctx<'a> {
+    /// What `shipcheck queue` prints of this run
+    note: &'a queue::Note,
     /// The run slot's lock, which a job's reaper inherits
     slot_lock: std::os::fd::RawFd,
     slots: &'a Slots,
@@ -2767,6 +2795,7 @@ fn try_job(
     // A job of any workflow in this run waits here until fewer than `max_parallel` run
     let waited = Instant::now();
     let _slot = ctx.slots.take();
+    let _going = ctx.note.job(format!("{file}/{job}"));
     timing(file, job, "slot wait", waited);
     let dir = ctx.slot.join(file).join(job);
     let template = ctx.templates.join(file).join(job);
@@ -3512,7 +3541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let queue = dir.path().join("queue");
         let slot = |t: &Ticket| match queue_step(dir.path(), t, 1).unwrap() {
-            QueueStep::Slot(lock) => Ok(lock),
+            QueueStep::Slot(lock, _) => Ok(lock),
             QueueStep::Ahead(n) => Err(n),
         };
         // A child another test forks holds a dropped lock until it execs, so a slot can free a moment late
@@ -3527,8 +3556,8 @@ mod tests {
         };
 
         // A run the hooks started came first, `shipcheck run` still goes ahead of it
-        let hook = Ticket::take(&queue, 1).unwrap();
-        let agent = Ticket::take(&queue, 0).unwrap();
+        let hook = Ticket::take(&queue, 1, &queue::Run::default()).unwrap();
+        let agent = Ticket::take(&queue, 0, &queue::Run::default()).unwrap();
         assert_eq!(slot(&hook).err(), Some(1));
         let held = eventually(&agent).unwrap();
         drop(agent);

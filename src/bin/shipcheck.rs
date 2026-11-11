@@ -170,6 +170,12 @@ enum Cmd {
         #[arg(long, default_value_t = 20, value_name = "n")]
         limit: usize,
     },
+    /// List the runs of every repository going or queued on this machine
+    Queue {
+        /// Print the runs as JSON on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Check this machine and repository, and say what to fix
     Doctor {
         /// Accepted for scripts written for older versions, these commands never fetch
@@ -353,6 +359,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         Cmd::History { json: js, limit: l } => {
             (json, limit) = (js, l);
             "history"
+        }
+        Cmd::Queue { json: js } => {
+            json = js;
+            "queue"
         }
         Cmd::Doctor { base: b, .. } => {
             on_base(b, &mut base, &mut base_set, &mut fetch);
@@ -705,6 +715,19 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 println!("no runs recorded for {repo} on this machine yet");
             } else {
                 print!("{}", shipcheck::record::table(&runs));
+            }
+
+            Ok(ExitCode::SUCCESS)
+        }
+        "queue" => {
+            let runs = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
+
+            if json {
+                println!("{}", serde_json::Value::from(runs));
+            } else if runs.is_empty() {
+                println!("no run is going or queued on this machine");
+            } else {
+                print!("{}", shipcheck::queue::table(&runs));
             }
 
             Ok(ExitCode::SUCCESS)

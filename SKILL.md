@@ -53,6 +53,8 @@ With no `shipcheck.toml` on `main` there is nothing to run. `shipcheck run` exit
 
 A tree that already passed answers at once, so a run after a rebase that changed nothing is cheap.
 
+Runs of every repository share the machine's run slots. When all are busy, `shipcheck run` prints `queued behind 2 runs (position 3)` and waits, then prints `started after 40s in the queue`. `shipcheck queue --json` lists every run on the machine, from any directory. Each has a `state`, `running` or `queued`, and `position`, `repo`, `path`, `branch`, `sha`, `trigger`, `pid`, `queued_unix`, `started_unix`, `elapsed_s` and `jobs`, the jobs going now. A queued run starts when the runs ahead of it end, so keep waiting. `shipcheck run` goes ahead of the runs the hooks and the daemon start.
+
 `shipcheck run` lists the untracked files it includes. Gitignore or delete the ones that are not part of the change, or the commit's tree differs from the one that ran. `shipcheck commit` refuses when a file changed since the run: run `shipcheck run` again.
 
 `shipcheck install` installs git hooks. Each push of a tree with no result to a branch other than the default starts a run in the background, and so does each commit when `on` in `shipcheck.toml` includes `commit`. Git never waits for it. On a signed-in machine a push is enough: its run posts the checks on the PR, so after `shipcheck commit` you only `git push`. When you rebase or update your PR on GitHub, the daemon that `install` starts runs the new head. `shipcheck run --sha HEAD` tests the last commit and ignores the working copy.
