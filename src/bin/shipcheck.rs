@@ -570,6 +570,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             }
 
             let (_key, waited) = run::lock_tree(&plan.key)?;
+            let mut estimated = None;
             let entry = match run::reusable(&plan, waited) {
                 // A `paths` skip is never stored, so it is no cached result
                 Some(entry) if entry.skipped.is_some() => {
@@ -590,6 +591,9 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     entry
                 }
                 None => {
+                    let (line, numbers) = estimate(&plan);
+                    say(&line);
+                    estimated = numbers;
                     let say = &mut |line: &str| say(&run::printable(line));
                     let entry = if only_failed {
                         run::run_only_failed(&plan, say)?
@@ -603,7 +607,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     entry
                 }
             };
-            let code = report(&entry, snapshot, json, false);
+            let code = report_with(&entry, snapshot, json, false, estimated);
             // Like a post, an upload needs the base this repository posts from, never a fallback
             let shares = plan.config.team.records && shipcheck::daemon::posts_from(&base, &cwd);
             keep_record(&plan, &entry, &record, &run::log_dir(&plan.key), shares);
@@ -720,7 +724,8 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "queue" => {
-            let runs = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
+            let mut runs = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
+            shipcheck::queue::forecast(&mut runs, run::max_runs(), false, &mut typical_times());
 
             if json {
                 println!("{}", serde_json::Value::from(runs));
@@ -1274,7 +1279,54 @@ fn toplevel(cwd: &Path) -> Result<std::path::PathBuf, String> {
 }
 
 /// `snapshot` names the working copy or the index when the run tested one instead of a commit
+/// Each repository's typical run time on this machine, read from its records once
+fn typical_times() -> impl FnMut(&str) -> Option<u64> {
+    let mut known = std::collections::BTreeMap::new();
+
+    move |repo: &str| {
+        *known.entry(repo.to_string()).or_insert_with(|| {
+            let runs = shipcheck::record::runs(&run::home(), repo, usize::MAX);
+            shipcheck::record::typical(&runs).map(|t| t.median_s)
+        })
+    }
+}
+
+/// The line `shipcheck run` prints before a run starts, and its numbers for `--json`, none
+/// without a full run in this repository's records
+fn estimate(plan: &run::Plan) -> (String, Option<serde_json::Value>) {
+    let runs = run::repo_id(&plan.repo)
+        .map(|repo| shipcheck::record::runs(&run::home(), &repo, usize::MAX))
+        .unwrap_or_default();
+    let Some(typical) = shipcheck::record::typical(&runs) else {
+        return (
+            "estimate: none yet, this machine has no full run of this repository on record".into(),
+            None,
+        );
+    };
+    let mut rows = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
+    let cli = std::env::var_os("SHIPCHECK_TRIGGER").is_none();
+    let wait = shipcheck::queue::forecast(&mut rows, run::max_runs(), cli, &mut typical_times());
+    let mut numbers = serde_json::json!(typical);
+    numbers["queue"] = serde_json::json!(wait);
+
+    (
+        shipcheck::queue::estimate_line(&typical, &wait),
+        Some(numbers),
+    )
+}
+
 fn report(entry: &run::Entry, snapshot: Option<&str>, json: bool, partial: bool) -> ExitCode {
+    report_with(entry, snapshot, json, partial, None)
+}
+
+/// [`report`] with the estimate the run printed at its start, for `--json`
+fn report_with(
+    entry: &run::Entry,
+    snapshot: Option<&str>,
+    json: bool,
+    partial: bool,
+    estimate: Option<serde_json::Value>,
+) -> ExitCode {
     let logs = if partial {
         run::partial_log_dir(&entry.key)
     } else {
@@ -1284,7 +1336,9 @@ fn report(entry: &run::Entry, snapshot: Option<&str>, json: bool, partial: bool)
     let tested = snapshot.map_or(entry.sha.as_str(), |w| w.trim_start_matches("the "));
 
     if json {
-        println!("{}", report::json(entry, tested, &workflows, partial));
+        let mut result = report::json(entry, tested, &workflows, partial);
+        result["estimate"] = estimate.into();
+        println!("{result}");
     } else {
         let s = Style::stdout();
 

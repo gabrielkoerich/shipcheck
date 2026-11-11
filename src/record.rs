@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::check::{self, iso};
 use crate::report;
-use crate::run::{Entry, Plan, home, printable, unix_now};
+use crate::run::{Entry, Plan, QUEUED_S, home, printable, unix_now};
 
 pub const VERSION: u64 = 1;
 const MAX_BYTES: u64 = 50 * 1024 * 1024;
@@ -113,6 +115,7 @@ pub fn line(
         "started": iso(run.started),
         "finished": iso(finished),
         "duration_s": finished.saturating_sub(run.started),
+        "queued_s": QUEUED_S.load(Ordering::Relaxed),
         "repo": repo,
         "base": plan.base,
         "branch": run.branch,
@@ -301,6 +304,43 @@ pub fn runs(home: &Path, repo: &str, limit: usize) -> Vec<Value> {
     lines
 }
 
+/// How long a full run of a repository takes on this machine, without its time in the queue
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Typical {
+    pub median_s: u64,
+    pub slowest_s: u64,
+    pub runs: usize,
+}
+
+/// From the last ten full runs that ran: no partial run, no cached result, no `paths` skip
+pub fn typical(runs: &[Value]) -> Option<Typical> {
+    let mut times: Vec<u64> = runs
+        .iter()
+        .rev()
+        .filter(|r| r["partial"] != true && r["cache_hit"] != true && r["skipped"] != true)
+        .filter_map(|r| {
+            let queued = r["queued_s"].as_u64().unwrap_or_default();
+            Some(r["duration_s"].as_u64()?.saturating_sub(queued))
+        })
+        .take(10)
+        .collect();
+    times.sort_unstable();
+
+    Some(Typical {
+        median_s: *times.get(times.len() / 2)?,
+        slowest_s: *times.last()?,
+        runs: times.len(),
+    })
+}
+
+/// `6m07s`, or `42s` under a minute
+pub fn clock(secs: u64) -> String {
+    match secs / 60 {
+        0 => format!("{secs}s"),
+        m => format!("{m}m{:02}s", secs % 60),
+    }
+}
+
 /// `shipcheck history`: one row per run, newest last
 pub fn table(runs: &[Value]) -> String {
     let mut out = format!(
@@ -374,6 +414,43 @@ pub fn posting(runs: &[Value], repo: &str, sha: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typical_is_of_the_last_ten_runs_that_ran_without_their_queue_time() {
+        let run = |secs: u64, extra: Value| {
+            let mut run = json!({"event": "run", "duration_s": secs});
+            run.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            run
+        };
+        assert_eq!(typical(&[]), None);
+        assert_eq!(
+            typical(&[run(5, json!({"cache_hit": true}))]),
+            None,
+            "a cached result ran nothing"
+        );
+
+        let mut runs = vec![run(9000, json!({}))];
+        runs.extend((1..=10).map(|n| run(n * 60, json!({}))));
+        runs.push(run(1, json!({"partial": true})));
+        runs.push(run(2, json!({"skipped": true})));
+        runs.push(run(3, json!({"cache_hit": true})));
+        runs.push(run(700, json!({"queued_s": 400})));
+        // The eleventh run back is out, and the newest one took 300s once it had a slot
+        assert_eq!(
+            typical(&runs),
+            Some(Typical {
+                median_s: 360,
+                slowest_s: 600,
+                runs: 10
+            })
+        );
+        assert_eq!(
+            (clock(42), clock(367), clock(3600)),
+            ("42s".into(), "6m07s".into(), "60m00s".into())
+        );
+    }
     use crate::config::RepoConfig;
     use crate::run::WorkflowResult;
 
