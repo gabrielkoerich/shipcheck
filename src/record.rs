@@ -82,16 +82,18 @@ pub fn line(
     for (wf, rep) in entry.workflows.iter().zip(&reports) {
         for job in &rep.jobs {
             let times = wf.times.get(&job.id);
-            let tests: Vec<String> = job
-                .failing_tests
-                .iter()
-                .filter(|t| {
-                    !secrets
-                        .iter()
-                        .any(|s| !s.is_empty() && t.contains(s.as_str()))
-                })
-                .map(|t| printable(t))
-                .collect();
+            let named = |tests: &[String]| -> Vec<String> {
+                tests
+                    .iter()
+                    .filter(|t| {
+                        !secrets
+                            .iter()
+                            .any(|s| !s.is_empty() && t.contains(s.as_str()))
+                    })
+                    .map(|t| printable(t))
+                    .collect()
+            };
+            let tests = named(&job.failing_tests);
             jobs.push(json!({
                 "workflow": wf.file,
                 "name": job.id,
@@ -103,6 +105,7 @@ pub fn line(
                 "duration_s": times.map(|t| t[1].saturating_sub(t[0])),
                 "failed_tests": tests,
                 "failed_tests_total": job.failing_tests_total,
+                "retried_tests": named(&job.retried_tests),
             }));
         }
     }
@@ -116,6 +119,8 @@ pub fn line(
         "finished": iso(finished),
         "duration_s": finished.saturating_sub(run.started),
         "queued_s": QUEUED_S.load(Ordering::Relaxed),
+        "load_1m": load(),
+        "cpus": std::thread::available_parallelism().map_or(0, |n| n.get()),
         "repo": repo,
         "base": plan.base,
         "branch": run.branch,
@@ -172,6 +177,14 @@ fn tools(identity: &str) -> Vec<String> {
     }
 
     out
+}
+
+/// The machine's load average over the last minute, which a timing test that fails at random follows
+fn load() -> Option<f64> {
+    let mut avg = [0f64; 1];
+    // Safe: getloadavg writes at most one value into avg
+    let got = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
+    (got == 1).then(|| (avg[0] * 100.0).round() / 100.0)
 }
 
 fn hostname() -> String {
@@ -333,6 +346,96 @@ pub fn typical(runs: &[Value]) -> Option<Typical> {
     })
 }
 
+/**
+ * `shipcheck history --flaky`: each test that failed and then passed on a retry in `runs`, with the
+ * runs it did so in, most first. A job whose failed attempts name no test counts as itself. Records
+ * from before `retried_tests` have only the job
+ **/
+pub fn flaky(runs: &[Value]) -> Vec<Value> {
+    struct Seen {
+        times: u64,
+        loads: Vec<f64>,
+        last: String,
+    }
+
+    let mut seen: BTreeMap<(String, Option<String>), Seen> = BTreeMap::new();
+
+    for run in runs.iter().filter(|r| r["cache_hit"] != true) {
+        for job in run["jobs"].as_array().into_iter().flatten() {
+            if job["status"] != "success" || job["attempts"].as_u64().unwrap_or(1) < 2 {
+                continue;
+            }
+
+            let name = format!(
+                "{}/{}",
+                job["workflow"].as_str().unwrap_or_default(),
+                job["name"].as_str().unwrap_or_default()
+            );
+            let mut tests: Vec<Option<String>> = job["retried_tests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.as_str().map(|t| Some(t.to_string())))
+                .collect();
+
+            if tests.is_empty() {
+                tests.push(None);
+            }
+
+            for test in tests {
+                let entry = seen.entry((name.clone(), test)).or_insert(Seen {
+                    times: 0,
+                    loads: Vec::new(),
+                    last: String::new(),
+                });
+                entry.times += 1;
+                entry.loads.extend(run["load_1m"].as_f64());
+                entry.last = run["finished"].as_str().unwrap_or_default().to_string();
+            }
+        }
+    }
+
+    let mut rows: Vec<Value> = seen
+        .into_iter()
+        .map(|((job, test), seen)| {
+            let load = (!seen.loads.is_empty())
+                .then(|| seen.loads.iter().sum::<f64>() / seen.loads.len() as f64)
+                .map(|l| (l * 100.0).round() / 100.0);
+            json!({"job": job, "test": test, "times": seen.times, "load_1m": load, "last": seen.last})
+        })
+        .collect();
+    // Stable, so equal counts stay in the order of their names
+    rows.sort_by_key(|r| std::cmp::Reverse(r["times"].as_u64()));
+    rows
+}
+
+/// The flaky report as a table, `LOAD` being the machine's average load when the test flaked
+pub fn flaky_table(rows: &[Value]) -> String {
+    let mut out = format!(
+        "{:>5} {:>6} {:<20} {:<28} {}\n",
+        "TIMES", "LOAD", "LAST", "JOB", "TEST"
+    );
+
+    for r in rows {
+        out.push_str(&format!(
+            "{:>5} {:>6} {:<20} {:<28} {}\n",
+            r["times"].as_u64().unwrap_or_default(),
+            r["load_1m"]
+                .as_f64()
+                .map_or("-".to_string(), |l| format!("{l:.2}")),
+            r["last"]
+                .as_str()
+                .unwrap_or_default()
+                .replace('T', " ")
+                .replace('Z', ""),
+            r["job"].as_str().unwrap_or_default(),
+            r["test"].as_str().unwrap_or("(no test named)"),
+        ));
+    }
+
+    out
+}
+
 /// `6m07s`, or `42s` under a minute
 pub fn clock(secs: u64) -> String {
     match secs / 60 {
@@ -414,6 +517,49 @@ pub fn posting(runs: &[Value], repo: &str, sha: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flaky_counts_the_tests_that_passed_on_a_retry_most_first() {
+        let job = |name: &str, status: &str, attempts: u64, tests: Value| json!({"workflow": "ci.yml", "name": name, "status": status, "attempts": attempts, "retried_tests": tests});
+        let run = |load: Value, finished: &str, jobs: Value| json!({"event": "run", "load_1m": load, "finished": finished, "jobs": jobs});
+        let runs = [
+            run(
+                json!(4.0),
+                "2026-11-01T10:00:00Z",
+                json!([job("test", "success", 2, json!(["timer", "port"]))]),
+            ),
+            run(
+                json!(8.0),
+                "2026-11-02T10:00:00Z",
+                json!([
+                    job("test", "success", 3, json!(["timer"])),
+                    // A record from before the tests were kept, a first-try pass and a real failure
+                    json!({"workflow": "ci.yml", "name": "e2e", "status": "success", "attempts": 2}),
+                    job("lint", "success", 1, json!([])),
+                    job("docs", "failure", 2, json!([])),
+                ]),
+            ),
+        ];
+        let rows = flaky(&runs);
+        assert_eq!(
+            rows,
+            [
+                json!({"job": "ci.yml/test", "test": "timer", "times": 2, "load_1m": 6.0, "last": "2026-11-02T10:00:00Z"}),
+                json!({"job": "ci.yml/e2e", "test": null, "times": 1, "load_1m": 8.0, "last": "2026-11-02T10:00:00Z"}),
+                json!({"job": "ci.yml/test", "test": "port", "times": 1, "load_1m": 4.0, "last": "2026-11-01T10:00:00Z"}),
+            ]
+        );
+        let table = flaky_table(&rows);
+        assert!(
+            table
+                .lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("    2   6.00 2026-11-02 10:00:00")
+        );
+        assert!(table.lines().nth(2).unwrap().ends_with("(no test named)"));
+        assert_eq!(flaky(&[]), Vec::<Value>::new());
+    }
 
     #[test]
     fn typical_is_of_the_last_ten_runs_that_ran_without_their_queue_time() {

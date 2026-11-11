@@ -28,6 +28,8 @@ pub struct JobReport {
     pub failing_tests: Vec<String>,
     /// How many failing tests the log named, more than `failing_tests` holds once capped
     pub failing_tests_total: usize,
+    /// The tests its failed attempts named, when a later attempt passed
+    pub retried_tests: Vec<String>,
     pub tail: Vec<String>,
     pub log: PathBuf,
     pub attempt_logs: Vec<PathBuf>,
@@ -384,10 +386,24 @@ fn job_report(
         note: None,
         failing_tests: Vec::new(),
         failing_tests_total: 0,
+        retried_tests: Vec::new(),
         tail: Vec::new(),
         log: log.clone(),
         attempt_logs,
     };
+
+    if status == "success" {
+        for attempt in &report.attempt_logs {
+            let text = fs::read(attempt).unwrap_or_default();
+            let found = job_output(&String::from_utf8_lossy(&text), host);
+
+            for test in failing_tests(&found.output) {
+                if !report.retried_tests.contains(&test) && report.retried_tests.len() < MAX_TESTS {
+                    report.retried_tests.push(test);
+                }
+            }
+        }
+    }
 
     // A job that never ran has no log, and its status says why
     if !failed(status) || status.starts_with("not run") {
@@ -456,6 +472,36 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
 
         if wf.passed {
             s.push_str(&format!("{}: passed, {attempts}\n", check::name(&wf.file)));
+
+            // A pass after a failed attempt hides a test that fails at random, so it is named
+            for job in wf
+                .jobs
+                .iter()
+                .filter(|j| j.attempts > 1 && !failed(&j.status))
+            {
+                let nth = job.attempts;
+
+                if job.retried_tests.is_empty() {
+                    s.push_str(&format!(
+                        "  {}: passed on attempt {nth}, the earlier attempts name no test\n",
+                        job.id
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "  {}: passed on attempt {nth}, these tests failed before:\n",
+                        job.id
+                    ));
+                }
+
+                for t in &job.retried_tests {
+                    s.push_str(&format!("    {t}\n"));
+                }
+
+                for log in &job.attempt_logs {
+                    s.push_str(&format!("    earlier attempt: {}\n", log.display()));
+                }
+            }
+
             continue;
         }
 
@@ -1016,6 +1062,53 @@ mod tests {
         assert!(text.contains("      and 10 more, in the log\n"));
         assert!(text.contains("  lint: success, tests in 4 shards\n"));
         assert!(text.ends_with("failed, tree t from abc. `shipcheck logs` prints every log\n"));
+    }
+
+    #[test]
+    fn a_pass_on_a_retry_names_the_tests_that_failed_before() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("ci.yml")).unwrap();
+        let failed = [
+            "FAILED t.py::test_timer - assert",
+            "FAILED t.py::test_port - assert",
+        ];
+        fs::write(
+            dir.path().join("ci.yml/test.attempt-1.log"),
+            act_log(&[("Run pytest", &failed, false)]),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ci.yml/test.attempt-2.log"),
+            act_log(&[("Run pytest", &failed[..1], false)]),
+        )
+        .unwrap();
+        fs::write(dir.path().join("ci.yml/test.log"), "").unwrap();
+        fs::write(dir.path().join("ci.yml/lint.attempt-1.log"), "").unwrap();
+        let mut e = entry(&[
+            ("test", "success"),
+            ("lint", "success"),
+            ("docs", "success"),
+        ]);
+        e.passed = true;
+        e.workflows[0].passed = true;
+        e.workflows[0].exit = Some(0);
+        e.workflows[0].attempts = 3;
+        let wfs = workflows(&e, dir.path());
+        let v = json(&e, "abc", &wfs, false);
+        // Each test once, however many attempts it failed
+        assert_eq!(
+            v["workflows"][0]["jobs"][2]["retried_tests"],
+            json!(["t.py::test_timer", "t.py::test_port"])
+        );
+        assert_eq!(v["workflows"][0]["jobs"][0]["retried_tests"], json!([]));
+        let text = text(&e, "abc", &wfs);
+        assert!(text.contains(
+            "ci.yml: passed, 3 attempts\n  lint: passed on attempt 2, the earlier attempts name no test\n"
+        ));
+        assert!(text.contains(
+            "  test: passed on attempt 3, these tests failed before:\n    t.py::test_timer\n    t.py::test_port\n    earlier attempt: "
+        ));
+        assert!(!text.contains("  docs:"));
     }
 
     #[test]
