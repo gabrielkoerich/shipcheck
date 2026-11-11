@@ -171,9 +171,12 @@ enum Cmd {
         /// Print the runs as JSON on stdout
         #[arg(long)]
         json: bool,
-        /// How many runs to list
-        #[arg(long, default_value_t = 20, value_name = "n")]
-        limit: usize,
+        /// How many runs to list, 20 unless `--flaky`, which reads the last 200
+        #[arg(long, value_name = "n")]
+        limit: Option<usize>,
+        /// List the tests and jobs that failed and then passed on a retry, most often first
+        #[arg(long)]
+        flaky: bool,
     },
     /// List the runs of every repository going or queued on this machine
     Queue {
@@ -252,6 +255,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let mut limit = 20;
     let mut uninstall = false;
     let mut heartbeat = true;
+    let mut flaky = false;
     // Set by the hooks and the daemon on a background run that posts its checks
     let mut posts: Option<String> = None;
     let (mut refname, mut pushed, mut remote_ref) = (String::new(), None, None);
@@ -364,8 +368,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             on_base(b, &mut base, &mut base_set, &mut fetch);
             "post"
         }
-        Cmd::History { json: js, limit: l } => {
-            (json, limit) = (js, l);
+        Cmd::History {
+            json: js,
+            limit: l,
+            flaky: f,
+        } => {
+            (json, flaky) = (js, f);
+            limit = l.unwrap_or(if flaky { 200 } else { 20 });
             "history"
         }
         Cmd::Queue { json: js } => {
@@ -717,6 +726,23 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         "history" => {
             let repo = run::repo_id(&toplevel(&cwd)?)?;
             let runs = shipcheck::record::runs(&run::home(), &repo, limit);
+
+            if flaky {
+                let rows = shipcheck::record::flaky(&runs);
+
+                if json {
+                    println!("{}", serde_json::Value::from(rows));
+                } else if rows.is_empty() {
+                    println!(
+                        "no job passed on a retry in the last {} runs of {repo} on this machine",
+                        runs.len()
+                    );
+                } else {
+                    print!("{}", shipcheck::record::flaky_table(&rows));
+                }
+
+                return Ok(ExitCode::SUCCESS);
+            }
 
             if json {
                 println!("{}", serde_json::Value::from(runs));
