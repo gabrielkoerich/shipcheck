@@ -594,3 +594,44 @@ fn a_local_ref_moved_to_a_branch_never_makes_its_run_a_base_run() {
         "a branch run wrote the base's cache: {planted:?}"
     );
 }
+
+#[test]
+#[cfg_attr(jail, ignore = "macOS refuses a sandbox inside shipcheck's jail")]
+fn an_async_run_returns_an_id_and_wait_collects_its_verdict() {
+    // The check holds the run long enough for the commands below to find it going
+    let config = "runner = \"host\"\nretries = 0\n[host]\nchecks = { slow = \"sleep 10 && test -f marker.txt\" }\n";
+    let repo = Repo::new(config);
+    let (code, out) = repo.shipcheck(&["wait"]);
+    assert_eq!(code, Some(4), "no run and no result: {out}");
+
+    repo.write("marker.txt", "x");
+    let (code, out) = repo.shipcheck(&["run", "--no-fetch", "--async", "--json"]);
+    assert_eq!(code, Some(0), "{out}");
+    let state = out.lines().find(|l| l.starts_with('{')).expect(&out);
+    let state: serde_json::Value = serde_json::from_str(state).unwrap();
+    let id = state["id"].as_str().unwrap();
+    assert_eq!(id.len(), 12, "{out}");
+
+    let (code, out) = repo.shipcheck(&["status", id]);
+    assert_eq!(code, Some(3), "the run still goes: {out}");
+    // A second request for the tree starts nothing and names the same run
+    let (code, out) = repo.shipcheck(&["run", "--no-fetch", "--async"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains(&format!("run {id} of tree")) && out.contains("already going"),
+        "{out}"
+    );
+    let (code, out) = repo.shipcheck(&["wait", id, "--timeout", "0"]);
+    assert_eq!(code, Some(3), "a timeout is not a failure: {out}");
+
+    let (code, out) = repo.shipcheck(&["wait", id]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("passed, tree "), "{out}");
+    assert_eq!(repo.cached(), 1, "two requests ran the tree once");
+    // The working copy is that tree, and the id now names a stored result
+    let (code, out) = repo.shipcheck(&["wait"]);
+    assert_eq!(code, Some(0), "{out}");
+    let (code, out) = repo.shipcheck(&["status", id]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("passed, tree "), "{out}");
+}

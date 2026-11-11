@@ -10,7 +10,7 @@ use shipcheck::config::Trigger;
 use shipcheck::record::Run as Record;
 use shipcheck::service::{self, Poster, Sender};
 use shipcheck::ui::{Live, Style};
-use shipcheck::{agents, autostart, background, check, report, run, setup};
+use shipcheck::{agents, autostart, background, check, queue, report, run, setup};
 
 const PARTIAL: &str = "partial run: not the check, run `shipcheck run` before committing";
 
@@ -98,6 +98,9 @@ enum Cmd {
         /// Print no line each minute that says where the run stands, when the output is not a terminal
         #[arg(long)]
         no_heartbeat: bool,
+        /// Start the run in the background, print its id and exit, `shipcheck wait <id>` collects it
+        #[arg(long = "async", visible_alias = "detach", conflicts_with_all = ["jobs", "workflows", "background"])]
+        detach: bool,
         /// Set by the hooks and the daemon on a run that posts its checks
         #[arg(long, hide = true, value_name = "name")]
         background: Option<String>,
@@ -122,7 +125,27 @@ enum Cmd {
         #[arg(long)]
         no_verify: bool,
     },
-    /// Print the stored result of a tree
+    /// Wait for the run of a tree that is queued or going, then print its result
+    Wait {
+        /// A run's id or a commit, instead of the working copy
+        target: Option<String>,
+        /// The index instead of the working copy
+        #[arg(long, conflicts_with = "target")]
+        staged: bool,
+        /// Stop waiting after this long, as `90`, `90s`, `10m` or `1h`, and exit 3 while the run still goes
+        #[arg(long, value_name = "duration")]
+        timeout: Option<String>,
+        /// Print the result as JSON on stdout
+        #[arg(long)]
+        json: bool,
+        /// Print no line each minute that says where the run stands, when the output is not a terminal
+        #[arg(long)]
+        no_heartbeat: bool,
+        /// The ref the run read shipcheck.toml from
+        #[arg(long, value_name = "ref")]
+        base: Option<String>,
+    },
+    /// Print the stored result of a tree, or where the run with this id stands
     Status {
         /// Accepted for scripts written for older versions, these commands never fetch
         #[arg(long, hide = true)]
@@ -256,6 +279,8 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let mut uninstall = false;
     let mut heartbeat = true;
     let mut flaky = false;
+    let mut detach = false;
+    let mut timeout: Option<String> = None;
     // Set by the hooks and the daemon on a background run that posts its checks
     let mut posts: Option<String> = None;
     let (mut refname, mut pushed, mut remote_ref) = (String::new(), None, None);
@@ -320,10 +345,12 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             only_failed: f,
             json: js,
             no_heartbeat,
+            detach: d,
             background,
             home_ok: h,
             rev: r,
         } => {
+            detach = d;
             heartbeat = !no_heartbeat;
             only_failed = f;
             at(sha.or(r), &mut rev, &mut explicit);
@@ -333,6 +360,19 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             on_base(b, &mut base, &mut base_set, &mut fetch);
             (jobs, workflows, json, posts) = (j, w, js, background);
             "run"
+        }
+        Cmd::Wait {
+            target,
+            staged: st,
+            timeout: t,
+            json: js,
+            no_heartbeat,
+            base: b,
+        } => {
+            at(target, &mut rev, &mut explicit);
+            (staged, json, timeout, heartbeat) = (st, js, t, !no_heartbeat);
+            on_base(b, &mut base, &mut base_set, &mut fetch);
+            "wait"
         }
         Cmd::Status {
             rev: r,
@@ -477,9 +517,33 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 warn_untracked(&plan.repo)?;
             }
 
+            if detach {
+                let mut args = vec!["run".to_string(), "--no-fetch".into()];
+
+                if base_set {
+                    args.extend(["--base".into(), base.clone()]);
+                }
+
+                if explicit {
+                    args.extend(["--sha".into(), rev.clone()]);
+                }
+
+                for (flag, set) in [
+                    ("--staged", staged),
+                    ("--only-failed", only_failed),
+                    ("--no-heartbeat", !heartbeat),
+                ] {
+                    if set {
+                        args.push(flag.into());
+                    }
+                }
+
+                return detached(&cwd, &plan, &args, json, &say);
+            }
+
             if !jobs.is_empty() || !workflows.is_empty() {
                 let _key = run::lock_key(&plan.key)?;
-                let entry = progress(&live, heartbeat, || {
+                let entry = progress(&live, heartbeat, &own_run, || {
                     run::run_partial(&plan, &jobs, &workflows, &mut |line| {
                         say(&run::printable(line))
                     })
@@ -581,6 +645,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(report(&entry, snapshot, json, false));
             }
 
+            if run::running(&plan.key) {
+                say(&format!(
+                    "run {} of this tree is already going, waiting for its result",
+                    queue::id(&plan.key)
+                ));
+            }
+
             let (_key, waited) = run::lock_tree(&plan.key)?;
             let mut estimated = None;
             let entry = match run::reusable(&plan, waited) {
@@ -607,7 +678,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     say(&line);
                     estimated = numbers;
                     let say = &mut |line: &str| say(&run::printable(line));
-                    let entry = progress(&live, heartbeat, || {
+                    let entry = progress(&live, heartbeat, &own_run, || {
                         if only_failed {
                             run::run_only_failed(&plan, say)
                         } else {
@@ -681,7 +752,109 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 Ok(ExitCode::from(1))
             }
         }
+        "wait" => {
+            // An id names a tree that ran or runs here, anything else is a commit
+            let known = explicit
+                .then(|| run::find_key(&run::home(), &rev))
+                .flatten();
+            let (plan, snapshot) = match known {
+                Some(_) => (None, None),
+                None => {
+                    if !base_set {
+                        base = shipcheck::daemon::command_base(name, &cwd);
+                    }
+
+                    let (tested, snapshot) = subject(&cwd, &rev, explicit, staged)?;
+                    (Some(run::plan(&cwd, &tested, &base)?), snapshot)
+                }
+            };
+            let key = known
+                .or_else(|| plan.as_ref().map(|p| p.key.clone()))
+                .unwrap_or_default();
+            let id = queue::id(&key);
+            let limit = timeout.as_deref().map(duration).transpose()?;
+            let started = Instant::now();
+            let mut went = false;
+            let late = progress(&live, heartbeat, &|r| r["key"] == key.as_str(), || {
+                while run::running(&key) {
+                    went = true;
+
+                    if limit.is_some_and(|limit| started.elapsed() >= limit) {
+                        return true;
+                    }
+
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+
+                false
+            });
+
+            if late {
+                let state = run_state(&key);
+                say(&format!(
+                    "run {id} still goes after {}: {}",
+                    shipcheck::record::clock(started.elapsed().as_secs()),
+                    state["state"].as_str().unwrap_or_default()
+                ));
+
+                if json {
+                    println!("{state}");
+                }
+
+                return Ok(ExitCode::from(STILL_GOING));
+            }
+
+            let result = match &plan {
+                Some(plan) => run::lookup(plan),
+                None => run::cached(&key),
+            };
+
+            match result {
+                Some(entry) => Ok(report(&entry, snapshot, json, false)),
+                None => {
+                    if json {
+                        println!("{}", run_state(&key));
+                    }
+
+                    if went {
+                        say(&format!(
+                            "run {id} ended without a result: it could not run, was stopped, or was a partial run"
+                        ));
+                        Ok(ExitCode::from(2))
+                    } else {
+                        say(&format!(
+                            "no run of this tree is queued or going, and it has no result, `shipcheck run` starts one (id {id})"
+                        ));
+                        Ok(ExitCode::from(NO_RUN))
+                    }
+                }
+            }
+        }
         "status" => {
+            if explicit && let Some(key) = run::find_key(&run::home(), &rev) {
+                let state = run_state(&key);
+
+                if state["state"] == "queued"
+                    || state["state"] == "running"
+                    || state["state"] == "starting"
+                {
+                    if json {
+                        println!("{state}");
+                    } else {
+                        let rows = queue::list(&run::home().join("runners"), run::unix_now());
+                        let secs = state["elapsed_s"].as_u64().unwrap_or_default();
+                        let at = queue::standing(&rows, &|r| r["key"] == key.as_str(), secs);
+                        say(&format!("run {}: {at}", queue::id(&key)));
+                    }
+
+                    return Ok(ExitCode::from(STILL_GOING));
+                }
+
+                if let Some(entry) = run::cached(&key) {
+                    return Ok(report(&entry, None, json, false));
+                }
+            }
+
             // Before a commit, whether committing all of it or the index as it is reuses a result
             if !explicit {
                 for (label, staged) in [("working copy", false), ("index", true)] {
@@ -1310,6 +1483,151 @@ fn toplevel(cwd: &Path) -> Result<std::path::PathBuf, String> {
 }
 
 /// `snapshot` names the working copy or the index when the run tested one instead of a commit
+/// `wait` and `status` exit with this while the run is queued or going
+const STILL_GOING: u8 = 3;
+
+/// `wait` exits with this when the tree has no run and no result
+const NO_RUN: u8 = 4;
+
+/// How long `run --async` waits for the run it started to take its tree's lock
+const ASYNC_START: Duration = Duration::from_secs(60);
+
+/// This process's row of the machine's queue
+fn own_run(row: &serde_json::Value) -> bool {
+    row["pid"] == std::process::id()
+}
+
+/// `90`, `90s`, `10m` or `1h`
+fn duration(text: &str) -> Result<Duration, String> {
+    let (number, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => text.split_at(at),
+        None => (text, "s"),
+    };
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => {
+            return Err(format!(
+                "--timeout {text}: use a number with s, m or h, as 10m"
+            ));
+        }
+    };
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("--timeout {text}: use a number with s, m or h, as 10m"))?;
+    Ok(Duration::from_secs(number.saturating_mul(scale)))
+}
+
+/// Where the run of `key` stands, without waiting: queued, running, starting while it holds the
+/// tree's lock and no place in the queue yet, finished with its verdict, or none
+fn run_state(key: &str) -> serde_json::Value {
+    let rows = queue::list(&run::home().join("runners"), run::unix_now());
+    let mut state = serde_json::json!({"id": queue::id(key), "key": key, "result": null});
+
+    if let Some(row) = rows.iter().find(|r| r["key"] == key) {
+        for field in [
+            "state",
+            "position",
+            "jobs",
+            "elapsed_s",
+            "started_unix",
+            "queued_unix",
+        ] {
+            state[field] = row[field].clone();
+        }
+    } else if run::running(key) {
+        state["state"] = "starting".into();
+    } else if let Some(entry) = run::cached(key) {
+        state["state"] = "finished".into();
+        state["passed"] = entry.passed.into();
+    } else {
+        state["state"] = "none".into();
+    }
+
+    state
+}
+
+/**
+ * `shipcheck run --async`: starts the run as its own process group and returns once that run holds
+ * the tree's lock, so a `shipcheck wait` right after finds it. The run takes its own snapshot of
+ * the working copy before it takes the lock, so edits made after this returns are not in it. A tree
+ * that passed or already runs starts nothing, and its id names that result or run
+ **/
+fn detached(
+    cwd: &Path,
+    plan: &run::Plan,
+    args: &[String],
+    json: bool,
+    say: &dyn Fn(&str),
+) -> Result<ExitCode, String> {
+    use std::os::unix::process::CommandExt;
+
+    let id = queue::id(&plan.key);
+    let tree = &plan.tree[..12];
+    let dir = run::home().join("async");
+    let log = dir.join(format!("{id}.log"));
+    let attached = run::running(&plan.key);
+    let stored = run::lookup(plan).is_some_and(|e| e.passed);
+
+    if !attached && !stored {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let out = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut child = Command::new(exe)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(out.try_clone().map_err(|e| e.to_string())?)
+            .stderr(out)
+            .process_group(0)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let started = Instant::now();
+
+        while !run::running(&plan.key) {
+            // A run that ended at once stored its result, or says in its log why it could not run
+            if child.try_wait().is_ok_and(|ended| ended.is_some()) {
+                break;
+            }
+
+            if started.elapsed() > ASYNC_START {
+                return Err(format!(
+                    "the run did not start on tree {tree} in {}s, its output is {}",
+                    ASYNC_START.as_secs(),
+                    log.display()
+                ));
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let state = run_state(&plan.key);
+    let at = match state["state"].as_str().unwrap_or_default() {
+        "queued" => format!("queued at position {}", state["position"]),
+        "finished" if stored => "already passed".to_string(),
+        "finished" => "finished".to_string(),
+        "none" => format!("ended without a result, its output is {}", log.display()),
+        _ if attached => "already going".to_string(),
+        _ => "started in the background".to_string(),
+    };
+    say(&format!(
+        "run {id} of tree {tree}: {at}, `shipcheck wait {id}` waits for its result"
+    ));
+
+    if json {
+        let mut state = state;
+        state["tree"] = plan.tree.clone().into();
+        state["log"] = (!attached && !stored)
+            .then(|| log.display().to_string())
+            .into();
+        println!("{state}");
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
 /// How often a run that is not at a terminal says where it stands
 const HEARTBEAT: Duration = Duration::from_secs(60);
 
@@ -1317,11 +1635,16 @@ const HEARTBEAT: Duration = Duration::from_secs(60);
  * Runs `run` while a thread shows where it stands: the live line at a terminal, and otherwise one
  * line each `HEARTBEAT` when `heartbeat` is on. It reads the run's own row of the machine's queue
  **/
-fn progress<T>(live: &Live, heartbeat: bool, run: impl FnOnce() -> T) -> T {
+fn progress<T>(
+    live: &Live,
+    heartbeat: bool,
+    mine: &(dyn Fn(&serde_json::Value) -> bool + Sync),
+    run: impl FnOnce() -> T,
+) -> T {
     let done = AtomicBool::new(false);
     let standing = |secs: u64| {
-        let rows = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
-        shipcheck::queue::standing(&rows, std::process::id(), secs)
+        let rows = queue::list(&run::home().join("runners"), run::unix_now());
+        queue::standing(&rows, mine, secs)
     };
 
     std::thread::scope(|s| {
@@ -1455,6 +1778,19 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_is_seconds_unless_it_names_a_unit() {
+        assert_eq!(duration("90"), Ok(Duration::from_secs(90)));
+        assert_eq!(duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(duration("10m"), Ok(Duration::from_secs(600)));
+        assert_eq!(duration("1h"), Ok(Duration::from_secs(3600)));
+        assert!(duration("soon").is_err());
+        assert!(duration("5d").is_err());
+        // An async run is a full run, and never one the hooks started
+        assert!(!parses(&["run", "--async", "--job", "test"]));
+        assert!(!parses(&["run", "--async", "--background", "feature"]));
+    }
+
+    #[test]
     fn the_command_line_is_consistent() {
         Cli::command().debug_assert();
     }
@@ -1491,6 +1827,15 @@ mod tests {
             &["status", "--staged", "--json"],
             &["logs", "--staged"],
             &["history", "--json", "--limit", "5"],
+            &["history", "--flaky"],
+            &["queue", "--json"],
+            &["run", "--no-heartbeat"],
+            &["run", "--async"],
+            &["run", "--detach", "--json"],
+            &["wait"],
+            &["wait", "--staged"],
+            &["wait", "0123456789ab", "--timeout", "10m", "--json"],
+            &["status", "0123456789ab"],
             &["commit", "-m", "subject"],
             &[
                 "commit",
