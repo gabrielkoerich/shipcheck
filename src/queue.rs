@@ -262,6 +262,31 @@ pub fn forecast(
     wait
 }
 
+/// Where the run of `pid` stands after `secs`, for the live line and the heartbeat of `shipcheck run`
+pub fn standing(rows: &[Value], pid: u32, secs: u64) -> String {
+    let time = clock(secs);
+
+    match rows.iter().find(|r| r["pid"] == pid) {
+        Some(row) if row["state"] == "queued" => {
+            format!("queued at position {}, {time}", row["position"])
+        }
+        Some(row) => {
+            let jobs: Vec<&str> = row["jobs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+
+            match jobs.len() {
+                0 => format!("running, {time}"),
+                _ => format!("running {}, {time}", jobs.join(", ")),
+            }
+        }
+        None => format!("starting, {time}"),
+    }
+}
+
 /// `shipcheck run`'s first line: how long the run takes, and its wait when it has one
 pub fn estimate_line(typical: &Typical, wait: &Wait) -> String {
     let mut line = format!(
@@ -420,6 +445,9 @@ mod tests {
                 .starts_with("queued     1 owner/app")
         );
 
+        assert_eq!(standing(&rows, 1, 95), "running ci.yml/test, 1m35s");
+        assert_eq!(standing(&rows, 3, 95), "queued at position 2, 1m35s");
+        assert_eq!(standing(&rows, 7, 2), "starting, 2s");
         let mut rows = rows;
         let wait = forecast(&mut rows, 1, true, &mut |_| Some(100));
         // The running run has 80s left, and only the queued `shipcheck run` goes first
@@ -456,6 +484,7 @@ mod tests {
 
         drop(going);
         assert_eq!(list(dir.path(), 130)[0]["jobs"], json!([]));
+        assert_eq!(standing(&list(dir.path(), 130), 1, 5), "running, 5s");
         drop(note);
         drop(slot);
         assert_eq!(list(dir.path(), 130).len(), 2);

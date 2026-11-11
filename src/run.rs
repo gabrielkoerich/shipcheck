@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::cache::{self, KeyInputs};
 use crate::config::{RepoConfig, RunnerKind};
 use crate::queue;
+use crate::record::clock;
 use crate::runner::host::{self as host_runner, HOST};
 use crate::runner::shard::{self, Rejected, ShardRun};
 use crate::runner::{RunRequest, Runner, Runners};
@@ -1416,6 +1417,17 @@ pub struct JobDone {
     pub times: [u64; 2],
 }
 
+/// The line of a job that ended, with the time it took when it ran
+fn ended(file: &str, job: &str, state: &str, time: [u64; 2]) -> String {
+    match time {
+        [0, _] => format!("{file}/{job}: {state}"),
+        [start, end] => format!(
+            "{file}/{job}: {state}, {}",
+            clock(end.saturating_sub(start))
+        ),
+    }
+}
+
 /// Sends a job that ended to the run's poster, when the run has one
 fn job_done(ctx: &Ctx, file: &str, job: &str, state: &str, times: [u64; 2]) {
     if let Some(tx) = ctx.jobs {
@@ -2094,7 +2106,15 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
                     let start = unix_now();
                     let run = run_job(ctx, HOST, name, &none, deadline, &unused, &tx);
                     let time = [start, unix_now()];
-                    job_done(ctx, HOST, name, host_state(&run), time);
+                    let state = host_state(&run);
+
+                    if let Err(e) = &run {
+                        let _ = tx.send(Msg::Say(format!("{HOST}/{name}: {e}")));
+                    }
+
+                    // Said as the check ends, so the output shows where the time went
+                    let _ = tx.send(Msg::Say(ended(HOST, name, state, time)));
+                    job_done(ctx, HOST, name, state, time);
                     (name.clone(), run, time)
                 })
             })
@@ -2116,6 +2136,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
             })
             .collect()
     });
+    let reused: BTreeSet<String> = kept.keys().cloned().collect();
     runs.extend(
         kept.into_iter()
             .map(|(name, (run, time))| (name, Ok(run), time)),
@@ -2150,11 +2171,20 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
             }
             Err(e) => {
                 exit = exit.and(Some(1));
-                say(&format!("{HOST}/{name}: {e}"));
+
+                // A check that ran said its error as it ended, a thread that panicked said nothing
+                if name.is_empty() {
+                    say(&format!("{HOST}/{name}: {e}"));
+                }
+
                 state
             }
         };
-        say(&format!("{HOST}/{name}: {state}"));
+
+        if reused.contains(&name) || name.is_empty() {
+            say(&format!("{HOST}/{name}: {state}"));
+        }
+
         states.insert(name, state.to_string());
     }
 
@@ -2601,7 +2631,12 @@ fn run_workflow(
                             error_state(&e).to_string()
                         }
                     };
-                    say(&format!("{file}/{job}: {state}"));
+                    say(&ended(
+                        file,
+                        &job,
+                        &state,
+                        times.get(&job).copied().unwrap_or_default(),
+                    ));
                     job_done(
                         ctx,
                         file,
@@ -2832,6 +2867,7 @@ fn try_job(
         }
 
         attempts += 1;
+        let attempt_at = Instant::now();
         say(format!("{file}/{job}: running, attempt {attempts}"));
         {
             let at = Instant::now();
@@ -2975,7 +3011,9 @@ fn try_job(
 
         let kept = keep_attempt_log(&log_path, attempts)?;
         say(format!(
-            "{file}/{job}: attempt {attempts} failed, its log is {}",
+            "{file}/{job}: attempt {attempts} of {} failed after {}, its log is {}",
+            before + ctx.plan.config.retries + 1,
+            clock(attempt_at.elapsed().as_secs()),
             kept.display()
         ));
     }
