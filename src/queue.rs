@@ -13,6 +13,8 @@ use crate::record::{Typical, clock};
 #[serde(default)]
 pub struct Run {
     pub repo: String,
+    /// The key of the tree's result, whose first characters are the run's id
+    pub key: String,
     pub path: String,
     pub branch: Option<String>,
     pub sha: String,
@@ -96,9 +98,15 @@ fn read(path: &Path) -> Run {
         .unwrap_or_default()
 }
 
+/// A run's id: the start of its tree's key, so every request for one tree names one run
+pub fn id(key: &str) -> &str {
+    &key[..key.len().min(12)]
+}
+
 fn row(run: &Run, position: Option<usize>, now: u64) -> Value {
     let since = run.started_unix.unwrap_or(run.queued_unix);
     let mut row = json!(run);
+    row["id"] = json!(id(&run.key));
     row["state"] = json!(if position.is_some() {
         "queued"
     } else {
@@ -262,11 +270,11 @@ pub fn forecast(
     wait
 }
 
-/// Where the run of `pid` stands after `secs`, for the live line and the heartbeat of `shipcheck run`
-pub fn standing(rows: &[Value], pid: u32, secs: u64) -> String {
+/// Where the run that `mine` picks stands after `secs`, for the live line and the heartbeat
+pub fn standing(rows: &[Value], mine: &dyn Fn(&Value) -> bool, secs: u64) -> String {
     let time = clock(secs);
 
-    match rows.iter().find(|r| r["pid"] == pid) {
+    match rows.iter().find(|r| mine(r)) {
         Some(row) if row["state"] == "queued" => {
             format!("queued at position {}, {time}", row["position"])
         }
@@ -395,6 +403,7 @@ mod tests {
             path: format!("/work/{branch}"),
             branch: Some(branch.into()),
             sha: "0123456789abcdef".into(),
+            key: "a".repeat(16),
             trigger: "cli".into(),
             pid,
             queued_unix: 100,
@@ -445,9 +454,11 @@ mod tests {
                 .starts_with("queued     1 owner/app")
         );
 
-        assert_eq!(standing(&rows, 1, 95), "running ci.yml/test, 1m35s");
-        assert_eq!(standing(&rows, 3, 95), "queued at position 2, 1m35s");
-        assert_eq!(standing(&rows, 7, 2), "starting, 2s");
+        let of = |pid: u32| move |r: &Value| r["pid"] == pid;
+        assert_eq!(standing(&rows, &of(1), 95), "running ci.yml/test, 1m35s");
+        assert_eq!(standing(&rows, &of(3), 95), "queued at position 2, 1m35s");
+        assert_eq!(standing(&rows, &of(7), 2), "starting, 2s");
+        assert_eq!(rows[0]["id"], "a".repeat(12));
         let mut rows = rows;
         let wait = forecast(&mut rows, 1, true, &mut |_| Some(100));
         // The running run has 80s left, and only the queued `shipcheck run` goes first
@@ -484,7 +495,7 @@ mod tests {
 
         drop(going);
         assert_eq!(list(dir.path(), 130)[0]["jobs"], json!([]));
-        assert_eq!(standing(&list(dir.path(), 130), 1, 5), "running, 5s");
+        assert_eq!(standing(&list(dir.path(), 130), &of(1), 5), "running, 5s");
         drop(note);
         drop(slot);
         assert_eq!(list(dir.path(), 130).len(), 2);

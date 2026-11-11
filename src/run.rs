@@ -1389,6 +1389,30 @@ pub fn reusable(plan: &Plan, waited: Option<u64>) -> Option<Entry> {
     lookup(plan).filter(|e| e.passed || waited.is_some_and(|t| e.finished_unix >= t))
 }
 
+/// The one key under `home` that starts with `id`, a run's id, among the trees that ran or run
+pub fn find_key(home: &Path, id: &str) -> Option<String> {
+    if id.len() < 6 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let mut keys = BTreeSet::new();
+
+    for (dir, ext) in [("locks", ".lock"), ("cache", ".json")] {
+        for entry in fs::read_dir(home.join(dir)).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+
+            if let Some(key) = name.to_str().and_then(|n| n.strip_suffix(ext))
+                && key.starts_with(id)
+            {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+
+    // An id that names two trees names none
+    (keys.len() == 1).then(|| keys.pop_first()).flatten()
+}
+
 /// Whether a run of this key is going right now on this machine, without waiting for it
 pub fn running(key: &str) -> bool {
     let path = home().join("locks").join(format!("{key}.lock"));
@@ -1544,6 +1568,7 @@ fn claim_runner(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<(fs::File, que
     let priority = u8::from(trigger.is_some());
     let run = queue::Run {
         repo: repo_id(&plan.repo).unwrap_or_default(),
+        key: plan.key.clone(),
         path: plan.repo.display().to_string(),
         branch: plan.branch.clone(),
         sha: plan.sha.clone(),
@@ -3576,6 +3601,22 @@ mod tests {
             keep_jobs(&graph, &states(&[("lint", "success")])),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn an_id_names_the_one_key_it_starts() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("locks")).unwrap();
+        fs::create_dir_all(home.path().join("cache")).unwrap();
+        fs::write(home.path().join("locks/abcdef0123456789.lock"), "").unwrap();
+        fs::write(home.path().join("cache/abcdef0123456789.json"), "").unwrap();
+        fs::write(home.path().join("cache/abcdef9999999999.json"), "").unwrap();
+        let find = |id: &str| find_key(home.path(), id);
+        assert_eq!(find("abcdef0123"), Some("abcdef0123456789".into()));
+        assert_eq!(find("abcdef"), None, "two trees start with it");
+        assert_eq!(find("abcde"), None, "too short to name a tree");
+        assert_eq!(find("feature"), None, "a branch is no id");
+        assert_eq!(find("0000000000"), None);
     }
 
     #[test]
