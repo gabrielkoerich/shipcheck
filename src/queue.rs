@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::record::{Typical, clock};
+
 /// What a run says of itself in the machine's queue, in its ticket while it waits and beside its
 /// slot's lock while it runs
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -164,12 +166,140 @@ pub fn list(dir: &Path, now: u64) -> Vec<Value> {
         .collect()
 }
 
+/**
+ * When each run of `queued` gets a slot, in seconds from now, and last when a run that arrives now
+ * does. `running` holds the seconds each running run has left and `queued` the seconds each
+ * waiting run takes, in the queue's order
+ **/
+fn starts(running: &[u64], queued: &[u64], slots: usize) -> Vec<u64> {
+    let mut free = running.to_vec();
+    free.sort_unstable();
+    // With more runs than slots, the first ones to end free no slot
+    free.drain(..free.len().saturating_sub(slots.max(1)));
+    free.resize(slots.max(1), 0);
+    let mut out = Vec::new();
+
+    for takes in queued.iter().map(Some).chain([None]) {
+        let (slot, at) = free
+            .iter()
+            .copied()
+            .enumerate()
+            .min_by_key(|(_, at)| *at)
+            .unwrap_or_default();
+        out.push(at);
+
+        if let Some(takes) = takes {
+            free[slot] = at + takes;
+        }
+    }
+
+    out
+}
+
+/// The wait of a run that arrives now, as [`forecast`] gives it
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Wait {
+    pub wait_s: u64,
+    /// The queued runs that get a slot first
+    pub ahead: usize,
+    /// Whether every run ahead has a typical time, without which the wait is a lower bound
+    pub known: bool,
+}
+
+/**
+ * Gives every row its repository's typical time as `estimate_s`, and every queued row the wait
+ * until it starts as `wait_s`. Returns the wait of a run that arrives now: `shipcheck run` when
+ * `cli`, which goes ahead of the queued runs the hooks and the daemon started
+ **/
+pub fn forecast(
+    rows: &mut [Value],
+    slots: usize,
+    cli: bool,
+    typical: &mut dyn FnMut(&str) -> Option<u64>,
+) -> Wait {
+    for row in rows.iter_mut() {
+        row["estimate_s"] = json!(typical(row["repo"].as_str().unwrap_or_default()));
+    }
+
+    let takes = |r: &Value| r["estimate_s"].as_u64();
+    let (queued, running): (Vec<&Value>, Vec<&Value>) =
+        rows.iter().partition(|r| r["state"] == "queued");
+    let left: Vec<u64> = running
+        .iter()
+        .map(|r| {
+            takes(r)
+                .unwrap_or_default()
+                .saturating_sub(r["elapsed_s"].as_u64().unwrap_or_default())
+        })
+        .collect();
+    let all: Vec<u64> = queued
+        .iter()
+        .map(|r| takes(r).unwrap_or_default())
+        .collect();
+    let ahead: Vec<&&Value> = queued
+        .iter()
+        .filter(|r| !cli || r["trigger"] == "cli")
+        .collect();
+    let first: Vec<u64> = ahead.iter().map(|r| takes(r).unwrap_or_default()).collect();
+    let wait = Wait {
+        wait_s: starts(&left, &first, slots).pop().unwrap_or_default(),
+        ahead: ahead.len(),
+        known: running
+            .iter()
+            .chain(ahead.iter().copied())
+            .all(|r| takes(r).is_some()),
+    };
+    let waits = starts(&left, &all, slots);
+
+    for (row, wait) in rows
+        .iter_mut()
+        .filter(|r| r["state"] == "queued")
+        .zip(waits)
+    {
+        row["wait_s"] = json!(wait);
+    }
+
+    wait
+}
+
+/// `shipcheck run`'s first line: how long the run takes, and its wait when it has one
+pub fn estimate_line(typical: &Typical, wait: &Wait) -> String {
+    let mut line = format!(
+        "estimate: about {}, the median of the last {} full runs here, the slowest took {}",
+        clock(typical.median_s),
+        typical.runs,
+        clock(typical.slowest_s)
+    );
+
+    if wait.wait_s > 0 || wait.ahead > 0 {
+        line.push_str(&format!(
+            ", after {} {} in the queue with {} ahead",
+            if wait.known { "about" } else { "at least" },
+            clock(wait.wait_s),
+            wait.ahead
+        ));
+    }
+
+    line
+}
+
 /// `shipcheck queue`: one row per run, the running ones first
 pub fn table(rows: &[Value]) -> String {
     let mut out = format!(
-        "{:<8} {:>3} {:<28} {:<24} {:<12} {:<7} {:>8}  {:<24} {}\n",
-        "STATE", "POS", "REPOSITORY", "BRANCH", "COMMIT", "BY", "ELAPSED", "JOBS", "PATH"
+        "{:<8} {:>3} {:<28} {:<24} {:<12} {:<7} {:>8} {:>8} {:>8}  {:<24} {}\n",
+        "STATE",
+        "POS",
+        "REPOSITORY",
+        "BRANCH",
+        "COMMIT",
+        "BY",
+        "ELAPSED",
+        "TYPICAL",
+        "STARTS",
+        "JOBS",
+        "PATH"
     );
+    let time = |v: &Value| v.as_u64().map_or("-".to_string(), clock);
 
     for r in rows {
         let text = |key: &str| r[key].as_str().filter(|s| !s.is_empty()).unwrap_or("-");
@@ -181,7 +311,7 @@ pub fn table(rows: &[Value]) -> String {
             .filter_map(Value::as_str)
             .collect();
         out.push_str(&format!(
-            "{:<8} {:>3} {:<28} {:<24} {:<12} {:<7} {:>7}s  {:<24} {}\n",
+            "{:<8} {:>3} {:<28} {:<24} {:<12} {:<7} {:>8} {:>8} {:>8}  {:<24} {}\n",
             text("state"),
             r["position"]
                 .as_u64()
@@ -190,7 +320,9 @@ pub fn table(rows: &[Value]) -> String {
             text("branch"),
             &sha[..sha.len().min(12)],
             text("trigger"),
-            r["elapsed_s"].as_u64().unwrap_or_default(),
+            time(&r["elapsed_s"]),
+            time(&r["estimate_s"]),
+            time(&r["wait_s"]),
             if jobs.is_empty() {
                 "-".to_string()
             } else {
@@ -212,6 +344,20 @@ mod tests {
         let file = fs::File::open(path).unwrap();
         file.try_lock().unwrap();
         file
+    }
+
+    fn column_of(rows: &[Value], key: &str) -> Vec<Value> {
+        rows.iter().map(|r| r[key].clone()).collect()
+    }
+
+    #[test]
+    fn a_run_starts_when_the_runs_ahead_free_a_slot() {
+        // Two slots: the first waiting run takes the one free in 10s, the next the one free in 30s
+        assert_eq!(starts(&[30, 10], &[100, 5], 2), [10, 30, 35]);
+        assert_eq!(starts(&[], &[], 2), [0]);
+        assert_eq!(starts(&[50], &[], 2), [0]);
+        // Three runs on two slots, as when the limit went down: the first to end frees none
+        assert_eq!(starts(&[10, 20, 30], &[], 2), [20]);
     }
 
     #[test]
@@ -242,7 +388,11 @@ mod tests {
         )
         .unwrap();
         fs::write(queue.join("0-000-9"), json!(run(9, "gone")).to_string()).unwrap();
-        let _hook = lock(&queue.join("1-001-3"), &run(3, "third"));
+        let hook = Run {
+            trigger: "hook-push".into(),
+            ..run(3, "third")
+        };
+        let _hook = lock(&queue.join("1-001-3"), &hook);
         let _agent = lock(&queue.join("0-002-2"), &run(2, "second"));
 
         let rows = list(dir.path(), 130);
@@ -269,6 +419,40 @@ mod tests {
                 .unwrap()
                 .starts_with("queued     1 owner/app")
         );
+
+        let mut rows = rows;
+        let wait = forecast(&mut rows, 1, true, &mut |_| Some(100));
+        // The running run has 80s left, and only the queued `shipcheck run` goes first
+        assert_eq!(
+            wait,
+            Wait {
+                wait_s: 180,
+                ahead: 1,
+                known: true
+            }
+        );
+        assert_eq!(
+            column_of(&rows, "wait_s"),
+            [json!(null), json!(80), json!(180)]
+        );
+        assert_eq!(rows[0]["estimate_s"], 100);
+        assert!(table(&rows).lines().nth(2).unwrap().contains("  1m20s "));
+        assert!(!forecast(&mut rows, 1, true, &mut |_| None).known);
+        let typical = Typical {
+            median_s: 367,
+            slowest_s: 552,
+            runs: 10,
+        };
+        assert_eq!(
+            estimate_line(&typical, &wait),
+            "estimate: about 6m07s, the median of the last 10 full runs here, the slowest took 9m12s, after about 3m00s in the queue with 1 ahead"
+        );
+        let none = Wait {
+            wait_s: 0,
+            ahead: 0,
+            known: true,
+        };
+        assert!(estimate_line(&typical, &none).ends_with("took 9m12s"));
 
         drop(going);
         assert_eq!(list(dir.path(), 130)[0]["jobs"], json!([]));

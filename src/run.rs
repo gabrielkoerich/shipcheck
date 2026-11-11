@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1400,7 +1400,7 @@ pub fn running(key: &str) -> bool {
 
 /// The machine's run slots: `SHIPCHECK_MAX_RUNS`, or a sixth of the CPUs, since three brain runs on
 /// 14 CPUs left none idle and failed its timing tests
-fn max_runs() -> usize {
+pub fn max_runs() -> usize {
     std::env::var("SHIPCHECK_MAX_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1433,6 +1433,9 @@ pub static WAITING_FOR_SLOT: AtomicBool = AtomicBool::new(false);
 
 /// Whether this process holds a run slot, so its checks may show it running
 pub static HAS_SLOT: AtomicBool = AtomicBool::new(false);
+
+/// The seconds this process waited for its run slot, which its record keeps apart from the run's time
+pub static QUEUED_S: AtomicU64 = AtomicU64::new(0);
 
 /// A run's place in the queue for a machine run slot, a file it holds locked and removes when it goes
 struct Ticket {
@@ -1546,6 +1549,7 @@ fn claim_runner(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<(fs::File, que
                 WAITING_FOR_SLOT.store(false, Ordering::Relaxed);
                 HAS_SLOT.store(true, Ordering::Relaxed);
                 let now = unix_now();
+                QUEUED_S.store(now.saturating_sub(run.queued_unix), Ordering::Relaxed);
 
                 if told.is_some() {
                     say(&format!(
