@@ -3,11 +3,13 @@ use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use shipcheck::config::Trigger;
 use shipcheck::record::Run as Record;
 use shipcheck::service::{self, Poster, Sender};
-use shipcheck::ui::Style;
+use shipcheck::ui::{Live, Style};
 use shipcheck::{agents, autostart, background, check, report, run, setup};
 
 const PARTIAL: &str = "partial run: not the check, run `shipcheck run` before committing";
@@ -93,6 +95,9 @@ enum Cmd {
         /// Print the result as JSON on stdout
         #[arg(long)]
         json: bool,
+        /// Print no line each minute that says where the run stands, when the output is not a terminal
+        #[arg(long)]
+        no_heartbeat: bool,
         /// Set by the hooks and the daemon on a run that posts its checks
         #[arg(long, hide = true, value_name = "name")]
         background: Option<String>,
@@ -246,6 +251,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     let (mut json, mut only_failed) = (false, false);
     let mut limit = 20;
     let mut uninstall = false;
+    let mut heartbeat = true;
     // Set by the hooks and the daemon on a background run that posts its checks
     let mut posts: Option<String> = None;
     let (mut refname, mut pushed, mut remote_ref) = (String::new(), None, None);
@@ -309,10 +315,12 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             workflows: w,
             only_failed: f,
             json: js,
+            no_heartbeat,
             background,
             home_ok: h,
             rev: r,
         } => {
+            heartbeat = !no_heartbeat;
             only_failed = f;
             at(sha.or(r), &mut rev, &mut explicit);
             home_ok = h;
@@ -414,15 +422,8 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     } else {
         Style::stdout()
     };
-    let say = |line: &str| {
-        let line = style.status(line);
-
-        if json {
-            eprintln!("{line}");
-        } else {
-            println!("{line}");
-        }
-    };
+    let live = Live::new(json);
+    let say = |line: &str| live.line(&style.status(line));
 
     match name {
         "run" => {
@@ -469,8 +470,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
             if !jobs.is_empty() || !workflows.is_empty() {
                 let _key = run::lock_key(&plan.key)?;
-                let entry = run::run_partial(&plan, &jobs, &workflows, &mut |line| {
-                    say(&run::printable(line))
+                let entry = progress(&live, heartbeat, || {
+                    run::run_partial(&plan, &jobs, &workflows, &mut |line| {
+                        say(&run::printable(line))
+                    })
                 })?;
                 say(&format!(
                     "tested {what}, tree {tree}: ran in {:.1?}",
@@ -595,11 +598,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     say(&line);
                     estimated = numbers;
                     let say = &mut |line: &str| say(&run::printable(line));
-                    let entry = if only_failed {
-                        run::run_only_failed(&plan, say)?
-                    } else {
-                        run::run(&plan, say)?
-                    };
+                    let entry = progress(&live, heartbeat, || {
+                        if only_failed {
+                            run::run_only_failed(&plan, say)
+                        } else {
+                            run::run(&plan, say)
+                        }
+                    })?;
                     say(&format!(
                         "tested {what}, tree {tree}: ran in {:.1?}",
                         started.elapsed()
@@ -1279,6 +1284,51 @@ fn toplevel(cwd: &Path) -> Result<std::path::PathBuf, String> {
 }
 
 /// `snapshot` names the working copy or the index when the run tested one instead of a commit
+/// How often a run that is not at a terminal says where it stands
+const HEARTBEAT: Duration = Duration::from_secs(60);
+
+/**
+ * Runs `run` while a thread shows where it stands: the live line at a terminal, and otherwise one
+ * line each `HEARTBEAT` when `heartbeat` is on. It reads the run's own row of the machine's queue
+ **/
+fn progress<T>(live: &Live, heartbeat: bool, run: impl FnOnce() -> T) -> T {
+    let done = AtomicBool::new(false);
+    let standing = |secs: u64| {
+        let rows = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
+        shipcheck::queue::standing(&rows, std::process::id(), secs)
+    };
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let started = Instant::now();
+            let (mut frame, mut beats, mut at) = (0, 0, String::new());
+
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                let elapsed = started.elapsed();
+
+                if live.terminal {
+                    // The queue is read once a second, the spinner turns ten times
+                    if frame % 10 == 0 {
+                        at = standing(elapsed.as_secs());
+                    }
+
+                    live.show(frame, &at);
+                    frame += 1;
+                } else if heartbeat && elapsed.as_secs() / HEARTBEAT.as_secs() > beats {
+                    beats = elapsed.as_secs() / HEARTBEAT.as_secs();
+                    live.line(&standing(elapsed.as_secs()));
+                }
+            }
+
+            live.clear();
+        });
+        let out = run();
+        done.store(true, Ordering::Relaxed);
+        out
+    })
+}
+
 /// Each repository's typical run time on this machine, read from its records once
 fn typical_times() -> impl FnMut(&str) -> Option<u64> {
     let mut known = std::collections::BTreeMap::new();
