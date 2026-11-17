@@ -10,7 +10,7 @@ use shipcheck::config::Trigger;
 use shipcheck::record::Run as Record;
 use shipcheck::service::{self, Poster, Sender};
 use shipcheck::ui::{Live, Style};
-use shipcheck::{agents, autostart, background, check, queue, report, run, setup};
+use shipcheck::{agents, autostart, background, check, handoff, queue, report, run, setup};
 
 const PARTIAL: &str = "partial run: not the check, run `shipcheck run` before committing";
 
@@ -250,6 +250,9 @@ enum Cmd {
         #[arg(long)]
         uninstall: bool,
     },
+    /// Says whether a run asked for from inside a sandbox would reach the daemon here
+    #[command(hide = true)]
+    Handoff,
     /// Called by the post-commit hook
     #[command(hide = true)]
     OnCommit,
@@ -328,6 +331,16 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             eprintln!(
                 "set it as SHIPCHECK_TOKEN on the other machine, `shipcheck logout` there or `shipcheck logout --all` anywhere revokes it"
             );
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cmd::Handoff => {
+            if !shipcheck::daemon::registered(&toplevel(&cwd)?) {
+                return Err(
+                    "the daemon does not watch this repository, `shipcheck install` in the main checkout adds it".into(),
+                );
+            }
+
+            println!("the daemon watches this repository and runs what a sandbox hands it");
             return Ok(ExitCode::SUCCESS);
         }
         Cmd::Init { yes: y } => {
@@ -455,6 +468,59 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             "on-push"
         }
     };
+
+    // A host check's sandbox cannot start inside another one, so the daemon runs these outside
+    if posts.is_none() && matches!(name, "run" | "status" | "logs" | "wait") && handoff::wanted() {
+        if base_set {
+            return Err(
+                "--base is not available inside a sandbox, where the daemon runs the checks from the base it posts from".into(),
+            );
+        }
+
+        let limit = timeout.as_deref().map(duration).transpose()?;
+
+        if name == "wait" && explicit && handoff::known(&rev) {
+            return handoff::follow(&rev, limit);
+        }
+
+        let (sha, target) = if explicit {
+            let sha = handoff::commit_of(&cwd, &rev);
+            let id = sha.is_none().then(|| rev.clone());
+            (sha, id)
+        } else {
+            let (tested, snapshot) = subject(&cwd, &rev, false, staged)?;
+
+            if name == "run" && snapshot.is_some() && !staged {
+                warn_untracked(&toplevel(&cwd)?)?;
+            }
+
+            (handoff::commit_of(&cwd, &tested), None)
+        };
+
+        let request = handoff::Request {
+            cmd: name.into(),
+            sha,
+            target,
+            snapshot: !explicit,
+            staged,
+            branch: Some(current_branch(&cwd)).filter(|b| b != "detached"),
+            jobs,
+            workflows,
+            only_failed,
+            json,
+            no_fetch: name == "run" && !fetch,
+            no_heartbeat: !heartbeat,
+            timeout,
+        };
+        let id = handoff::send(&cwd, &request)?;
+
+        if detach {
+            println!("run {id}: handed to the daemon, `shipcheck wait {id}` waits for its result");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        return handoff::follow(&id, None);
+    }
 
     let reads_base = matches!(
         name,
