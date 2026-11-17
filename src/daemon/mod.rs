@@ -5,6 +5,7 @@ use crate::daemon_config::DaemonConfig;
 use crate::daemon_config::RepoEntry;
 use crate::daemon_config::fetch_options;
 use crate::git;
+use crate::handoff;
 use crate::paths;
 use crate::post::service;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -52,6 +53,7 @@ const QUIET: Duration = Duration::from_mins(15);
  **/
 /// `home_ok` is a person's `--home-ok`, passed on to the runs it starts
 pub fn serve(home_ok: MovedHome) -> ! {
+    handoff::serve();
     let mut senders: BTreeMap<String, Sender> = BTreeMap::new();
     let mut done: HashSet<(String, String)> = HashSet::new();
     let mut waiting: HashMap<(String, String), Instant> = HashMap::new();

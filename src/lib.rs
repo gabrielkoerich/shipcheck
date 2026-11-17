@@ -18,6 +18,7 @@ pub mod daemon;
 pub mod daemon_config;
 pub mod doctor;
 pub mod git;
+pub mod handoff;
 pub mod history;
 pub mod onboard;
 pub mod paths;
