@@ -244,6 +244,7 @@ fn posts_from_in(file: &Path, base: &str, repo: &Path) -> bool {
  **/
 /// `home_ok` is a person's `--home-ok`, passed on to the runs it starts
 pub fn serve(home_ok: bool) -> ! {
+    crate::handoff::serve();
     let mut senders: BTreeMap<String, Sender> = BTreeMap::new();
     let mut done: HashSet<(String, String)> = HashSet::new();
     let mut waiting: HashMap<(String, String), Instant> = HashMap::new();

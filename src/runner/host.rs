@@ -419,7 +419,7 @@ pub fn sandbox() -> Result<&'static str, String> {
     }
 }
 
-const NESTED: &str = "the host checks' sandbox cannot start inside another sandbox, such as an agent's, so nothing ran: run shipcheck outside it, for example by exempting the `shipcheck` command in the agent's sandbox settings. A push still gets its checks from the hook's run and the daemon, which run outside it";
+const NESTED: &str = "the host checks' sandbox cannot start inside another sandbox, such as an agent's, so nothing ran. `shipcheck run`, `status`, `logs` and `wait` go through the daemon there, this command does not. A push still gets its checks from the hook's run and the daemon, which run outside it";
 
 /**
  * Whether this process already runs in a jail as strict as a host check's, as shipcheck's own

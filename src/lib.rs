@@ -8,6 +8,7 @@ pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod github;
+pub mod handoff;
 pub mod java;
 pub mod onboard;
 pub mod queue;
