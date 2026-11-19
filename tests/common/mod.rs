@@ -5,6 +5,7 @@
 
 use shipcheck::runner::act;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -247,7 +248,9 @@ impl Drop for CleanOnDrop {
                 let _ = Command::new("colima")
                     .args(["delete", "--force", "--data", vm])
                     .output();
-                let lima = std::env::home_dir().unwrap().join(".colima/_lima");
+                let lima = std::env::home_dir()
+                    .expect("a home dir")
+                    .join(".colima/_lima");
                 let _ = Command::new("limactl")
                     .args(["disk", "delete", &format!("colima-{vm}")])
                     .env("LIMA_HOME", lima)
@@ -277,7 +280,7 @@ impl Drop for CleanOnDrop {
 
         if std::thread::panicking() {
             if !left.is_empty() {
-                eprintln!("the test left {left:?}");
+                let _ = writeln!(io::stderr(), "the test left {left:?}");
             }
 
             return;

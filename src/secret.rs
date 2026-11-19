@@ -237,6 +237,7 @@ fn trash(path: &Path) {
 #[cfg(all(target_os = "macos", not(test)))]
 mod keychain {
     use std::ffi::c_void;
+    use std::{ptr, slice};
 
     const SERVICE: &str = "shipcheck";
     const NOT_FOUND: i32 = -25300;
@@ -283,22 +284,38 @@ mod keychain {
         format!("{what} the keychain item for {account}: {why}")
     }
 
-    /// Finds the item for `account`, with its data when `data` is set, which is what the item's list guards
-    fn find(account: &str, data: bool) -> Result<Option<(Item, Vec<u8>)>, String> {
-        let mut len = 0u32;
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        let mut item: *const c_void = std::ptr::null();
+    /// Whether `find` reads the item's data, which is what the item's list guards
+    #[derive(Clone, Copy)]
+    enum Content {
+        Read,
+        Skip,
+    }
+
+    fn len(what: &str, bytes: &[u8]) -> Result<u32, String> {
+        u32::try_from(bytes.len()).map_err(|_| format!("the keychain {what} is too long"))
+    }
+
+    fn find(account: &str, content: Content) -> Result<Option<(Item, Vec<u8>)>, String> {
+        let service_len = len("service", SERVICE.as_bytes())?;
+        let account_len = len("account", account.as_bytes())?;
+        let mut data_len = 0u32;
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let mut item: *const c_void = ptr::null();
+        let (len_out, data_out): (*mut u32, *mut *mut c_void) = match content {
+            Content::Read => (&raw mut data_len, &raw mut ptr),
+            Content::Skip => (ptr::null_mut(), ptr::null_mut()),
+        };
         // SAFETY: the lengths match the buffers, and the outputs are freed below
         let status = unsafe {
             SecKeychainFindGenericPassword(
-                std::ptr::null(),
-                SERVICE.len() as u32,
+                ptr::null(),
+                service_len,
                 SERVICE.as_ptr(),
-                account.len() as u32,
+                account_len,
                 account.as_ptr(),
-                if data { &mut len } else { std::ptr::null_mut() },
-                if data { &mut ptr } else { std::ptr::null_mut() },
-                &mut item,
+                len_out,
+                data_out,
+                &raw mut item,
             )
         };
 
@@ -313,35 +330,44 @@ mod keychain {
         let mut bytes = Vec::new();
 
         if !ptr.is_null() {
-            // SAFETY: the keychain returned `len` bytes at `ptr`
-            bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }.to_vec();
-            unsafe { SecKeychainItemFreeContent(std::ptr::null_mut(), ptr) };
+            let n = usize::try_from(data_len)
+                .map_err(|_| "the keychain item is too long".to_string())?;
+            // SAFETY: the keychain returned `n` bytes at `ptr`
+            bytes = unsafe { slice::from_raw_parts(ptr.cast::<u8>(), n) }.to_vec();
+            // SAFETY: `ptr` came from the keychain and is freed once
+            unsafe { SecKeychainItemFreeContent(ptr::null_mut(), ptr) };
         }
 
         Ok(Some((item, bytes)))
     }
 
-    pub fn get(account: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(find(account, true)?.map(|(item, data)| {
-            unsafe { CFRelease(item) };
+    fn release(item: Item) {
+        // SAFETY: `item` came from the keychain and is released once
+        unsafe { CFRelease(item) };
+    }
+
+    pub(super) fn get(account: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(find(account, Content::Read)?.map(|(item, data)| {
+            release(item);
             data
         }))
     }
 
-    pub fn exists(account: &str) -> bool {
-        let Ok(Some((item, _))) = find(account, false) else {
+    pub(super) fn exists(account: &str) -> bool {
+        let Ok(Some((item, _))) = find(account, Content::Skip) else {
             return false;
         };
-        unsafe { CFRelease(item) };
+        release(item);
         true
     }
 
-    pub fn delete(account: &str) -> Result<(), String> {
-        let Some((item, _)) = find(account, false)? else {
+    pub(super) fn delete(account: &str) -> Result<(), String> {
+        let Some((item, _)) = find(account, Content::Skip)? else {
             return Ok(());
         };
+        // SAFETY: `item` came from the keychain and is still held
         let status = unsafe { SecKeychainItemDelete(item) };
-        unsafe { CFRelease(item) };
+        release(item);
 
         if status != 0 {
             return Err(fail("deleting", account, status));
@@ -351,19 +377,22 @@ mod keychain {
     }
 
     /// Replaces the item, so its list trusts only this binary, which created it
-    pub fn set(account: &str, data: &[u8]) -> Result<(), String> {
+    pub(super) fn set(account: &str, data: &[u8]) -> Result<(), String> {
         delete(account)?;
+        let service_len = len("service", SERVICE.as_bytes())?;
+        let account_len = len("account", account.as_bytes())?;
+        let data_len = len("item", data)?;
         // SAFETY: the lengths match the buffers, and no item is asked for
         let status = unsafe {
             SecKeychainAddGenericPassword(
-                std::ptr::null(),
-                SERVICE.len() as u32,
+                ptr::null(),
+                service_len,
                 SERVICE.as_ptr(),
-                account.len() as u32,
+                account_len,
                 account.as_ptr(),
-                data.len() as u32,
-                data.as_ptr() as *const c_void,
-                std::ptr::null_mut(),
+                data_len,
+                data.as_ptr().cast::<c_void>(),
+                ptr::null_mut(),
             )
         };
 

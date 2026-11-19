@@ -20,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -57,7 +57,7 @@ fn ours() -> Vec<String> {
     let out = Command::new("colima")
         .args(["list", "-j"])
         .output()
-        .unwrap();
+        .expect("run the command");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())

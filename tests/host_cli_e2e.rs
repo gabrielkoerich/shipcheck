@@ -18,9 +18,9 @@ struct Repo {
 impl Repo {
     /// A clone whose origin/main holds `config` as shipcheck.toml, on a new branch `feature`
     fn new(config: &str) -> Repo {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("create a temp dir");
         let origin = tmp.path().join("origin.git");
-        fs::create_dir(&origin).unwrap();
+        fs::create_dir(&origin).expect("create the dir");
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         git(
             tmp.path(),
@@ -36,7 +36,7 @@ impl Repo {
         repo.git(&["config", "user.name", "t"]);
         repo.git(&["config", "user.email", "t@t"]);
         repo.git(&["config", "commit.gpgsign", "false"]);
-        fs::write(repo.work.join("shipcheck.toml"), config).unwrap();
+        fs::write(repo.work.join("shipcheck.toml"), config).expect("write the file");
         repo.commit("main");
         repo.git(&["push", "-q", "origin", "main"]);
         repo.git(&["fetch", "-q", "origin"]);
@@ -45,7 +45,7 @@ impl Repo {
         // `tmutil addexclusion` can take 10s a folder, so mark them excluded as it would
         for dir in ["templates", "runs", "hostcache"] {
             let dir = repo.home.join(dir);
-            fs::create_dir_all(&dir).unwrap();
+            fs::create_dir_all(&dir).expect("create the dir");
 
             if cfg!(target_os = "macos") {
                 let _ = Command::new("xattr")
@@ -67,7 +67,7 @@ impl Repo {
     }
 
     fn write(&self, file: &str, text: &str) {
-        fs::write(self.work.join(file), text).unwrap();
+        fs::write(self.work.join(file), text).expect("write the file");
     }
 
     fn commit(&self, message: &str) -> String {
@@ -78,7 +78,7 @@ impl Repo {
 
     /// The exit code, and stdout then stderr
     fn shipcheck(&self, args: &[&str]) -> (Option<i32>, String) {
-        let out = self.command(args).output().unwrap();
+        let out = self.command(args).output().expect("run the command");
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -113,7 +113,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",

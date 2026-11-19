@@ -304,7 +304,6 @@ fn exclude_from_backup(home: &Path) {
 
 #[cfg(target_os = "macos")]
 fn excluded(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };

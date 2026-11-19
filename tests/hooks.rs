@@ -16,7 +16,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -46,7 +46,7 @@ fn records(home: &Path) -> String {
 /// A clone whose main has a host check, on a branch `feature` one commit ahead, and its commit
 fn clone_with_feature(tmp: &Path) -> (PathBuf, String) {
     let origin = tmp.join("origin.git");
-    fs::create_dir(&origin).unwrap();
+    fs::create_dir(&origin).expect("create the dir");
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
     git(tmp, &["clone", "-q", &origin.to_string_lossy(), "work"]);
     let work = tmp.join("work");
@@ -58,13 +58,13 @@ fn clone_with_feature(tmp: &Path) -> (PathBuf, String) {
         work.join("shipcheck.toml"),
         "runner = \"host\"\nretries = 0\n[host]\nchecks = { ok = \"true\" }\n",
     )
-    .unwrap();
+    .expect("write the file");
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-qm", "config"]);
     git(&work, &["push", "-q", "origin", "main"]);
     git(&work, &["fetch", "-q", "origin"]);
     git(&work, &["switch", "-q", "-c", "feature"]);
-    fs::write(work.join("a.txt"), "a").unwrap();
+    fs::write(work.join("a.txt"), "a").expect("write the file");
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-qm", "a"]);
     let sha = git(&work, &["rev-parse", "HEAD"]);
@@ -173,8 +173,11 @@ fn no_shipcheck_toml_on_main_runs_nothing() {
 /// A fake shipcheck service that refuses every call as the real one does for a repository the App
 /// is not on while `refuse` holds, and accepts every call after
 fn fake_service(refuse: Arc<AtomicBool>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("the listener has an address")
+    );
 
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {

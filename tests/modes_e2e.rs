@@ -20,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -32,17 +32,17 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// A clone on `feature` of an origin whose main holds `config` and `files`
 fn repo(tmp: &Path, config: &str, files: &[(&str, &str)]) -> PathBuf {
     let origin = tmp.join("origin.git");
-    fs::create_dir(&origin).unwrap();
+    fs::create_dir(&origin).expect("create the dir");
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
     git(tmp, &["clone", "-q", &origin.to_string_lossy(), "work"]);
     let work = tmp.join("work");
     git(&work, &["checkout", "-q", "-b", "main"]);
-    fs::write(work.join("shipcheck.toml"), config).unwrap();
+    fs::write(work.join("shipcheck.toml"), config).expect("write the file");
 
     for (path, text) in files {
         let path = work.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
+        fs::create_dir_all(path.parent().expect("the path has a parent")).expect("create the dir");
+        fs::write(path, text).expect("write the file");
     }
 
     git(&work, &["add", "-A"]);
@@ -54,7 +54,7 @@ fn repo(tmp: &Path, config: &str, files: &[(&str, &str)]) -> PathBuf {
 
 fn commit(work: &Path, files: &[&str]) {
     for f in files {
-        fs::write(work.join(f), "ok").unwrap();
+        fs::write(work.join(f), "ok").expect("write the file");
     }
 
     git(work, &["add", "-A"]);
@@ -95,7 +95,7 @@ fn interrupt(mut run: Child, ready: impl Fn() -> bool) -> std::process::ExitStat
 
     while !ready() {
         assert!(
-            run.try_wait().unwrap().is_none(),
+            run.try_wait().expect("wait for the run").is_none(),
             "the run ended before it was interrupted"
         );
         assert!(
@@ -110,10 +110,11 @@ fn interrupt(mut run: Child, ready: impl Fn() -> bool) -> std::process::ExitStat
         Command::new("kill")
             .args(["-INT", &pid])
             .status()
-            .unwrap()
-            .success()
+            .expect("run the command")
+            .success(),
+        "kill -INT failed"
     );
-    run.wait().unwrap()
+    run.wait().expect("wait for the run")
 }
 
 /// The processes whose command line holds `marker`
@@ -121,7 +122,7 @@ fn running(marker: &str) -> Vec<String> {
     let out = Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output()
-        .unwrap();
+        .expect("run the command");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| l.contains(marker) && !l.contains("ps -axo"))
@@ -141,7 +142,7 @@ fn containers() -> Vec<String> {
             "{{.Names}}",
         ])
         .output()
-        .unwrap();
+        .expect("run the command");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(String::from)

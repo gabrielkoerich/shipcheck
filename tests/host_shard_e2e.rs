@@ -1,6 +1,7 @@
 //! Host checks split into shards by test file
 
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::process::Command;
 
@@ -19,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -53,15 +54,20 @@ fn run_branch(work: &Path, name: &str, files: &[(&str, &str)]) -> run::Entry {
     git(work, &["checkout", "-q", "-b", name, "main"]);
 
     for (path, body) in files {
-        fs::create_dir_all(work.join(path).parent().unwrap()).unwrap();
-        fs::write(work.join(path), body).unwrap();
+        fs::create_dir_all(work.join(path).parent().expect("the path has a parent"))
+            .expect("create the dir");
+        fs::write(work.join(path), body).expect("write the file");
     }
 
     git(work, &["add", "-A"]);
     git(work, &["commit", "-q", "-m", name]);
-    let plan = run::plan(work, name, "origin/main").unwrap();
-    let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
-    eprintln!(
+    let plan = run::plan(work, name, "origin/main").expect("plan the run");
+    let entry = run::run(&plan, &mut |l| {
+        let _ = writeln!(io::stderr(), "{l}");
+    })
+    .expect("run the plan");
+    let _ = writeln!(
+        io::stderr(),
         "{}",
         fs::read_to_string(run::log_dir(&plan.key).join("host.log")).unwrap_or_default()
     );

@@ -20,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -37,7 +37,7 @@ impl Drop for OwnVolumes {
             .args(["volume", "ls", "-q", "--filter"])
             .arg(format!("name={}", self.0))
             .output()
-            .unwrap();
+            .expect("run the command");
         let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter(|n| n.starts_with(&self.0))

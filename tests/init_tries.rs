@@ -38,7 +38,7 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -50,18 +50,18 @@ fn git(dir: &Path, args: &[&str]) {
 fn repo(tmp: &Path) -> (PathBuf, PathBuf) {
     let origin = tmp.join("origin.git");
     let work = tmp.join("work");
-    fs::create_dir(&origin).unwrap();
+    fs::create_dir(&origin).expect("create the dir");
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
     git(tmp, &["clone", "-q", &origin.to_string_lossy(), "work"]);
     git(&work, &["checkout", "-q", "-b", "main"]);
     git(&work, &["config", "user.name", "t"]);
     git(&work, &["config", "user.email", "t@t"]);
     git(&work, &["config", "commit.gpgsign", "false"]);
-    fs::create_dir_all(work.join(".github/workflows")).unwrap();
-    fs::write(work.join(".github/workflows/ci.yml"), CI).unwrap();
-    fs::write(work.join("check.sh"), CHECK).unwrap();
+    fs::create_dir_all(work.join(".github/workflows")).expect("create the dir");
+    fs::write(work.join(".github/workflows/ci.yml"), CI).expect("write the file");
+    fs::write(work.join("check.sh"), CHECK).expect("write the file");
     let mode = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
-    fs::set_permissions(work.join("check.sh"), mode).unwrap();
+    fs::set_permissions(work.join("check.sh"), mode).expect("set the mode");
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "ci"]);
     git(&work, &["push", "-q", "origin", "main"]);
@@ -72,7 +72,7 @@ fn repo(tmp: &Path) -> (PathBuf, PathBuf) {
     // `tmutil addexclusion` can take 10s a folder, so mark them excluded as it would
     for dir in ["templates", "runs", "hostcache"] {
         let dir = home.join(dir);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).expect("create the dir");
 
         if cfg!(target_os = "macos") {
             let _ = Command::new("xattr")
@@ -103,7 +103,7 @@ fn init(work: &Path, home: &Path, args: &[&str]) -> String {
         .env_remove("SHIPCHECK_TOKEN")
         .stdin(Stdio::null())
         .output()
-        .unwrap();
+        .expect("run the command");
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -144,10 +144,10 @@ fn changed(before: &Snapshot, after: &Snapshot) -> Vec<PathBuf> {
 /// A worktree entry of the repository's own whose folder is gone, which only `git worktree prune` drops
 fn stale_entry(work: &Path) {
     let entry = work.join(".git/worktrees/gone");
-    fs::create_dir_all(&entry).unwrap();
-    fs::write(entry.join("gitdir"), "/nonexistent/gone/.git\n").unwrap();
-    fs::write(entry.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    fs::write(entry.join("commondir"), "../..\n").unwrap();
+    fs::create_dir_all(&entry).expect("create the dir");
+    fs::write(entry.join("gitdir"), "/nonexistent/gone/.git\n").expect("write the file");
+    fs::write(entry.join("HEAD"), "ref: refs/heads/main\n").expect("write the file");
+    fs::write(entry.join("commondir"), "../..\n").expect("write the file");
 }
 
 #[test]

@@ -5,6 +5,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -13,6 +15,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use sandbox_jail::known::{self, LAUNCHCTL};
+#[cfg(target_os = "macos")]
+use sandbox_jail::macos::{denies, sandboxed};
 use sandbox_jail::{Access, Backend, Policy, Sandbox};
 
 use super::{Outcome, RunRequest, Runner, shard};
@@ -304,7 +308,6 @@ fn clone_dir(src: &Path, dst: &Path) -> Result<(), String> {
     // One clonefile call copies the whole tree on APFS
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::ffi::OsStrExt;
         let from = std::ffi::CString::new(src.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
         let to = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
 
@@ -451,11 +454,9 @@ const NESTED: &str = "the host checks' sandbox cannot start inside another sandb
  **/
 #[cfg(target_os = "macos")]
 pub fn in_a_jail() -> bool {
-    use sandbox_jail::macos::{denies, sandboxed};
-
-    let home = crate::run::user_dir();
+    let home = run::user_dir();
     // A sandbox that passes these is reused only where results never post, since any can pass them
-    crate::run::home_overridden()
+    run::home_overridden()
         && sandboxed()
         && denies("file-read-data", &home)
         && denies("file-write-data", &home.join(".shipcheck-probe"))
@@ -1142,8 +1143,17 @@ pub fn coalition_members(coal: u64) -> Vec<libc::pid_t> {
  **/
 #[cfg(target_os = "macos")]
 mod job {
-    use super::*;
+    use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+    use std::{io, mem, ptr, thread};
+
+    use sha2::{Digest, Sha256};
+
+    use super::{
+        BTreeMap, Command, Duration, Instant, LAUNCHCTL, Path, PathBuf, Stdio, fs, real_dir,
+    };
+    use crate::{cache, run};
 
     // From XNU's proc_info_private.h, readable for any pid by any user
     const PROC_PIDCOALITIONINFO: libc::c_int = 20;
@@ -1162,21 +1172,15 @@ mod job {
     }
 
     /// The resource coalition of a live process, None when it is gone or a zombie
-    pub fn coalition(pid: libc::pid_t) -> Option<u64> {
+    pub(super) fn coalition(pid: libc::pid_t) -> Option<u64> {
         let mut info = CoalitionInfo {
             id: [0; 2],
             reserved: [0; 3],
         };
-        let size = std::mem::size_of::<CoalitionInfo>() as libc::c_int;
+        let size = libc::c_int::try_from(mem::size_of::<CoalitionInfo>()).ok()?;
         // SAFETY: the kernel writes at most `size` bytes into `info`
         let n = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                PROC_PIDCOALITIONINFO,
-                0,
-                (&mut info as *mut CoalitionInfo).cast(),
-                size,
-            )
+            libc::proc_pidinfo(pid, PROC_PIDCOALITIONINFO, 0, (&raw mut info).cast(), size)
         };
         (n == size && info.id[0] != 0 && state(pid).is_some_and(|s| s != SZOMB))
             .then_some(info.id[0])
@@ -1184,15 +1188,15 @@ mod job {
 
     fn state(pid: libc::pid_t) -> Option<u32> {
         // SAFETY: a plain C struct of integers, which zero is a valid value of
-        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        let mut info: libc::proc_bsdshortinfo = unsafe { mem::zeroed() };
+        let size = libc::c_int::try_from(mem::size_of::<libc::proc_bsdshortinfo>()).ok()?;
         // SAFETY: the kernel writes at most `size` bytes into `info`
         let n = unsafe {
             libc::proc_pidinfo(
                 pid,
                 libc::PROC_PIDT_SHORTBSDINFO,
                 0,
-                (&mut info as *mut libc::proc_bsdshortinfo).cast(),
+                (&raw mut info).cast(),
                 size,
             )
         };
@@ -1202,15 +1206,16 @@ mod job {
     /// Every pid on the machine, in a buffer doubled until the list fits with room to spare
     fn all_pids() -> Vec<libc::pid_t> {
         // SAFETY: a null buffer only asks for the count
-        let mut cap =
-            unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) }.max(0) as usize + 256;
+        let count = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
+        let mut cap = usize::try_from(count).unwrap_or(0) + 256;
 
         loop {
             let mut pids: Vec<libc::pid_t> = vec![0; cap];
-            let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
+            let size = libc::c_int::try_from(mem::size_of_val(pids.as_slice()))
+                .expect("a buffer for every pid on the machine fits in a C int");
             // SAFETY: the kernel writes at most `size` bytes into `pids`
-            let n =
-                unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) }.max(0) as usize;
+            let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
+            let n = usize::try_from(listed).unwrap_or(0);
 
             if n < cap {
                 pids.truncate(n);
@@ -1221,7 +1226,7 @@ mod job {
         }
     }
 
-    pub fn members(coal: u64) -> Vec<libc::pid_t> {
+    pub(super) fn members(coal: u64) -> Vec<libc::pid_t> {
         let mut pids = all_pids();
         pids.retain(|&p| p > 1 && coalition(p) == Some(coal));
         pids
@@ -1232,7 +1237,7 @@ mod job {
      * process cannot fork, then kills them. Each pid is checked again right before its signal.
      * Returns every pid signaled, an error when a member cannot be stopped or keeps forking
      **/
-    pub fn reap(coal: u64) -> Result<Vec<libc::pid_t>, String> {
+    pub(super) fn reap(coal: u64) -> Result<Vec<libc::pid_t>, String> {
         // SAFETY: getpid cannot fail
         if coal <= 1 || coalition(unsafe { libc::getpid() }) == Some(coal) {
             return Err(format!(
@@ -1262,7 +1267,7 @@ mod job {
 
                 // SAFETY: kill only sends a signal
                 if unsafe { libc::kill(pid, sig) } == -1
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
                 {
                     return Err(format!(
                         "process {pid} of a host check runs as another user, so shipcheck cannot stop it"
@@ -1272,7 +1277,7 @@ mod job {
                 signaled.push(pid);
             }
 
-            std::thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
 
         Err("a host check's processes kept forking faster than shipcheck could stop them".into())
@@ -1280,7 +1285,7 @@ mod job {
 
     /// The launchd domain of the user's jobs: the login session's, else the background one over ssh
     fn domain() -> &'static str {
-        static DOMAIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static DOMAIN: OnceLock<String> = OnceLock::new();
         DOMAIN.get_or_init(|| {
             // SAFETY: getuid cannot fail
             let uid = unsafe { libc::getuid() };
@@ -1305,8 +1310,8 @@ mod job {
             libc::sysctlbyname(
                 c"kern.bootsessionuuid".as_ptr(),
                 buf.as_mut_ptr().cast(),
-                &mut len,
-                std::ptr::null_mut(),
+                &raw mut len,
+                ptr::null_mut(),
                 0,
             )
         } == 0;
@@ -1317,21 +1322,20 @@ mod job {
     }
 
     /// Each job this process started and has not booted out, with its coalition and record once known
-    static RUNNING: std::sync::Mutex<BTreeMap<String, Option<(u64, PathBuf)>>> =
-        std::sync::Mutex::new(BTreeMap::new());
+    static RUNNING: Mutex<BTreeMap<String, Option<(u64, PathBuf)>>> = Mutex::new(BTreeMap::new());
 
-    fn running() -> std::sync::MutexGuard<'static, BTreeMap<String, Option<(u64, PathBuf)>>> {
-        RUNNING.lock().unwrap_or_else(|e| e.into_inner())
+    fn running() -> MutexGuard<'static, BTreeMap<String, Option<(u64, PathBuf)>>> {
+        RUNNING.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /**
      * What a signal does before shipcheck dies: reap every running check and boot out its job.
      * Returns the lock, which the caller holds until it dies, so no check starts meanwhile
      **/
-    pub fn stop_all() -> std::sync::MutexGuard<'static, BTreeMap<String, Option<(u64, PathBuf)>>> {
+    pub(super) fn stop_all() -> MutexGuard<'static, BTreeMap<String, Option<(u64, PathBuf)>>> {
         let mut held = running();
 
-        for (target, known) in std::mem::take(&mut *held) {
+        for (target, known) in mem::take(&mut *held) {
             // A record whose reap failed stays, so the slot's next run tries again
             if let Some((coal, record)) = known
                 && reap(coal).is_ok()
@@ -1357,14 +1361,12 @@ mod job {
 
     /// Where the coalition of the check that ran in `dir` is kept until it is reaped, outside every jail
     fn record(dir: &Path) -> PathBuf {
-        use sha2::{Digest, Sha256};
-
-        let id = crate::cache::hex(&Sha256::digest(dir.as_os_str().as_bytes())[..16]);
-        crate::run::home().join("reap").join(id)
+        let id = cache::hex(&Sha256::digest(dir.as_os_str().as_bytes())[..16]);
+        run::home().join("reap").join(id)
     }
 
-    pub fn reap_slot(slot: &Path) -> Result<(), String> {
-        let dir = crate::run::home().join("reap");
+    pub(super) fn reap_slot(slot: &Path) -> Result<(), String> {
+        let dir = run::home().join("reap");
 
         if fs::read_dir(&dir).map_or(true, |mut d| d.next().is_none()) {
             return Ok(());
@@ -1473,7 +1475,7 @@ mod job {
     }
 
     /// Starts a job of `/usr/bin/true` and boots it out, the error naming why launchd refused it
-    pub fn probe() -> Result<String, String> {
+    pub(super) fn probe() -> Result<String, String> {
         let keep = tempfile::Builder::new()
             .prefix("shipcheck-job-")
             .tempdir()
@@ -1522,7 +1524,7 @@ mod job {
     }
 
     /// Runs the check as a launchd job, then reaps its coalition and removes the job. None on timeout
-    pub fn run(
+    pub(super) fn run(
         cmd: &Command,
         dir: &Path,
         log: &Path,
@@ -1532,7 +1534,7 @@ mod job {
     }
 
     /// [`run`], and every pid the reap signaled
-    pub fn reaped(
+    pub(super) fn reaped(
         cmd: &Command,
         dir: &Path,
         log: &Path,
@@ -1549,7 +1551,7 @@ mod job {
 
         // SAFETY: the path is a valid C string that outlives the call
         if unsafe { libc::mkfifo(go.as_ptr(), 0o600) } != 0 {
-            return Err(format!("mkfifo: {}", std::io::Error::last_os_error()));
+            return Err(format!("mkfifo: {}", io::Error::last_os_error()));
         }
 
         let sh = ctl.join("job.sh");
@@ -1635,7 +1637,7 @@ mod job {
                 ));
             }
 
-            std::thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         };
         // The script's `mv` of its pid file may not have exited yet
         let coal = loop {
@@ -1647,7 +1649,7 @@ mod job {
                 return Err("launchd did not give the check a coalition of its own".into());
             }
 
-            std::thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         };
         let record = record(dir);
         let parent = record.parent().ok_or("no reap dir")?;
@@ -1657,7 +1659,7 @@ mod job {
         let mut text = line.into_bytes();
         text.extend_from_slice(dir.as_os_str().as_bytes());
         fs::write(&new, text)
-            .and_then(|_| fs::rename(&new, &record))
+            .and_then(|()| fs::rename(&new, &record))
             .map_err(|e| format!("{}: {e}", record.display()))?;
         running().insert(target.to_string(), Some((coal, record.clone())));
 
@@ -1679,7 +1681,7 @@ mod job {
                     break Ok(None);
                 }
 
-                std::thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(20));
             }
         });
 
@@ -1690,14 +1692,14 @@ mod job {
     }
 
     /// The coalition of a job's waiting script, None unless it is the only member, so never a shared one
-    pub fn own_coalition(pid: libc::pid_t) -> Option<u64> {
+    pub(super) fn own_coalition(pid: libc::pid_t) -> Option<u64> {
         // SAFETY: getpid cannot fail
         let own = coalition(unsafe { libc::getpid() });
         coalition(pid).filter(|&c| c > 1 && Some(c) != own && members(c) == [pid])
     }
 
     /// Lets the job's script run the check, false when the deadline passed first
-    fn release(go: &std::ffi::CStr, deadline: Instant) -> Result<bool, String> {
+    fn release(go: &CStr, deadline: Instant) -> Result<bool, String> {
         loop {
             // SAFETY: the path is a valid C string, and a nonblocking open fails until the script reads
             let fd = unsafe {
@@ -1709,22 +1711,21 @@ mod job {
 
             if fd >= 0 {
                 // SAFETY: fd is ours, and the byte outlives the call
-                unsafe {
-                    libc::write(fd, b"\n".as_ptr().cast(), 1);
-                    libc::close(fd);
-                }
+                unsafe { libc::write(fd, b"\n".as_ptr().cast(), 1) };
+                // SAFETY: fd is ours and closed once
+                unsafe { libc::close(fd) };
                 return Ok(true);
             }
 
-            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENXIO) {
-                return Err(format!("job fifo: {}", std::io::Error::last_os_error()));
+            if io::Error::last_os_error().raw_os_error() != Some(libc::ENXIO) {
+                return Err(format!("job fifo: {}", io::Error::last_os_error()));
             }
 
             if Instant::now() >= deadline {
                 return Ok(false);
             }
 
-            std::thread::sleep(Duration::from_millis(2));
+            thread::sleep(Duration::from_millis(2));
         }
     }
 }
@@ -3674,10 +3675,10 @@ mod tests {
             .collect();
         let all = || {
             let mut pids: Vec<libc::pid_t> = vec![0; 16384];
-            let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
+            let size = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())).unwrap();
             // SAFETY: the kernel writes at most `size` bytes into `pids`
             let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
-            pids.truncate(n.max(0) as usize);
+            pids.truncate(usize::try_from(n).unwrap_or(0));
             pids
         };
 
@@ -3746,8 +3747,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn a_users_own_tool_of_a_setuid_name_is_not_shadowed() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let ps = dir.path().join("ps");
         fs::write(&ps, "#!/bin/sh\necho procps\n").unwrap();
