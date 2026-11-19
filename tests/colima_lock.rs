@@ -1,3 +1,6 @@
+//! A colima job that waits past its timeout for the VM lock
+
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -25,7 +28,7 @@ fn a_colima_job_that_waits_past_its_time_for_the_vm_times_out() {
     )
     .unwrap();
     let log = tmp.path().join("e2e.log");
-    let needs = Default::default();
+    let needs = BTreeMap::default();
     let request = RunRequest {
         run_dir: &run_dir,
         file: "ci.yml",

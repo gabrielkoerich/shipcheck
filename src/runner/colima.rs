@@ -1,3 +1,7 @@
+use crate::run;
+use crate::secret;
+use crate::workflow;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -17,6 +21,7 @@ use crate::cache;
  * with the job's labels on `-self-hosted`, so the job's steps run on the VM with its own Docker and
  * kernel. The VM reaches the Mac's loopback through its gateway, so it is for trusted repositories
  **/
+#[derive(Debug)]
 pub struct Colima;
 
 /// The VM's packages, act pinned as ci.yml pins it, Node 24 LTS as GitHub runs actions on, and
@@ -243,7 +248,7 @@ fn timed_out() -> Outcome {
         exit: None,
         skipped: false,
         unsupported_jobs: Vec::new(),
-        outputs: Default::default(),
+        outputs: BTreeMap::default(),
         shards: None,
         summary: String::new(),
     }
@@ -267,7 +272,7 @@ fn is_base(name: &str) -> bool {
 /// The base of this home for colima, lima and `SETUP` as they are now
 fn base_name() -> Option<String> {
     let identity = Colima.identity().ok()?;
-    let home = crate::run::home();
+    let home = run::home();
     let hash = cache::hex(&Sha256::digest(format!("{}\n{identity}", home.display())));
     Some(format!("sc-base-{}", &hash[..12]))
 }
@@ -283,7 +288,7 @@ fn base(cpus: u64, log: &fs::File) -> Option<String> {
     let lock = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(crate::run::home().join("locks").join("colima-base.lock"))
+        .open(run::home().join("locks").join("colima-base.lock"))
         .ok()?;
     lock.lock().ok()?;
     let listed = profiles();
@@ -323,7 +328,7 @@ fn base(cpus: u64, log: &fs::File) -> Option<String> {
 
 /// Where this home records each VM it starts until the VM is deleted
 fn records() -> std::path::PathBuf {
-    crate::run::home().join("colima")
+    run::home().join("colima")
 }
 
 /// The VMs this home started and has not seen deleted, which colima still lists
@@ -355,7 +360,7 @@ fn leftovers(keep: Option<&str>) -> Vec<String> {
     let lock = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(crate::run::home().join("locks").join("colima.lock"));
+        .open(run::home().join("locks").join("colima.lock"));
 
     let Ok(lock) = lock else {
         return Vec::new();
@@ -411,7 +416,7 @@ fn profiles() -> Vec<String> {
  * `self-hosted` and `linux`, mapped to the VM itself. Any other label, such as a macOS leg, is
  * unsupported as it is on docker, so it fails rather than pass on Linux
  **/
-fn act_args(request: &RunRequest, labels: Vec<String>) -> Vec<String> {
+fn act_args(request: &RunRequest<'_>, labels: Vec<String>) -> Vec<String> {
     let mut args: Vec<String> = [
         "workflow_dispatch",
         "-W",
@@ -453,8 +458,8 @@ fn act_args(request: &RunRequest, labels: Vec<String>) -> Vec<String> {
  * container, so the image is a placeholder, and labels go to it and never to `-self-hosted`, which
  * would set up the job on the Mac itself
  **/
-fn skipped_by_if(act: &Act, request: &RunRequest, workflow: &str, actions: &Path) -> bool {
-    let has_if = crate::workflow::load(workflow)
+fn skipped_by_if(act: &Act, request: &RunRequest<'_>, workflow: &str, actions: &Path) -> bool {
+    let has_if = workflow::load(workflow)
         .is_ok_and(|root| !yaml_rust2::Yaml::Hash(root)["jobs"][request.job]["if"].is_badvalue());
     let mut cmd = Command::new("act");
     cmd.arg("workflow_dispatch")
@@ -495,8 +500,7 @@ fn dry_run(profile: &str, args: &[String]) -> String {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 impl Engine for Colima {
@@ -516,11 +520,15 @@ impl Engine for Colima {
         self.identity().map(|_| ())
     }
 
-    fn run(&self, act: &Act, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one VM's life, from start to removal, read top to bottom"
+    )]
+    fn run(&self, act: &Act, request: &RunRequest<'_>, log_path: &Path) -> Result<Outcome, String> {
         // The job's time starts now, waiting for a VM slot too
         let deadline = Instant::now() + request.timeout;
         let run_dir = request.run_dir;
-        let isolated = act::isolated(request, &act::run_tag(run_dir), false)?;
+        let isolated = act::isolated(request, &act::run_tag(run_dir), act::Checkout::InVm)?;
         fs::write(request.workflow, &isolated).map_err(|e| e.to_string())?;
 
         let actions = act::job_actions(request)?;
@@ -538,7 +546,7 @@ impl Engine for Colima {
             });
         }
 
-        let artifacts = crate::workflow::job_runs(&isolated)
+        let artifacts = workflow::job_runs(&isolated)
             .into_iter()
             .flat_map(|j| j.steps)
             .filter_map(|s| s.uses)
@@ -553,7 +561,7 @@ impl Engine for Colima {
             ));
         }
 
-        let home = crate::run::home().join("locks");
+        let home = run::home().join("locks");
         fs::create_dir_all(&home).map_err(|e| e.to_string())?;
         let open = |name: String| {
             fs::OpenOptions::new()
@@ -607,13 +615,13 @@ impl Engine for Colima {
         if act::cached_actions_resolve(&actions) {
             args.push("--action-offline-mode".into());
         }
-        let secrets = crate::secret::read(&crate::run::secrets_file(request.repo_id))?;
+        let secrets = secret::read(&run::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         let status = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         // Split between the VMs that may run at once, since each compile in an 8 GB VM takes memory
         let cpus = std::thread::available_parallelism().map_or(2, |n| {
-            (n.get().saturating_sub(1) as u64 / vm_slots()).max(2)
+            (u64::try_from(n.get().saturating_sub(1)).unwrap_or(u64::MAX) / vm_slots()).max(2)
         });
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
         let context = docker_context();
@@ -636,7 +644,7 @@ impl Engine for Colima {
             .env(
                 "LOCK_FDS",
                 held.iter()
-                    .map(|f| f.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(" "),
             )
@@ -755,7 +763,7 @@ impl Engine for Colima {
             .create(true)
             .append(true)
             .open(
-                crate::run::home()
+                run::home()
                     .join("locks")
                     .join(format!("colima-{name}.lock")),
             )
@@ -779,6 +787,9 @@ impl Engine for Colima {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner;
+    use crate::runner::tests;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn only_vms_this_home_recorded_are_ever_cleaned_up() {
@@ -817,7 +828,6 @@ mod tests {
 
     #[test]
     fn the_reaper_deletes_the_vm_only_when_shipcheck_dies_first() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("colima.log");
 
@@ -846,7 +856,7 @@ mod tests {
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let mut reaper = Command::new(crate::runner::posix_sh())
+            let mut reaper = Command::new(runner::posix_sh())
                 .args(["-c", REAPER, "sh", "sc-abc"])
                 .env("PATH", &path)
                 .env("COLIMA_HOME", dir.path())
@@ -893,19 +903,18 @@ mod tests {
 
     #[test]
     fn the_reaper_keeps_its_locks_from_colima_and_gives_up_on_a_hung_delete() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("colima.log");
         let child = dir.path().join("child.pid");
         // A lock at 10 or higher, which a shell cannot redirect
-        let lock = crate::runner::tests::high(fs::File::create(dir.path().join("x.lock")).unwrap());
+        let lock = tests::high(fs::File::create(dir.path().join("x.lock")).unwrap());
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
 
         for (hang, kept) in [(false, false), (true, true)] {
             let record = dir.path().join("sc-abc");
             fs::write(&record, "").unwrap();
             let _ = fs::remove_file(&log);
-            let mut cmd = Command::new(crate::runner::posix_sh());
+            let mut cmd = Command::new(runner::posix_sh());
             let held =
                 super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
             assert_eq!(held, [9]);
@@ -959,6 +968,7 @@ mod tests {
 
             if hang {
                 let pid: i32 = fs::read_to_string(&child).unwrap().trim().parse().unwrap();
+                // SAFETY: signal 0 only checks that the process exists
                 let gone = || unsafe { libc::kill(pid, 0) } != 0;
                 let deadline = Instant::now() + Duration::from_secs(5);
 
@@ -973,7 +983,6 @@ mod tests {
 
     #[test]
     fn the_vm_gets_node_24_from_nodejs_org_and_not_ubuntus_node_18() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("calls.log");
         let fakes = [
@@ -991,7 +1000,7 @@ mod tests {
 
         for (arch, node) in [("aarch64", "linux-arm64"), ("x86_64", "linux-x64")] {
             let _ = fs::remove_file(&log);
-            let out = Command::new(crate::runner::posix_sh())
+            let out = Command::new(runner::posix_sh())
                 .args(["-c", SETUP])
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
                 .env("HOME", dir.path())
@@ -1020,7 +1029,6 @@ mod tests {
 
     #[test]
     fn a_vm_that_fails_to_start_is_deleted_and_started_again_up_to_three_times() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (log, count) = (dir.path().join("colima.log"), dir.path().join("starts"));
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
@@ -1079,7 +1087,7 @@ mod tests {
             fs::write(dir.path().join("colima"), fake).unwrap();
             fs::set_permissions(dir.path().join("colima"), fs::Permissions::from_mode(0o755))
                 .unwrap();
-            let out = Command::new(crate::runner::posix_sh())
+            let out = Command::new(runner::posix_sh())
                 .args(["-c", JOB, "sh", "sc-abc", "/nowhere", "wf", "secrets", "2"])
                 .arg(dir.path().join("status"))
                 .arg(dir.path().join("actions"))
@@ -1124,7 +1132,6 @@ mod tests {
 
     #[test]
     fn a_vm_a_failed_start_never_made_still_loses_its_disk() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (bin, home) = (dir.path().join("bin"), dir.path().join("home"));
         let log = dir.path().join("calls.log");
@@ -1139,7 +1146,7 @@ mod tests {
             }
 
             let _ = fs::remove_file(&log);
-            let mut cmd = Command::new(crate::runner::posix_sh());
+            let mut cmd = Command::new(runner::posix_sh());
             cmd.args(["-c", concat!(vms!(), r#"gone "$1""#), "sh", "sc-abc"])
                 .env_clear()
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -1176,7 +1183,7 @@ mod tests {
     #[test]
     fn maps_the_jobs_labels_to_the_vm() {
         let dir = tempfile::tempdir().unwrap();
-        let none = Default::default();
+        let none = BTreeMap::default();
         let request = RunRequest {
             run_dir: dir.path(),
             file: "ci.yml",

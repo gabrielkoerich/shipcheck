@@ -10,7 +10,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -21,8 +21,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn write(dir: &Path, name: &str, text: &str) {
     let path = dir.join(name);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, text).unwrap();
+    fs::create_dir_all(path.parent().expect("the path has a parent")).expect("create the dir");
+    fs::write(path, text).expect("write the file");
 }
 
 fn shipcheck(home: &Path, dir: &Path, args: &[&str]) -> Output {
@@ -32,7 +32,7 @@ fn shipcheck(home: &Path, dir: &Path, args: &[&str]) -> Output {
         .env("SHIPCHECK_NO_DAEMON", "1")
         .current_dir(dir)
         .output()
-        .unwrap()
+        .expect("run the command")
 }
 
 fn said(out: &Output) -> String {
@@ -133,7 +133,7 @@ fn a_run_never_uses_build_output_another_tree_left() {
     held.lock().unwrap();
     let ran_b = shipcheck(&home, &b, &["run", "--no-fetch"]);
     drop(held);
-    let out = said(&ran_b) + &said(&shipcheck(&home, &b, &["logs"]));
+    let out = format!("{}{}", said(&ran_b), said(&shipcheck(&home, &b, &["logs"])));
     assert!(
         !out.contains("only_in_branch_a"),
         "b ran a test only branch a has, from a's build:\n{out}"

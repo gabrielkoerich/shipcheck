@@ -1,5 +1,7 @@
 //! `init --yes` tries each host check it would write in the jail, through the built binary
 
+use shipcheck::config::RepoConfig;
+use shipcheck::run;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,7 +38,7 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -48,18 +50,18 @@ fn git(dir: &Path, args: &[&str]) {
 fn repo(tmp: &Path) -> (PathBuf, PathBuf) {
     let origin = tmp.join("origin.git");
     let work = tmp.join("work");
-    fs::create_dir(&origin).unwrap();
+    fs::create_dir(&origin).expect("create the dir");
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
     git(tmp, &["clone", "-q", &origin.to_string_lossy(), "work"]);
     git(&work, &["checkout", "-q", "-b", "main"]);
     git(&work, &["config", "user.name", "t"]);
     git(&work, &["config", "user.email", "t@t"]);
     git(&work, &["config", "commit.gpgsign", "false"]);
-    fs::create_dir_all(work.join(".github/workflows")).unwrap();
-    fs::write(work.join(".github/workflows/ci.yml"), CI).unwrap();
-    fs::write(work.join("check.sh"), CHECK).unwrap();
+    fs::create_dir_all(work.join(".github/workflows")).expect("create the dir");
+    fs::write(work.join(".github/workflows/ci.yml"), CI).expect("write the file");
+    fs::write(work.join("check.sh"), CHECK).expect("write the file");
     let mode = <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
-    fs::set_permissions(work.join("check.sh"), mode).unwrap();
+    fs::set_permissions(work.join("check.sh"), mode).expect("set the mode");
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "ci"]);
     git(&work, &["push", "-q", "origin", "main"]);
@@ -70,7 +72,7 @@ fn repo(tmp: &Path) -> (PathBuf, PathBuf) {
     // `tmutil addexclusion` can take 10s a folder, so mark them excluded as it would
     for dir in ["templates", "runs", "hostcache"] {
         let dir = home.join(dir);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).expect("create the dir");
 
         if cfg!(target_os = "macos") {
             let _ = Command::new("xattr")
@@ -101,7 +103,7 @@ fn init(work: &Path, home: &Path, args: &[&str]) -> String {
         .env_remove("SHIPCHECK_TOKEN")
         .stdin(Stdio::null())
         .output()
-        .unwrap();
+        .expect("run the command");
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -132,7 +134,7 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 type Snapshot = BTreeMap<PathBuf, Option<Vec<u8>>>;
 
 /// The paths whose contents differ between two snapshots
-fn changed(before: &Snapshot, after: Snapshot) -> Vec<PathBuf> {
+fn changed(before: &Snapshot, after: &Snapshot) -> Vec<PathBuf> {
     let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
     keys.into_iter()
         .filter(|k| before.get(k) != after.get(k))
@@ -142,10 +144,10 @@ fn changed(before: &Snapshot, after: Snapshot) -> Vec<PathBuf> {
 /// A worktree entry of the repository's own whose folder is gone, which only `git worktree prune` drops
 fn stale_entry(work: &Path) {
     let entry = work.join(".git/worktrees/gone");
-    fs::create_dir_all(&entry).unwrap();
-    fs::write(entry.join("gitdir"), "/nonexistent/gone/.git\n").unwrap();
-    fs::write(entry.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    fs::write(entry.join("commondir"), "../..\n").unwrap();
+    fs::create_dir_all(&entry).expect("create the dir");
+    fs::write(entry.join("gitdir"), "/nonexistent/gone/.git\n").expect("write the file");
+    fs::write(entry.join("HEAD"), "ref: refs/heads/main\n").expect("write the file");
+    fs::write(entry.join("commondir"), "../..\n").expect("write the file");
 }
 
 #[test]
@@ -159,12 +161,12 @@ fn init_without_a_terminal_or_yes_shows_the_plan_and_writes_nothing() {
     assert!(said.contains("Review"), "{said}");
     assert!(said.contains("rerun with --yes to apply"), "{said}");
     assert_eq!(
-        changed(&home_before, snapshot(&home)),
+        changed(&home_before, &snapshot(&home)),
         Vec::<PathBuf>::new(),
         "SHIPCHECK_HOME changed"
     );
     assert_eq!(
-        changed(&repo_before, snapshot(&work)),
+        changed(&repo_before, &snapshot(&work)),
         Vec::<PathBuf>::new(),
         "the repository changed"
     );
@@ -211,8 +213,9 @@ fn a_preview_stopped_mid_trial_leaves_nothing_behind() {
             assert!(started.elapsed().as_secs() < 120, "no trial started");
             std::thread::sleep(std::time::Duration::from_millis(100));
         };
-        // Safe: kill only sends a signal to the init this test started
-        unsafe { libc::kill(init.id() as i32, sig) };
+        let pid = libc::pid_t::try_from(init.id()).expect("a pid fits a pid_t");
+        // SAFETY: kill only sends a signal to the init this test started
+        unsafe { libc::kill(pid, sig) };
         let status = init.wait().unwrap();
         assert_eq!(status.code(), Some(128 + sig), "{sig}");
         // The scratch home holds the trial's templates or slots
@@ -230,12 +233,12 @@ fn a_preview_stopped_mid_trial_leaves_nothing_behind() {
             "{sig}: the scratch home {scratch_home:?} is left"
         );
         assert_eq!(
-            changed(&home_before, snapshot(&home)),
+            changed(&home_before, &snapshot(&home)),
             Vec::<PathBuf>::new(),
             "{sig}: SHIPCHECK_HOME changed"
         );
         assert_eq!(
-            changed(&repo_before, snapshot(&work)),
+            changed(&repo_before, &snapshot(&work)),
             Vec::<PathBuf>::new(),
             "{sig}: the repository changed"
         );
@@ -300,13 +303,13 @@ fn a_trial_tries_the_host_checks_and_never_an_act_job() {
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "a"]);
     // An act job that names no job would fail the whole run if the trial ran it
-    let config = shipcheck::config::RepoConfig::parse(
+    let config = RepoConfig::parse(
         "runner = \"host\"\n[host.checks]\nok = \"true\"\n[jobs.\"ci.yml/missing\"]\nrunner = \"act\"\n",
     )
     .unwrap();
     // SAFETY: the only test in this binary that sets the environment, the other passes its own to a child
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
-    let tried = shipcheck::run::trial(&work, config, &mut |_| {}).unwrap();
+    let tried = run::trial(&work, config, &mut |_| {}).unwrap();
     assert_eq!(tried.keys().collect::<Vec<_>>(), ["ok"]);
     assert!(tried["ok"].passed, "{}", tried["ok"].log);
 }

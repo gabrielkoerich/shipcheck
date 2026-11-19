@@ -1,3 +1,5 @@
+//! Output without a terminal carries no escape codes
+
 use std::fs;
 use std::process::{Command, Stdio};
 

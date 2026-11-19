@@ -1,13 +1,24 @@
+use crate::agents;
+use crate::autostart;
+use crate::background;
+use crate::check;
+use crate::config::Engine;
+use crate::config::Team;
+use crate::run;
+use crate::secret;
+use crate::service;
+use crate::service::Sender;
+use crate::setup;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use crate::config::{Network, RepoConfig, RunnerKind};
-use crate::run;
 use crate::runner::{self, Runner};
 use crate::service::Poster;
 
 /// One thing shipcheck needs, and the command that fixes it when it is missing
+#[derive(Debug)]
 pub struct Check {
     pub name: &'static str,
     pub ok: bool,
@@ -52,8 +63,7 @@ fn hardened_note() -> String {
         .arg("-dv")
         .arg(&exe)
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
-        .unwrap_or_default();
+        .map_or_default(|o| String::from_utf8_lossy(&o.stderr).into_owned());
 
     if flags.contains("runtime") {
         return String::new();
@@ -69,6 +79,10 @@ fn hardened_note() -> String {
  * Everything a run needs on this machine and in this repository, each with what to do when it is
  * missing, so an agent can set shipcheck up from the output alone
  **/
+#[expect(
+    clippy::too_many_lines,
+    reason = "one check per line of doctor's output, in the order it prints"
+)]
 pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     let mut found = vec![check(
         "git",
@@ -85,7 +99,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     found.push(check(
         "docker",
         act.preflight()
-            .and_then(|_| {
+            .and_then(|()| {
                 output(
                     "docker",
                     &["version", "--format", "{{.Server.Platform.Name}} {{.Server.Version}}"],
@@ -116,8 +130,8 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 
     let (templates, runs) = (home.join("templates"), home.join("runs"));
     let cow = fs::create_dir_all(&templates)
-        .and_then(|_| fs::create_dir_all(&runs))
-        .is_ok_and(|_| git_cow::can_clone(&templates, &runs));
+        .and_then(|()| fs::create_dir_all(&runs))
+        .is_ok_and(|()| git_cow::can_clone(&templates, &runs));
     found.push(Check {
         name: "copy-on-write",
         ok: true,
@@ -134,12 +148,12 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     found.push(Check {
         name: "post",
         ok: true,
-        detail: match crate::service::poster() {
+        detail: match service::poster() {
             Poster::Key => "`shipcheck post` uses a key on this machine instead of `shipcheck login`".into(),
             Poster::Service(_) => format!(
                 "`shipcheck post` goes through {} with {}",
-                crate::service::api(),
-                crate::service::identity().unwrap_or_default()
+                service::api(),
+                service::identity().unwrap_or_default()
             ),
             Poster::None => "not signed in. Optional: `shipcheck login`, or SHIPCHECK_TOKEN from `shipcheck token`, lets `shipcheck post` put the check on PRs".into(),
         },
@@ -147,16 +161,13 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 
     let mut secrets = vec![home.join("token"), home.join("app.pem")];
     secrets.extend(run::repo_id(cwd).ok().map(|id| run::secrets_file(&id)));
-    let secrets: Vec<_> = secrets
-        .into_iter()
-        .filter(|p| crate::secret::exists(p))
-        .collect();
+    let secrets: Vec<_> = secrets.into_iter().filter(|p| secret::exists(p)).collect();
 
     if !secrets.is_empty() {
         // Reads each one, so after an upgrade the keychain asks here, where someone can answer
         let failed: Vec<_> = secrets
             .iter()
-            .filter_map(|p| crate::secret::read(p).err())
+            .filter_map(|p| secret::read(p).err())
             .collect();
         let names: Vec<_> = secrets
             .iter()
@@ -245,7 +256,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                     .collect();
 
                 if !open.is_empty() {
-                    host = format!("{host}. {} {}", open.join(", "), crate::run::UNSANDBOXED);
+                    host = format!("{host}. {} {}", open.join(", "), run::UNSANDBOXED);
                 }
 
                 let held: Vec<&str> = p
@@ -258,7 +269,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
                     .collect();
 
                 if !held.is_empty() {
-                    host = format!("{host}. {}: {}", held.join(", "), crate::run::UNTRUSTED);
+                    host = format!("{host}. {}: {}", held.join(", "), run::UNTRUSTED);
                 }
 
                 if p.config.acts() && p.config.hosts() {
@@ -312,7 +323,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         && let Some(required) = required_checks(cwd, base)
     {
         let jobs = run::jobs(p).unwrap_or_default();
-        let names: Vec<String> = crate::check::job_names(&jobs)
+        let names: Vec<String> = check::job_names(&jobs)
             .into_iter()
             .map(|(_, _, n)| n)
             .collect();
@@ -351,7 +362,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         }
     }
 
-    if planned.as_ref().is_ok_and(|c| c.hosts()) {
+    if planned.as_ref().is_ok_and(super::config::RepoConfig::hosts) {
         found.push(check(
             "sandbox",
             runner::host::sandbox().map(|s| {
@@ -389,7 +400,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         let on_vm: Vec<String> = config
             .engines()
             .into_iter()
-            .filter(|(_, e)| *e == crate::config::Engine::Colima)
+            .filter(|(_, e)| *e == Engine::Colima)
             .map(|(job, _)| job)
             .collect();
 
@@ -418,7 +429,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         },
     });
 
-    if let Some(gap) = crate::setup::install_gap(Path::new(&top)) {
+    if let Some(gap) = setup::install_gap(Path::new(&top)) {
         found.push(Check {
             name: "install",
             ok: false,
@@ -427,14 +438,14 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     }
 
     // The post itself refuses a repository the App cannot reach, so ask GitHub here, before a push
-    if crate::service::can_post()
+    if service::can_post()
         && let Ok(repo) = run::repo_id(Path::new(&top))
     {
-        let answer = crate::service::Sender::new(&repo).and_then(|s| s.open_prs().map(|_| ()));
+        let answer = Sender::new(&repo).and_then(|s| s.open_prs().map(|_| ()));
         found.push(check("app", app_line(&repo, answer)));
     }
 
-    let missing = crate::agents::notes(Path::new(&top));
+    let missing = agents::notes(Path::new(&top));
     found.push(Check {
         name: "instructions",
         ok: true,
@@ -459,7 +470,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         });
     }
 
-    if cfg!(target_os = "macos") && crate::autostart::logs_to_legacy_home() {
+    if cfg!(target_os = "macos") && autostart::logs_to_legacy_home() {
         found.push(Check {
             name: "daemon",
             ok: false,
@@ -489,13 +500,13 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 fn app_line(repo: &str, answer: Result<(), String>) -> Result<String, String> {
     match answer {
         Ok(()) => Ok(format!("installed on {repo}, runs can post its checks")),
-        Err(e) if crate::background::not_installed(&e) => Err(crate::background::install_fix(repo)),
+        Err(e) if background::not_installed(&e) => Err(background::install_fix(repo)),
         Err(e) => Err(e),
     }
 }
 
 /// What `[team]` on the base sends. `cache` and `logs` are accepted so a later release can use them
-fn team_line(team: crate::config::Team) -> String {
+fn team_line(team: Team) -> String {
     let mut line = if team.records {
         "records on: each full run's record goes to the service, which keeps it only when this account has a plan for team features".to_string()
     } else {
@@ -527,7 +538,7 @@ fn jobs_line(config: &RepoConfig) -> String {
             .jobs_on(RunnerKind::Act)
             .into_iter()
             .map(|j| match engines.get(&j) {
-                Some(crate::config::Engine::Colima) => format!("job {j} on colima"),
+                Some(Engine::Colima) => format!("job {j} on colima"),
                 _ => format!("job {j}"),
             }),
     );
@@ -608,6 +619,11 @@ const GIB: u64 = 1 << 30;
  * A note when Docker's VM has under 8 GiB or under a third of the Mac's memory. Test shards and
  * parallel jobs run out of memory before CPUs. Linux engines share the host's memory, so it is macOS only
  **/
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "sizes shown in GiB to one decimal"
+)]
 fn memory_note(docker: u64, host: u64) -> Option<String> {
     (docker < 8 * GIB || docker < host / 3).then(|| {
         format!(
@@ -621,10 +637,10 @@ fn memory_note(docker: u64, host: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Team;
 
     #[test]
     fn team_line_says_what_leaves_and_what_is_not_yet() {
-        use crate::config::Team;
         assert!(team_line(Team::default()).starts_with("off"));
         let all = team_line(Team {
             records: true,
@@ -664,7 +680,11 @@ mod tests {
 
     #[test]
     fn notes_ruleset_drift() {
-        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let v = |l: &[&str]| {
+            l.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+        };
         let jobs = v(&["shipcheck/lint", "shipcheck/test"]);
         assert!(
             ruleset_note(

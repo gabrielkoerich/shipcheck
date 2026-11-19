@@ -1,16 +1,34 @@
-use std::io::IsTerminal;
+//! The `shipcheck` command line
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a CLI talks on stdout and stderr"
+)]
 
-use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::io::IsTerminal;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitCode};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use clap::{Parser, Subcommand};
+
+use shipcheck::background::Posting;
+use shipcheck::check::Tails;
 use shipcheck::config::Trigger;
-use shipcheck::record::Run as Record;
-use shipcheck::service::{self, Poster, Sender};
-use shipcheck::ui::{Live, Style};
-use shipcheck::{agents, autostart, background, check, queue, report, run, setup};
+use shipcheck::daemon::{self, DaemonConfig};
+use shipcheck::onboard::{self, App};
+use shipcheck::queue::Arrival;
+use shipcheck::record::{self, Run as Record};
+use shipcheck::report::Coverage;
+use shipcheck::run::{Failed, MovedHome, Tree};
+use shipcheck::runner::host;
+use shipcheck::service::{self, Credentials, Poster, Revoke, Sender};
+use shipcheck::ui::{Live, Screen, Stream, Style};
+use shipcheck::{agents, autostart, background, check, doctor, queue, report, run, setup, trust};
 
 const PARTIAL: &str = "partial run: not the check, run `shipcheck run` before committing";
 
@@ -21,7 +39,7 @@ fn main() -> ExitCode {
         .unwrap_or(0);
 
     for (key, value) in run::safe_git_env(existing) {
-        // Safe: no other thread exists yet
+        // SAFETY: no other thread exists yet
         unsafe { std::env::set_var(key, value) };
     }
 
@@ -31,8 +49,8 @@ fn main() -> ExitCode {
         let _ = run::CALLER_PATH.set(path);
     }
 
-    // Safe: no other thread exists yet
-    unsafe { std::env::set_var("PATH", shipcheck::runner::host::jail_path()) };
+    // SAFETY: no other thread exists yet
+    unsafe { std::env::set_var("PATH", host::jail_path()) };
 
     run::migrate_home();
 
@@ -104,7 +122,7 @@ enum Cmd {
         /// Set by the hooks and the daemon on a run that posts its checks
         #[arg(long, hide = true, value_name = "name")]
         background: Option<String>,
-        /// Set with `--background` when the daemon runs from a moved SHIPCHECK_HOME
+        /// Set with `--background` when the daemon runs from a moved `SHIPCHECK_HOME`
         #[arg(long, hide = true)]
         home_ok: bool,
         #[arg(hide = true)]
@@ -183,7 +201,7 @@ enum Cmd {
         no_fetch: bool,
         /// The commit to post, HEAD by default
         rev: Option<String>,
-        /// Post from a SHIPCHECK_HOME other than the default
+        /// Post from a `SHIPCHECK_HOME` other than the default
         #[arg(long)]
         home_ok: bool,
         #[arg(long, hide = true, value_name = "ref")]
@@ -243,7 +261,7 @@ enum Cmd {
     },
     /// Watch the open PRs and run each new head, as a service
     Daemon {
-        /// Run from a SHIPCHECK_HOME other than the default
+        /// Run from a `SHIPCHECK_HOME` other than the default
         #[arg(long)]
         home_ok: bool,
         /// Stop the service and remove it
@@ -262,6 +280,10 @@ enum Cmd {
     },
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per subcommand, read as one table"
+)]
 fn cli(command: Cmd) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut rev = "HEAD".to_string();
@@ -320,7 +342,12 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 args.push("--no-verify".into());
             }
 
-            return commit(&cwd, &args, allow_failed);
+            let failed = if allow_failed {
+                Failed::Allow
+            } else {
+                Failed::Refuse
+            };
+            return commit(&cwd, &args, failed);
         }
         // Only the token goes to stdout, so a script can capture it
         Cmd::Token { name } => {
@@ -337,28 +364,28 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         Cmd::Install => "install",
         Cmd::Run {
             sha,
-            staged: st,
+            staged: run_staged,
             no_fetch,
-            base: b,
-            jobs: j,
-            workflows: w,
-            only_failed: f,
-            json: js,
+            base: run_base,
+            jobs: run_jobs,
+            workflows: run_workflows,
+            only_failed: run_only_failed,
+            json: run_json,
             no_heartbeat,
-            detach: d,
+            detach: run_detach,
             background,
-            home_ok: h,
-            rev: r,
+            home_ok: run_home_ok,
+            rev: run_rev,
         } => {
-            detach = d;
+            detach = run_detach;
             heartbeat = !no_heartbeat;
-            only_failed = f;
-            at(sha.or(r), &mut rev, &mut explicit);
-            home_ok = h;
-            staged = st;
+            only_failed = run_only_failed;
+            at(sha.or(run_rev), &mut rev, &mut explicit);
+            home_ok = run_home_ok;
+            staged = run_staged;
             fetch = !no_fetch;
-            on_base(b, &mut base, &mut base_set, &mut fetch);
-            (jobs, workflows, json, posts) = (j, w, js, background);
+            on_base(run_base, &mut base, &mut base_set, &mut fetch);
+            (jobs, workflows, json, posts) = (run_jobs, run_workflows, run_json, background);
             "run"
         }
         Cmd::Wait {
@@ -462,7 +489,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     );
 
     if !base_set && reads_base {
-        base = shipcheck::daemon::command_base(name, &cwd);
+        base = daemon::command_base(name, &cwd);
     }
 
     // With --json, stdout holds only the result object
@@ -471,8 +498,21 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
     } else {
         Style::stdout()
     };
-    let live = Live::new(json);
+    let live = Live::new(if json { Stream::Stderr } else { Stream::Stdout });
     let say = |line: &str| live.line(&style.status(line));
+    let moved_home = if home_ok {
+        MovedHome::Allowed
+    } else {
+        MovedHome::Refused
+    };
+    let tree_kind = if staged { Tree::Staged } else { Tree::Working };
+    let given = if base_set { Base::Given } else { Base::Default };
+    let format = if json { Format::Json } else { Format::Text };
+    let beat = if heartbeat {
+        Heartbeat::On
+    } else {
+        Heartbeat::Off
+    };
 
     match name {
         "run" => {
@@ -492,7 +532,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 posts = None;
             }
 
-            if posts.is_some() && !shipcheck::daemon::posts_from(&base, &cwd) {
+            if posts.is_some() && !daemon::posts_from(&base, &cwd) {
                 say(&format!(
                     "{base} is not the base this repository posts from, so nothing is posted"
                 ));
@@ -508,7 +548,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 .ok()
                 .or_else(|| Some(current_branch(&cwd)))
                 .filter(|b| b != "detached");
-            let (tested, snapshot) = subject(&cwd, &rev, explicit, staged)?;
+            let (tested, snapshot) = subject(&cwd, explicit.then_some(rev.as_str()), tree_kind)?;
             let plan = run::plan(&cwd, &tested, &base)?;
             let what = snapshot.map_or_else(|| plan.sha[..12].to_string(), String::from);
             let tree = &plan.tree[..12];
@@ -521,7 +561,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 let mut args = vec!["run".to_string(), "--no-fetch".into()];
 
                 if base_set {
-                    args.extend(["--base".into(), base.clone()]);
+                    args.extend(["--base".into(), base]);
                 }
 
                 if explicit {
@@ -538,21 +578,21 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     }
                 }
 
-                return detached(&cwd, &plan, &args, json, &say);
+                return detached(&cwd, &plan, &args, format, &say);
             }
 
             if !jobs.is_empty() || !workflows.is_empty() {
                 let _key = run::lock_key(&plan.key)?;
-                let entry = progress(&live, heartbeat, &own_run, || {
+                let entry = progress(&live, beat, &own_run, || {
                     run::run_partial(&plan, &jobs, &workflows, &mut |line| {
-                        say(&run::printable(line))
+                        say(&run::printable(line));
                     })
                 })?;
                 say(&format!(
                     "tested {what}, tree {tree}: ran in {:.1?}",
                     started.elapsed()
                 ));
-                let code = report(&entry, snapshot, json, true);
+                let code = report(&entry, snapshot, format, Coverage::Partial);
 
                 if !explicit {
                     run::record_tested(
@@ -572,13 +612,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     &entry,
                     &record,
                     &run::partial_log_dir(&plan.key),
-                    false,
+                    Upload::Off,
                 );
                 say(PARTIAL);
                 return Ok(code);
             }
 
-            if posts.is_some() && !background::home_allows_post(run::home_overridden(), home_ok) {
+            if posts.is_some() && !background::home_allows_post(run::which_home(), moved_home) {
                 say(&format!(
                     "{}: not posted, SHIPCHECK_HOME is not the default, so its results may not come from runs. A person who set it can pass --home-ok",
                     &plan.sha[..12]
@@ -586,10 +626,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
                 if let Ok(repo) = run::repo_id(&plan.repo) {
                     let fields = serde_json::json!({"sha": plan.sha, "reason": "home_moved"});
-                    shipcheck::record::keep(
-                        &repo,
-                        &shipcheck::record::event(&repo, "skipped", fields),
-                    );
+                    record::keep(&repo, &record::event(&repo, "skipped", fields));
                 }
 
                 posts = None;
@@ -612,7 +649,13 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     background::remember_post(&repo, Some(&refused));
 
                     if let Some(entry) = run::lookup(&plan) {
-                        keep_record(&plan, &entry, &record, &run::log_dir(&plan.key), false);
+                        keep_record(
+                            &plan,
+                            &entry,
+                            &record,
+                            &run::log_dir(&plan.key),
+                            Upload::Off,
+                        );
                     }
 
                     return Err(format!(
@@ -626,9 +669,8 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 if let Some(entry) = &posted {
                     background::remember_post(&repo, None);
                     record.posted_checks = true;
-                    record.posted_comment =
-                        shipcheck::daemon::comment(sender, None, &plan, &base, entry);
-                    keep_record(&plan, entry, &record, &run::log_dir(&plan.key), true);
+                    record.posted_comment = daemon::comment(sender, None, &plan, &base, entry);
+                    keep_record(&plan, entry, &record, &run::log_dir(&plan.key), Upload::On);
                 }
 
                 let Some(entry) = posted else {
@@ -642,7 +684,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     "tested {what}, tree {tree}: posted in {:.1?}",
                     started.elapsed()
                 ));
-                return Ok(report(&entry, snapshot, json, false));
+                return Ok(report(&entry, snapshot, format, Coverage::Full));
             }
 
             if run::running(&plan.key) {
@@ -674,11 +716,11 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     entry
                 }
                 None => {
-                    let (line, numbers) = estimate(&plan);
-                    say(&line);
+                    let (forecast, numbers) = estimate(&plan);
+                    say(&forecast);
                     estimated = numbers;
                     let say = &mut |line: &str| say(&run::printable(line));
-                    let entry = progress(&live, heartbeat, &own_run, || {
+                    let entry = progress(&live, beat, &own_run, || {
                         if only_failed {
                             run::run_only_failed(&plan, say)
                         } else {
@@ -692,10 +734,14 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                     entry
                 }
             };
-            let code = report_with(&entry, snapshot, json, false, estimated);
+            let code = report_with(&entry, snapshot, format, Coverage::Full, estimated);
             // Like a post, an upload needs the base this repository posts from, never a fallback
-            let shares = plan.config.team.records && shipcheck::daemon::posts_from(&base, &cwd);
-            keep_record(&plan, &entry, &record, &run::log_dir(&plan.key), shares);
+            let upload = if plan.config.team.records && daemon::posts_from(&base, &cwd) {
+                Upload::On
+            } else {
+                Upload::Off
+            };
+            keep_record(&plan, &entry, &record, &run::log_dir(&plan.key), upload);
 
             if !explicit {
                 run::record_tested(
@@ -727,7 +773,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             Ok(code)
         }
         "doctor" => {
-            let checks = shipcheck::doctor::checks(&cwd, &base);
+            let checks = doctor::checks(&cwd, &base);
             let width = checks.iter().map(|c| c.name.len()).max().unwrap_or(0);
             // Agents and pipes read the plain words, a person at a terminal gets marks and color
             let s = Style::stdout();
@@ -757,16 +803,16 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             let known = explicit
                 .then(|| run::find_key(&run::home(), &rev))
                 .flatten();
-            let (plan, snapshot) = match known {
-                Some(_) => (None, None),
-                None => {
-                    if !base_set {
-                        base = shipcheck::daemon::command_base(name, &cwd);
-                    }
-
-                    let (tested, snapshot) = subject(&cwd, &rev, explicit, staged)?;
-                    (Some(run::plan(&cwd, &tested, &base)?), snapshot)
+            let (plan, snapshot) = if known.is_some() {
+                (None, None)
+            } else {
+                if !base_set {
+                    base = daemon::command_base(name, &cwd);
                 }
+
+                let (tested, snapshot) =
+                    subject(&cwd, explicit.then_some(rev.as_str()), tree_kind)?;
+                (Some(run::plan(&cwd, &tested, &base)?), snapshot)
             };
             let key = known
                 .or_else(|| plan.as_ref().map(|p| p.key.clone()))
@@ -775,7 +821,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             let limit = timeout.as_deref().map(duration).transpose()?;
             let started = Instant::now();
             let mut went = false;
-            let late = progress(&live, heartbeat, &|r| r["key"] == key.as_str(), || {
+            let late = progress(&live, beat, &|r| r["key"] == key.as_str(), || {
                 while run::running(&key) {
                     went = true;
 
@@ -793,7 +839,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 let state = run_state(&key);
                 say(&format!(
                     "run {id} still goes after {}: {}",
-                    shipcheck::record::clock(started.elapsed().as_secs()),
+                    record::clock(started.elapsed().as_secs()),
                     state["state"].as_str().unwrap_or_default()
                 ));
 
@@ -809,24 +855,23 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 None => run::cached(&key),
             };
 
-            match result {
-                Some(entry) => Ok(report(&entry, snapshot, json, false)),
-                None => {
-                    if json {
-                        println!("{}", run_state(&key));
-                    }
+            if let Some(entry) = result {
+                Ok(report(&entry, snapshot, format, Coverage::Full))
+            } else {
+                if json {
+                    println!("{}", run_state(&key));
+                }
 
-                    if went {
-                        say(&format!(
-                            "run {id} ended without a result: it could not run, was stopped, or was a partial run"
-                        ));
-                        Ok(ExitCode::from(2))
-                    } else {
-                        say(&format!(
-                            "no run of this tree is queued or going, and it has no result, `shipcheck run` starts one (id {id})"
-                        ));
-                        Ok(ExitCode::from(NO_RUN))
-                    }
+                if went {
+                    say(&format!(
+                        "run {id} ended without a result: it could not run, was stopped, or was a partial run"
+                    ));
+                    Ok(ExitCode::from(2))
+                } else {
+                    say(&format!(
+                        "no run of this tree is queued or going, and it has no result, `shipcheck run` starts one (id {id})"
+                    ));
+                    Ok(ExitCode::from(NO_RUN))
                 }
             }
         }
@@ -851,16 +896,16 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
 
                 if let Some(entry) = run::cached(&key) {
-                    return Ok(report(&entry, None, json, false));
+                    return Ok(report(&entry, None, format, Coverage::Full));
                 }
             }
 
             // Before a commit, whether committing all of it or the index as it is reuses a result
             if !explicit {
-                for (label, staged) in [("working copy", false), ("index", true)] {
-                    let (tested, _) = subject(&cwd, &rev, false, staged)?;
+                for (label, tree) in [("working copy", Tree::Working), ("index", Tree::Staged)] {
+                    let (tested, _) = subject(&cwd, None, tree)?;
                     let mut plan = run::plan(&cwd, &tested, &base)?;
-                    last_run_key(&mut plan, base_set, |k| run::cached(k).is_some());
+                    last_run_key(&mut plan, given, |k| run::cached(k).is_some());
                     let verdict = match run::lookup(&plan) {
                         Some(e) if e.passed => "passed",
                         Some(_) => "failed",
@@ -870,10 +915,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 }
             }
 
-            let (tested, snapshot) = subject(&cwd, &rev, explicit, staged)?;
+            let (tested, snapshot) = subject(&cwd, explicit.then_some(rev.as_str()), tree_kind)?;
             let mut plan = run::plan(&cwd, &tested, &base)?;
 
-            if let Some(other) = last_run_key(&mut plan, base_set, |k| run::cached(k).is_some()) {
+            if let Some(other) = last_run_key(&mut plan, given, |k| run::cached(k).is_some()) {
                 say(&format!(
                     "the last run of this tree read shipcheck.toml from {other}, not {base}"
                 ));
@@ -884,7 +929,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             }
 
             match run::lookup(&plan) {
-                Some(entry) => Ok(report(&entry, snapshot, json, false)),
+                Some(entry) => Ok(report(&entry, snapshot, format, Coverage::Full)),
                 // With --json, stdout stays JSON an agent can parse, even with nothing to report
                 None if json => {
                     println!("{}", serde_json::json!({"tree": plan.tree, "result": null}));
@@ -898,10 +943,10 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         }
         "history" => {
             let repo = run::repo_id(&toplevel(&cwd)?)?;
-            let runs = shipcheck::record::runs(&run::home(), &repo, limit);
+            let runs = record::runs(&run::home(), &repo, limit);
 
             if flaky {
-                let rows = shipcheck::record::flaky(&runs);
+                let rows = record::flaky(&runs);
 
                 if json {
                     println!("{}", serde_json::Value::from(rows));
@@ -911,7 +956,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                         runs.len()
                     );
                 } else {
-                    print!("{}", shipcheck::record::flaky_table(&rows));
+                    print!("{}", record::flaky_table(&rows));
                 }
 
                 return Ok(ExitCode::SUCCESS);
@@ -922,30 +967,35 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             } else if runs.is_empty() {
                 println!("no runs recorded for {repo} on this machine yet");
             } else {
-                print!("{}", shipcheck::record::table(&runs));
+                print!("{}", record::table(&runs));
             }
 
             Ok(ExitCode::SUCCESS)
         }
         "queue" => {
-            let mut runs = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
-            shipcheck::queue::forecast(&mut runs, run::max_runs(), false, &mut typical_times());
+            let mut runs = queue::list(&run::home().join("runners"), run::unix_now());
+            queue::forecast(
+                &mut runs,
+                run::max_runs(),
+                Arrival::Background,
+                &mut typical_times(),
+            );
 
             if json {
                 println!("{}", serde_json::Value::from(runs));
             } else if runs.is_empty() {
                 println!("no run is going or queued on this machine");
             } else {
-                print!("{}", shipcheck::queue::table(&runs));
+                print!("{}", queue::table(&runs));
             }
 
             Ok(ExitCode::SUCCESS)
         }
         "logs" => {
-            let (tested, _) = subject(&cwd, &rev, explicit, staged)?;
+            let (tested, _) = subject(&cwd, explicit.then_some(rev.as_str()), tree_kind)?;
             let mut plan = run::plan(&cwd, &tested, &base)?;
 
-            if let Some(other) = last_run_key(&mut plan, base_set, |k| {
+            if let Some(other) = last_run_key(&mut plan, given, |k| {
                 run::log_dir(k).exists() || run::partial_log_dir(k).exists()
             }) {
                 println!("the last run of this tree read shipcheck.toml from {other}, not {base}");
@@ -963,8 +1013,8 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             }
 
             if let Ok(repo) = run::repo_id(&plan.repo)
-                && let Some(line) = shipcheck::record::posting(
-                    &shipcheck::record::runs(&run::home(), &repo, usize::MAX),
+                && let Some(line) = record::posting(
+                    &record::runs(&run::home(), &repo, usize::MAX),
                     &repo,
                     &plan.sha,
                 )
@@ -975,9 +1025,9 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "post" => {
-            refuse_moved_home(home_ok)?;
+            refuse_moved_home(moved_home)?;
 
-            if !shipcheck::daemon::posts_from(&base, &cwd) {
+            if !daemon::posts_from(&base, &cwd) {
                 return Err(format!(
                     "{base} is not the base this repository posts from: its default branch, or the daemon's base for it. A result from another base is a trial, never a check"
                 ));
@@ -1001,10 +1051,11 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             run::secret_values(&run::repo_id(&plan.repo)?)?;
             let sender = Sender::new(&run::repo_id(&plan.repo)?)?;
             // Job checks go first, so a failed post leaves `shipcheck` unposted
-            let bodies = check::final_bodies(&plan, &entry, true);
+            let bodies = check::final_bodies(&plan, &entry, Tails::Shown);
             let repo = run::repo_id(&plan.repo)?;
-            let url = background::finish(&|b, id| sender.send(b, id), &bodies, &Default::default())
-                .inspect_err(|e| background::remember_post(&repo, Some(e)))?;
+            let url =
+                background::finish(&|b, id| sender.send(b, id), &bodies, &BTreeMap::default())
+                    .inspect_err(|e| background::remember_post(&repo, Some(e)))?;
             background::remember_post(&repo, None);
 
             println!(
@@ -1013,7 +1064,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 &plan.sha[..12]
             );
 
-            let commented = shipcheck::daemon::comment(&sender, None, &plan, &base, &entry);
+            let commented = daemon::comment(&sender, None, &plan, &base, &entry);
             let fields = serde_json::json!({
                 "sha": plan.sha,
                 "tree": plan.tree,
@@ -1021,7 +1072,7 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 "checks": true,
                 "comment": commented,
             });
-            shipcheck::record::keep(&repo, &shipcheck::record::event(&repo, "posted", fields));
+            record::keep(&repo, &record::event(&repo, "posted", fields));
             Ok(ExitCode::SUCCESS)
         }
         "login" => {
@@ -1040,7 +1091,14 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "logout" => {
-            println!("{}", service::logout(all)?);
+            println!(
+                "{}",
+                service::logout(if all {
+                    Revoke::All
+                } else {
+                    Revoke::ThisMachine
+                })?
+            );
             Ok(ExitCode::SUCCESS)
         }
         // Called by the hooks, so they never fail and never make a commit or a push wait
@@ -1051,7 +1109,15 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 && plan.config.runs_on(Trigger::Commit)
                 && !run::skip_requested(&plan)
             {
-                background::start(&cwd, &plan, &base, &branch, false, "hook-commit", false);
+                background::start(
+                    &cwd,
+                    &plan,
+                    &base,
+                    &branch,
+                    Posting::Off,
+                    "hook-commit",
+                    MovedHome::Refused,
+                );
             }
 
             Ok(ExitCode::SUCCESS)
@@ -1066,16 +1132,24 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 && !run::skip_requested(&plan)
             {
                 // The pushed commit's checks, posted by its run, unless the result could be an agent's
-                let post = background::posts(run::home_overridden(), service::can_post());
+                let post = background::posts(run::which_home(), service::credentials());
 
-                if !post {
+                if post == Posting::Off {
                     background::note(&format!(
                         "{} on {branch}: checks not posted, run `shipcheck login`, or set SHIPCHECK_TOKEN from `shipcheck token`",
                         &plan.sha[..12]
                     ));
                 }
 
-                background::start(&cwd, &plan, &base, &branch, post, "hook-push", false);
+                background::start(
+                    &cwd,
+                    &plan,
+                    &base,
+                    &branch,
+                    post,
+                    "hook-push",
+                    MovedHome::Refused,
+                );
 
                 // One line on the push, git shows a hook's output and the push goes on
                 if let Some(line) = unposted(&plan.repo) {
@@ -1086,7 +1160,12 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "trust" => {
-            let origin = shipcheck::trust::set(&toplevel(&cwd)?, !all)?;
+            let root = toplevel(&cwd)?;
+            let origin = if all {
+                trust::remove(&root)?
+            } else {
+                trust::add(&root)?
+            };
 
             if all {
                 println!(
@@ -1103,7 +1182,9 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
         "clean" => {
             let repo = if all { None } else { Some(toplevel(&cwd)?) };
 
-            for line in run::clean(repo.as_deref(), all)? {
+            let scope = repo.as_deref().map_or(run::Scope::All, run::Scope::Repo);
+
+            for line in run::clean(scope)? {
                 println!("{line}");
             }
 
@@ -1119,14 +1200,14 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            refuse_moved_home(home_ok)?;
-            let config = shipcheck::daemon::DaemonConfig::load()?;
+            refuse_moved_home(moved_home)?;
+            let config = DaemonConfig::load()?;
             println!(
                 "shipcheck daemon: watching {} repositories every {}s",
                 config.repos.len(),
                 config.interval_seconds
             );
-            shipcheck::daemon::serve(home_ok)
+            daemon::serve(moved_home)
         }
         "init" => {
             let root = toplevel(&cwd)?;
@@ -1137,31 +1218,22 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
 
             // A person gets the wizard, `--yes` the recommended choices, an agent or a script without `--yes` only the plan
             if yes {
-                shipcheck::onboard::plain(
-                    &root,
-                    shipcheck::onboard::App::find(),
-                    &mut std::io::stdout(),
-                    finish,
-                )?;
+                onboard::plain(&root, App::find(), &mut std::io::stdout(), finish)?;
                 return Ok(ExitCode::SUCCESS);
             }
 
             if terminal {
-                shipcheck::onboard::tui(&root, shipcheck::onboard::App::find, finish)?;
+                onboard::tui(&root, App::find, finish)?;
                 return Ok(ExitCode::SUCCESS);
             }
 
             // The preview's own process, which the one below starts with a scratch home
-            if std::env::var_os(shipcheck::onboard::PREVIEW).is_some() {
-                shipcheck::onboard::preview(
-                    &root,
-                    shipcheck::onboard::App::find(),
-                    &mut std::io::stdout(),
-                )?;
+            if std::env::var_os(onboard::PREVIEW).is_some() {
+                onboard::preview(&root, App::find(), &mut std::io::stdout())?;
                 return Ok(ExitCode::SUCCESS);
             }
 
-            Ok(ExitCode::from(shipcheck::onboard::preview_apart(&root)?))
+            Ok(ExitCode::from(onboard::preview_apart(&root)?))
         }
         "install" => {
             let root = toplevel(&cwd)?;
@@ -1190,9 +1262,13 @@ fn machine_setup(root: &Path, say: &mut dyn FnMut(&str)) -> Result<(), String> {
 
 /// Signs the machine in for `install` and `init` when it cannot post, never failing them
 fn sign_in(say: &mut dyn FnMut(&str)) {
-    let terminal = std::io::stdin().is_terminal();
+    let credentials = if service::poster() == Poster::None {
+        Credentials::Missing
+    } else {
+        Credentials::Found
+    };
 
-    match service::sign_in(service::poster() != Poster::None, terminal) {
+    match service::sign_in(credentials, Screen::of(&std::io::stdin())) {
         service::SignIn::Already => {
             say(&format!(
                 "signed in: checks post with {}",
@@ -1222,9 +1298,9 @@ fn remove_old_hooks(root: &Path, say: &mut dyn FnMut(&str)) {
     }
 }
 
-/// An agent can point SHIPCHECK_HOME at a folder it wrote, so only a person passes `--home-ok`
-fn refuse_moved_home(home_ok: bool) -> Result<(), String> {
-    if run::home_overridden() && !home_ok {
+/// An agent can point `SHIPCHECK_HOME` at a folder it wrote, so only a person passes `--home-ok`
+fn refuse_moved_home(moved: MovedHome) -> Result<(), String> {
+    if run::home_overridden() && moved == MovedHome::Refused {
         return Err(format!(
             "SHIPCHECK_HOME is {}, not the default {}, so its results may not come from runs. A person who set it can pass --home-ok",
             run::home().display(),
@@ -1235,37 +1311,39 @@ fn refuse_moved_home(home_ok: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// What `run`, `status` and `logs` test with no revision: the working copy, or the index with
-/// `--staged`, as a commit no ref names, else HEAD when it has no change. Named when not a commit
+/// What `run`, `status` and `logs` test: the `named` revision, or with none the working copy, or the
+/// index with `--staged`, as a commit no ref names, else HEAD when it has no change. Named when not
+/// a commit
 fn subject(
     cwd: &Path,
-    rev: &str,
-    explicit: bool,
-    staged: bool,
+    named: Option<&str>,
+    tree: Tree,
 ) -> Result<(String, Option<&'static str>), String> {
-    if explicit {
+    if let Some(rev) = named {
         return Ok((rev.to_string(), None));
     }
 
-    let what = if staged {
-        "the index"
-    } else {
-        "the working copy"
+    let what = match tree {
+        Tree::Staged => "the index",
+        Tree::Working => "the working copy",
     };
 
-    Ok(match run::snapshot(cwd, staged)? {
+    Ok(match run::snapshot(cwd, tree)? {
         Some(sha) => (sha, Some(what)),
-        None => (rev.to_string(), None),
+        None => ("HEAD".to_string(), None),
     })
 }
 
+/// Whether the command was given `--base`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Base {
+    Given,
+    Default,
+}
+
 /// Without `--base`, a tree whose key has nothing to show takes the key of its last recorded run
-fn last_run_key(
-    plan: &mut run::Plan,
-    base_set: bool,
-    has: impl Fn(&str) -> bool,
-) -> Option<String> {
-    if base_set || has(&plan.key) {
+fn last_run_key(plan: &mut run::Plan, base: Base, has: impl Fn(&str) -> bool) -> Option<String> {
+    if base == Base::Given || has(&plan.key) {
         return None;
     }
 
@@ -1291,7 +1369,7 @@ fn warn_untracked(repo: &Path) -> Result<(), String> {
         .join(", ");
 
     if files.len() > 20 {
-        names.push_str(&format!(" and {} more", files.len() - 20));
+        let _ = write!(names, " and {} more", files.len() - 20);
     }
 
     let count = match files.len() {
@@ -1308,7 +1386,7 @@ fn warn_untracked(repo: &Path) -> Result<(), String> {
 }
 
 /// Commits the tree the last run tested, `git_args` being the message and `--no-verify` for git
-fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCode, String> {
+fn commit(cwd: &Path, git_args: &[String], failed: Failed) -> Result<ExitCode, String> {
     let repo = toplevel(cwd)?;
 
     if let Some(gap) = setup::install_gap(&repo) {
@@ -1316,18 +1394,16 @@ fn commit(cwd: &Path, git_args: &[String], allow_failed: bool) -> Result<ExitCod
     }
 
     // Plain `git commit` still works on it, the hooks never block git
-    if let Some(branch) = run::on_default_branch(
-        &repo,
-        &shipcheck::daemon::command_base("commit", &repo),
-        None,
-    ) {
+    if let Some(branch) =
+        run::on_default_branch(&repo, &daemon::command_base("commit", &repo), None)
+    {
         return Err(format!(
             "{branch} is the default branch, PRs carry shipcheck's checks: `git switch -c <branch>`, then `shipcheck commit`"
         ));
     }
 
     let tested = run::last_tested(&repo).ok_or("no `shipcheck run` of this working copy yet")?;
-    let sha = run::commit(cwd, &tested, git_args, allow_failed)?;
+    let sha = run::commit(cwd, &tested, git_args, failed)?;
     println!(
         "committed {}, the tree that {} in `shipcheck run`",
         &sha[..12],
@@ -1366,8 +1442,6 @@ fn posting_run(
     rec: &mut Record,
     say: &mut dyn FnMut(&str),
 ) -> Result<Option<run::Entry>, String> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
     let repo = run::repo_id(&plan.repo)?;
     let record = background::record(&repo, name);
     let secrets = run::secret_values(&repo).unwrap_or_default();
@@ -1410,31 +1484,28 @@ fn posting_run(
 
                 let (_key, waited) = run::lock_tree(&plan.key)?;
 
-                match run::reusable(plan, waited) {
-                    Some(entry) => {
-                        hit = true;
-                        Ok(entry)
-                    }
-                    None => {
-                        // The error becomes the checks' log, so it gets the masking a job log gets
-                        let mut entry =
-                            run::run_reporting(plan, &mut |line| say(&run::printable(line)), jobs)
-                                .map_err(|e| check::mask(e, &secrets))?;
+                if let Some(entry) = run::reusable(plan, waited) {
+                    hit = true;
+                    Ok(entry)
+                } else {
+                    // The error becomes the checks' log, so it gets the masking a job log gets
+                    let mut entry =
+                        run::run_reporting(plan, &mut |line| say(&run::printable(line)), jobs)
+                            .map_err(|e| check::mask(e, &secrets))?;
 
-                        // A fresh pass is checked like a stored one before it is posted, and fails closed
-                        if entry.passed && !run::holds(plan, &entry) {
-                            say(
-                                "the run's tree, base or logs do not match its result, posting a failure",
-                            );
-                            run::fail_closed(&mut entry);
-                        }
-
-                        Ok(entry)
+                    // A fresh pass is checked like a stored one before it is posted, and fails closed
+                    if entry.passed && !run::holds(plan, &entry) {
+                        say(
+                            "the run's tree, base or logs do not match its result, posting a failure",
+                        );
+                        run::fail_closed(&mut entry);
                     }
+
+                    Ok(entry)
                 }
             },
             &run::HAS_SLOT,
-            |entry| check::final_bodies(plan, entry, true),
+            |entry| check::final_bodies(plan, entry, Tails::Shown),
             || background::current(&record, pid),
             &background::WAITS,
             Some(&|job: &run::JobDone| check::job_body(plan, job)),
@@ -1453,18 +1524,25 @@ fn posting_run(
     Ok(posted)
 }
 
-/// Appends the run to this machine's records, read by `shipcheck history`, and with `share` uploads
-/// it as `[team] records` says. A record never fails a run
-fn keep_record(plan: &run::Plan, entry: &run::Entry, record: &Record, logs: &Path, share: bool) {
+/// Whether a run's record may go to the service
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Upload {
+    On,
+    Off,
+}
+
+/// Appends the run to this machine's records, read by `shipcheck history`, and with `Upload::On`
+/// uploads it as `[team] records` says. A record never fails a run
+fn keep_record(plan: &run::Plan, entry: &run::Entry, record: &Record, logs: &Path, upload: Upload) {
     let Ok(repo) = run::repo_id(&plan.repo) else {
         return;
     };
     let secrets = run::secret_values(&repo).unwrap_or_default();
-    let line = shipcheck::record::line(&repo, plan, entry, record, logs, &secrets);
-    shipcheck::record::keep(&repo, &line);
+    let line = record::line(&repo, plan, entry, record, logs, &secrets);
+    record::keep(&repo, &line);
 
-    if share {
-        shipcheck::record::share(plan, &repo, &line);
+    if upload == Upload::On {
+        record::share(plan, &repo, &line);
     }
 }
 
@@ -1558,11 +1636,9 @@ fn detached(
     cwd: &Path,
     plan: &run::Plan,
     args: &[String],
-    json: bool,
+    format: Format,
     say: &dyn Fn(&str),
 ) -> Result<ExitCode, String> {
-    use std::os::unix::process::CommandExt;
-
     let id = queue::id(&plan.key);
     let tree = &plan.tree[..12];
     let dir = run::home().join("async");
@@ -1616,7 +1692,7 @@ fn detached(
         "run {id} of tree {tree}: {at}, `shipcheck wait {id}` waits for its result"
     ));
 
-    if json {
+    if format == Format::Json {
         let mut state = state;
         state["tree"] = plan.tree.clone().into();
         state["log"] = (!attached && !stored)
@@ -1631,13 +1707,20 @@ fn detached(
 /// How often a run that is not at a terminal says where it stands
 const HEARTBEAT: Duration = Duration::from_secs(60);
 
+/// Whether a run away from a terminal says where it stands each `HEARTBEAT`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heartbeat {
+    On,
+    Off,
+}
+
 /**
  * Runs `run` while a thread shows where it stands: the live line at a terminal, and otherwise one
- * line each `HEARTBEAT` when `heartbeat` is on. It reads the run's own row of the machine's queue
+ * line each `HEARTBEAT` with `Heartbeat::On`. It reads the run's own row of the machine's queue
  **/
 fn progress<T>(
     live: &Live,
-    heartbeat: bool,
+    heartbeat: Heartbeat,
     mine: &(dyn Fn(&serde_json::Value) -> bool + Sync),
     run: impl FnOnce() -> T,
 ) -> T {
@@ -1656,7 +1739,7 @@ fn progress<T>(
                 std::thread::sleep(Duration::from_millis(100));
                 let elapsed = started.elapsed();
 
-                if live.terminal {
+                if live.screen == Screen::Terminal {
                     // The queue is read once a second, the spinner turns ten times
                     if frame % 10 == 0 {
                         at = standing(elapsed.as_secs());
@@ -1664,7 +1747,9 @@ fn progress<T>(
 
                     live.show(frame, &at);
                     frame += 1;
-                } else if heartbeat && elapsed.as_secs() / HEARTBEAT.as_secs() > beats {
+                } else if heartbeat == Heartbeat::On
+                    && elapsed.as_secs() / HEARTBEAT.as_secs() > beats
+                {
                     beats = elapsed.as_secs() / HEARTBEAT.as_secs();
                     live.line(&standing(elapsed.as_secs()));
                 }
@@ -1684,8 +1769,8 @@ fn typical_times() -> impl FnMut(&str) -> Option<u64> {
 
     move |repo: &str| {
         *known.entry(repo.to_string()).or_insert_with(|| {
-            let runs = shipcheck::record::runs(&run::home(), repo, usize::MAX);
-            shipcheck::record::typical(&runs).map(|t| t.median_s)
+            let runs = record::runs(&run::home(), repo, usize::MAX);
+            record::typical(&runs).map(|t| t.median_s)
         })
     }
 }
@@ -1694,39 +1779,51 @@ fn typical_times() -> impl FnMut(&str) -> Option<u64> {
 /// without a full run in this repository's records
 fn estimate(plan: &run::Plan) -> (String, Option<serde_json::Value>) {
     let runs = run::repo_id(&plan.repo)
-        .map(|repo| shipcheck::record::runs(&run::home(), &repo, usize::MAX))
-        .unwrap_or_default();
-    let Some(typical) = shipcheck::record::typical(&runs) else {
+        .map_or_default(|repo| record::runs(&run::home(), &repo, usize::MAX));
+    let Some(typical) = record::typical(&runs) else {
         return (
             "estimate: none yet, this machine has no full run of this repository on record".into(),
             None,
         );
     };
-    let mut rows = shipcheck::queue::list(&run::home().join("runners"), run::unix_now());
-    let cli = std::env::var_os("SHIPCHECK_TRIGGER").is_none();
-    let wait = shipcheck::queue::forecast(&mut rows, run::max_runs(), cli, &mut typical_times());
+    let mut rows = queue::list(&run::home().join("runners"), run::unix_now());
+    let arrival = if std::env::var_os("SHIPCHECK_TRIGGER").is_none() {
+        Arrival::Cli
+    } else {
+        Arrival::Background
+    };
+    let wait = queue::forecast(&mut rows, run::max_runs(), arrival, &mut typical_times());
     let mut numbers = serde_json::json!(typical);
     numbers["queue"] = serde_json::json!(wait);
 
-    (
-        shipcheck::queue::estimate_line(&typical, &wait),
-        Some(numbers),
-    )
+    (queue::estimate_line(&typical, &wait), Some(numbers))
 }
 
-fn report(entry: &run::Entry, snapshot: Option<&str>, json: bool, partial: bool) -> ExitCode {
-    report_with(entry, snapshot, json, partial, None)
+/// How a command prints its result
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Json,
+    Text,
+}
+
+fn report(
+    entry: &run::Entry,
+    snapshot: Option<&str>,
+    format: Format,
+    coverage: Coverage,
+) -> ExitCode {
+    report_with(entry, snapshot, format, coverage, None)
 }
 
 /// [`report`] with the estimate the run printed at its start, for `--json`
 fn report_with(
     entry: &run::Entry,
     snapshot: Option<&str>,
-    json: bool,
-    partial: bool,
+    format: Format,
+    coverage: Coverage,
     estimate: Option<serde_json::Value>,
 ) -> ExitCode {
-    let logs = if partial {
+    let logs = if coverage == Coverage::Partial {
         run::partial_log_dir(&entry.key)
     } else {
         run::log_dir(&entry.key)
@@ -1734,8 +1831,8 @@ fn report_with(
     let workflows = report::workflows(entry, &logs);
     let tested = snapshot.map_or(entry.sha.as_str(), |w| w.trim_start_matches("the "));
 
-    if json {
-        let mut result = report::json(entry, tested, &workflows, partial);
+    if format == Format::Json {
+        let mut result = report::json(entry, tested, &workflows, coverage);
         result["estimate"] = estimate.into();
         println!("{result}");
     } else {
@@ -1870,8 +1967,13 @@ mod tests {
     fn what_shipcheck_passes_itself_parses() {
         let sha = "0".repeat(40);
 
-        for (post, home_ok) in [(false, false), (true, false), (false, true), (true, true)] {
-            let args = background::run_args(&sha, "origin/main", "pr:1", post, home_ok);
+        for (post, moved) in [
+            (Posting::Off, MovedHome::Refused),
+            (Posting::On, MovedHome::Refused),
+            (Posting::Off, MovedHome::Allowed),
+            (Posting::On, MovedHome::Allowed),
+        ] {
+            let args = background::run_args(&sha, "origin/main", "pr:1", post, moved);
             let call: Vec<&str> = args.iter().map(String::as_str).collect();
             assert!(
                 parses(&call),

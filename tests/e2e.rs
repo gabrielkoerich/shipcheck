@@ -1,5 +1,10 @@
+//! The act end-to-end test: run, cache and isolate a job on the working copy
+
 mod common;
 
+use shipcheck::cache;
+use shipcheck::check;
+use shipcheck::secret;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -23,7 +28,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -56,6 +61,10 @@ jobs:
 
 #[test]
 #[ignore = "needs act and Docker"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end story, each step builds on the last"
+)]
 fn runs_caches_and_tests_the_working_copy() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary that reads or writes the environment
@@ -63,6 +72,7 @@ fn runs_caches_and_tests_the_working_copy() {
     // A hook finds shipcheck on PATH, which must be this build and never the installed one
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_shipcheck")).parent().unwrap();
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
+    // SAFETY: the test sets PATH before it starts any thread
     unsafe { std::env::set_var("PATH", &path) };
     // Declared after `tmp`, so it drops first and removes the volumes while the home still exists
     let _volumes = common::CleanOnDrop::new(&tmp.path().join("home"));
@@ -580,7 +590,7 @@ fn runs_caches_and_tests_the_working_copy() {
             "https://u:host-secret@example.com",
         ],
     );
-    let own_hash = shipcheck::cache::hex(&sha2::Sha256::digest(b"own-canary-5d1e"));
+    let own_hash = cache::hex(&sha2::Sha256::digest(b"own-canary-5d1e"));
     // A listener on the host's loopback, and host files a job's checkout links to
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -637,12 +647,19 @@ fn runs_caches_and_tests_the_working_copy() {
     // SAFETY: this is the only test in this binary that reads or writes the environment
     unsafe {
         std::env::set_var("GITHUB_TOKEN", "host-token");
+    }
+    // SAFETY: as above
+    unsafe {
         std::env::set_var("HOST_CANARY", "host-canary");
     }
     let plan = run::plan(&work, "main", "origin/main").unwrap();
     let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
+    // SAFETY: as above
     unsafe {
         std::env::remove_var("GITHUB_TOKEN");
+    }
+    // SAFETY: as above
+    unsafe {
         std::env::remove_var("HOST_CANARY");
     }
     assert!(
@@ -681,7 +698,7 @@ fn runs_caches_and_tests_the_working_copy() {
     // Log tails posted to the check never carry a value of the secrets file
     let mut failed = entry;
     failed.workflows[0].passed = false;
-    let tail = shipcheck::check::failure_text(
+    let tail = check::failure_text(
         &failed,
         &run::log_dir(&plan.key),
         &run::secret_values(&id).unwrap(),
@@ -690,7 +707,7 @@ fn runs_caches_and_tests_the_working_copy() {
     assert!(!log.contains("own-canary") && !tail.contains("own-canary"));
     // `.cargo/config.toml` keeps the secrets file a file, out of the login keychain
     assert!(own.exists());
-    shipcheck::secret::remove(&own).unwrap();
+    secret::remove(&own).unwrap();
     // `shipcheck logs` hands no control character from a job to the terminal
     let logs = Command::new(bin)
         .args(["logs", "main"])
@@ -1212,7 +1229,7 @@ fn status_names_the_result_for_the_working_copy_and_the_index() {
     fs::write(work.join("untracked.txt"), "left out").unwrap();
 
     // A passing result for the index's tree, as a `run --staged` leaves it
-    let staged = run::snapshot(&work, true).unwrap().unwrap();
+    let staged = run::snapshot(&work, run::Tree::Staged).unwrap().unwrap();
     let plan = run::plan(&work, &staged, "origin/main").unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(home.join("cache")).unwrap();

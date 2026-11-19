@@ -1,11 +1,28 @@
+use crate::agents;
+use crate::check;
+use crate::config;
+use crate::daemon;
+use crate::run;
+use crate::run::Trial;
+use crate::runner;
+#[cfg(not(test))]
+use crate::runner::Runner;
+use crate::runner::host;
+use crate::setup;
+use crate::tabs;
+use crate::workflow;
+use crate::workflow::Job;
+use cliclack::log;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::config::{RepoConfig, RunnerKind};
-use crate::setup;
 use crate::ui::Style;
 
 /// The hosted App's slug and ID
@@ -20,7 +37,7 @@ const PROTECTION_DOCS: &str = "https://shipcheck.run/docs/branch-protection/";
 /// The App that posts the checks
 #[derive(Clone, Debug, PartialEq)]
 pub enum App {
-    /// SHIPCHECK_APP_ID names an App of the person's own
+    /// `SHIPCHECK_APP_ID` names an App of the person's own
     Own(String),
     Hosted,
     /// The hosted App is not public yet
@@ -28,7 +45,7 @@ pub enum App {
 }
 
 impl App {
-    /// SHIPCHECK_APP_ID, else whether GitHub shows the hosted App
+    /// `SHIPCHECK_APP_ID`, else whether GitHub shows the hosted App
     pub fn find() -> App {
         if let Ok(id) = std::env::var("SHIPCHECK_APP_ID") {
             return App::Own(id);
@@ -59,6 +76,7 @@ fn install_url() -> String {
 }
 
 /// One workflow edit init offers
+#[derive(Debug)]
 pub struct Change {
     pub file: String,
     edited: String,
@@ -71,6 +89,7 @@ pub struct Change {
 }
 
 /// The required checks init can turn on
+#[derive(Debug)]
 pub struct Ruleset {
     app: String,
     pub names: Vec<String>,
@@ -79,6 +98,7 @@ pub struct Ruleset {
 }
 
 /// What `init` would do, read from the repository and the machine, with nothing written
+#[derive(Debug)]
 pub struct Plan {
     pub base: String,
     /// The shipcheck.toml to write and what it holds, None when one exists
@@ -205,7 +225,7 @@ fn plan_with(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            _ => format!("workflows {}", cfg.workflows.join(", ")),
+            RunnerKind::Act => format!("workflows {}", cfg.workflows.join(", ")),
         };
         let acts = cfg.jobs_on(RunnerKind::Act);
 
@@ -361,7 +381,7 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
         };
         let tool = version.split_whitespace().next().unwrap_or_default();
         r.done(
-            false,
+            Mark::Warn,
             &format!("`{version}` does not run, so shipcheck.toml leaves it out of versions"),
         );
 
@@ -372,7 +392,7 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
 
             if starts && !tried.contains_key(name) {
                 r.done(
-                    false,
+                    Mark::Warn,
                     &format!("{name} ... failed, `{version}` does not run"),
                 );
                 tried.insert(
@@ -410,7 +430,7 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
         ));
         first = false;
         let mut round = RepoConfig::parse(text)?;
-        round.host.versions = versions.clone();
+        round.host.versions.clone_from(&versions);
         round.host.checks = todo
             .iter()
             .map(|(n, c)| (n.clone(), c[0].clone().into()))
@@ -430,10 +450,10 @@ fn try_checks(root: &Path, text: &str, r: &mut dyn Report) -> Result<(Tried, Vec
                 } else {
                     ", with color off"
                 };
-                r.done(true, &format!("{name} ... passed {}s{how}", t.secs));
+                r.done(Mark::Ok, &format!("{name} ... passed {}s{how}", t.secs));
                 tried.insert(name, Ok(command));
             } else if commands.is_empty() || deterministic(&t.log) {
-                r.done(false, &format!("{name} ... failed {}s", t.secs));
+                r.done(Mark::Warn, &format!("{name} ... failed {}s", t.secs));
                 tried.insert(name, Err(reason(&t.log)));
             } else {
                 next.push((name, commands));
@@ -451,19 +471,20 @@ fn plural(n: usize, what: &str) -> String {
 }
 
 #[cfg(not(test))]
-fn run_trial(root: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, crate::run::Trial>, String> {
-    crate::run::trial(root, cfg, &mut |_| {})
+fn run_trial(root: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, Trial>, String> {
+    run::trial(root, cfg, &mut |_| {})
 }
 
 // Unit tests start no jail, every check passes. tests/init_tries.rs runs the real ones
 #[cfg(test)]
-fn run_trial(_: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, crate::run::Trial>, String> {
+#[expect(clippy::unnecessary_wraps, reason = "the signature of the real trial")]
+fn run_trial(_: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, Trial>, String> {
     Ok(cfg
         .host
         .checks
         .into_iter()
         .map(|(name, command)| {
-            let t = crate::run::Trial {
+            let t = Trial {
                 passed: !command.contains("fails-in-trial"),
                 log: String::new(),
                 secs: 0,
@@ -475,20 +496,17 @@ fn run_trial(_: &Path, cfg: RepoConfig) -> Result<BTreeMap<String, crate::run::T
 
 /// Whether one `versions` command answers in the sandbox, as every plan runs it
 #[cfg(not(test))]
-fn probe(root: &Path, host: &crate::config::Host, version: &str) -> Result<(), String> {
-    use crate::runner::Runner;
-    let host = crate::config::Host {
+fn probe(root: &Path, host: &config::Host, version: &str) -> Result<(), String> {
+    let host = config::Host {
         versions: vec![version.to_string()],
         ..host.clone()
     };
-    crate::runner::host::Host::new(host, root)
-        .identity()
-        .map(|_| ())
+    host::Host::new(host, root).identity().map(|_| ())
 }
 
 // A toolchain named `missing` is one this machine lacks
 #[cfg(test)]
-fn probe(_: &Path, _: &crate::config::Host, version: &str) -> Result<(), String> {
+fn probe(_: &Path, _: &config::Host, version: &str) -> Result<(), String> {
     if version.contains("+missing") {
         return Err("error: toolchain 'missing' is not installed".into());
     }
@@ -592,11 +610,11 @@ fn reason(log: &str) -> String {
     let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = lines[lines.len().saturating_sub(6)..]
         .iter()
-        .map(|l| format!("\n      {}", l.trim_end()))
-        .collect::<String>();
-    let fix = missing_tool(log)
-        .map(|t| format!("\n    fix: install {t}"))
-        .unwrap_or_default();
+        .fold(String::new(), |mut s, l| {
+            let _ = write!(s, "\n      {}", l.trim_end());
+            s
+        });
+    let fix = missing_tool(log).map_or_default(|t| format!("\n    fix: install {t}"));
     format!("failed when init tried it:{tail}{fix}")
 }
 
@@ -607,7 +625,7 @@ fn kept(root: &Path, failed: &[(String, String, String)]) -> Vec<setup::Kept> {
     for (file, job, why) in failed {
         let source =
             fs::read_to_string(root.join(".github/workflows").join(file)).unwrap_or_default();
-        let checks = crate::workflow::job_runs(&source)
+        let checks = workflow::job_runs(&source)
             .into_iter()
             .find(|j| j.id == *job)
             .and_then(|j| j.check_names);
@@ -775,20 +793,37 @@ impl Plan {
         }
     }
 
-    pub fn set(&self, step: Step, a: &mut Answers, yes: bool) {
+    /// Takes the step's change
+    pub fn choose(&self, step: Step, a: &mut Answers) {
+        *Self::slot(step, a) = true;
+    }
+
+    /// Leaves the step's change out
+    pub fn skip(&self, step: Step, a: &mut Answers) {
+        *Self::slot(step, a) = false;
+    }
+
+    fn slot(step: Step, a: &mut Answers) -> &mut bool {
         match step {
-            Step::Config => a.config = yes,
-            Step::Workflow(i) => a.workflows[i] = yes,
-            Step::App => a.open_app = yes,
-            Step::Ruleset => a.ruleset = yes,
+            Step::Config => &mut a.config,
+            Step::Workflow(i) => &mut a.workflows[i],
+            Step::App => &mut a.open_app,
+            Step::Ruleset => &mut a.ruleset,
         }
     }
+}
+
+/// How a line apply reports is marked: done, or one for the person to look at
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    Ok,
+    Warn,
 }
 
 /// Where apply reports: a spinner at a terminal, lines otherwise
 pub trait Report {
     fn start(&mut self, what: &str);
-    fn done(&mut self, ok: bool, line: &str);
+    fn done(&mut self, mark: Mark, line: &str);
 }
 
 /// What `init` does after the repository's files, run by the caller: instructions, hooks, daemon, sign-in
@@ -798,11 +833,15 @@ pub type Finish<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&str)) -> Result<(), Stri
  * Writes the answered plan in order and returns the next steps for the person. Without a
  * shipcheck.toml it stops after the first step, since the rest is for checks the repository lacks
  **/
+#[expect(
+    clippy::too_many_lines,
+    reason = "the steps of init's apply, in the order they run"
+)]
 pub fn apply(
     root: &Path,
     plan: &Plan,
     a: &Answers,
-    finish: Finish,
+    finish: Finish<'_>,
     r: &mut dyn Report,
 ) -> Result<Vec<String>, String> {
     let mut next = Vec::new();
@@ -810,13 +849,16 @@ pub fn apply(
 
     if let Some((text, _)) = &plan.config {
         if !a.config {
-            r.done(false, "no shipcheck.toml written, so init set nothing up");
+            r.done(
+                Mark::Warn,
+                "no shipcheck.toml written, so init set nothing up",
+            );
             return Ok(next);
         }
 
         r.start("writing shipcheck.toml");
-        crate::agents::write_in_repo(root, &root.join("shipcheck.toml"), text)?;
-        r.done(true, "wrote shipcheck.toml");
+        agents::write_in_repo(root, &root.join("shipcheck.toml"), text)?;
+        r.done(Mark::Ok, "wrote shipcheck.toml");
         wrote = true;
     }
 
@@ -828,12 +870,12 @@ pub fn apply(
         let path = format!(".github/workflows/{}", w.file);
         r.start(&format!("writing {path}"));
 
-        match crate::agents::write_in_repo(root, &root.join(&path), &w.edited) {
+        match agents::write_in_repo(root, &root.join(&path), &w.edited) {
             Ok(()) => {
-                r.done(true, &format!("wrote {path}"));
+                r.done(Mark::Ok, &format!("wrote {path}"));
                 wrote = true;
             }
-            Err(e) => r.done(false, &e),
+            Err(e) => r.done(Mark::Warn, &e),
         }
     }
 
@@ -842,7 +884,7 @@ pub fn apply(
             let attention = line.starts_with("not ")
                 || line.starts_with("could not")
                 || line.contains(" not installed");
-            r.done(!attention, line);
+            r.done(if attention { Mark::Warn } else { Mark::Ok }, line);
         }
     })?;
 
@@ -853,17 +895,17 @@ pub fn apply(
             } else {
                 "xdg-open"
             };
-            let opened = Command::new(opener)
+            let launched = Command::new(opener)
                 .arg(install_url())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .is_ok_and(|s| s.success());
             r.done(
-                opened,
+                if launched { Mark::Ok } else { Mark::Warn },
                 &format!(
                     "{} the App install page: {}",
-                    if opened { "opened" } else { "could not open" },
+                    if launched { "opened" } else { "could not open" },
                     install_url()
                 ),
             );
@@ -891,11 +933,11 @@ pub fn apply(
 
             match create_ruleset(root, rule) {
                 Ok(()) => r.done(
-                    true,
+                    Mark::Ok,
                     "protected the default branch with the ruleset `shipcheck`",
                 ),
                 Err(e) => {
-                    r.done(false, &e);
+                    r.done(Mark::Warn, &e);
                     next.push(format!(
                         "Protect the default branch by hand: {PROTECTION_DOCS}"
                     ));
@@ -930,21 +972,33 @@ pub struct Lines<'a> {
     pub style: Style,
 }
 
+impl fmt::Debug for Lines<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lines")
+            .field("style", &self.style)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Report for Lines<'_> {
     fn start(&mut self, _: &str) {}
 
-    fn done(&mut self, ok: bool, line: &str) {
-        let mark = if ok {
-            self.style.ok()
-        } else {
-            self.style.warn()
+    fn done(&mut self, mark: Mark, line: &str) {
+        let mark = match mark {
+            Mark::Ok => self.style.ok(),
+            Mark::Warn => self.style.warn(),
         };
         let _ = writeln!(self.out, "  {mark} {line}");
     }
 }
 
 /// `init --yes`: no questions, the plan in plain text and the recommended choices applied
-pub fn plain(root: &Path, app: App, out: &mut dyn Write, finish: Finish) -> Result<bool, String> {
+pub fn plain(
+    root: &Path,
+    app: App,
+    out: &mut dyn Write,
+    finish: Finish<'_>,
+) -> Result<bool, String> {
     let s = Style::stdout();
     let Some((plan, a)) = show(
         root,
@@ -971,7 +1025,7 @@ extern "C" fn forward(sig: libc::c_int) {
     let pid = PREVIEW_CHILD.load(std::sync::atomic::Ordering::SeqCst);
 
     if pid > 0 {
-        // Safe: kill only sends a signal, to the preview's own group
+        // SAFETY: kill only sends a signal, to the preview's own group
         unsafe {
             libc::kill(-pid, sig);
         }
@@ -986,10 +1040,12 @@ extern "C" fn forward(sig: libc::c_int) {
  * ended. The exit code is the preview's, or 128 plus the signal that ended it
  **/
 pub fn preview_apart(root: &Path) -> Result<u8, String> {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-
     let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let had = worktrees(root).is_some_and(|w| w.exists());
+    let folder = if worktrees(root).is_some_and(|w| w.exists()) {
+        Folder::Existed
+    } else {
+        Folder::New
+    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // Its own group, so a signal also reaches the git its trial runs, which writes into the scratch home
     let mut child = std::process::Command::new(exe)
@@ -1001,20 +1057,23 @@ pub fn preview_apart(root: &Path) -> Result<u8, String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("shipcheck: {e}"))?;
-    PREVIEW_CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    let pid = i32::try_from(child.id()).expect("a pid fits an i32");
+    PREVIEW_CHILD.store(pid, std::sync::atomic::Ordering::SeqCst);
     let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-    // Safe: the handler calls only kill and reads an atomic
     for sig in signals {
+        #[expect(clippy::as_conversions, reason = "libc takes a handler as an integer")]
+        let handler = forward as *const () as libc::sighandler_t;
+        // SAFETY: the handler calls only kill and reads an atomic
         unsafe {
-            libc::signal(sig, forward as *const () as libc::sighandler_t);
+            libc::signal(sig, handler);
         }
     }
 
     let status = child.wait();
 
     for sig in signals {
-        // Safe: back to the default action
+        // SAFETY: back to the default action
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
         }
@@ -1022,25 +1081,27 @@ pub fn preview_apart(root: &Path) -> Result<u8, String> {
 
     PREVIEW_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
     stop_group(child.id());
-    forget_worktrees(root, scratch.path(), had);
+    forget_worktrees(root, scratch.path(), folder);
     drop(scratch);
     let status = status.map_err(|e| e.to_string())?;
     Ok(match (status.code(), status.signal()) {
-        (Some(code), _) => code.clamp(0, 255) as u8,
-        (None, Some(sig)) => (128 + sig).clamp(0, 255) as u8,
+        (Some(code), _) => u8::try_from(code.clamp(0, 255)).unwrap_or(1),
+        (None, Some(sig)) => u8::try_from((128 + sig).clamp(0, 255)).unwrap_or(1),
         _ => 1,
     })
 }
 
 /// Ends what is left of process group `pgid` and waits until it is empty, at most 10 seconds
 fn stop_group(pgid: u32) {
-    crate::runner::signal_group(pgid, libc::SIGKILL);
+    runner::signal_group(pgid, libc::SIGKILL);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
-    // Safe: signal 0 only asks whether the group still has a process
-    while unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0
-        && std::time::Instant::now() < deadline
-    {
+    let Ok(group) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+
+    // SAFETY: signal 0 only asks whether the group still has a process
+    while unsafe { libc::kill(-group, 0) } == 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
@@ -1073,8 +1134,15 @@ fn worktrees(root: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).join("worktrees"))
 }
 
+/// Whether the repository's worktrees folder was there before the trial
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Folder {
+    Existed,
+    New,
+}
+
 /// Removes the repository's git worktree entries for checkouts under `dir`, and no other, and the folder when it had none
-fn forget_worktrees(root: &Path, dir: &Path, had: bool) {
+fn forget_worktrees(root: &Path, dir: &Path, folder: Folder) {
     let Some(worktrees) = worktrees(root) else {
         return;
     };
@@ -1091,7 +1159,7 @@ fn forget_worktrees(root: &Path, dir: &Path, had: bool) {
     }
 
     // remove_dir removes only an empty folder
-    if !had {
+    if folder == Folder::New {
         let _ = fs::remove_dir(&worktrees);
     }
 }
@@ -1166,17 +1234,16 @@ impl Report for Spinners {
         self.spinner = Some(spinner);
     }
 
-    fn done(&mut self, ok: bool, line: &str) {
+    fn done(&mut self, mark: Mark, line: &str) {
         if let Some(spinner) = self.spinner.take() {
             spinner.clear();
         }
 
-        let mark = if ok {
-            self.style.ok()
-        } else {
-            self.style.warn()
+        let mark = match mark {
+            Mark::Ok => self.style.ok(),
+            Mark::Warn => self.style.warn(),
         };
-        let _ = cliclack::log::remark(format!("{mark} {line}"));
+        let _ = log::remark(format!("{mark} {line}"));
     }
 }
 
@@ -1185,10 +1252,10 @@ const QUIT: &str =
     "Quit, nothing written to the repository. Trial clones stay in shipcheck's cache";
 
 /**
- * The terminal wizard: QuickStart or every step, a review that can reopen a step, then apply.
+ * The terminal wizard: `QuickStart` or every step, a review that can reopen a step, then apply.
  * Nothing is written before apply, and Ctrl-C or quit leaves everything as it was
  **/
-pub fn tui(root: &Path, find: fn() -> App, finish: Finish) -> Result<bool, String> {
+pub fn tui(root: &Path, find: fn() -> App, finish: Finish<'_>) -> Result<bool, String> {
     match wizard(root, find, finish) {
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
             let _ = cliclack::outro_cancel(QUIT);
@@ -1199,10 +1266,14 @@ pub fn tui(root: &Path, find: fn() -> App, finish: Finish) -> Result<bool, Strin
     }
 }
 
-fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Result<bool, String>> {
+fn wizard(
+    root: &Path,
+    find: fn() -> App,
+    finish: Finish<'_>,
+) -> std::io::Result<Result<bool, String>> {
     let s = Style::stderr();
     cliclack::intro(s.bold(" shipcheck init "))?;
-    cliclack::log::remark(s.dim(
+    log::remark(s.dim(
         "Sets this repository up so its PRs get their checks from this machine. Nothing changes until you apply",
     ))?;
     let mut report = Spinners {
@@ -1230,7 +1301,7 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
     }
 
     // Every choice is made in the tabs, and nothing is written before Apply on the Review tab
-    let Some((plan, a)) = crate::tabs::run(root, plan)? else {
+    let Some((plan, a)) = tabs::run(root, plan)? else {
         cliclack::outro_cancel(QUIT)?;
         return Ok(Ok(false));
     };
@@ -1253,7 +1324,7 @@ fn wizard(root: &Path, find: fn() -> App, finish: Finish) -> std::io::Result<Res
 
 /// The base the daemon, the hooks and `shipcheck run` use, as a branch name. Offline it refuses to guess
 fn base_branch(root: &Path) -> Result<String, String> {
-    let base = crate::daemon::known_base(root).ok_or(
+    let base = daemon::known_base(root).ok_or(
         "origin did not say its default branch, so init cannot tell which branch to gate. Run `shipcheck init` again when online",
     )?;
     Ok(base.strip_prefix("origin/").unwrap_or(&base).to_string())
@@ -1271,25 +1342,16 @@ struct Cover {
  * host mode a job is covered when every command it checks with is a part of some check's command,
  * in the job's directory when it has one. Check names do not count, since a person names them
  **/
-fn coverage(
-    root: &Path,
-    cfg: &RepoConfig,
-    file: &str,
-    jobs: &[crate::workflow::Job],
-) -> Vec<Cover> {
-    let names = crate::run::expected_jobs(cfg, |f| {
+fn coverage(root: &Path, cfg: &RepoConfig, file: &str, jobs: &[Job]) -> Vec<Cover> {
+    let names = run::expected_jobs(cfg, |f| {
         fs::read_to_string(root.join(".github/workflows").join(f)).ok()
     })
-    .map(|jobs| crate::check::job_names(&jobs))
-    .unwrap_or_default();
+    .map_or_default(|jobs| check::job_names(&jobs));
     let name = |f: &str, job: &str| {
         names
             .iter()
             .find(|(nf, nj, _)| nf == f && nj == job)
-            .map_or_else(
-                || format!("{}/{job}", crate::check::NAME),
-                |(_, _, n)| n.clone(),
-            )
+            .map_or_else(|| format!("{}/{job}", check::NAME), |(_, _, n)| n.clone())
     };
 
     // act runs it whole, as a listed workflow's job or one `[jobs]` names
@@ -1324,7 +1386,7 @@ fn coverage(
         .iter()
         .map(|(key, command)| {
             (
-                name(crate::runner::host::HOST, key),
+                name(host::HOST, key),
                 &command.run,
                 setup::commands(command),
             )
@@ -1398,7 +1460,7 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
         None => kept(root, &plan.failed),
     };
     // A job the config runs with act is shipcheck's, whatever this machine could run
-    let on_act = crate::run::expected_jobs(cfg, |f| {
+    let on_act = run::expected_jobs(cfg, |f| {
         fs::read_to_string(root.join(".github/workflows").join(f)).ok()
     })
     .unwrap_or_default();
@@ -1407,7 +1469,7 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
     for file in setup::workflow_files(root).unwrap_or_default() {
         let path = root.join(".github/workflows").join(&file);
         let source = fs::read_to_string(&path).map_err(|e| format!("{file}: {e}"))?;
-        let jobs = crate::workflow::job_runs(&source);
+        let jobs = workflow::job_runs(&source);
         let covers = coverage(root, cfg, &file, &jobs);
         let staying: Vec<&str> = kept
             .iter()
@@ -1416,7 +1478,7 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
             .map(|k| k.job.as_str())
             .collect();
 
-        if !crate::workflow::runs_for_branches(&source) {
+        if !workflow::runs_for_branches(&source) {
             continue;
         }
 
@@ -1441,7 +1503,7 @@ fn workflows(root: &Path, cfg: &RepoConfig, plan: &mut Plan) -> Result<(), Strin
 fn gate(
     file: &str,
     source: &str,
-    jobs: &[crate::workflow::Job],
+    jobs: &[Job],
     covers: &[Cover],
     staying: &[&str],
     base: &str,
@@ -1455,7 +1517,7 @@ fn gate(
         .collect();
 
     // A gated job still runs on the base branch, so a job that runs only there may need it
-    let base_only = crate::setup::base_only(jobs);
+    let base_only = setup::base_only(jobs);
 
     // Until no job left on GitHub for PRs needs a gated one
     while let Some(need) = jobs
@@ -1473,7 +1535,7 @@ fn gate(
         .map(|j| j.id.clone())
         .filter(|id| !ungated.contains(id))
         .collect();
-    let stays: Vec<&crate::workflow::Job> = jobs
+    let stays: Vec<&Job> = jobs
         .iter()
         .filter(|j| ungated.contains(&j.id) && !base_only.contains(&j.id))
         .collect();
@@ -1488,7 +1550,7 @@ fn gate(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let on_prs = crate::workflow::runs_on_prs(source);
+    let on_prs = workflow::runs_on_prs(source);
 
     if gated.is_empty() {
         plan.notes.push(if on_prs {
@@ -1505,7 +1567,7 @@ fn gate(
     }
 
     // init is init: a workflow an earlier init gated is the person's now, and doctor reports drift
-    let before = crate::workflow::gated_jobs(source);
+    let before = workflow::gated_jobs(source);
 
     if !before.is_empty() {
         plan.notes.push(format!(
@@ -1515,11 +1577,11 @@ fn gate(
         return;
     }
 
-    let Some(edited) = crate::workflow::gate_jobs(source, &gated, base) else {
+    let Some(edited) = workflow::gate_jobs(source, &gated, base) else {
         plan.notes.push(format!(
             "{file}: a job has a form shipcheck does not edit. To run {} on GitHub only where shipcheck does not, give each `if: {gate}` by hand, or `if: (<its own>) && {gate}`",
             gated.join(", "),
-            gate = crate::workflow::gate_condition(source, base)
+            gate = workflow::gate_condition(source, base)
         ));
         return;
     };
@@ -1563,10 +1625,10 @@ fn gate(
 
 /// Where else GitHub keeps running the gated jobs, since shipcheck runs only PRs into the base
 fn elsewhere(source: &str, base: &str) -> String {
-    let (pushes, prs) = crate::workflow::other_branches(source, base);
+    let (pushes, prs) = workflow::other_branches(source, base);
     let (kept, dropped): (Vec<String>, Vec<String>) = pushes
         .into_iter()
-        .partition(|p| crate::workflow::push_condition(p).is_some());
+        .partition(|p| workflow::push_condition(p).is_some());
     let mut more: Vec<String> = Vec::new();
 
     if !kept.is_empty() {
@@ -1648,10 +1710,10 @@ pub fn diff(file: &str, old: &str, new: &str) -> String {
 /// The job check names of a shipcheck.toml, the checks `init` requires
 pub fn job_checks(root: &Path, text: &str) -> Result<Vec<String>, String> {
     let cfg = RepoConfig::parse(text)?;
-    let jobs = crate::run::expected_jobs(&cfg, |file| {
+    let jobs = run::expected_jobs(&cfg, |file| {
         fs::read_to_string(root.join(".github/workflows").join(file)).ok()
     })?;
-    Ok(crate::check::job_names(&jobs)
+    Ok(check::job_names(&jobs)
         .into_iter()
         .map(|(_, _, name)| name)
         .collect())
@@ -1683,7 +1745,7 @@ fn ruleset_plan(
             fs::read_to_string(root.join(".github/workflows").join(file)).unwrap_or_default();
         let now: Vec<String> = required
             .iter()
-            .filter(|c| crate::workflow::may_name(&source, job, c))
+            .filter(|c| workflow::may_name(&source, job, c))
             .cloned()
             .collect();
 
@@ -1806,7 +1868,7 @@ pub fn ruleset(app_id: &str, names: &[String], github: &[String]) -> serde_json:
 
 /// The repository's page for a new ruleset, else the docs that describe it
 fn rules_url(root: &Path) -> String {
-    crate::run::repo_id(root).map_or_else(
+    run::repo_id(root).map_or_else(
         |_| PROTECTION_DOCS.to_string(),
         |id| format!("https://github.com/{id}/settings/rules/new?target=branch"),
     )
@@ -1867,6 +1929,9 @@ fn create_ruleset(root: &Path, rule: &Ruleset) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run;
+    use crate::setup::tests;
+    use crate::workflow;
 
     fn repo(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1886,12 +1951,19 @@ mod tests {
     impl Report for Said {
         fn start(&mut self, _: &str) {}
 
-        fn done(&mut self, ok: bool, line: &str) {
-            self.0
-                .push(format!("{} {line}", if ok { "ok" } else { "!" }));
+        fn done(&mut self, mark: Mark, line: &str) {
+            let mark = match mark {
+                Mark::Ok => "ok",
+                Mark::Warn => "!",
+            };
+            self.0.push(format!("{mark} {line}"));
         }
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the signature apply takes for its finish step"
+    )]
     fn finish_nothing(say: &mut dyn FnMut(&str)) -> Result<(), String> {
         say("wrote hooks");
         Ok(())
@@ -1908,7 +1980,7 @@ mod tests {
     const OWN_E2E: &str = include_str!("../tests/fixtures/own/e2e.yml");
     const OWN_LEAKS: &str = include_str!("../tests/fixtures/own/leaks.yml");
 
-    /// OWN_CI without the step that sets AppArmor up with `sudo`, which keeps the test job on GitHub
+    /// `OWN_CI` without the step that sets `AppArmor` up with `sudo`, which keeps the test job on GitHub
     fn own_ci() -> String {
         let start = OWN_CI.find("      - timeout-minutes: 5").unwrap();
         let end = OWN_CI.find("      - run: cargo test").unwrap();
@@ -1952,7 +2024,10 @@ mod tests {
         assert!(deterministic("open /dev/ptmx: Operation not permitted"));
         assert!(!deterministic("error: 2 tests failed"));
         assert_eq!(missing_tool("error: 2 tests failed"), None);
-        let log = (1..=20).map(|n| format!("line {n}\n")).collect::<String>();
+        let log = (1..=20).fold(String::new(), |mut s, n| {
+            let _ = writeln!(s, "line {n}");
+            s
+        });
         let why = reason(&log);
         assert!(why.starts_with("failed when init tried it:"), "{why}");
         assert!(why.contains("line 15") && why.contains("line 20") && !why.contains("line 14"));
@@ -2112,15 +2187,15 @@ mod tests {
         assert_eq!(a.workflows, [true, true]);
 
         // Changing step 2, lint.yml, and back again, as the review's "Change a step" does
-        plan.set(Step::Workflow(1), &mut a, false);
+        plan.skip(Step::Workflow(1), &mut a);
         assert!(
             plan.review(&a)[2].contains("PRs and main: GitHub, as now"),
             "{:?}",
             plan.review(&a)
         );
-        plan.set(Step::Workflow(1), &mut a, true);
+        plan.choose(Step::Workflow(1), &mut a);
         assert!(plan.review(&a)[2].contains("PRs: shipcheck/clippy, main and forks: GitHub"));
-        plan.set(Step::Workflow(1), &mut a, false);
+        plan.skip(Step::Workflow(1), &mut a);
 
         let mut said = Said::default();
         let next = apply(dir.path(), &plan, &a, &mut finish_nothing, &mut said).unwrap();
@@ -2209,7 +2284,7 @@ mod tests {
 
     #[test]
     fn a_job_that_runs_only_on_main_keeps_no_pr_job_ungated() {
-        let ci = crate::setup::tests::CI_WITH_RELEASE;
+        let ci = tests::CI_WITH_RELEASE;
         let config = "runner = \"host\"\n[host.checks]\ntest = \"cargo test\"\n";
         let dir = repo(&[(".github/workflows/ci.yml", ci), ("shipcheck.toml", config)]);
         let plan =
@@ -2304,7 +2379,7 @@ mod tests {
         let change = &plan.workflows[0];
         assert_eq!(
             Some(change.edited.clone()),
-            crate::workflow::gate_jobs(lint, &["ruby".to_string()], "main")
+            workflow::gate_jobs(lint, &["ruby".to_string()], "main")
         );
         // yaml stays on GitHub for PRs, so the ruleset requires its check from GitHub Actions
         assert_eq!(plan.ruleset.unwrap().github, ["yaml"]);
@@ -2427,10 +2502,10 @@ mod tests {
         ]);
         let plan =
             super::plan_at(dir.path(), "main", App::NotPublic, &mut Said::default()).unwrap();
-        let gate = crate::workflow::gate_condition(flow, "main");
+        let gate = workflow::gate_condition(flow, "main");
         let note = plan.notes.iter().find(|n| n.contains("by hand")).unwrap();
         assert!(note.contains(&format!("`if: {gate}`")), "{note}");
-        assert_eq!(crate::workflow::ungate(&gate).as_deref(), Some(""));
+        assert_eq!(workflow::ungate(&gate).as_deref(), Some(""));
     }
 
     #[test]
@@ -2500,7 +2575,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            crate::run::remote_base(dir.path()).as_deref(),
+            run::remote_base(dir.path()).as_deref(),
             Some("origin/master")
         );
         let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
@@ -2509,7 +2584,7 @@ mod tests {
 
         // A remote that does not answer gives no base, never the local origin/HEAD, and init refuses
         git(dir.path(), &["remote", "set-url", "origin", "/nonexistent"]);
-        assert_eq!(crate::run::remote_base(dir.path()), None);
+        assert_eq!(run::remote_base(dir.path()), None);
         assert!(
             base_branch(dir.path())
                 .unwrap_err()
@@ -2573,8 +2648,8 @@ mod tests {
         assert_eq!(
             rule["required_status_checks"],
             serde_json::json!([
-                { "context": "shipcheck/lint", "integration_id": 5400635 },
-                { "context": "shipcheck/test", "integration_id": 5400635 },
+                { "context": "shipcheck/lint", "integration_id": 5_400_635 },
+                { "context": "shipcheck/test", "integration_id": 5_400_635 },
                 { "context": "MINGW64", "integration_id": 15368 }
             ])
         );

@@ -2,8 +2,8 @@ runner = "host"
 on = ["push", "commit"]
 
 [host]
-checks = { fmt = "cargo fmt --check", clippy = "cargo clippy --all-targets -- -D warnings", test-macos = "cargo test", gitleaks = "d=$(mktemp -d \"$HOME/scan.XXXXXX\") && git archive HEAD | tar -x -C \"$d\" && gitleaks dir --redact --no-banner \"$d\"" }
-versions = ["cargo --version", "rustc --version", "gitleaks version"]
+checks = { fmt = "cargo fmt --check", clippy = "cargo clippy --all-targets -- -D warnings", dylint = "DYLINT_RUSTFLAGS=\"-D warnings\" cargo dylint --all -- --all-targets", test-macos = "cargo test", gitleaks = "d=$(mktemp -d \"$HOME/scan.XXXXXX\") && git archive HEAD | tar -x -C \"$d\" && gitleaks dir --redact --no-banner \"$d\"" }
+versions = ["cargo --version", "rustc --version", "cargo dylint --version", "gitleaks version"]
 
 [jobs."ci.yml/test"]
 runner = "act"

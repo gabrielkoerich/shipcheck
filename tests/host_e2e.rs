@@ -1,3 +1,7 @@
+//! Host checks in the jail, on a clone of the tree, without the host's token
+
+use shipcheck::runner::host;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +21,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -40,12 +44,22 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-fn config(cow: bool, canaries: &[&Path]) -> String {
-    let deps = if cow { "test -f" } else { "test ! -e" };
-    let escapes: String = canaries
-        .iter()
-        .map(|c| format!("; touch '{}' 2>/dev/null", c.display()))
-        .collect();
+/// How the job clones come out on this filesystem
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clones {
+    Cow,
+    Plain,
+}
+
+fn config(clones: Clones, canaries: &[&Path]) -> String {
+    let deps = match clones {
+        Clones::Cow => "test -f",
+        Clones::Plain => "test ! -e",
+    };
+    let escapes = canaries.iter().fold(String::new(), |mut s, c| {
+        let _ = write!(s, "; touch '{}' 2>/dev/null", c.display());
+        s
+    });
     format!(
         r#"runner = "host"
 retries = 0
@@ -57,11 +71,18 @@ versions = ["echo tool 1.0"]
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end story, each step builds on the last"
+)]
 fn runs_host_checks_caches_by_tree_and_commits() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary, and it sets the environment before any thread
     unsafe {
         std::env::set_var("SHIPCHECK_HOME", tmp.path().join(".local/state/shipcheck"));
+    }
+    // SAFETY: as above
+    unsafe {
         std::env::set_var("HOST_E2E_TOKEN", "hunter2");
     }
 
@@ -80,13 +101,17 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     git(&work, &["config", "commit.gpgsign", "false"]);
     let home = tmp.path().join(".local/state/shipcheck");
     fs::create_dir_all(&home).unwrap();
-    let cow = git_cow::can_clone(&home, &home);
+    let clones = if git_cow::can_clone(&home, &home) {
+        Clones::Cow
+    } else {
+        Clones::Plain
+    };
     let real_home = run::user_dir().join(format!(".shipcheck-canary-{}", std::process::id()));
     let _canary = RemoveOnDrop(real_home.clone());
     let outside = tmp.path().join("outside");
     fs::write(
         work.join("shipcheck.toml"),
-        config(cow, &[&real_home, &outside]),
+        config(clones, &[&real_home, &outside]),
     )
     .unwrap();
     fs::write(work.join(".gitignore"), "deps/\n").unwrap();
@@ -115,7 +140,7 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     // The sandbox kept the check's writes in its clone. Nested in a host check, the outer jail
     // stands in for it and lets its own temp folder be written, where `outside` is
     assert!(!real_home.exists());
-    assert_eq!(outside.exists(), shipcheck::runner::host::in_a_jail());
+    assert_eq!(outside.exists(), host::in_a_jail());
     assert!(!log().contains("hunter2"));
     // The checks ran in clones, never in the developer's checkout
     assert_eq!(git(&work, &["status", "--porcelain"]), "");
@@ -129,7 +154,7 @@ fn runs_host_checks_caches_by_tree_and_commits() {
 
     // A clone that is not the plan's tree fails every check, and that result is never kept
     let mut wrong = run::plan(&work, "main", "origin/main").unwrap();
-    wrong.tree = same.tree.clone();
+    wrong.tree = same.tree;
     let entry = run::run(&wrong, &mut |l| eprintln!("{l}")).unwrap();
     assert!(!entry.passed);
     assert!(

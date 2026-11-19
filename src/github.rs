@@ -1,4 +1,7 @@
+use crate::run;
+use crate::secret;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +16,15 @@ pub struct App {
     key: EncodingKey,
 }
 
+// The key stays out of every log line
+impl fmt::Debug for App {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("App")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Serialize)]
 struct Claims<'a> {
     iat: u64,
@@ -25,13 +37,13 @@ impl App {
     pub fn from_env() -> Result<Self, String> {
         let id = std::env::var("SHIPCHECK_APP_ID")
             .map_err(|_| "SHIPCHECK_APP_ID is not set".to_string())?;
-        let pem = match std::env::var_os("SHIPCHECK_APP_KEY_FILE").map(PathBuf::from) {
-            Some(path) => std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?,
-            None => {
-                let path = crate::run::home().join("app.pem");
-                crate::secret::read(&path)?
-                    .ok_or_else(|| format!("no App key: put it at {}", path.display()))?
-            }
+        let pem = if let Some(path) = std::env::var_os("SHIPCHECK_APP_KEY_FILE").map(PathBuf::from)
+        {
+            std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?
+        } else {
+            let path = run::home().join("app.pem");
+            secret::read(&path)?
+                .ok_or_else(|| format!("no App key: put it at {}", path.display()))?
         };
         let key = EncodingKey::from_rsa_pem(&pem)
             .map_err(|e| format!("the App key is not an RSA private key: {e}"))?;
@@ -56,15 +68,15 @@ impl App {
     /// A token for the App's installation on `repo`, as `owner/name`
     pub fn installation_token(&self, repo: &str) -> Result<String, String> {
         // Only what the daemon calls, on this repository, not all the installation can do
-        self.token(repo, json!({"checks": "write", "pull_requests": "read"}))
+        self.token(repo, &json!({"checks": "write", "pull_requests": "read"}))
     }
 
     /// A token that writes the PR comment, which GitHub refuses until the App has Pull requests write
     pub fn comment_token(&self, repo: &str) -> Result<String, String> {
-        self.token(repo, json!({"pull_requests": "write"}))
+        self.token(repo, &json!({"pull_requests": "write"}))
     }
 
-    fn token(&self, repo: &str, permissions: Value) -> Result<String, String> {
+    fn token(&self, repo: &str, permissions: &Value) -> Result<String, String> {
         let jwt = self.jwt()?;
         let installation = get(&format!("{API}/repos/{repo}/installation"), &jwt).map_err(|e| {
             if e.contains("404") {
@@ -95,6 +107,7 @@ impl App {
     }
 }
 
+#[derive(Debug)]
 pub struct OpenPr {
     pub number: u64,
     pub sha: String,
@@ -193,25 +206,23 @@ pub fn open_prs(token: &str, repo: &str) -> Result<Vec<OpenPr>, String> {
 
 /// Open PRs from GitHub's list, which the hosted service passes on in the same shape
 pub fn parse_prs(prs: &Value) -> Vec<OpenPr> {
-    prs.as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|pr| {
-                    Some(OpenPr {
-                        number: pr["number"].as_u64()?,
-                        sha: pr["head"]["sha"].as_str()?.to_string(),
-                        base: pr["base"]["ref"].as_str()?.to_string(),
-                        head_repo: pr["head"]["repo"]["full_name"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                        branch: pr["head"]["ref"].as_str().unwrap_or_default().to_string(),
-                        author: pr["user"]["login"].as_str().unwrap_or_default().to_string(),
-                    })
+    prs.as_array().map_or_default(|list| {
+        list.iter()
+            .filter_map(|pr| {
+                Some(OpenPr {
+                    number: pr["number"].as_u64()?,
+                    sha: pr["head"]["sha"].as_str()?.to_string(),
+                    base: pr["base"]["ref"].as_str()?.to_string(),
+                    head_repo: pr["head"]["repo"]["full_name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    branch: pr["head"]["ref"].as_str().unwrap_or_default().to_string(),
+                    author: pr["user"]["login"].as_str().unwrap_or_default().to_string(),
                 })
-                .collect()
-        })
-        .unwrap_or_default()
+            })
+            .collect()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,10 +331,10 @@ fn pages(url: &str, token: &str, cap: u32) -> Result<Vec<Value>, String> {
     for page in 1..=cap {
         let list = get(&format!("{url}?per_page=100&page={page}"), token)?;
         let list = list.as_array().cloned().unwrap_or_default();
-        let last = list.len() < 100;
+        let final_page = list.len() < 100;
         all.extend(list);
 
-        if last {
+        if final_page {
             break;
         }
     }

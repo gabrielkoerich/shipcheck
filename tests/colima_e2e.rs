@@ -1,3 +1,5 @@
+//! A job on the colima engine, in a VM shipcheck starts for it and removes after
+
 mod common;
 
 use std::fs;
@@ -18,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -69,7 +71,7 @@ fn ours() -> Vec<String> {
     let out = Command::new("colima")
         .args(["list", "-j"])
         .output()
-        .unwrap();
+        .expect("run the command");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -80,27 +82,34 @@ fn ours() -> Vec<String> {
 }
 
 fn profiles() -> String {
-    String::from_utf8_lossy(&Command::new("colima").arg("list").output().unwrap().stdout).into()
+    String::from_utf8_lossy(
+        &Command::new("colima")
+            .arg("list")
+            .output()
+            .expect("run the command")
+            .stdout,
+    )
+    .into()
 }
 
 fn repo(tmp: &Path) -> PathBuf {
     let origin = tmp.join("origin.git");
-    fs::create_dir(&origin).unwrap();
+    fs::create_dir(&origin).expect("create the dir");
     git(&origin, &["init", "-q", "--bare", "-b", "main"]);
     git(tmp, &["clone", "-q", &origin.to_string_lossy(), "work"]);
     let work = tmp.join("work");
     git(&work, &["checkout", "-q", "-b", "main"]);
-    fs::create_dir_all(work.join(".github/workflows")).unwrap();
-    fs::write(work.join(".github/workflows/ci.yml"), CI).unwrap();
-    fs::write(work.join("shipcheck.toml"), CONFIG).unwrap();
+    fs::create_dir_all(work.join(".github/workflows")).expect("create the dir");
+    fs::write(work.join(".github/workflows/ci.yml"), CI).expect("write the file");
+    fs::write(work.join("shipcheck.toml"), CONFIG).expect("write the file");
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "main"]);
     git(&work, &["push", "-q", "origin", "main"]);
     git(&work, &["fetch", "-q", "origin"]);
     git(&work, &["checkout", "-q", "-b", "feature"]);
-    fs::write(work.join("marker.txt"), "ok").unwrap();
+    fs::write(work.join("marker.txt"), "ok").expect("write the file");
     // A branch's own workflow never runs, the job sees the base's
-    fs::write(work.join(".github/workflows/ci.yml"), "# changed\n").unwrap();
+    fs::write(work.join(".github/workflows/ci.yml"), "# changed\n").expect("write the file");
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "feature"]);
     work
@@ -129,7 +138,7 @@ fn job_records(home: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter(|p| {
             !p.file_name()
-                .unwrap()
+                .expect("the path has a file name")
                 .to_string_lossy()
                 .starts_with("sc-base-")
         })

@@ -1,3 +1,5 @@
+//! A timeout counts only the attempts that started
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +19,7 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",

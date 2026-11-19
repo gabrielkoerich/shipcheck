@@ -1,3 +1,5 @@
+//! An action's post step runs from the copy act made for its main step
+
 mod common;
 
 use std::fs;
@@ -19,7 +21,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",

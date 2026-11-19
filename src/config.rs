@@ -1,3 +1,5 @@
+use crate::runner::act;
+use crate::runner::host;
 use std::collections::{BTreeMap, BTreeSet};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -239,7 +241,7 @@ pub struct Act {
     pub cache_paths: Vec<String>,
     /// Paths with a volume per repository, slot and job, for caches that do not lock themselves
     pub slot_paths: Vec<String>,
-    /// A directory of its own under JOB_HOMES for each job, per environment variable
+    /// A directory of its own under `JOB_HOMES` for each job, per environment variable
     pub job_homes: BTreeMap<String, Home>,
 }
 
@@ -273,7 +275,7 @@ impl Default for Act {
             jobs: BTreeMap::new(),
             // Parallel jobs share these volumes. Tools that break under sharing get a home per job in JOB_HOMES
             cache_paths: [
-                crate::runner::act::JOB_HOMES,
+                act::JOB_HOMES,
                 "/home/runner/.npm",
                 "/home/runner/.bun/install/cache",
                 "/home/runner/.cache",
@@ -547,7 +549,7 @@ impl RepoConfig {
                 Some(f) if kind == RunnerKind::Host && !self.workflows.iter().any(|w| w == f) => {
                     problems.push(format!(
                         "jobs entry {name:?} is on the host runner, but workflows does not list {f}, so it changes nothing"
-                    ))
+                    ));
                 }
                 Some(_) => {}
             }
@@ -604,7 +606,7 @@ impl RepoConfig {
             let ok =
                 !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
 
-            if !ok || crate::runner::host::refused_env(name) {
+            if !ok || host::refused_env(name) {
                 problems.push(format!(
                     "host env {name:?} is refused: only plain names, and none that carries a credential"
                 ));
@@ -816,7 +818,7 @@ mod tests {
     }
 
     fn workflows(files: &[&str]) -> BTreeSet<String> {
-        files.iter().map(|f| f.to_string()).collect()
+        files.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]
@@ -824,7 +826,7 @@ mod tests {
         let cfg = RepoConfig::parse(r#"workflows = ["ci.yml"]"#).unwrap();
         assert_eq!(cfg.workflows, ["ci.yml"]);
         assert_eq!(cfg.on, [Trigger::Push]);
-        assert!(cfg.paths.is_empty());
+        assert_eq!(cfg.paths, Vec::<std::string::String>::new());
         assert_eq!(cfg.timeout_minutes, 30);
         assert_eq!(cfg.retries, 1);
         assert!(!cfg.keep_passed);
@@ -853,7 +855,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.runner, RunnerKind::Host);
-        assert!(cfg.workflows.is_empty());
+        assert_eq!(cfg.workflows, Vec::<std::string::String>::new());
         assert_eq!(cfg.host.checks["test"], "yarn test");
         assert_eq!(cfg.host.versions, ["node --version"]);
         assert_eq!(cfg.validate(&workflows(&["ci.yml"])), Ok(()));
@@ -1079,7 +1081,7 @@ mod tests {
             .unwrap()
             .act;
         own.for_tree(["pom.xml", "go.sum"]);
-        assert!(own.slot_paths.is_empty());
+        assert_eq!(own.slot_paths, Vec::<std::string::String>::new());
         assert!(
             own.cache_paths
                 .iter()

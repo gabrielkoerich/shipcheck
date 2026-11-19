@@ -1,7 +1,9 @@
 use crate::check::{self, Jobs};
+use crate::config::Logs;
 use crate::github;
 use crate::run::Entry;
 use crate::service;
+use std::fmt::Write as _;
 
 /// The first line of the App's PR comment, how a post finds it again
 pub const MARKER: &str = "<!-- shipcheck:summary -->";
@@ -31,7 +33,7 @@ pub fn sections(
         .iter()
         .map(|w| (w.file.clone(), w.jobs.keys().cloned().collect()))
         .collect();
-    let bodies = check::job_bodies(sha, &jobs, entry, None, false);
+    let bodies = check::job_bodies(sha, &jobs, entry, None, Logs::Failed);
 
     check::job_names(&jobs)
         .into_iter()
@@ -65,12 +67,22 @@ fn end(name: &str) -> String {
     format!("<!-- shipcheck:end:{name} -->")
 }
 
-fn section(name: &str, failed: bool, sha: &str, summary: &str) -> Section {
-    let state = if failed { "failed" } else { "passed" };
+/// How a job of the result ended
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Job {
+    Passed,
+    Failed,
+}
+
+fn section(name: &str, job: Job, sha: &str, summary: &str) -> Section {
+    let state = match job {
+        Job::Failed => "failed",
+        Job::Passed => "passed",
+    };
     let short = &sha[..12.min(sha.len())];
     Section {
         name: name.to_string(),
-        failed,
+        failed: job == Job::Failed,
         text: format!("### {name}: {state} on `{short}`\n\n{summary}\n"),
     }
 }
@@ -129,10 +141,10 @@ pub fn merge(
         .into_iter()
         .filter(|s| !new.iter().any(|(n, _, _)| *n == s.name))
         .collect();
-    all.extend(
-        new.iter()
-            .filter_map(|(n, failed, s)| Some(section(n, *failed, sha, s.as_deref()?))),
-    );
+    all.extend(new.iter().filter_map(|(n, failed, s)| {
+        let job = if *failed { Job::Failed } else { Job::Passed };
+        Some(section(n, job, sha, s.as_deref()?))
+    }));
     all.sort_by_key(|s| (!s.failed, s.name.clone()));
 
     let short = |s: &str| s[..12.min(s.len())].to_string();
@@ -148,7 +160,7 @@ pub fn merge(
         } else {
             s.text
         };
-        body.push_str(&format!("\n{}\n{text}{}\n", start(&s.name), end(&s.name)));
+        let _ = write!(body, "\n{}\n{text}{}\n", start(&s.name), end(&s.name));
     }
 
     Some(body)

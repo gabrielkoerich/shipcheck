@@ -1,8 +1,19 @@
+use crate::comment;
+use crate::github;
+use crate::github::App;
+use crate::github::Checks;
+use crate::github::OpenPr;
+use crate::run;
+use crate::run::Entry;
+use crate::secret;
+use crate::ui::Screen;
+use std::fmt;
 use std::fs;
 use std::io::{ErrorKind, IsTerminal};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use ureq::http::Response;
 
 use serde_json::{Value, json};
 use tungstenite::client::IntoClientRequest;
@@ -20,11 +31,11 @@ pub fn api() -> String {
 }
 
 fn token_path() -> PathBuf {
-    crate::run::home().join("token")
+    run::home().join("token")
 }
 
 fn login_path() -> PathBuf {
-    crate::run::home().join("login")
+    run::home().join("login")
 }
 
 /// The GitHub login `shipcheck login` signed in, None for a sign-in from before it was kept
@@ -45,29 +56,53 @@ pub enum Poster {
     None,
 }
 
+/// Whether an own App's id and key are set on this machine
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppKey {
+    Set,
+    Unset,
+}
+
 pub fn poster() -> Poster {
     let has_key = has_key();
     // Read only when it is used, since on a Mac a read can ask the user
     let file_token = (!env_token_set() && !has_key).then(login_token).flatten();
-    choose(std::env::var("SHIPCHECK_TOKEN").ok(), has_key, file_token)
+    let key = if has_key { AppKey::Set } else { AppKey::Unset };
+    choose(std::env::var("SHIPCHECK_TOKEN").ok(), key, file_token)
+}
+
+/// Whether this machine has a way to post checks
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Credentials {
+    Found,
+    Missing,
+}
+
+/// [`can_post`] as [`Credentials`]
+pub fn credentials() -> Credentials {
+    if can_post() {
+        Credentials::Found
+    } else {
+        Credentials::Missing
+    }
 }
 
 /// Whether `poster` finds a way to post, without reading a secret, so a git hook never waits on a
 /// keychain prompt
 pub fn can_post() -> bool {
-    env_token_set() || has_key() || crate::secret::exists(&token_path())
+    env_token_set() || has_key() || secret::exists(&token_path())
 }
 
 // An own App needs its id as well as its key, a key file alone leaves the login in charge
 fn has_key() -> bool {
     std::env::var_os("SHIPCHECK_APP_ID").is_some()
         && (std::env::var_os("SHIPCHECK_APP_KEY_FILE").is_some()
-            || crate::secret::exists(&crate::run::home().join("app.pem")))
+            || secret::exists(&run::home().join("app.pem")))
 }
 
 /// The `shipcheck login` token, from the keychain on macOS (`secret::read`)
 fn login_token() -> Option<String> {
-    let token = crate::secret::read(&token_path()).ok()??;
+    let token = secret::read(&token_path()).ok()??;
     Some(String::from_utf8_lossy(&token).into_owned())
 }
 
@@ -104,22 +139,21 @@ pub enum SignIn {
 }
 
 /// The device flow needs a person, so only a terminal gets it
-pub fn sign_in(can_post: bool, terminal: bool) -> SignIn {
-    match (can_post, terminal) {
-        (true, _) => SignIn::Already,
-        (false, true) => SignIn::Ask,
-        (false, false) => SignIn::Skip,
+pub fn sign_in(credentials: Credentials, screen: Screen) -> SignIn {
+    match (credentials, screen) {
+        (Credentials::Found, _) => SignIn::Already,
+        (Credentials::Missing, Screen::Terminal) => SignIn::Ask,
+        (Credentials::Missing, Screen::Piped) => SignIn::Skip,
     }
 }
 
-fn choose(env_token: Option<String>, has_key: bool, file_token: Option<String>) -> Poster {
+fn choose(env_token: Option<String>, key: AppKey, file_token: Option<String>) -> Poster {
     let env_token = env_token.filter(|t| !t.trim().is_empty());
     let file_token = file_token.filter(|t| !t.trim().is_empty());
 
-    match (env_token, has_key, file_token) {
-        (Some(t), _, _) => Poster::Service(t.trim().to_string()),
-        (None, true, _) => Poster::Key,
-        (None, false, Some(t)) => Poster::Service(t.trim().to_string()),
+    match (env_token, key, file_token) {
+        (Some(t), _, _) | (None, AppKey::Unset, Some(t)) => Poster::Service(t.trim().to_string()),
+        (None, AppKey::Set, _) => Poster::Key,
         _ => Poster::None,
     }
 }
@@ -134,7 +168,7 @@ fn agent() -> ureq::Agent {
 
 fn send(
     what: &str,
-    res: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    res: Result<Response<ureq::Body>, ureq::Error>,
 ) -> Result<(u16, Value), String> {
     let mut res = res.map_err(|e| format!("{what}: {e}"))?;
     let body = res.body_mut().read_json().unwrap_or(Value::Null);
@@ -156,16 +190,15 @@ fn ok(what: &str, (status, body): (u16, Value)) -> Result<Value, String> {
 pub fn login() -> Result<String, String> {
     let machine = std::process::Command::new("hostname")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     let res = grant(&machine)?;
     let token = res["token"]
         .as_str()
         .ok_or("the service returned no token")?;
-    crate::secret::write(&token_path(), token.as_bytes())?;
+    secret::write(&token_path(), token.as_bytes())?;
     let login = res["login"].as_str().unwrap_or_default().to_string();
     // The login names the user and is no secret, so it stays a file
-    crate::secret::write_file(&login_path(), login.as_bytes())?;
+    secret::write_file(&login_path(), login.as_bytes())?;
     Ok(login)
 }
 
@@ -285,13 +318,34 @@ fn grant(machine: &str) -> Result<Value, String> {
     )
 }
 
-/// Revokes the machine token on the service, or with `all` every token of its user, and deletes
+/// Which tokens `logout` revokes
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Revoke {
+    ThisMachine,
+    All,
+}
+
+/// Where the machine token came from
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenSource {
+    Env,
+    Login,
+}
+
+/// Revokes the machine token on the service, or with `All` every token of its user, and deletes
 /// the stored login token unless the token came from `SHIPCHECK_TOKEN`. Returns what to tell the user
-pub fn logout(all: bool) -> Result<String, String> {
+pub fn logout(revoke: Revoke) -> Result<String, String> {
     let path = token_path();
-    let from_env = env_token_set();
+    let source = if env_token_set() {
+        TokenSource::Env
+    } else {
+        TokenSource::Login
+    };
     let token = machine_token().ok_or("not signed in")?;
-    let route = if all { "/v1/tokens" } else { "/v1/login" };
+    let route = match revoke {
+        Revoke::All => "/v1/tokens",
+        Revoke::ThisMachine => "/v1/login",
+    };
     let res = send(
         &format!("DELETE {route}"),
         agent()
@@ -299,18 +353,22 @@ pub fn logout(all: bool) -> Result<String, String> {
             .header("Authorization", format!("Bearer {}", token.trim()))
             .call(),
     )?;
-    let said = revoked(all, from_env, res)?;
+    let said = revoked(revoke, source, res)?;
 
-    if !from_env {
+    if source == TokenSource::Login {
         let _ = fs::remove_file(login_path());
-        crate::secret::remove(&path)?;
+        secret::remove(&path)?;
     }
 
     Ok(said)
 }
 
-fn revoked(all: bool, from_env: bool, (status, body): (u16, Value)) -> Result<String, String> {
-    if all {
+fn revoked(
+    revoke: Revoke,
+    source: TokenSource,
+    (status, body): (u16, Value),
+) -> Result<String, String> {
+    if revoke == Revoke::All {
         // A token the service does not know revokes nothing, so the others stay alive
         if status == 401 {
             return Err("this machine's token is no longer valid, so nothing was revoked: run `shipcheck login`, then `shipcheck logout --all`".into());
@@ -329,7 +387,7 @@ fn revoked(all: bool, from_env: bool, (status, body): (u16, Value)) -> Result<St
 
     Ok(format!(
         "signed out, {} is revoked",
-        if from_env {
+        if source == TokenSource::Env {
             "SHIPCHECK_TOKEN"
         } else {
             "this machine's token"
@@ -412,10 +470,19 @@ pub struct Sender {
     how: How,
 }
 
+// The tokens stay out of every log line
+impl fmt::Debug for Sender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sender")
+            .field("repo", &self.repo)
+            .finish_non_exhaustive()
+    }
+}
+
 enum How {
     /// The App key, its installation token, and this machine's `shipcheck login` token if any
     Key(
-        crate::github::App,
+        App,
         Mutex<Option<(String, Instant)>>,
         OnceLock<Option<String>>,
     ),
@@ -425,11 +492,7 @@ enum How {
 impl Sender {
     pub fn new(repo: &str) -> Result<Self, String> {
         let how = match poster() {
-            Poster::Key => How::Key(
-                crate::github::App::from_env()?,
-                Mutex::new(None),
-                OnceLock::new(),
-            ),
+            Poster::Key => How::Key(App::from_env()?, Mutex::new(None), OnceLock::new()),
             Poster::Service(token) => How::Service(token),
             Poster::None => return Err(NOT_SIGNED_IN.into()),
         };
@@ -442,13 +505,13 @@ impl Sender {
     // Installation tokens last an hour, so mint a new one after fifty minutes
     fn installation_token(
         &self,
-        app: &crate::github::App,
+        app: &App,
         cache: &Mutex<Option<(String, Instant)>>,
     ) -> Result<String, String> {
         let mut cache = cache.lock().map_err(|e| e.to_string())?;
 
         if let Some((token, minted)) = &*cache
-            && minted.elapsed() < Duration::from_secs(50 * 60)
+            && minted.elapsed() < Duration::from_mins(50)
         {
             return Ok(token.clone());
         }
@@ -466,24 +529,21 @@ impl Sender {
                 let token = self.installation_token(app, cache)?;
 
                 match id {
-                    Some(id) => Ok((
-                        id,
-                        crate::github::update_check(&token, &self.repo, id, body)?,
-                    )),
-                    None => crate::github::post_check(&token, &self.repo, body),
+                    Some(id) => Ok((id, github::update_check(&token, &self.repo, id, body)?)),
+                    None => github::post_check(&token, &self.repo, body),
                 }
             }
         }
     }
 
-    pub fn open_prs(&self) -> Result<Vec<crate::github::OpenPr>, String> {
+    pub fn open_prs(&self) -> Result<Vec<OpenPr>, String> {
         match &self.how {
             How::Service(token) => {
                 let res = get_json(token, "/v1/pulls", &[("repo", &self.repo)])?;
-                Ok(crate::github::parse_prs(&res["pulls"]))
+                Ok(github::parse_prs(&res["pulls"]))
             }
             How::Key(app, cache, _) => {
-                crate::github::open_prs(&self.installation_token(app, cache)?, &self.repo)
+                github::open_prs(&self.installation_token(app, cache)?, &self.repo)
             }
         }
     }
@@ -495,15 +555,15 @@ impl Sender {
         prs: Option<&[u64]>,
         base: &str,
         sha: &str,
-        entry: &crate::run::Entry,
+        entry: &Entry,
         secrets: &[String],
     ) -> Result<Vec<String>, String> {
         match &self.how {
             How::Service(token) => {
-                crate::comment::post_with_service(token, &self.repo, base, sha, entry, secrets)
+                comment::post_with_service(token, &self.repo, base, sha, entry, secrets)
             }
             How::Key(app, _, _) => {
-                crate::comment::post_with_app(app, &self.repo, prs, base, sha, entry, secrets)
+                comment::post_with_app(app, &self.repo, prs, base, sha, entry, secrets)
             }
         }
     }
@@ -513,8 +573,7 @@ impl Sender {
         match &self.how {
             How::Service(_) => Ok(None),
             How::Key(app, cache, _) => {
-                crate::github::pull(&self.installation_token(app, cache)?, &self.repo, number)
-                    .map(Some)
+                github::pull(&self.installation_token(app, cache)?, &self.repo, number).map(Some)
             }
         }
     }
@@ -545,7 +604,7 @@ impl Sender {
                 // Read once, since on a Mac a read can ask the user
                 let service = login.get_or_init(machine_token).as_deref().map(ask);
                 service_first(service, || {
-                    Ok(crate::github::find_pusher(
+                    Ok(github::find_pusher(
                         &self.installation_token(app, cache)?,
                         &self.repo,
                         pr,
@@ -578,13 +637,13 @@ impl Sender {
     }
 
     /// shipcheck's latest check run per name on `sha`
-    pub fn find_checks(&self, sha: &str) -> Result<crate::github::Checks, String> {
+    pub fn find_checks(&self, sha: &str) -> Result<Checks, String> {
         match &self.how {
             How::Service(token) => {
                 let res = get_json(token, "/v1/checks", &[("repo", &self.repo), ("sha", sha)])?;
-                Ok(crate::github::parse_checks(&res))
+                Ok(github::parse_checks(&res))
             }
-            How::Key(app, cache, _) => crate::github::find_checks(
+            How::Key(app, cache, _) => github::find_checks(
                 &self.installation_token(app, cache)?,
                 &self.repo,
                 sha,
@@ -623,7 +682,7 @@ fn stream(
                     wake();
                 }
             }
-            Ok(Message::Close(_)) => return Ok(()),
+            Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
             Ok(_) => heard = Instant::now(),
             Err(tungstenite::Error::Io(e))
                 if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
@@ -636,7 +695,6 @@ fn stream(
                     .send(Message::text("ping"))
                     .map_err(|e| format!("GET /v1/events: {e}"))?;
             }
-            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
             Err(e) => return Err(format!("GET /v1/events: {e}")),
         }
     }
@@ -754,6 +812,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tungstenite::handshake::server::Request;
 
     /// A service on localhost that runs `serve` on the first connection, and its `ws://` URL
     fn events_server(
@@ -769,22 +828,23 @@ mod tests {
     }
 
     /// The socket after the handshake, with the Authorization header the client sent
-    // The callback's error type is tungstenite's
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the callback's error type is tungstenite's"
+    )]
     fn accept(tcp: std::net::TcpStream) -> (WebSocket<std::net::TcpStream>, String) {
         let auth = Mutex::new(String::new());
-        let socket =
-            tungstenite::accept_hdr(tcp, |req: &tungstenite::handshake::server::Request, res| {
-                let got = req
-                    .headers()
-                    .get("authorization")
-                    .unwrap()
-                    .to_str()
-                    .unwrap();
-                *auth.lock().unwrap() = got.to_string();
-                Ok(res)
-            })
-            .unwrap();
+        let socket = tungstenite::accept_hdr(tcp, |req: &Request, res| {
+            let got = req
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            *auth.lock().unwrap() = got.to_string();
+            Ok(res)
+        })
+        .unwrap();
         (socket, auth.into_inner().unwrap())
     }
 
@@ -909,37 +969,51 @@ mod tests {
     #[test]
     fn picks_how_to_post() {
         let t = || Some("shc_x\n".to_string());
-        assert_eq!(choose(t(), true, None), Poster::Service("shc_x".into()));
-        assert_eq!(choose(None, true, t()), Poster::Key);
-        assert_eq!(choose(None, false, t()), Poster::Service("shc_x".into()));
         assert_eq!(
-            choose(Some(" ".into()), false, Some("".into())),
+            choose(t(), AppKey::Set, None),
+            Poster::Service("shc_x".into())
+        );
+        assert_eq!(choose(None, AppKey::Set, t()), Poster::Key);
+        assert_eq!(
+            choose(None, AppKey::Unset, t()),
+            Poster::Service("shc_x".into())
+        );
+        assert_eq!(
+            choose(Some(" ".into()), AppKey::Unset, Some(String::new())),
             Poster::None
         );
     }
 
     #[test]
     fn signs_in_only_at_a_terminal_when_it_cannot_post() {
-        assert_eq!(sign_in(true, true), SignIn::Already);
-        assert_eq!(sign_in(true, false), SignIn::Already);
-        assert_eq!(sign_in(false, true), SignIn::Ask);
-        assert_eq!(sign_in(false, false), SignIn::Skip);
+        assert_eq!(
+            sign_in(Credentials::Found, Screen::Terminal),
+            SignIn::Already
+        );
+        assert_eq!(sign_in(Credentials::Found, Screen::Piped), SignIn::Already);
+        assert_eq!(sign_in(Credentials::Missing, Screen::Terminal), SignIn::Ask);
+        assert_eq!(sign_in(Credentials::Missing, Screen::Piped), SignIn::Skip);
     }
 
     #[test]
     fn logout_all_reports_what_it_revoked() {
         let gone = (401, json!({"error": "unknown or revoked machine token"}));
         assert!(
-            revoked(true, false, gone.clone())
+            revoked(Revoke::All, TokenSource::Login, gone.clone())
                 .unwrap_err()
                 .contains("nothing was revoked")
         );
         assert_eq!(
-            revoked(true, false, (200, json!({"revoked": 3}))).unwrap(),
+            revoked(
+                Revoke::All,
+                TokenSource::Login,
+                (200, json!({"revoked": 3}))
+            )
+            .unwrap(),
             "signed out, revoked 3 machine tokens"
         );
         assert_eq!(
-            revoked(false, true, gone).unwrap(),
+            revoked(Revoke::ThisMachine, TokenSource::Env, gone).unwrap(),
             "signed out, SHIPCHECK_TOKEN is revoked"
         );
     }

@@ -1,4 +1,7 @@
+use crate::run;
+use crate::secret;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -19,7 +22,7 @@ use crate::workflow::{self, key, step};
 pub const JOB_HOMES: &str = "/home/runner/.shipcheck";
 
 /// Runs workflows with nektos/act, each job in a Docker container
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Act {
     config: config::Act,
     network: config::Network,
@@ -38,6 +41,7 @@ impl Act {
         }
     }
 
+    #[must_use]
     pub fn with_engines(self, engines: BTreeMap<String, config::Engine>) -> Self {
         Act { engines, ..self }
     }
@@ -59,10 +63,12 @@ impl Act {
         self.engines.values().any(|e| *e == config::Engine::Colima)
     }
 
+    #[must_use]
     pub fn with_network(self, network: config::Network) -> Self {
         Act { network, ..self }
     }
 
+    #[must_use]
     pub fn with_shards(self, shards: config::ShardTests) -> Self {
         Act { shards, ..self }
     }
@@ -89,7 +95,7 @@ pub trait Engine: Sync {
     fn preflight(&self) -> Result<(), String>;
 
     /// Runs one job of the prepared workflow with act, as [`Runner::run`]
-    fn run(&self, act: &Act, request: &RunRequest, log: &Path) -> Result<Outcome, String>;
+    fn run(&self, act: &Act, request: &RunRequest<'_>, log: &Path) -> Result<Outcome, String>;
 
     /// Removes what a dead run left for this job's checkout
     fn reclaim(&self, run_dir: &Path);
@@ -102,6 +108,7 @@ pub trait Engine: Sync {
 }
 
 /// Each job in a container on the current Docker context
+#[derive(Debug)]
 pub struct Docker;
 
 impl Act {
@@ -168,7 +175,7 @@ impl Runner for Act {
         self.prepare_workflow(source, file)
     }
 
-    fn run(&self, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+    fn run(&self, request: &RunRequest<'_>, log_path: &Path) -> Result<Outcome, String> {
         self.engine(request.file, request.job)
             .run(self, request, log_path)
     }
@@ -273,8 +280,10 @@ impl Act {
         let mounts: String = (self.config.cache_paths.iter())
             .chain(&self.config.slot_paths)
             .filter(|p| *p != "/var/lib/apt/lists")
-            .map(|p| format!("\"{p}\" "))
-            .collect();
+            .fold(String::new(), |mut s, p| {
+                let _ = write!(s, "\"{p}\" ");
+                s
+            });
         // Docker creates a new volume and the missing dirs above it owned by root, and the job runs
         // as `runner`, which has sudo. setup-go then writes `~/go/bin` beside `~/go/pkg/mod`
         let own_mounts = format!(
@@ -411,7 +420,7 @@ fn step_guard(cond: &str, env: impl Fn(&str) -> Option<String>) -> Option<String
         .replace("always()", "true");
 
     if !reads
-        || crate::run::false_on_every_pr(c)
+        || run::false_on_every_pr(c)
         || passing.contains("failure()")
         || passing.contains("cancelled()")
     {
@@ -480,13 +489,17 @@ impl Engine for Docker {
         engine_problem(String::from_utf8_lossy(&out.stdout).trim()).map_or(Ok(()), Err)
     }
 
-    fn run(&self, act: &Act, request: &RunRequest, log_path: &Path) -> Result<Outcome, String> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one act process, from its arguments to its outcome"
+    )]
+    fn run(&self, act: &Act, request: &RunRequest<'_>, log_path: &Path) -> Result<Outcome, String> {
         let run_dir = request.run_dir;
         let began = Instant::now();
         let (file, job) = (request.file, request.job);
         let wf_path = request.workflow;
         let tag = run_tag(run_dir);
-        let isolated = isolated(request, &tag, true)?;
+        let isolated = isolated(request, &tag, Checkout::Shared)?;
         let shards = (request.shard && isolated.contains(shard::MARK))
             .then(|| shard::count(act.shards, engine_resources()));
 
@@ -516,7 +529,7 @@ impl Engine for Docker {
         };
         let mut cmd = Command::new("act");
         let port = free_port()?;
-        let home = crate::run::home();
+        let home = run::home();
 
         // Stamped first, so a parallel run's prune never takes it for an empty one no run used
         for (name, path) in volumes(&act.config, request.repo_id, &tag) {
@@ -563,7 +576,7 @@ impl Engine for Docker {
         }
 
         // On a Mac the secrets live in the keychain, so act reads a private copy that lives as long as it
-        let secrets = crate::secret::read(&crate::run::secrets_file(request.repo_id))?;
+        let secrets = secret::read(&run::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         cmd.arg("--secret-file").arg(secrets_copy.path());
@@ -617,7 +630,7 @@ impl Engine for Docker {
 
         chown_tree(run_dir, Some(RUNNER_ID.into()));
 
-        crate::run::timing(file, job, "act prepare", began);
+        run::timing(file, job, "act prepare", began);
         let spawned = Instant::now();
         let mut reaper = reaper(run_dir, request.slot_lock);
         // A group of its own, so the reaper can stop act and the docker commands it runs
@@ -646,7 +659,7 @@ impl Engine for Docker {
                     let seen = text.contains(line);
 
                     if seen {
-                        crate::run::timing(file, job, phase, spawned);
+                        run::timing(file, job, phase, spawned);
                     }
 
                     !seen
@@ -657,7 +670,7 @@ impl Engine for Docker {
             let ended = super::has_exited(child.id());
 
             if matches!(ended, Ok(true)) {
-                crate::run::timing(file, job, "act total", spawned);
+                run::timing(file, job, "act total", spawned);
 
                 // act ended by itself and removed its containers, so the reaper has nothing to do
                 if let Some(stdin) = reaper.as_mut().and_then(|r| r.stdin.as_mut()) {
@@ -695,7 +708,7 @@ impl Engine for Docker {
 
         let at = Instant::now();
         hand_back(run_dir);
-        crate::run::timing(file, job, "hand_back", at);
+        run::timing(file, job, "hand_back", at);
         let log = fs::read(log_path).map_err(|e| e.to_string())?;
         let log = String::from_utf8_lossy(&log);
 
@@ -763,10 +776,15 @@ impl Engine for Docker {
             }
         }
 
-        let prefix = repo_id.map(volume_prefix).unwrap_or_else(home_prefix);
+        let prefix = repo_id.map_or_else(home_prefix, volume_prefix);
         let (home, own, host) = here_parts();
         let here = here(&home, &own, &host);
-        done.extend(gc::clean(&gc::Docker, &here, &prefix, repo_id.is_none()));
+        let orphans = if repo_id.is_none() {
+            gc::Orphans::Remove
+        } else {
+            gc::Orphans::Keep
+        };
+        done.extend(gc::clean(&gc::Docker, &here, &prefix, orphans));
         // Networks are per slot, not per repository, and Docker refuses to remove one in use
         let prefix = format!("{}net-", home_prefix());
         let Ok(listed) = Command::new("docker")
@@ -880,7 +898,7 @@ fn chown_tree(dir: &Path, owner: Option<String>) {
         return;
     };
 
-    gc::stamp(&crate::run::home(), "images", BUSYBOX);
+    gc::stamp(&run::home(), "images", BUSYBOX);
     let _ = Command::new("docker")
         .args(["run", "--rm", "--network", "none", "-v"])
         .arg(format!("{}:/w", dir.display()))
@@ -901,13 +919,13 @@ pub fn engine_resources() -> Option<(u32, u64)> {
 
 /// Where act keeps the actions it fetched, per job below this, for one repository or every one
 fn actions_dir(repo_id: Option<&str>) -> PathBuf {
-    let dir = crate::run::home().join("actions");
+    let dir = run::home().join("actions");
     repo_id.map_or(dir.clone(), |id| dir.join(id))
 }
 
 /// The job's own action cache, since parallel act processes cloning one action into one cache
 /// corrupt it. Canonical, since act 0.2.89 runs a post step by the cleaned path, so a `..` failed it
-pub(super) fn job_actions(request: &RunRequest) -> Result<PathBuf, String> {
+pub(super) fn job_actions(request: &RunRequest<'_>) -> Result<PathBuf, String> {
     let actions = actions_dir(Some(request.repo_id))
         .join(request.file)
         .join(request.job);
@@ -943,7 +961,7 @@ pub(super) fn cached_actions_resolve(dir: &Path) -> bool {
 
 /// Where older versions kept act's `actions/cache` entries, which `shipcheck clean` still removes
 fn cache_dir(repo_id: Option<&str>) -> PathBuf {
-    let dir = crate::run::home().join("actcache");
+    let dir = run::home().join("actcache");
     repo_id.map_or(dir.clone(), |id| dir.join(id))
 }
 
@@ -1213,9 +1231,10 @@ fn outputs_step(job: &Hash) -> Option<Yaml> {
         };
         let var = format!("SHIPCHECK_OUTPUT_{i}");
         env.insert(key(&var), key(&value));
-        script.push_str(&format!(
-            "printf 'shipcheck-output %s %s\\n' '{name}' \"$(printf %s \"${var}\" | od -An -v -tx1 | tr -d ' \\n')\"\n"
-        ));
+        let _ = writeln!(
+            script,
+            "printf 'shipcheck-output %s %s\\n' '{name}' \"$(printf %s \"${var}\" | od -An -v -tx1 | tr -d ' \\n')\""
+        );
     }
 
     if script.is_empty() {
@@ -1314,7 +1333,7 @@ fn literal(value: &str) -> String {
             let mut units = [0; 2];
 
             for unit in c.encode_utf16(&mut units) {
-                json.push_str(&format!("\\u{unit:04x}"));
+                let _ = write!(json, "\\u{unit:04x}");
             }
         }
     }
@@ -1363,11 +1382,28 @@ fn replace_needs(s: &str, needs: &BTreeMap<String, BTreeMap<String, String>>) ->
     out
 }
 
+/// Whether a YAML value is the value of an `if` key, where GitHub reads a bare expression
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    If,
+    Other,
+}
+
+impl Key {
+    fn of(k: &Yaml) -> Key {
+        if k.as_str() == Some("if") {
+            Key::If
+        } else {
+            Key::Other
+        }
+    }
+}
+
 /// Replaces needs only inside `${{ }}` and in a bare `if`, the places GitHub reads them. Elsewhere a
 /// value would be plain text where act still expands any `${{ }}` the value holds
-fn substitute(y: &mut Yaml, needs: &BTreeMap<String, BTreeMap<String, String>>, is_if: bool) {
+fn substitute(y: &mut Yaml, needs: &BTreeMap<String, BTreeMap<String, String>>, key: Key) {
     match y {
-        Yaml::String(s) if is_if && !s.contains("${{") => *s = replace_needs(s, needs),
+        Yaml::String(s) if key == Key::If && !s.contains("${{") => *s = replace_needs(s, needs),
         Yaml::String(s) => {
             let mut out = String::new();
             let mut rest = s.as_str();
@@ -1383,16 +1419,18 @@ fn substitute(y: &mut Yaml, needs: &BTreeMap<String, BTreeMap<String, String>>, 
             out.push_str(rest);
             *s = out;
         }
-        Yaml::Array(items) => items.iter_mut().for_each(|i| substitute(i, needs, false)),
+        Yaml::Array(items) => items
+            .iter_mut()
+            .for_each(|i| substitute(i, needs, Key::Other)),
         Yaml::Hash(h) => h
             .iter_mut()
-            .for_each(|(k, v)| substitute(v, needs, k.as_str() == Some("if"))),
+            .for_each(|(k, v)| substitute(v, needs, Key::of(k))),
         _ => {}
     }
 }
 
 /// An expression that still reads the `needs` context, such as `toJSON(needs)`
-fn reads_needs(y: &Yaml, is_if: bool) -> Option<String> {
+fn reads_needs(y: &Yaml, key: Key) -> Option<String> {
     let mentions = |expr: &str| {
         expr.match_indices("needs").any(|(i, _)| {
             let before = expr[..i].bytes().last();
@@ -1404,7 +1442,7 @@ fn reads_needs(y: &Yaml, is_if: bool) -> Option<String> {
 
     match y {
         Yaml::String(s) => {
-            if is_if && !s.contains("${{") && mentions(s) {
+            if key == Key::If && !s.contains("${{") && mentions(s) {
                 return Some(s.clone());
             }
 
@@ -1414,12 +1452,17 @@ fn reads_needs(y: &Yaml, is_if: bool) -> Option<String> {
                 .find(|expr| mentions(expr))
                 .map(|expr| expr.trim().to_string())
         }
-        Yaml::Array(items) => items.iter().find_map(|i| reads_needs(i, false)),
-        Yaml::Hash(h) => h
-            .iter()
-            .find_map(|(k, v)| reads_needs(v, k.as_str() == Some("if"))),
+        Yaml::Array(items) => items.iter().find_map(|i| reads_needs(i, Key::Other)),
+        Yaml::Hash(h) => h.iter().find_map(|(k, v)| reads_needs(v, Key::of(k))),
         _ => None,
     }
+}
+
+/// Whether a job's checkout reaches the engine through file sharing or sits in a VM of its own
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Checkout {
+    Shared,
+    InVm,
 }
 
 /**
@@ -1427,7 +1470,11 @@ fn reads_needs(y: &Yaml, is_if: bool) -> Option<String> {
  * act reads its dotfiles from the checkout, so a commit could change how its own run behaves, and
  * they go first
  **/
-pub(super) fn isolated(request: &RunRequest, tag: &str, shared: bool) -> Result<String, String> {
+pub(super) fn isolated(
+    request: &RunRequest<'_>,
+    tag: &str,
+    checkout: Checkout,
+) -> Result<String, String> {
     let run_dir = request.run_dir;
 
     for dotfile in [".actrc", ".env", ".secrets", ".vars", ".input"] {
@@ -1447,7 +1494,7 @@ pub(super) fn isolated(request: &RunRequest, tag: &str, shared: bool) -> Result<
         ))[..16],
     );
     // A new VM has no file sharing to show stale files, so only a shared checkout gets the nonce
-    if shared {
+    if checkout == Checkout::Shared {
         write_nonces(run_dir, &nonce).map_err(|e| e.to_string())?;
     }
 
@@ -1457,7 +1504,7 @@ pub(super) fn isolated(request: &RunRequest, tag: &str, shared: bool) -> Result<
         request.job,
         request.needs,
         tag,
-        shared.then_some(nonce.as_str()),
+        (checkout == Checkout::Shared).then_some(nonce.as_str()),
     )
 }
 
@@ -1495,7 +1542,7 @@ fn write_nonces(run_dir: &Path, nonce: &str) -> std::io::Result<()> {
 }
 
 /**
- * The first step of every job. OrbStack has shown a job the files a previous run left at the same
+ * The first step of every job. `OrbStack` has shown a job the files a previous run left at the same
  * bind mount path, and colima shows an empty directory for a path it does not share. Either would
  * let a job pass on a tree it never tested, so a job that does not see this attempt's nonce, in
  * `.git` and at the root, fails
@@ -1558,7 +1605,7 @@ fn isolate(
     }
 
     let before = this["env"].clone();
-    substitute(&mut this, &known, false);
+    substitute(&mut this, &known, Key::Other);
     // act evaluates a job's `env` again in each step, which would read a `${{ }}` inside a value as
     // an expression. So the values from needs go to each step's `env`, which act evaluates once
     let refuse = || {
@@ -1606,7 +1653,7 @@ fn isolate(
         }
     }
 
-    if let Some(expr) = reads_needs(&this, false) {
+    if let Some(expr) = reads_needs(&this, Key::Other) {
         return Err(format!(
             "job {job} reads `needs` in `{expr}`, shipcheck passes only needs.<job>.outputs and needs.<job>.result between jobs"
         ));
@@ -1628,7 +1675,7 @@ fn isolate(
     *jobs = Hash::from_iter([(key(job), this)]);
     // act would name an unnamed workflow after the path it runs, which is outside the checkout
     root.entry(key("name"))
-        .or_insert_with(|| key(&format!("{}/{file}", crate::run::WORKFLOWS)));
+        .or_insert_with(|| key(&format!("{}/{file}", run::WORKFLOWS)));
     workflow::emit(root)
 }
 
@@ -1744,10 +1791,10 @@ fn matrix_condition(value: &str, leg: &Hash) -> Option<bool> {
     }
 
     for (name, test) in [
-        (
-            "endsWith",
-            (|a: &str, b: &str| a.ends_with(b)) as fn(&str, &str) -> bool,
-        ),
+        ("endsWith", {
+            let ends: fn(&str, &str) -> bool = |a, b| a.ends_with(b);
+            ends
+        }),
         ("startsWith", |a, b| a.starts_with(b)),
         ("contains", |a, b| a.contains(b)),
     ] {
@@ -1805,7 +1852,7 @@ fn resolve_matrix(value: &Yaml, leg: &Hash) -> Option<Yaml> {
             }
         };
         let falsy = match &value {
-            None | Some(Yaml::Null) | Some(Yaml::Boolean(false)) | Some(Yaml::Integer(0)) => true,
+            None | Some(Yaml::Null | Yaml::Boolean(false) | Yaml::Integer(0)) => true,
             Some(Yaml::String(s)) => s.is_empty(),
             _ => false,
         };
@@ -2004,7 +2051,7 @@ fn reaper(run_dir: &Path, slot_lock: Option<std::os::fd::RawFd>) -> Option<std::
     cmd.env(
         "LOCK_FDS",
         held.iter()
-            .map(|f| f.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(" "),
     );
@@ -2086,7 +2133,7 @@ fn create_network(run_dir: &Path, wait: Duration) -> Result<Network, String> {
 }
 
 /// How long a job waits for a Docker address pool before it fails
-const POOL_WAIT: Duration = Duration::from_secs(10 * 60);
+const POOL_WAIT: Duration = Duration::from_mins(10);
 
 /// Calls `create` until it succeeds, fails for another reason than a lack of address pools, or the
 /// deadline passes. Other runs' jobs hold every pool, and each gives its pool back when it ends
@@ -2111,11 +2158,11 @@ fn gateway(inspect: &str) -> Option<std::net::Ipv4Addr> {
     inspect
         .split_whitespace()
         .find_map(|a| a.parse::<std::net::Ipv4Addr>().ok())
-        .filter(|a| a.is_private())
+        .filter(std::net::Ipv4Addr::is_private)
 }
 
 /// A bridge container on Linux reaches the host only at its network's gateway, never the host's
-/// loopback. act gives jobs this address too, unless ACTIONS_RUNTIME_URL is set as on a Mac
+/// loopback. act gives jobs this address too, unless `ACTIONS_RUNTIME_URL` is set as on a Mac
 fn artifact_addr(network: Option<&Network>) -> String {
     match network {
         Some(n) if !cfg!(target_os = "macos") => n.gateway.to_string(),
@@ -2152,7 +2199,7 @@ fn volume_prefix(repo_id: &str) -> String {
 /// The start of every volume name under this `SHIPCHECK_HOME`, so `clean --all` of one home leaves
 /// the volumes of another, such as a test's, alone
 pub fn home_prefix() -> String {
-    prefix_of(&crate::run::home())
+    prefix_of(&run::home())
 }
 
 pub fn prefix_of(home: &Path) -> String {
@@ -2162,7 +2209,7 @@ pub fn prefix_of(home: &Path) -> String {
 
 /// The home, its prefix and the host name, which `here` borrows
 pub fn here_parts() -> (PathBuf, String, String) {
-    let home = crate::run::home();
+    let home = run::home();
     let prefix = prefix_of(&home);
     (home, prefix, gc::hostname())
 }
@@ -2172,7 +2219,7 @@ pub fn here<'a>(home: &'a Path, prefix: &'a str, host: &'a str) -> gc::Here<'a> 
         home,
         prefix,
         host,
-        sweep: !crate::run::home_overridden(),
+        sweep: !run::home_overridden(),
     }
 }
 
@@ -2297,7 +2344,7 @@ fn no_prune(steps: &mut Vec<Yaml>) -> Vec<String> {
             with.remove(&key("run_install"));
             installs = runs
                 .into_iter()
-                .map(|(run, cwd)| install_step(step, run, cwd))
+                .map(|(run, cwd)| install_step(step, &run, cwd.as_deref()))
                 .collect();
         }
 
@@ -2347,7 +2394,7 @@ fn pnpm_installs(input: &Yaml) -> Option<Vec<(String, Option<String>)>> {
                     args = a
                         .iter()
                         .map(|a| a.as_str().map(String::from))
-                        .collect::<Option<_>>()?
+                        .collect::<Option<_>>()?;
                 }
                 _ => return None,
             }
@@ -2371,9 +2418,9 @@ fn pnpm_installs(input: &Yaml) -> Option<Vec<(String, Option<String>)>> {
 }
 
 /// A step that runs one of the setup step's installs, under the setup step's condition and env
-fn install_step(setup: &Hash, run: String, cwd: Option<String>) -> Yaml {
+fn install_step(setup: &Hash, run: &str, cwd: Option<&str>) -> Yaml {
     let mut h = Hash::new();
-    h.insert(key("name"), key(&run));
+    h.insert(key("name"), key(run));
 
     for field in ["if", "env", "continue-on-error"] {
         if let Some(v) = setup.get(&key(field)) {
@@ -2381,12 +2428,12 @@ fn install_step(setup: &Hash, run: String, cwd: Option<String>) -> Yaml {
         }
     }
 
-    h.insert(key("run"), key(&run));
+    h.insert(key("run"), key(run));
     // Composite actions need a shell on every run step
     h.insert(key("shell"), key("bash"));
 
     if let Some(dir) = cwd {
-        h.insert(key("working-directory"), key(&dir));
+        h.insert(key("working-directory"), key(dir));
     }
 
     Yaml::Hash(h)
@@ -2475,6 +2522,9 @@ fn volume_name(repo_id: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner;
+    use crate::runner::tests;
+    use std::os::unix::fs::PermissionsExt;
     use yaml_rust2::YamlLoader;
 
     fn load(s: &str) -> Yaml {
@@ -2526,7 +2576,7 @@ jobs:
     fn the_checkout_step_needs_both_nonces() {
         let script = nonce_step("abc")["run"].as_str().unwrap().to_string();
         let run = |dir: &Path| {
-            let out = Command::new(crate::runner::posix_sh())
+            let out = Command::new(runner::posix_sh())
                 .args(["-e", "-c", &script])
                 .env("GITHUB_WORKSPACE", dir)
                 .output()
@@ -2775,7 +2825,6 @@ jobs:
 
     #[test]
     fn the_homes_step_owns_the_dirs_docker_made_above_a_mount() {
-        use std::os::unix::fs::PermissionsExt;
         let out = load(&inject(CI, "abc").unwrap());
         let dir = tempfile::tempdir().unwrap();
         let (home, bin) = (dir.path().join("home"), dir.path().join("bin"));
@@ -2901,8 +2950,9 @@ jobs:
                 assert!(std::io::BufRead::read_line(&mut out, &mut line).unwrap() > 0);
             }
 
-            // Safe: kill only sends a signal to the child this test started
-            unsafe { libc::kill(shipcheck.id() as libc::pid_t, signal) };
+            let pid = libc::pid_t::try_from(shipcheck.id()).expect("a pid fits a pid_t");
+            // SAFETY: kill only sends a signal to the child this test started
+            unsafe { libc::kill(pid, signal) };
             let status = shipcheck.wait().unwrap();
             assert_eq!(
                 std::os::unix::process::ExitStatusExt::signal(&status),
@@ -2932,7 +2982,6 @@ jobs:
 
     #[test]
     fn the_reaper_cleans_up_only_when_shipcheck_dies_first() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("docker.log");
         let docker = dir.path().join("docker");
@@ -2946,8 +2995,7 @@ jobs:
         fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!("{}:/usr/bin:/bin", dir.path().display());
         // A slot lock at 10 or higher, which a shell cannot redirect, so it must come in lower
-        let lock =
-            crate::runner::tests::high(fs::File::create(dir.path().join("slot.lock")).unwrap());
+        let lock = tests::high(fs::File::create(dir.path().join("slot.lock")).unwrap());
 
         // Ended by itself, killed at the timeout, or shipcheck died
         for state in ["done", "exited", ""] {
@@ -2957,7 +3005,7 @@ jobs:
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let mut cmd = Command::new(crate::runner::posix_sh());
+            let mut cmd = Command::new(runner::posix_sh());
             let held =
                 super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
             let mut reaper = cmd
@@ -3870,8 +3918,8 @@ jobs:
                    [ci.yml/t] \u{2b50} Run Complete job\n";
         assert_eq!(read_summary(log), "| a | b |\n|---|---|\n| 1 | 2 |\nsecond");
         assert_eq!(read_summary("[ci.yml/t] nothing\n"), "");
-        let long = format!("[w/j]   \u{2699}  Summary - {}\n", "\u{e9}".repeat(20_000));
-        assert!(read_summary(&long).ends_with("[...cut at 20000 bytes...]"));
+        let long_line = format!("[w/j]   \u{2699}  Summary - {}\n", "\u{e9}".repeat(20_000));
+        assert!(read_summary(&long_line).ends_with("[...cut at 20000 bytes...]"));
     }
 
     #[test]

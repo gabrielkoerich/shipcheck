@@ -1,4 +1,9 @@
+use crate::config::{Logs, RunnerKind};
+use crate::run;
+use crate::run::JobDone;
+use crate::run::Plan;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
@@ -6,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::report;
 use crate::run::{ALLOWED, Entry};
-use crate::runner::host::HOST;
+use crate::runner::host::{HOST, runner_of};
 use crate::runner::shard::ShardRun;
 
 pub const NAME: &str = "shipcheck";
@@ -48,14 +53,14 @@ pub fn summary(entry: &Entry) -> String {
         s.push_str("This commit changes CI. Changes to workflows and `shipcheck.toml` did not run, the base's versions did. Changes to what a command runs, such as `package.json` scripts, did run. All of them apply to every PR once merged:\n\n");
 
         for change in &entry.ci_changes {
-            s.push_str(&format!("- {change}\n"));
+            let _ = writeln!(s, "- {change}");
         }
 
         s.push('\n');
     }
 
     if let Some(reason) = &entry.skipped {
-        s.push_str(&format!("Nothing ran: {reason}.\n"));
+        let _ = writeln!(s, "Nothing ran: {reason}.");
         return clip(s);
     }
 
@@ -81,13 +86,14 @@ pub fn summary(entry: &Entry) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         let exit = wf.exit.map_or("timeout".to_string(), |c| c.to_string());
-        s.push_str(&format!(
-            "| {} | {} | {exit} | {} | {jobs} | `{}` |\n",
+        let _ = writeln!(
+            s,
+            "| {} | {} | {exit} | {} | {jobs} | `{}` |",
             name(&wf.file),
             if wf.passed { "passed" } else { "failed" },
             wf.attempts,
             &wf.log_sha256[..12.min(wf.log_sha256.len())]
-        ));
+        );
     }
 
     clip(s)
@@ -100,7 +106,7 @@ pub fn failure_text(entry: &Entry, log_dir: &Path, secrets: &[String]) -> String
 
     for wf in entry.workflows.iter().filter(|w| !w.passed) {
         let tail = tail(&log_dir.join(format!("{}.log", wf.file)), secrets);
-        s.push_str(&format!("### {}\n\n```\n{tail}\n```\n\n", name(&wf.file)));
+        let _ = write!(s, "### {}\n\n```\n{tail}\n```\n\n", name(&wf.file));
     }
 
     clip(s)
@@ -123,7 +129,8 @@ fn tail_of(log: &str) -> String {
     // A cut log still names its command, which a host check's log starts with
     if lines.len() > TAIL_LINES {
         let head = lines.first().filter(|l| l.starts_with("$ "));
-        tail = head.map_or("[...]".to_string(), |h| format!("{h}\n[...]")) + "\n" + &tail;
+        let head = head.map_or("[...]".to_string(), |h| format!("{h}\n[...]"));
+        tail = format!("{head}\n{tail}");
     }
 
     tail
@@ -142,21 +149,21 @@ pub fn mask(mut text: String, secrets: &[String]) -> String {
  * is, then the end of the log. The tail keeps at most half the field, the failures get the rest,
  * and a failure that does not fit whole is left out after the first, which keeps its start
  **/
-fn failed_text(path: &Path, host: bool, secrets: &[String]) -> String {
+fn failed_text(path: &Path, kind: RunnerKind, secrets: &[String]) -> String {
     let log = read_masked(path, secrets);
-    let (names, blocks) = report::failures(&log, host);
+    let (names, blocks) = report::failures(&log, kind);
     let tail = tail_of(&log);
     let mut s = String::new();
 
     if !names.is_empty() {
-        s.push_str(&format!("Failed tests ({}):\n\n```\n", names.len()));
+        let _ = write!(s, "Failed tests ({}):\n\n```\n", names.len());
 
         for name in names.iter().take(report::MAX_TESTS) {
-            s.push_str(&format!("{name}\n"));
+            let _ = writeln!(s, "{name}");
         }
 
         if names.len() > report::MAX_TESTS {
-            s.push_str(&format!("and {} more\n", names.len() - report::MAX_TESTS));
+            let _ = writeln!(s, "and {} more", names.len() - report::MAX_TESTS);
         }
 
         s.push_str("```\n\n");
@@ -168,7 +175,7 @@ fn failed_text(path: &Path, host: bool, secrets: &[String]) -> String {
         let mut kept = 0;
 
         for (_, lines) in &blocks {
-            let block = lines.join("\n") + "\n\n";
+            let block = format!("{}\n\n", lines.join("\n"));
 
             if out.len() + block.len() > budget {
                 if kept == 0 {
@@ -189,18 +196,20 @@ fn failed_text(path: &Path, host: bool, secrets: &[String]) -> String {
             kept += 1;
         }
 
-        s.push_str(&format!("```\n{}\n```\n\n", out.trim_end()));
+        let _ = write!(s, "```\n{}\n```\n\n", out.trim_end());
 
         if kept < blocks.len() {
-            s.push_str(&format!(
+            let _ = write!(
+                s,
                 "{} more failed tests were left out, `shipcheck logs` has the rest.\n\n",
                 blocks.len() - kept
-            ));
+            );
         }
     }
 
     let room = MAX_FIELD.saturating_sub(s.len() + 10);
-    s + &format!("```\n{}\n```\n", clip_to(tail, room))
+    let _ = writeln!(s, "```\n{}\n```", clip_to(tail, room));
+    s
 }
 
 /// Job ids per file a run reports: the `[host]` checks under [`HOST`], or each required workflow's jobs
@@ -262,14 +271,14 @@ fn all_jobs(jobs: &Jobs, entry: &Entry) -> Jobs {
  * One check per job, each required in branch protection. A `paths` skip makes every one `skipped`,
  * which GitHub counts as passing. A job the result lacks fails, and so does every job of a workflow
  * that failed with no failed job, so all job checks pass only when every workflow passed. A job's
- * log tail goes in as in `body`, and with `all` for a job that passed too
+ * log tail goes in as in `body`, and with `Logs::All` for a job that passed too
  **/
 pub fn job_bodies(
     sha: &str,
     jobs: &Jobs,
     entry: &Entry,
     logs: Option<(&Path, &[String])>,
-    all: bool,
+    tails: Logs,
 ) -> Vec<Value> {
     let mut bodies = Vec::new();
 
@@ -302,10 +311,10 @@ pub fn job_bodies(
         let text = match logs {
             Some((dir, secrets)) if conclusion == "failure" => failed_text(
                 &dir.join(&file).join(format!("{job}.log")),
-                file == HOST,
+                runner_of(&file),
                 secrets,
             ),
-            Some((dir, secrets)) if all => format!(
+            Some((dir, secrets)) if tails == Logs::All => format!(
                 "```\n{}\n```\n",
                 tail(&dir.join(&file).join(format!("{job}.log")), secrets)
             ),
@@ -343,28 +352,32 @@ pub fn job_bodies(
 }
 
 /// Every job check's name and then `shipcheck`, from the jobs on main
-pub fn names(plan: &crate::run::Plan) -> Vec<String> {
-    let jobs = crate::run::jobs(plan).unwrap_or_default();
+pub fn names(plan: &Plan) -> Vec<String> {
+    let jobs = run::jobs(plan).unwrap_or_default();
     let mut names: Vec<String> = job_names(&jobs).into_iter().map(|(_, _, n)| n).collect();
     names.push(NAME.into());
     names
 }
 
-/// Every job check and then `shipcheck`, so a failed post leaves `shipcheck` open. Log tails go in
-/// only `with_logs` and when the repository's secrets can be read, so none goes out unmasked
-pub fn final_bodies(plan: &crate::run::Plan, entry: &Entry, with_logs: bool) -> Vec<Value> {
-    use crate::run;
+/// Whether the checks carry log tails
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tails {
+    Shown,
+    Withheld,
+}
 
+/// Every job check and then `shipcheck`, so a failed post leaves `shipcheck` open. Log tails go in
+/// only when `Shown` and the repository's secrets can be read, so none goes out unmasked
+pub fn final_bodies(plan: &Plan, entry: &Entry, tails: Tails) -> Vec<Value> {
     let dir = run::log_dir(&plan.key);
     let secrets = run::repo_id(&plan.repo).and_then(|id| run::secret_values(&id));
     let logs = match &secrets {
-        Ok(secrets) if with_logs => Some((dir.as_path(), secrets.as_slice())),
+        Ok(secrets) if tails == Tails::Shown => Some((dir.as_path(), secrets.as_slice())),
         _ => None,
     };
-    let all = plan.config.logs == crate::config::Logs::All;
     // A workflow main cannot parse fails the run, whose result then names its jobs
     let jobs = run::jobs(plan).unwrap_or_default();
-    let mut bodies = job_bodies(&plan.sha, &jobs, entry, logs, all);
+    let mut bodies = job_bodies(&plan.sha, &jobs, entry, logs, plan.config.logs);
     bodies.push(body(&plan.sha, entry, logs));
     bodies
 }
@@ -373,13 +386,10 @@ pub fn final_bodies(plan: &crate::run::Plan, entry: &Entry, with_logs: bool) -> 
  * The check of one job that ended while its run goes on, built as [`final_bodies`] builds it from a
  * result of that job alone. The final post replaces it, so a run that fails closed still fails it
  **/
-pub fn job_body(plan: &crate::run::Plan, done: &crate::run::JobDone) -> Option<Value> {
-    use crate::run;
-
+pub fn job_body(plan: &Plan, done: &JobDone) -> Option<Value> {
     let dir = run::log_dir(&plan.key);
     let secrets = run::repo_id(&plan.repo).and_then(|id| run::secret_values(&id));
     let logs = secrets.as_ref().ok().map(|s| (dir.as_path(), s.as_slice()));
-    let all = plan.config.logs == crate::config::Logs::All;
     let jobs = Jobs::from([(done.file.clone(), BTreeSet::from([done.job.clone()]))]);
     let entry = Entry {
         key: plan.key.clone(),
@@ -403,7 +413,7 @@ pub fn job_body(plan: &crate::run::Plan, done: &crate::run::JobDone) -> Option<V
         skipped: None,
         ci_changes: Vec::new(),
     };
-    job_bodies(&plan.sha, &jobs, &entry, logs, all)
+    job_bodies(&plan.sha, &jobs, &entry, logs, plan.config.logs)
         .into_iter()
         .next()
 }
@@ -418,20 +428,27 @@ fn conclusion(state: &str) -> &'static str {
     }
 }
 
+/// Whether a run of a check's tree goes now
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    Queued,
+    Running,
+}
+
 /// Body of a check that has no result yet: `in_progress` while a run of its tree goes, which GitHub
 /// shows as a yellow dot, or `queued` while no machine runs it
-pub fn waiting(name: &str, sha: &str, running: bool) -> Value {
-    let mut body = waiting_body(name, sha, running);
+pub fn waiting(name: &str, sha: &str, wait: Wait) -> Value {
+    let mut body = waiting_body(name, sha, wait);
 
-    if running {
-        body["started_at"] = iso(crate::run::unix_now()).into();
+    if wait == Wait::Running {
+        body["started_at"] = iso(run::unix_now()).into();
     }
 
     body
 }
 
-fn waiting_body(name: &str, sha: &str, running: bool) -> Value {
-    let (status, title, summary) = if running {
+fn waiting_body(name: &str, sha: &str, wait: Wait) -> Value {
+    let (status, title, summary) = if wait == Wait::Running {
         (
             "in_progress",
             "running",
@@ -512,7 +529,7 @@ pub fn errored(name: &str, sha: &str, error: &str) -> Value {
         "head_sha": sha,
         "status": "completed",
         "conclusion": "failure",
-        "completed_at": iso(crate::run::unix_now()),
+        "completed_at": iso(run::unix_now()),
         "output": {
             "title": "could not run",
             "summary": "shipcheck stopped before this commit's checks ran. The text below says why.",
@@ -523,7 +540,8 @@ pub fn errored(name: &str, sha: &str, error: &str) -> Value {
 
 /// Unix seconds as the UTC ISO 8601 time GitHub takes, by Howard Hinnant's days-to-civil algorithm
 pub fn iso(secs: u64) -> String {
-    let (days, rest) = ((secs / 86_400) as i64 + 719_468, secs % 86_400);
+    let days = i64::try_from(secs / 86_400).expect("days since 1970 fit an i64");
+    let (days, rest) = (days + 719_468, secs % 86_400);
     let era = days.div_euclid(146_097);
     let doe = days - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -542,12 +560,22 @@ pub fn iso(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::report;
+    use crate::run;
     use std::collections::BTreeMap;
 
     use super::*;
     use crate::run::WorkflowResult;
 
-    fn entry(passed: bool) -> Entry {
+    /// Whether the test entry passed
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Verdict {
+        Passed,
+        Failed,
+    }
+
+    fn entry(verdict: Verdict) -> Entry {
+        let passed = verdict == Verdict::Passed;
         Entry {
             key: "k".into(),
             sha: "s".into(),
@@ -556,7 +584,7 @@ mod tests {
             passed,
             workflows: vec![WorkflowResult {
                 file: "ci.yml".into(),
-                exit: Some(if passed { 0 } else { 1 }),
+                exit: Some(i32::from(!passed)),
                 attempts: if passed { 1 } else { 2 },
                 log_sha256: "abcdef0123456789".into(),
                 jobs: BTreeMap::from([(
@@ -584,8 +612,8 @@ mod tests {
 
     #[test]
     fn waiting_has_no_conclusion() {
-        for (running, status) in [(true, "in_progress"), (false, "queued")] {
-            let body = waiting("shipcheck/test", "s", running);
+        for (wait, status) in [(Wait::Running, "in_progress"), (Wait::Queued, "queued")] {
+            let body = waiting("shipcheck/test", "s", wait);
             assert_eq!(body["name"], "shipcheck/test");
             assert_eq!(body["status"], status);
             assert_eq!(body["head_sha"], "s");
@@ -595,7 +623,7 @@ mod tests {
 
     #[test]
     fn passing_body() {
-        let b = body("abc", &entry(true), None);
+        let b = body("abc", &entry(Verdict::Passed), None);
         assert_eq!(b["name"], "shipcheck");
         assert_eq!(b["head_sha"], "abc");
         assert_eq!(b["conclusion"], "success");
@@ -608,10 +636,10 @@ mod tests {
 
     #[test]
     fn a_pass_that_does_not_hold_fails_every_job_check() {
-        let mut e = entry(true);
-        crate::run::fail_closed(&mut e);
-        let bodies = job_bodies("abc", &Jobs::new(), &e, None, false);
-        assert!(!bodies.is_empty());
+        let mut e = entry(Verdict::Passed);
+        run::fail_closed(&mut e);
+        let bodies = job_bodies("abc", &Jobs::new(), &e, None, Logs::Failed);
+        assert_ne!(bodies, Vec::<serde_json::Value>::new());
 
         for b in &bodies {
             assert_eq!(b["conclusion"], "failure", "{b}");
@@ -620,7 +648,7 @@ mod tests {
 
     #[test]
     fn names_ci_changes_without_failing() {
-        let mut e = entry(true);
+        let mut e = entry(Verdict::Passed);
         e.ci_changes = vec![".github/workflows/ci.yml: job test gets continue-on-error".into()];
         let b = body("abc", &e, None);
         assert_eq!(b["conclusion"], "success");
@@ -632,16 +660,16 @@ mod tests {
 
     #[test]
     fn a_job_shipcheck_could_not_start_is_not_the_codes_failure() {
-        let mut e = entry(false);
+        let mut e = entry(Verdict::Failed);
         let jobs = &mut e.workflows[0].jobs;
-        jobs.insert("test".into(), crate::run::COULD_NOT_RUN.into());
+        jobs.insert("test".into(), run::COULD_NOT_RUN.into());
         jobs.insert(
             "after".into(),
             "not run, a job it needs did not pass".into(),
         );
         assert!(e.could_not_run());
-        assert_eq!(crate::run::exit_code(&e), 2);
-        assert!(crate::report::text(&e, "abc", &[]).contains("could not run, tree t from abc"));
+        assert_eq!(run::exit_code(&e), 2);
+        assert!(report::text(&e, "abc", &[]).contains("could not run, tree t from abc"));
         assert_eq!(
             body("abc", &e, None)["output"]["title"],
             "could not run, Docker or the sandbox failed before the code ran"
@@ -650,17 +678,17 @@ mod tests {
         // One job that ran and failed makes it the code's failure again
         e.workflows[0].jobs.insert("lint".into(), "failure".into());
         assert!(!e.could_not_run());
-        assert_eq!(crate::run::exit_code(&e), 1);
-        assert_eq!(crate::run::exit_code(&entry(true)), 0);
-        assert!(!entry(false).could_not_run());
-        assert!(!entry(true).could_not_run());
+        assert_eq!(run::exit_code(&e), 1);
+        assert_eq!(run::exit_code(&entry(Verdict::Passed)), 0);
+        assert!(!entry(Verdict::Failed).could_not_run());
+        assert!(!entry(Verdict::Passed).could_not_run());
     }
 
     #[test]
     fn failing_body_keeps_logs_local_for_a_fork() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("ci.yml.log"), "token=hunter2\n").unwrap();
-        let b = body("abc", &entry(false), None);
+        let b = body("abc", &entry(Verdict::Failed), None);
         let text = b["output"]["text"].as_str().unwrap();
         assert!(!text.contains("hunter2"));
         assert!(text.contains("shipcheck logs"));
@@ -669,11 +697,14 @@ mod tests {
     #[test]
     fn failing_body_has_the_log_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let log: String = (1..=150).map(|i| format!("line {i}\n")).collect();
+        let log = (1..=150).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "line {i}");
+            s
+        });
         let log = log.replace("line 120\n", "line 120 hunter2\n");
         fs::write(dir.path().join("ci.yml.log"), log).unwrap();
         let secret = vec!["hunter2".to_string()];
-        let b = body("abc", &entry(false), Some((dir.path(), &secret)));
+        let b = body("abc", &entry(Verdict::Failed), Some((dir.path(), &secret)));
         assert_eq!(b["conclusion"], "failure");
         assert_eq!(b["output"]["title"], "failed, 1 of 1 workflows");
         let text = b["output"]["text"].as_str().unwrap();
@@ -686,7 +717,7 @@ mod tests {
 
     #[test]
     fn names_host_checks() {
-        let mut e = entry(false);
+        let mut e = entry(Verdict::Failed);
         e.workflows[0].file = HOST.into();
         e.workflows[0].jobs = BTreeMap::from([
             ("lint".into(), "success".into()),
@@ -705,7 +736,12 @@ mod tests {
 
     fn jobs(list: &[(&str, &[&str])]) -> Jobs {
         list.iter()
-            .map(|(f, js)| (f.to_string(), js.iter().map(|j| j.to_string()).collect()))
+            .map(|(f, js)| {
+                (
+                    f.to_string(),
+                    js.iter().map(std::string::ToString::to_string).collect(),
+                )
+            })
             .collect()
     }
 
@@ -768,7 +804,7 @@ mod tests {
     #[test]
     fn a_check_per_job_with_its_own_log() {
         let dir = tempfile::tempdir().unwrap();
-        let mut e = entry(false);
+        let mut e = entry(Verdict::Failed);
         e.workflows[0].jobs.insert("lint".into(), "success".into());
         e.workflows[0]
             .jobs
@@ -781,7 +817,13 @@ mod tests {
         let secret = vec!["hunter2".to_string()];
         // `gone` is a job main has that the result lacks
         let expected = jobs(&[("ci.yml", &["bench", "docs", "gone", "lint", "test"])]);
-        let bodies = job_bodies("abc", &expected, &e, Some((dir.path(), &secret)), false);
+        let bodies = job_bodies(
+            "abc",
+            &expected,
+            &e,
+            Some((dir.path(), &secret)),
+            Logs::Failed,
+        );
         let by = |n: &str| bodies.iter().find(|b| b["name"] == n).unwrap().clone();
         assert_eq!(bodies.len(), 5);
         assert_eq!(by("shipcheck/lint")["conclusion"], "success");
@@ -798,7 +840,7 @@ mod tests {
         assert_eq!(test["head_sha"], "abc");
         assert_eq!(test["conclusion"], "failure");
         assert_eq!(test["output"]["text"], "```\nboom ***\n```\n");
-        let local = job_bodies("abc", &expected, &e, None, false);
+        let local = job_bodies("abc", &expected, &e, None, Logs::Failed);
         assert!(
             local[4]["output"]["text"]
                 .as_str()
@@ -809,9 +851,9 @@ mod tests {
 
     #[test]
     fn a_failed_workflow_with_no_failed_job_fails_every_job() {
-        let mut e = entry(false);
+        let mut e = entry(Verdict::Failed);
         e.workflows[0].jobs = BTreeMap::from([("test".into(), "skipped".into())]);
-        let bodies = job_bodies("abc", &Jobs::new(), &e, None, false);
+        let bodies = job_bodies("abc", &Jobs::new(), &e, None, Logs::Failed);
         assert_eq!(bodies[0]["name"], "shipcheck/test");
         assert_eq!(bodies[0]["conclusion"], "failure");
     }
@@ -819,7 +861,7 @@ mod tests {
     #[test]
     fn all_logs_and_durations() {
         let dir = tempfile::tempdir().unwrap();
-        let mut e = entry(true);
+        let mut e = entry(Verdict::Passed);
         e.workflows[0]
             .times
             .insert("test".into(), [1_700_000_000, 1_700_000_042]);
@@ -828,24 +870,28 @@ mod tests {
         fs::write(dir.path().join("ci.yml/test.log"), "ok hunter2\n").unwrap();
         let secret = vec!["hunter2".to_string()];
         let logs = Some((dir.path(), secret.as_slice()));
-        let all = job_bodies("abc", &Jobs::new(), &e, logs, true);
+        let all = job_bodies("abc", &Jobs::new(), &e, logs, Logs::All);
         assert_eq!(all[0]["output"]["text"], "```\nok ***\n```\n");
         assert_eq!(all[0]["started_at"], "2023-11-14T22:13:20Z");
         assert_eq!(all[0]["completed_at"], "2023-11-14T22:14:02Z");
-        let failed_only = job_bodies("abc", &Jobs::new(), &e, logs, false);
+        let failed_only = job_bodies("abc", &Jobs::new(), &e, logs, Logs::Failed);
         assert_eq!(failed_only[0]["output"]["text"], "");
         let summary = body("abc", &e, None);
         assert_eq!(summary["started_at"], "2023-11-14T22:13:20Z");
         assert_eq!(summary["completed_at"], "2023-11-14T22:14:10Z");
         // An entry from before times has none, GitHub then uses the post time
-        assert!(body("abc", &entry(true), None).get("started_at").is_none());
         assert!(
-            waiting("shipcheck/test", "s", true)
+            body("abc", &entry(Verdict::Passed), None)
+                .get("started_at")
+                .is_none()
+        );
+        assert!(
+            waiting("shipcheck/test", "s", Wait::Running)
                 .get("started_at")
                 .is_some()
         );
         assert!(
-            waiting("shipcheck/test", "s", false)
+            waiting("shipcheck/test", "s", Wait::Queued)
                 .get("started_at")
                 .is_none()
         );
@@ -860,7 +906,7 @@ mod tests {
 
     #[test]
     fn a_paths_skip_skips_every_job() {
-        let mut e = entry(true);
+        let mut e = entry(Verdict::Passed);
         e.workflows.clear();
         e.skipped = Some("no change under paths (src/**)".into());
         let bodies = job_bodies(
@@ -868,7 +914,7 @@ mod tests {
             &jobs(&[("ci.yml", &["lint", "test"])]),
             &e,
             None,
-            false,
+            Logs::Failed,
         );
         assert_eq!(bodies.len(), 2);
 
@@ -902,10 +948,16 @@ mod tests {
         log.extend((1..=150).map(|i| format!("line {i}\n")));
         fs::create_dir(dir.path().join(HOST)).unwrap();
         fs::write(dir.path().join("host/test.log"), &log).unwrap();
-        let mut e = entry(false);
+        let mut e = entry(Verdict::Failed);
         e.workflows[0].file = HOST.into();
         let secret = vec!["hunter2".to_string()];
-        let bodies = job_bodies("abc", &Jobs::new(), &e, Some((dir.path(), &secret)), false);
+        let bodies = job_bodies(
+            "abc",
+            &Jobs::new(),
+            &e,
+            Some((dir.path(), &secret)),
+            Logs::Failed,
+        );
         let text = bodies[0]["output"]["text"].as_str().unwrap();
         assert!(
             text.starts_with(
@@ -922,14 +974,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let secret = "s3cr3t-value-0123456789".to_string();
         // The secret straddles the 400-byte cut of a block line, and sits in a test name
-        let long = format!("{}{secret} tail", "x".repeat(390));
+        let long_line = format!("{}{secret} tail", "x".repeat(390));
         let p = "[CI/test 13f69a23]   |";
         let log = format!(
-            "{p} test a::{secret} ... FAILED\n{p} ---- a::{secret} stdout ----\n{p} {long}\n{p} failures:\n[CI/test 13f69a23]   ❌  Failure - Main Run cargo test [1s]\n"
+            "{p} test a::{secret} ... FAILED\n{p} ---- a::{secret} stdout ----\n{p} {long_line}\n{p} failures:\n[CI/test 13f69a23]   ❌  Failure - Main Run cargo test [1s]\n"
         );
         let path = dir.path().join("test.log");
         fs::write(&path, log).unwrap();
-        let text = failed_text(&path, false, std::slice::from_ref(&secret));
+        let text = failed_text(&path, RunnerKind::Act, std::slice::from_ref(&secret));
         assert!(text.contains("---- a::*** stdout ----"), "{text}");
         assert!(!text.contains("s3cr3t"), "{text}");
     }
@@ -941,13 +993,13 @@ mod tests {
 
         for i in 0..200 {
             let line = format!("panic {i} ").repeat(40);
-            log.push_str(&format!("---- t{i} stdout ----\n{line}\n{line}\n{line}\n"));
+            let _ = write!(log, "---- t{i} stdout ----\n{line}\n{line}\n{line}\n");
         }
 
         log.push_str("failures:\nend\n");
         let path = dir.path().join("test.log");
         fs::write(&path, &log).unwrap();
-        let text = failed_text(&path, true, &[]);
+        let text = failed_text(&path, RunnerKind::Host, &[]);
         assert!(text.len() <= MAX_FIELD, "{}", text.len());
         let first = "panic 0 ".repeat(40);
         assert!(text.contains(&format!("---- t0 stdout ----\n{first}\n{first}\n{first}\n")));
@@ -966,7 +1018,7 @@ mod tests {
             format!("---- big stdout ----\n{}\nfailures:\n", "x".repeat(90_000)),
         )
         .unwrap();
-        let text = failed_text(&path, true, &[]);
+        let text = failed_text(&path, RunnerKind::Host, &[]);
         assert!(text.len() <= MAX_FIELD, "{}", text.len());
         assert!(text.starts_with("```\n---- big stdout ----\nxxx"));
         assert!(!text.contains("left out"));

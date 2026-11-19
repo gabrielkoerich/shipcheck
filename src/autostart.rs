@@ -1,3 +1,5 @@
+use crate::daemon;
+use crate::runner::host;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -115,7 +117,7 @@ pub(crate) fn main_checkout(root: &Path) -> PathBuf {
 /// Whether `shipcheck.toml` on the base branch leaves the daemon on, which it does when there is none yet
 fn wanted_on_main(root: &Path) -> bool {
     // Offline there is no base to read, and `register` then says why nothing was installed
-    let Some(base) = crate::daemon::known_base(root) else {
+    let Some(base) = daemon::known_base(root) else {
         return true;
     };
 
@@ -124,7 +126,7 @@ fn wanted_on_main(root: &Path) -> bool {
 
 /// Whether the base branch has a `shipcheck.toml` that leaves the daemon on, so the daemon has work here
 pub(crate) fn daemon_on_main(root: &Path) -> bool {
-    crate::daemon::known_base(root)
+    daemon::known_base(root)
         .and_then(|base| main_config(root, &base))
         .is_some_and(|c| c.daemon)
 }
@@ -160,7 +162,7 @@ fn try_install(root: &Path) -> Result<String, String> {
         return Ok("daemon not installed, SHIPCHECK_NO_DAEMON=1".into());
     }
 
-    if !owns_service(run::home_overridden()) {
+    if !owns_service(run::which_home()) {
         return Ok("daemon not installed, SHIPCHECK_HOME is not the default".into());
     }
 
@@ -171,16 +173,16 @@ fn try_install(root: &Path) -> Result<String, String> {
     register(&DaemonConfig::path(), &main_checkout(root))?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // The service runs outside any sandbox for weeks, so it keeps only the PATH entries a jail would
-    let path = crate::runner::host::jail_path()
-        .to_string_lossy()
-        .into_owned();
+    let path = host::jail_path().to_string_lossy().into_owned();
     let file = service_file();
 
     if cfg!(target_os = "macos") {
         let log = run::home().join("logs/daemon.log");
         fs::create_dir_all(run::home().join("logs")).map_err(|e| e.to_string())?;
         let changed = write(&file, &plist(&exe, &path, &log))?;
-        let target = format!("gui/{}/{LABEL}", unsafe { libc::getuid() });
+        // SAFETY: getuid cannot fail and touches no memory
+        let uid = unsafe { libc::getuid() };
+        let target = format!("gui/{uid}/{LABEL}");
 
         if changed || !ok("launchctl", &["print", &target]) {
             let domain = target.rsplit_once('/').map_or("", |(d, _)| d);
@@ -206,21 +208,21 @@ fn try_install(root: &Path) -> Result<String, String> {
     Ok(RUNNING.into())
 }
 
-/// Whether the LaunchAgent still logs into the home from before it left `~/Library`
+/// Whether the `LaunchAgent` still logs into the home from before it left `~/Library`
 pub fn logs_to_legacy_home() -> bool {
     let old = xml(&run::legacy_home().to_string_lossy());
     fs::read_to_string(service_file()).is_ok_and(|t| t.contains(&old))
 }
 
-/// The one service belongs to the default home, so a moved SHIPCHECK_HOME, such as a test's,
+/// The one service belongs to the default home, so a moved `SHIPCHECK_HOME`, such as a test's,
 /// never installs or removes it
-fn owns_service(home_overridden: bool) -> bool {
-    !home_overridden
+fn owns_service(home: run::Home) -> bool {
+    home == run::Home::Default
 }
 
 /// Stops the service and removes its file
 pub fn uninstall() -> Result<String, String> {
-    if !owns_service(run::home_overridden()) {
+    if !owns_service(run::which_home()) {
         return Ok("daemon service left alone, SHIPCHECK_HOME is not the default".into());
     }
 
@@ -231,7 +233,10 @@ pub fn uninstall() -> Result<String, String> {
             "launchctl",
             &[
                 "bootout",
-                &format!("gui/{}/{LABEL}", unsafe { libc::getuid() }),
+                &format!("gui/{}/{LABEL}", {
+                    // SAFETY: getuid cannot fail and touches no memory
+                    unsafe { libc::getuid() }
+                }),
             ],
         );
     } else {
@@ -311,9 +316,9 @@ mod tests {
 
     #[test]
     fn only_the_default_home_installs_or_removes_the_service() {
-        assert!(owns_service(false));
+        assert!(owns_service(run::Home::Default));
         assert!(
-            !owns_service(true),
+            !owns_service(run::Home::Moved),
             "a test's SHIPCHECK_HOME once ran `clean --all` and removed the developer's daemon"
         );
     }

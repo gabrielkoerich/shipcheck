@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use crate::run::git_lock_in;
 
 /// A template no run used for this long goes, the next run of its job clones it again
-pub const KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
+pub const KEEP: Duration = Duration::from_hours(168);
 
 #[derive(Debug)]
 pub struct Template {

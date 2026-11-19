@@ -1,9 +1,12 @@
+//! A stopped run reaps the host checks it started
 #![cfg(target_os = "macos")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+
+use shipcheck::runner::host;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -18,7 +21,7 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -40,13 +43,14 @@ fn wait_for<T>(what: &str, within: Duration, mut f: impl FnMut() -> Option<T>) -
 }
 
 /// Stops the test's run, which reaps its check, also when an assertion fails first
-struct Stop(std::process::Child);
+struct Stop(Child);
 
 impl Drop for Stop {
     fn drop(&mut self) {
         if self.0.try_wait().is_ok_and(|s| s.is_none()) {
-            // Safe: the run is this test's own child, not yet reaped
-            unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
+            let pid = libc::pid_t::try_from(self.0.id()).expect("a pid fits in pid_t");
+            // SAFETY: the run is this test's own child, not yet reaped
+            unsafe { libc::kill(pid, libc::SIGTERM) };
             let _ = self.0.wait();
         }
     }
@@ -64,7 +68,7 @@ fn record(home: &Path) -> Option<(u64, String, PathBuf)> {
 
 #[test]
 fn a_stopped_run_reaps_its_running_check_at_once() {
-    if shipcheck::runner::host::in_a_jail() {
+    if host::in_a_jail() {
         // A jail of shipcheck's own tests has no launchd to reach
         return;
     }
@@ -102,23 +106,20 @@ fn a_stopped_run_reaps_its_running_check_at_once() {
     );
     let (coal, target, file) = wait_for("reap record", Duration::from_secs(120), || record(&home));
     let members = wait_for("check processes", Duration::from_secs(30), || {
-        let m = shipcheck::runner::host::coalition_members(coal);
+        let m = host::coalition_members(coal);
         (m.len() >= 4).then_some(m)
     });
 
-    // Safe: the run is this test's own child
-    assert_eq!(
-        unsafe { libc::kill(run.0.id() as libc::pid_t, libc::SIGTERM) },
-        0
-    );
+    let pid = libc::pid_t::try_from(run.0.id()).expect("a pid fits in pid_t");
+    // SAFETY: the run is this test's own child
+    let killed = unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(killed, 0);
     let status = wait_for("run exit", Duration::from_secs(10), || {
         run.0.try_wait().unwrap()
     });
     assert!(!status.success());
     wait_for("empty coalition", Duration::from_secs(5), || {
-        shipcheck::runner::host::coalition_members(coal)
-            .is_empty()
-            .then_some(())
+        host::coalition_members(coal).is_empty().then_some(())
     });
     assert!(!file.exists(), "the record stayed");
     let loaded = Command::new("/bin/launchctl")
@@ -128,7 +129,7 @@ fn a_stopped_run_reaps_its_running_check_at_once() {
     assert!(!loaded.status.success(), "{target} stayed loaded");
 
     for pid in members {
-        // Safe: signal 0 only checks that the process exists
+        // SAFETY: signal 0 only checks that the process exists
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "{pid} outlived the run");
     }
 }

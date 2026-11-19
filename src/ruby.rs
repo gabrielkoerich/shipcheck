@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(not(test))]
+use crate::run;
 use crate::workflow::Job;
 
 /// A Ruby a version manager installed
@@ -16,11 +18,9 @@ pub struct Ruby {
 /// The Rubies mise, rbenv, asdf and chruby installed, in the directories a check's jail can read
 #[cfg(not(test))]
 pub fn installed() -> Vec<Ruby> {
-    let user = crate::run::user_dir();
+    let user = run::user_dir();
     let var = |name: &str, default: &str| {
-        std::env::var_os(name)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| user.join(default))
+        std::env::var_os(name).map_or_else(|| user.join(default), PathBuf::from)
     };
     from_dirs(&[
         var("MISE_DATA_DIR", ".local/share/mise").join("installs/ruby"),
@@ -63,7 +63,7 @@ fn from_dirs(dirs: &[PathBuf]) -> Vec<Ruby> {
     found
 }
 
-/// `jruby-9.4.5.0` as its engine and version, a plain `3.4.1` or `ruby-3.4.1` as CRuby's
+/// `jruby-9.4.5.0` as its engine and version, a plain `3.4.1` or `ruby-3.4.1` as `CRuby`'s
 fn split(name: &str) -> (String, String) {
     let name = name.trim();
 
@@ -90,6 +90,7 @@ fn takes(wanted: &str, version: &str) -> bool {
 }
 
 /// The Ruby a job's check runs with, and a note when it differs from the workflow's
+#[derive(Debug)]
 pub struct Pick<'a> {
     pub ruby: Option<&'a Ruby>,
     pub note: Option<String>,
@@ -97,9 +98,9 @@ pub struct Pick<'a> {
 
 /**
  * The Ruby `ruby/setup-ruby` sets up for a job: its `ruby-version`, or `.ruby-version` when that is
- * unset or `default`. A version manager's install that matches is pinned. Else a CRuby on the
+ * unset or `default`. A version manager's install that matches is pinned. Else a `CRuby` on the
  * `PATH` stands in, with a note when its version differs, and an error keeps the job on GitHub
- * when this machine has no such Ruby. `ruby` is the latest stable, which any CRuby stands in for
+ * when this machine has no such Ruby. `ruby` is the latest stable, which any `CRuby` stands in for
  **/
 pub fn pick<'a>(
     job: &Job,
@@ -171,13 +172,14 @@ pub fn pick<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow;
     use std::path::Path;
 
     fn job(with: &str) -> Job {
         let ci = format!(
             "on: push\njobs:\n  test:\n    steps:\n      - uses: ruby/setup-ruby@v1\n{with}      - run: bundle exec rake\n"
         );
-        crate::workflow::job_runs(&ci).remove(0)
+        workflow::job_runs(&ci).remove(0)
     }
 
     fn version(v: &str) -> Job {

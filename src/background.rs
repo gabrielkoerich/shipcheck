@@ -1,6 +1,11 @@
+use crate::daemon;
+use crate::github::Check;
+use crate::run::JobDone;
+use crate::runner;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,9 +14,10 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::check;
+use crate::check::{self, Wait};
 use crate::github::Checks;
-use crate::run::{self, Entry, Plan};
+use crate::run::{self, Entry, Home, MovedHome, Plan};
+use crate::service::Credentials;
 
 /// Seconds between posts while GitHub does not have the pushed commit yet, about two minutes in all
 pub const WAITS: [u64; 7] = [2, 4, 8, 16, 30, 30, 30];
@@ -26,14 +32,25 @@ pub fn record(repo_id: &str, name: &str) -> PathBuf {
 
 /// Whether a push's run posts its checks: the results are in the default home where no agent
 /// wrote them, and this machine can post
-pub fn posts(home_overridden: bool, can_post: bool) -> bool {
-    !home_overridden && can_post
+pub fn posts(home: Home, credentials: Credentials) -> Posting {
+    if home == Home::Default && credentials == Credentials::Found {
+        Posting::On
+    } else {
+        Posting::Off
+    }
+}
+
+/// Whether a background run posts its checks
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Posting {
+    On,
+    Off,
 }
 
 /// Whether a background run may post from this home. A moved home may hold an agent's results,
 /// so only a person's `--home-ok` lets it post, as for `post` and the daemon
-pub fn home_allows_post(home_overridden: bool, home_ok: bool) -> bool {
-    !home_overridden || home_ok
+pub fn home_allows_post(home: Home, moved: MovedHome) -> bool {
+    home == Home::Default || moved == MovedHome::Allowed
 }
 
 /// Appends a line to the log the background runs write to
@@ -122,17 +139,17 @@ pub fn unposted(repo: &str) -> Option<String> {
  * of the same commit is left alone, unless it does not post and this one does, so a push right
  * after a commit adds a run that waits for the commit's run and posts its result
  **/
-/// `home_ok` passes a person's `--home-ok` on, from a daemon started with it
+/// `moved` passes a person's `--home-ok` on, from a daemon started with it
 pub fn start(
     cwd: &Path,
     plan: &Plan,
     base: &str,
     name: &str,
-    post: bool,
+    post: Posting,
     trigger: &str,
-    home_ok: bool,
+    moved: MovedHome,
 ) {
-    if !post && run::lookup(plan).is_some_and(|e| e.passed) {
+    if post == Posting::Off && run::lookup(plan).is_some_and(|e| e.passed) {
         return;
     }
 
@@ -147,11 +164,11 @@ pub fn start(
 
     for pid in older {
         if let Ok(pid) = pid.parse() {
-            crate::runner::signal_group(pid, libc::SIGTERM);
+            runner::signal_group(pid, libc::SIGTERM);
         }
     }
 
-    if let Ok(child) = spawn(cwd, plan, base, name, post, trigger, home_ok) {
+    if let Ok(child) = spawn(cwd, plan, base, name, post, trigger, moved) {
         let pid = child.id();
         reap();
 
@@ -163,10 +180,10 @@ pub fn start(
         keep.push(format!(
             "{pid} {}{}",
             plan.sha,
-            if post { " post" } else { "" }
+            if post == Posting::On { " post" } else { "" }
         ));
         let _ = fs::create_dir_all(path.parent().unwrap_or(&path));
-        let _ = fs::write(&path, keep.join("\n") + "\n");
+        let _ = fs::write(&path, format!("{}\n", keep.join("\n")));
     }
 }
 
@@ -175,7 +192,7 @@ pub fn start(
 fn next_record(
     record: &str,
     sha: &str,
-    post: bool,
+    post: Posting,
     alive: impl Fn(&str) -> bool,
 ) -> Option<(Vec<String>, Vec<String>)> {
     let (mut keep, mut older) = (Vec::new(), Vec::new());
@@ -187,7 +204,7 @@ fn next_record(
         };
 
         if s == sha && alive(pid) {
-            if !post || fields.next() == Some("post") {
+            if post == Posting::Off || fields.next() == Some("post") {
                 return None;
             }
 
@@ -211,7 +228,7 @@ pub fn fetch_base(cwd: &Path, base: &str) -> bool {
     };
 
     Command::new("git")
-        .args(crate::daemon::fetch_options())
+        .args(daemon::fetch_options())
         .args(["fetch", "-q", "origin", branch])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -219,9 +236,16 @@ pub fn fetch_base(cwd: &Path, base: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Which background runs [`running_here`] counts
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runs {
+    Any,
+    Posting,
+}
+
 /// Whether a background run of `sha` goes on this machine, under any branch or PR
-/// `posting` counts only the runs that post their own checks
-pub fn running_here(repo_id: &str, sha: &str, posting: bool) -> bool {
+/// `Runs::Posting` counts only the runs that post their own checks
+pub fn running_here(repo_id: &str, sha: &str, runs: Runs) -> bool {
     let dir = run::home().join("background").join(repo_id);
 
     fs::read_dir(dir)
@@ -233,7 +257,7 @@ pub fn running_here(repo_id: &str, sha: &str, posting: bool) -> bool {
             text.lines().any(|line| {
                 let mut fields = line.split_whitespace();
                 matches!((fields.next(), fields.next()), (Some(pid), Some(s))
-                    if s == sha && (!posting || fields.next() == Some("post")) && our_run(pid))
+                    if s == sha && (runs == Runs::Any || fields.next() == Some("post")) && our_run(pid))
             })
         })
 }
@@ -277,7 +301,7 @@ pub fn stop_here(repo_id: &str, sha: &str) {
         if our_run(&pid)
             && let Ok(pid) = pid.parse()
         {
-            crate::runner::signal_group(pid, libc::SIGTERM);
+            runner::signal_group(pid, libc::SIGTERM);
         }
     }
 }
@@ -322,7 +346,7 @@ fn our_run(pid: &str) -> bool {
 
     matches!(
         (fields.next(), fields.next()),
-        (Some(pgid), Some(comm)) if pgid == pid && comm.rsplit('/').next() == Some("shipcheck")
+        (Some(group), Some(comm)) if group == pid && comm.rsplit('/').next() == Some("shipcheck")
     )
 }
 
@@ -430,12 +454,10 @@ fn spawn(
     plan: &Plan,
     base: &str,
     name: &str,
-    post: bool,
+    post: Posting,
     trigger: &str,
-    home_ok: bool,
+    moved: MovedHome,
 ) -> Result<Child, String> {
-    use std::os::unix::process::CommandExt;
-
     let log_dir = run::home().join("logs");
     fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     let log = fs::OpenOptions::new()
@@ -444,7 +466,7 @@ fn spawn(
         .open(log_dir.join("background.log"))
         .map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let args = run_args(&plan.sha, base, name, post, home_ok);
+    let args = run_args(&plan.sha, base, name, post, moved);
 
     // Its own process group, so Ctrl-C in the terminal after a commit does not stop the run.
     // git points hooks at the commit's index, which would break every git call the run makes
@@ -467,16 +489,16 @@ fn spawn(
 }
 
 /// What a background run passes to its own binary, which the binary's tests parse
-pub fn run_args(sha: &str, base: &str, name: &str, post: bool, home_ok: bool) -> Vec<String> {
+pub fn run_args(sha: &str, base: &str, name: &str, post: Posting, moved: MovedHome) -> Vec<String> {
     let mut args: Vec<String> = ["run", "--no-fetch", "--sha", sha, "--base", base]
         .map(String::from)
         .into();
 
-    if post {
+    if post == Posting::On {
         args.extend(["--background".to_string(), name.to_string()]);
     }
 
-    if home_ok {
+    if moved == MovedHome::Allowed {
         args.push("--home-ok".into());
     }
 
@@ -514,26 +536,29 @@ pub type Send<'a> = dyn Fn(&Value, Option<u64>) -> Result<(u64, String), String>
 pub type Find<'a> = dyn Fn() -> Result<Checks, String> + Sync + 'a;
 
 /// The check of one job that ended, posted while the run goes on
-pub type Early<'a> = dyn Fn(&crate::run::JobDone) -> Option<Value> + Sync + 'a;
+pub type Early<'a> = dyn Fn(&JobDone) -> Option<Value> + Sync + 'a;
 
-/// Shows each named check without a result: in_progress while a run goes, queued while none does.
+/// Shows each named check without a result: `in_progress` while a run goes, queued while none does.
 /// Returns the id of every named check
 pub fn mark(
-    send: &Send,
+    send: &Send<'_>,
     existing: &Checks,
     sha: &str,
     names: &[String],
-    running: bool,
+    wait: Wait,
 ) -> Result<BTreeMap<String, u64>, String> {
-    let wanted = if running { "in_progress" } else { "queued" };
+    let wanted = match wait {
+        Wait::Running => "in_progress",
+        Wait::Queued => "queued",
+    };
     let mut ids = BTreeMap::new();
 
     for name in names {
         // GitHub keeps a completed run's conclusion but takes a new title, so a late mark would say running
         let id = match existing.get(name) {
             Some(c) if c.status == wanted || c.status == "completed" => c.id,
-            Some(c) => send(&check::waiting(name, sha, running), Some(c.id))?.0,
-            None => send(&check::waiting(name, sha, running), None)?.0,
+            Some(c) => send(&check::waiting(name, sha, wait), Some(c.id))?.0,
+            None => send(&check::waiting(name, sha, wait), None)?.0,
         };
         ids.insert(name.clone(), id);
     }
@@ -543,7 +568,7 @@ pub fn mark(
 
 /// Posts the results, updating the runs in `ids` of the same name, and returns the last page
 pub fn finish(
-    send: &Send,
+    send: &Send<'_>,
     bodies: &[Value],
     ids: &BTreeMap<String, u64>,
 ) -> Result<String, String> {
@@ -565,19 +590,26 @@ pub fn finish(
  * newer commit replaced this one, and returns None. A failed mark is only a line, the result still
  * posts
  **/
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate input of one post"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one post, from the first check to the last, read top to bottom"
+)]
 pub fn post_run(
-    send: &Send,
-    find: &Find,
+    send: &Send<'_>,
+    find: &Find<'_>,
     sha: &str,
     names: &[String],
     cached: Option<Entry>,
-    run: impl FnOnce(Option<&mpsc::Sender<crate::run::JobDone>>) -> Result<Entry, String>,
+    run: impl FnOnce(Option<&mpsc::Sender<JobDone>>) -> Result<Entry, String>,
     slot: &AtomicBool,
     finals: impl FnOnce(&Entry) -> Vec<Value>,
     current: impl FnOnce() -> bool,
     waits: &[u64],
-    early: Option<&Early>,
+    early: Option<&Early<'_>>,
 ) -> Result<Option<Entry>, String> {
     // A service without the read endpoint, or a list GitHub refuses, means creating new runs
     let found = || match find() {
@@ -590,24 +622,22 @@ pub fn post_run(
         checks.retain(|_, c| c.status != "completed");
         Ok(checks)
     };
-    let marked = |running: bool, queued: &BTreeMap<String, u64>| {
+    let marked = |wait: Wait, queued: &BTreeMap<String, u64>| {
         let found = || -> Result<Checks, String> {
             let mut checks = open()?;
 
             // Without the read endpoint the queued checks are found nowhere else, so they are updated in place
             for (name, id) in queued {
-                checks
-                    .entry(name.clone())
-                    .or_insert_with(|| crate::github::Check {
-                        id: *id,
-                        status: "queued".into(),
-                        started_at: String::new(),
-                    });
+                checks.entry(name.clone()).or_insert_with(|| Check {
+                    id: *id,
+                    status: "queued".into(),
+                    started_at: String::new(),
+                });
             }
 
             Ok(checks)
         };
-        retry(waits, || mark(send, &found()?, sha, names, running)).unwrap_or_else(|e| {
+        retry(waits, || mark(send, &found()?, sha, names, wait)).unwrap_or_else(|e| {
             eprintln!(
                 "{}: could not mark the checks: {e}",
                 &sha[..sha.len().min(12)]
@@ -615,95 +645,94 @@ pub fn post_run(
             BTreeMap::new()
         })
     };
-    let (entry, ids) = match cached {
-        Some(entry) => {
-            let ids = retry(waits, found)
-                .map(|found| found.into_iter().map(|(n, c)| (n, c.id)).collect())
-                .unwrap_or_default();
-            (entry, ids)
-        }
-        None => {
-            let ended = AtomicBool::new(false);
-            // The ids the marks got, so a job that ends completes its own check at once
-            let (known, kept) = (Mutex::new(BTreeMap::new()), AtomicBool::new(false));
-            let keep = |ids: BTreeMap<String, u64>| {
-                *known.lock().unwrap_or_else(|e| e.into_inner()) = ids.clone();
-                kept.store(true, Ordering::Relaxed);
-                ids
-            };
-            let (entry, ids) = std::thread::scope(|s| {
-                let marks = s.spawn(|| {
-                    let none = BTreeMap::new();
+    let (entry, ids) = if let Some(entry) = cached {
+        let ids = retry(waits, found)
+            .map_or_default(|found| found.into_iter().map(|(n, c)| (n, c.id)).collect());
+        (entry, ids)
+    } else {
+        let ended = AtomicBool::new(false);
+        // The ids the marks got, so a job that ends completes its own check at once
+        let (known, kept) = (Mutex::new(BTreeMap::new()), AtomicBool::new(false));
+        let keep = |ids: BTreeMap<String, u64>| {
+            *known
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ids.clone();
+            kept.store(true, Ordering::Relaxed);
+            ids
+        };
+        let (entry, ids) = std::thread::scope(|s| {
+            let marks = s.spawn(|| {
+                let none = BTreeMap::new();
 
-                    if slot.load(Ordering::Relaxed) {
-                        return keep(marked(true, &none));
-                    }
-
-                    let queued = keep(marked(false, &none));
-
-                    while !slot.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-
-                    if slot.load(Ordering::Relaxed) {
-                        keep(marked(true, &queued))
-                    } else {
-                        queued
-                    }
-                });
-                // The run's own channel, joined before the final post so no early post lands after it
-                let (jobs, poster) = match early {
-                    Some(early) => {
-                        let (tx, rx) = mpsc::channel();
-                        let (known, kept, ended) = (&known, &kept, &ended);
-                        let poster = s.spawn(move || {
-                            for done in rx {
-                                let Some(body) = early(&done) else {
-                                    continue;
-                                };
-
-                                // A job can end before the marks have their ids, which come first
-                                while !kept.load(Ordering::Relaxed)
-                                    && !ended.load(Ordering::Relaxed)
-                                {
-                                    std::thread::sleep(Duration::from_millis(50));
-                                }
-
-                                let ids = known.lock().unwrap_or_else(|e| e.into_inner()).clone();
-
-                                // A check the marks have not made yet waits for the final post
-                                if body["name"].as_str().is_some_and(|n| ids.contains_key(n)) {
-                                    let _ = finish(send, &[body], &ids);
-                                }
-                            }
-                        });
-                        (Some(tx), Some(poster))
-                    }
-                    None => (None, None),
-                };
-                let entry = run(jobs.as_ref());
-                ended.store(true, Ordering::Relaxed);
-                drop(jobs);
-
-                if let Some(poster) = poster {
-                    let _ = poster.join();
+                if slot.load(Ordering::Relaxed) {
+                    return keep(marked(Wait::Running, &none));
                 }
 
-                (entry, marks.join().unwrap_or_default())
+                let queued = keep(marked(Wait::Queued, &none));
+
+                while !slot.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+
+                if slot.load(Ordering::Relaxed) {
+                    keep(marked(Wait::Running, &queued))
+                } else {
+                    queued
+                }
             });
+            // The run's own channel, joined before the final post so no early post lands after it
+            let (jobs, poster) = match early {
+                Some(early) => {
+                    let (tx, rx) = mpsc::channel();
+                    let (known, kept, ended) = (&known, &kept, &ended);
+                    let poster = s.spawn(move || {
+                        for done in rx {
+                            let Some(body) = early(&done) else {
+                                continue;
+                            };
 
-            match entry {
-                Ok(entry) => (entry, ids),
-                // Left in progress, the checks would read as another machine's claim until it went stale
-                Err(e) => {
-                    if current() {
-                        let bodies: Vec<Value> =
-                            names.iter().map(|n| check::errored(n, sha, &e)).collect();
-                        let _ = retry(waits, || finish(send, &bodies, &ids));
-                    }
+                            // A job can end before the marks have their ids, which come first
+                            while !kept.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed) {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
 
-                    return Err(e);
+                            let ids = known
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
+
+                            // A check the marks have not made yet waits for the final post
+                            if body["name"].as_str().is_some_and(|n| ids.contains_key(n)) {
+                                let _ = finish(send, &[body], &ids);
+                            }
+                        }
+                    });
+                    (Some(tx), Some(poster))
                 }
+                None => (None, None),
+            };
+            let entry = run(jobs.as_ref());
+            ended.store(true, Ordering::Relaxed);
+            drop(jobs);
+
+            if let Some(poster) = poster {
+                let _ = poster.join();
+            }
+
+            (entry, marks.join().unwrap_or_default())
+        });
+
+        match entry {
+            Ok(entry) => (entry, ids),
+            // Left in progress, the checks would read as another machine's claim until it went stale
+            Err(e) => {
+                if current() {
+                    let bodies: Vec<Value> =
+                        names.iter().map(|n| check::errored(n, sha, &e)).collect();
+                    let _ = retry(waits, || finish(send, &bodies, &ids));
+                }
+
+                return Err(e);
             }
         }
     };
@@ -719,6 +748,7 @@ pub fn post_run(
 
 #[cfg(test)]
 mod tests {
+    use crate::run::JobDone;
     use std::sync::Mutex;
 
     use serde_json::json;
@@ -779,7 +809,10 @@ mod tests {
                 body["status"].as_str().unwrap().into(),
                 id,
             ));
-            Ok((id.unwrap_or(100 + posts.len() as u64), String::new()))
+            Ok((
+                id.unwrap_or(100 + u64::try_from(posts.len()).expect("a count fits a u64")),
+                String::new(),
+            ))
         }
 
         fn posts(&self) -> Vec<(String, String, Option<u64>)> {
@@ -795,7 +828,7 @@ mod tests {
     fn a_job_that_ends_completes_its_check_before_the_run_does() {
         let fake = Fake::new(0);
         let slot = AtomicBool::new(true);
-        let early = |done: &crate::run::JobDone| {
+        let early = |done: &JobDone| {
             Some(
                 json!({"name": format!("shipcheck/{}", done.job), "status": "completed", "conclusion": done.state}),
             )
@@ -814,7 +847,7 @@ mod tests {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                let _ = jobs.unwrap().send(crate::run::JobDone {
+                let _ = jobs.unwrap().send(JobDone {
                     file: "host".into(),
                     job: "test".into(),
                     state: "success".into(),
@@ -862,24 +895,27 @@ mod tests {
 
         // A newer commit stops every older run still going, and forgets the dead one
         assert_eq!(
-            next_record(record, "ddd", false, alive),
+            next_record(record, "ddd", Posting::Off, alive),
             Some((vec![], vec!["11".into(), "12".into()]))
         );
         // The commit already running is left alone, posting or not
-        assert_eq!(next_record(record, "aaa", false, alive), None);
-        assert_eq!(next_record(record, "bbb", true, alive), None);
-        assert_eq!(next_record(record, "bbb", false, alive), None);
+        assert_eq!(next_record(record, "aaa", Posting::Off, alive), None);
+        assert_eq!(next_record(record, "bbb", Posting::On, alive), None);
+        assert_eq!(next_record(record, "bbb", Posting::Off, alive), None);
         // A push after the commit's run adds a run that posts, beside it
         assert_eq!(
-            next_record(record, "aaa", true, alive),
+            next_record(record, "aaa", Posting::On, alive),
             Some((vec!["11 aaa".into()], vec!["12".into()]))
         );
         // A run that died is started again
         assert_eq!(
-            next_record(record, "ccc", false, alive),
+            next_record(record, "ccc", Posting::Off, alive),
             Some((vec![], vec!["11".into(), "12".into()]))
         );
-        assert_eq!(next_record("", "aaa", true, alive), Some((vec![], vec![])));
+        assert_eq!(
+            next_record("", "aaa", Posting::On, alive),
+            Some((vec![], vec![]))
+        );
     }
 
     #[test]
@@ -967,7 +1003,14 @@ mod tests {
             ("shipcheck/test".into(), check(7, "completed")),
             ("shipcheck".into(), check(8, "queued")),
         ]);
-        let ids = mark(&|b, id| fake.send(b, id), &existing, "s", &names(), true).unwrap();
+        let ids = mark(
+            &|b, id| fake.send(b, id),
+            &existing,
+            "s",
+            &names(),
+            Wait::Running,
+        )
+        .unwrap();
         assert_eq!(ids["shipcheck/test"], 7);
         assert_eq!(
             fake.posts(),
@@ -1230,7 +1273,7 @@ mod tests {
 
     #[test]
     fn a_run_is_stuck_after_the_quiet_time() {
-        let quiet = Duration::from_secs(900);
+        let quiet = Duration::from_mins(15);
         assert!(!went_quiet(1_000, 1_000 + 900, quiet));
         assert!(went_quiet(1_000, 1_000 + 901, quiet));
     }
@@ -1250,7 +1293,10 @@ mod tests {
         }
 
         // A zombie still answers signal 0, a reaped process does not
-        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+        // SAFETY: signal 0 only checks that the process exists
+        let pid = libc::pid_t::try_from(pid).expect("a pid fits a pid_t");
+        // SAFETY: signal 0 only checks that the process exists
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
     }
 
     #[test]
@@ -1292,22 +1338,27 @@ mod tests {
 
     #[test]
     fn posts_only_when_signed_in() {
-        assert!(posts(false, true));
-        assert!(!posts(false, false), "not signed in posts nothing");
-        assert!(
-            !posts(true, true),
+        assert_eq!(posts(Home::Default, Credentials::Found), Posting::On);
+        assert_eq!(
+            posts(Home::Default, Credentials::Missing),
+            Posting::Off,
+            "not signed in posts nothing"
+        );
+        assert_eq!(
+            posts(Home::Moved, Credentials::Found),
+            Posting::Off,
             "a moved home may hold an agent's results"
         );
     }
 
     #[test]
     fn a_moved_home_posts_only_with_home_ok() {
-        assert!(home_allows_post(false, false));
+        assert!(home_allows_post(Home::Default, MovedHome::Refused));
         assert!(
-            !home_allows_post(true, false),
+            !home_allows_post(Home::Moved, MovedHome::Refused),
             "a moved home may hold an agent's results"
         );
-        assert!(home_allows_post(true, true));
+        assert!(home_allows_post(Home::Moved, MovedHome::Allowed));
     }
 
     #[test]

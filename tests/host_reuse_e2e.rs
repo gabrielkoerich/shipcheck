@@ -1,3 +1,5 @@
+//! `run --only-failed` keeps the host checks that passed on the branch's last failed result
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +19,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -41,6 +43,9 @@ fn a_rerun_keeps_the_checks_that_passed_on_the_branch_last_failed_result() {
     // SAFETY: this is the only test in this binary, and it sets the environment before any thread
     unsafe {
         std::env::set_var("SHIPCHECK_HOME", tmp.path().join(".local/state/shipcheck"));
+    }
+    // SAFETY: as above
+    unsafe {
         std::env::remove_var("FLAKY_PASS");
     }
 

@@ -1,5 +1,23 @@
+use crate::check::Jobs;
+use crate::config::Check;
+use crate::daemon;
+use crate::onboard;
+use crate::record;
+use crate::runner::act;
+use crate::runner::act::Act;
+use crate::runner::host;
+use crate::runner::host::Host;
+use crate::secret;
+use crate::templates;
+use crate::trust;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
+use std::io::Write as _;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,10 +28,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{self, KeyInputs};
-use crate::config::{RepoConfig, RunnerKind};
+use crate::config::{self, RepoConfig, RunnerKind};
 use crate::queue;
 use crate::record::clock;
-use crate::runner::host::{self as host_runner, HOST};
+use crate::runner::host::{self as host_runner, HOST, runner_of};
 use crate::runner::shard::{self, Rejected, ShardRun};
 use crate::runner::{RunRequest, Runner, Runners};
 use crate::workflow;
@@ -118,6 +136,7 @@ pub fn unix_now() -> u64 {
 }
 
 /// Everything about one commit that the cache key and a run need, read from git
+#[derive(Debug)]
 pub struct Plan {
     pub repo: PathBuf,
     pub sha: String,
@@ -150,7 +169,7 @@ const SAFE_GIT: [(&str, &str); 6] = [
     ("core.fsmonitor", "false"),
 ];
 
-/// The `GIT_CONFIG_*` variables for SAFE_GIT, after the `existing` entries the user already set
+/// The `GIT_CONFIG_*` variables for `SAFE_GIT`, after the `existing` entries the user already set
 pub fn safe_git_env(existing: usize) -> Vec<(String, String)> {
     let mut vars = vec![(
         "GIT_CONFIG_COUNT".to_string(),
@@ -206,8 +225,6 @@ enum Migration {
 /// Renames `old` to `new` when only `old` exists. A rename, since the home holds clones a copy
 /// would inflate
 fn move_home(old: &Path, new: &Path) -> Result<Migration, String> {
-    use std::os::unix::fs::PermissionsExt;
-
     match (old.is_dir(), new.exists()) {
         (false, _) => return Ok(Migration::Nothing),
         (true, true) => return Ok(Migration::Both),
@@ -219,7 +236,7 @@ fn move_home(old: &Path, new: &Path) -> Result<Migration, String> {
     }
 
     fs::rename(old, new)
-        .and_then(|_| fs::set_permissions(new, fs::Permissions::from_mode(0o700)))
+        .and_then(|()| fs::set_permissions(new, fs::Permissions::from_mode(0o700)))
         .map_err(|e| format!("moving {} to {}: {e}", old.display(), new.display()))?;
     Ok(Migration::Moved)
 }
@@ -235,7 +252,7 @@ pub fn migrate_home() {
 
     match move_home(&old, &new) {
         Ok(Migration::Moved) => {
-            eprintln!("shipcheck: moved {} to {}", old.display(), new.display())
+            eprintln!("shipcheck: moved {} to {}", old.display(), new.display());
         }
         Ok(_) => {}
         Err(e) => eprintln!("shipcheck: {e}"),
@@ -251,7 +268,7 @@ const REBUILT: [&str; 3] = ["templates", "runs", "hostcache"];
  * trials remove their own and must leave the repository's other entries as they are
  **/
 fn prune_worktrees(repo: &Path) {
-    if std::env::var_os(crate::onboard::PREVIEW).is_none() {
+    if std::env::var_os(onboard::PREVIEW).is_none() {
         let _ = git(repo, &["worktree", "prune"]);
     }
 }
@@ -287,11 +304,10 @@ fn exclude_from_backup(home: &Path) {
 
 #[cfg(target_os = "macos")]
 fn excluded(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };
-    // Safe: a size query with a null buffer reads nothing
+    // SAFETY: a size query with a null buffer reads nothing
     unsafe {
         libc::getxattr(
             path.as_ptr(),
@@ -314,31 +330,57 @@ pub fn home_overridden() -> bool {
     home() != default_home()
 }
 
+/// Whether the results live in the default home or in one `SHIPCHECK_HOME` moved
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Home {
+    Default,
+    Moved,
+}
+
+/// [`home_overridden`] as a [`Home`]
+pub fn which_home() -> Home {
+    if home_overridden() {
+        Home::Moved
+    } else {
+        Home::Default
+    }
+}
+
+/// Whether a person's `--home-ok` lets a moved home post
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MovedHome {
+    Allowed,
+    #[default]
+    Refused,
+}
+
 /// The user's home directory from the passwd entry, empty when there is none, so a check against
 /// it fails closed
 pub fn user_dir() -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut buf = vec![0 as libc::c_char; 16384];
-    // Safe: getpwuid_r writes only into pwd and buf, and pw_dir points into buf on success
-    unsafe {
-        let mut pwd: libc::passwd = std::mem::zeroed();
-        let mut found = std::ptr::null_mut();
-        let rc = libc::getpwuid_r(
-            libc::getuid(),
-            &mut pwd,
+    let mut buf: Vec<libc::c_char> = vec![0; 16384];
+    // SAFETY: passwd is plain C data, for which all zeroes is a valid value
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    // SAFETY: getuid cannot fail and touches no memory
+    let uid = unsafe { libc::getuid() };
+    // SAFETY: getpwuid_r writes only into pwd and buf, and pw_dir points into buf on success
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &raw mut pwd,
             buf.as_mut_ptr(),
             buf.len(),
-            &mut found,
-        );
+            &raw mut found,
+        )
+    };
 
-        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
-            return PathBuf::new();
-        }
-
-        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
-        PathBuf::from(std::ffi::OsStr::from_bytes(dir))
+    if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+        return PathBuf::new();
     }
+
+    // SAFETY: on success pw_dir is a NUL-terminated string in buf, which outlives this borrow
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+    PathBuf::from(std::ffi::OsStr::from_bytes(dir))
 }
 
 fn git_raw(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -367,6 +409,10 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Reads the commit, and the config and workflows from `base`, never from the commit or the working copy
+#[expect(
+    clippy::too_many_lines,
+    reason = "the plan's inputs, in the order the cache key reads them"
+)]
 pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
     let repo = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
     let sha = git(
@@ -387,7 +433,13 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
     )?
     .lines()
     {
-        if path.ends_with(".yml") || path.ends_with(".yaml") {
+        if std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yml"))
+            || std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml"))
+        {
             workflows.insert(
                 path.to_string(),
                 git_raw(&repo, &["show", &format!("{base}:{path}")])?,
@@ -423,7 +475,7 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
     );
 
     // Only this machine can let a check out of the sandbox, never the repository alone
-    if config.host.checks.values().any(|c| !c.sandbox) && !crate::trust::trusted(&repo) {
+    if config.host.checks.values().any(|c| !c.sandbox) && !trust::trusted(&repo) {
         for c in config.host.checks.values_mut().filter(|c| !c.sandbox) {
             c.sandbox = true;
             c.untrusted = true;
@@ -454,10 +506,10 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
 
     // So trusting a repository runs its unsandboxed checks again, rather than reuse a sandboxed result
     for (name, _) in config.host.checks.iter().filter(|(_, c)| !c.sandbox) {
-        tools.push_str(&format!("\nunsandboxed\0{name}"));
+        let _ = write!(tools, "\nunsandboxed\0{name}");
     }
 
-    let platforms = crate::runner::act::platforms(&config.act);
+    let platforms = act::platforms(&config.act);
     let inputs = |tree: &str| {
         cache::key(&KeyInputs {
             tree,
@@ -494,17 +546,28 @@ pub fn plan(cwd: &Path, rev: &str, base_ref: &str) -> Result<Plan, String> {
     })
 }
 
+/// Which tree a snapshot takes: the working copy with every edit, or the index as it is
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tree {
+    Working,
+    Staged,
+}
+
 /**
- * The working copy, or with `staged` the index, as a commit no ref names, with HEAD as parent, like
+ * The working copy, or with `Staged` the index, as a commit no ref names, with HEAD as parent, like
  * `git stash create`. The working copy is HEAD's tree with every edit and every file that is not
  * gitignored. It is built in a copy of the index, so the user's index, branches and stash stay as
  * they are. None when the tree is HEAD's
  **/
-pub fn snapshot(cwd: &Path, staged: bool) -> Result<Option<String>, String> {
+pub fn snapshot(cwd: &Path, tree: Tree) -> Result<Option<String>, String> {
     let repo = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
     let head = git(&repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     let (index, temp) = index_paths(&repo)?;
-    let tree = snapshot_tree(&repo, &index, &temp, staged);
+    let what = match tree {
+        Tree::Staged => "index",
+        Tree::Working => "working copy",
+    };
+    let tree = snapshot_tree(&repo, &index, &temp, tree);
     let _ = fs::remove_file(&temp);
     let tree = tree?;
 
@@ -512,7 +575,6 @@ pub fn snapshot(cwd: &Path, staged: bool) -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    let what = if staged { "index" } else { "working copy" };
     let sha = git(
         &repo,
         &[
@@ -559,7 +621,7 @@ fn copy_index(index: &Path, temp: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", temp.display()))
 }
 
-fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, staged: bool) -> Result<String, String> {
+fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, tree: Tree) -> Result<String, String> {
     let with_temp = |args: &[&str]| {
         let out = Command::new("git")
             .arg("-C")
@@ -587,7 +649,7 @@ fn snapshot_tree(repo: &Path, index: &Path, temp: &Path, staged: bool) -> Result
         with_temp(&["read-tree", "HEAD"])?;
     }
 
-    if !staged {
+    if tree == Tree::Working {
         with_temp(&["add", "-A"])?;
     }
 
@@ -625,6 +687,17 @@ pub struct Tested {
     pub partial: bool,
 }
 
+impl Tested {
+    /// Which tree the run took
+    pub fn tree_kind(&self) -> Tree {
+        if self.staged {
+            Tree::Staged
+        } else {
+            Tree::Working
+        }
+    }
+}
+
 fn tested_file(repo: &Path) -> PathBuf {
     let id = cache::hex(&Sha256::digest(repo.to_string_lossy().as_bytes()));
     home().join("tested").join(format!("{}.json", &id[..16]))
@@ -656,7 +729,9 @@ fn remote_head(repo: &Path) -> Option<(String, String)> {
     type Asked = BTreeMap<(PathBuf, String), Option<(String, String)>>;
     static ASKED: Mutex<Asked> = Mutex::new(BTreeMap::new());
     let url = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
-    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut asked = ASKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     asked
         .entry((repo.to_path_buf(), url))
         .or_insert_with(|| remote_default(repo))
@@ -665,12 +740,10 @@ fn remote_head(repo: &Path) -> Option<(String, String)> {
 
 /// `git ls-remote --symref origin HEAD`'s branch and commit, None when the remote does not answer in 5s
 fn remote_default(repo: &Path) -> Option<(String, String)> {
-    use std::io::Read;
-
     let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(crate::daemon::fetch_options())
+        .args(daemon::fetch_options())
         .args(["ls-remote", "--symref", "origin", "HEAD"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
@@ -742,11 +815,18 @@ pub static CALLER_PATH: std::sync::OnceLock<std::ffi::OsString> = std::sync::Onc
  * the tree is compared on that copy, so what is compared is what is committed. The copy becomes
  * the real index only after the commit. On any refusal the real index is untouched
  **/
+/// Whether `commit` takes a tree whose run failed, as `--allow-failed` asks
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failed {
+    Refuse,
+    Allow,
+}
+
 pub fn commit(
     cwd: &Path,
     tested: &Tested,
     git_args: &[String],
-    allow_failed: bool,
+    failed: Failed,
 ) -> Result<String, String> {
     let repo = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
 
@@ -756,14 +836,14 @@ pub fn commit(
         );
     }
 
-    if !tested.passed && !allow_failed {
+    if !tested.passed && failed == Failed::Refuse {
         return Err(
             "the run failed, fix it and run `shipcheck run` again, or pass --allow-failed".into(),
         );
     }
 
     let (index, temp) = index_paths(&repo)?;
-    let committed = snapshot_tree(&repo, &index, &temp, tested.staged).and_then(|tree| {
+    let committed = snapshot_tree(&repo, &index, &temp, tested.tree_kind()).and_then(|tree| {
         if tree != tested.tree {
             return Err("files changed since the run, run `shipcheck run` again".to_string());
         }
@@ -931,10 +1011,10 @@ fn check_definition_changes(
                 found.push(format!("{shown} changes what checks may run"));
             }
             (None, Some(_)) => {
-                found.push(format!("{shown} is added, it can change what checks run"))
+                found.push(format!("{shown} is added, it can change what checks run"));
             }
             (Some(_), None) => {
-                found.push(format!("{shown} is removed, it can change what checks run"))
+                found.push(format!("{shown} is removed, it can change what checks run"));
             }
             _ => {}
         }
@@ -947,7 +1027,7 @@ fn check_definition_changes(
 pub fn expected_jobs(
     config: &RepoConfig,
     source: impl Fn(&str) -> Option<String>,
-) -> Result<crate::check::Jobs, String> {
+) -> Result<Jobs, String> {
     let mut graphs = BTreeMap::new();
 
     for file in config.act_files() {
@@ -982,7 +1062,7 @@ pub fn expected_jobs(
  * and every job they need, less the jobs host entries take out. A host entry must name a job of its
  * file and a host check of that id, so no job is dropped without a check in its place
  **/
-fn act_jobs(config: &RepoConfig, graphs: &Graphs) -> Result<crate::check::Jobs, String> {
+fn act_jobs(config: &RepoConfig, graphs: &Graphs) -> Result<Jobs, String> {
     let mut chosen = select(graphs, &config.jobs_on(RunnerKind::Act), &config.workflows)?;
     let moved = config.jobs_on(RunnerKind::Host);
 
@@ -1042,7 +1122,7 @@ fn names_job(id: &str, job: &str) -> bool {
 }
 
 /// The jobs a run of this plan reports, from the base's workflows
-pub fn jobs(plan: &Plan) -> Result<crate::check::Jobs, String> {
+pub fn jobs(plan: &Plan) -> Result<Jobs, String> {
     expected_jobs(&plan.config, |file| {
         plan.workflows
             .iter()
@@ -1131,7 +1211,7 @@ pub fn last_run(
     tree: &str,
     has: impl Fn(&str) -> bool,
 ) -> Option<(String, String)> {
-    crate::record::runs(home, repo, usize::MAX)
+    record::runs(home, repo, usize::MAX)
         .into_iter()
         .rev()
         .find(|r| r["tree"] == tree && r["key"].as_str().is_some_and(&has))
@@ -1156,7 +1236,7 @@ pub fn lookup(plan: &Plan) -> Option<Entry> {
     }
 
     // A cached result can come from another commit with the same tree, the notes must be this one's
-    entry.ci_changes = plan.ci_changes.clone();
+    entry.ci_changes.clone_from(&plan.ci_changes);
     Some(entry)
 }
 
@@ -1206,11 +1286,19 @@ fn branch_link(plan: &Plan) -> Option<PathBuf> {
     Some(home().join("branches").join(id).join(name))
 }
 
+/// Whose failed result a run keeps the passes of: this tree's own, or also the branch's last one
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reuse {
+    Tree,
+    Branch,
+}
+
 /**
- * This tree's own failed result, or with `across` the branch's last one when it failed and only its
- * tree differs, the same base config, commands, workflows, versions and images. Its passes are kept
+ * This tree's own failed result, or with `Reuse::Branch` the branch's last one when it failed and
+ * only its tree differs, the same base config, commands, workflows, versions and images. Its passes
+ * are kept
  **/
-fn previous(plan: &Plan, across: bool) -> Option<Previous> {
+fn previous(plan: &Plan, reuse: Reuse) -> Option<Previous> {
     if let Some(entry) = cached(&plan.key).filter(|e| !e.passed && holds(plan, e)) {
         return Some(Previous {
             entry,
@@ -1218,7 +1306,7 @@ fn previous(plan: &Plan, across: bool) -> Option<Previous> {
         });
     }
 
-    if !across {
+    if reuse == Reuse::Tree {
         return None;
     }
 
@@ -1318,7 +1406,7 @@ pub fn secrets_file(repo_id: &str) -> PathBuf {
 /// The values in a repository's secrets file, longest first, to redact from anything posted. Each
 /// line of a value with `\n` escapes is a value too, since a log prints it line by line
 pub fn secret_values(repo_id: &str) -> Result<Vec<String>, String> {
-    let text = crate::secret::read(&secrets_file(repo_id))?.unwrap_or_default();
+    let text = secret::read(&secrets_file(repo_id))?.unwrap_or_default();
     Ok(parse_secrets(&String::from_utf8_lossy(&text)))
 }
 
@@ -1434,6 +1522,7 @@ pub fn max_runs() -> usize {
 }
 
 /// A job that ended, sent while the run goes on so its check can complete before the others
+#[derive(Debug)]
 pub struct JobDone {
     pub file: String,
     pub job: String,
@@ -1453,7 +1542,7 @@ fn ended(file: &str, job: &str, state: &str, time: [u64; 2]) -> String {
 }
 
 /// Sends a job that ended to the run's poster, when the run has one
-fn job_done(ctx: &Ctx, file: &str, job: &str, state: &str, times: [u64; 2]) {
+fn job_done(ctx: &Ctx<'_>, file: &str, job: &str, state: &str, times: [u64; 2]) {
     if let Some(tx) = ctx.jobs {
         let _ = tx.send(JobDone {
             file: file.to_string(),
@@ -1626,7 +1715,7 @@ pub fn run_reporting(
     say: &mut dyn FnMut(&str),
     jobs: Option<&mpsc::Sender<JobDone>>,
 ) -> Result<Entry, String> {
-    run_with(plan, say, jobs, false)
+    run_with(plan, say, jobs, Reuse::Tree)
 }
 
 /**
@@ -1641,16 +1730,16 @@ pub fn run_only_failed(plan: &Plan, say: &mut dyn FnMut(&str)) -> Result<Entry, 
         );
     }
 
-    run_with(plan, say, None, true)
+    run_with(plan, say, None, Reuse::Branch)
 }
 
 fn run_with(
     plan: &Plan,
     say: &mut dyn FnMut(&str),
     jobs: Option<&mpsc::Sender<JobDone>>,
-    keep: bool,
+    reuse: Reuse,
 ) -> Result<Entry, String> {
-    let entry = execute(plan, None, say, jobs, keep)?;
+    let entry = execute(plan, None, say, jobs, reuse)?;
 
     // Docker or the sandbox failed before the code ran, or a clone was wrong, so there is no verdict to keep
     if entry.could_not_run() || entry.wrong_tree() {
@@ -1673,7 +1762,7 @@ pub fn run_partial(
     workflows: &[String],
     say: &mut dyn FnMut(&str),
 ) -> Result<Entry, String> {
-    execute(plan, Some((jobs, workflows)), say, None, false)
+    execute(plan, Some((jobs, workflows)), say, None, Reuse::Tree)
 }
 
 /// The jobs to run per workflow file: every job of each named workflow, each job whose id or
@@ -1776,7 +1865,7 @@ pub fn select(
 
 /// The host checks `--job` names, under the one workflow host mode has. `--workflow` names none
 pub fn select_host(
-    checks: &BTreeMap<String, crate::config::Check>,
+    checks: &BTreeMap<String, Check>,
     jobs: &[String],
     workflows: &[String],
 ) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
@@ -1805,12 +1894,16 @@ pub fn partial_log_dir(key: &str) -> PathBuf {
 
 type Selection<'a> = Option<(&'a [String], &'a [String])>;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one run, from its slot to its result, read top to bottom"
+)]
 fn execute(
     plan: &Plan,
-    only: Selection,
+    only: Selection<'_>,
     say: &mut dyn FnMut(&str),
     jobs: Option<&mpsc::Sender<JobDone>>,
-    keep: bool,
+    reuse: Reuse,
 ) -> Result<Entry, String> {
     let (_runner, note) = claim_runner(plan, say)?;
     let home = home();
@@ -1823,7 +1916,7 @@ fn execute(
     let templates = home.join("templates").join(&id);
     let slots = home.join("runs").join(&id);
     fs::create_dir_all(&slots).map_err(|e| e.to_string())?;
-    let (slot, _slot) = claim_slot(&slots)?;
+    let (slot, slot_file) = claim_slot(&slots)?;
     let runners = Runners::new(&plan.config, &plan.repo);
 
     for runner in runners.all() {
@@ -1831,9 +1924,9 @@ fn execute(
     }
 
     prune(&home, SystemTime::now());
-    crate::templates::prune(&home, SystemTime::now(), &slot.with_extension("lock"));
+    templates::prune(&home, SystemTime::now(), &slot.with_extension("lock"));
     // A host check that outlived a crashed run could otherwise edit this slot's next checkout
-    crate::runner::host::reap_slot(&slot)?;
+    host::reap_slot(&slot)?;
     {
         let _git = git_lock(&id)?;
         remove_checkouts(plan, &runners, &slot);
@@ -1901,7 +1994,7 @@ fn execute(
     let slots = Slots::new(plan.config.max_parallel());
     let ctx = Ctx {
         note: &note,
-        slot_lock: std::os::fd::AsRawFd::as_raw_fd(&_slot),
+        slot_lock: slot_file.as_raw_fd(),
         plan,
         runners: &runners,
         acts: &acts,
@@ -1914,7 +2007,7 @@ fn execute(
         slots: &slots,
         jobs,
         previous: if only.is_none() {
-            previous(plan, keep)
+            previous(plan, reuse)
         } else {
             None
         },
@@ -1929,7 +2022,7 @@ fn execute(
         prune_worktrees(&plan.repo);
     }
 
-    for line in runners.all().flat_map(|r| r.prune()) {
+    for line in runners.all().flat_map(super::runner::Runner::prune) {
         say(&line);
     }
 
@@ -1951,6 +2044,7 @@ fn execute(
 }
 
 /// One host check as `init` tried it
+#[derive(Debug)]
 pub struct Trial {
     pub passed: bool,
     pub log: String,
@@ -1990,7 +2084,7 @@ pub fn trial(
         branch: None,
         inputs: String::new(),
     };
-    let entry = execute(&plan, None, say, None, false);
+    let entry = execute(&plan, None, say, None, Reuse::Tree);
     let logs = log_dir(&plan.key);
     let read = |name: &str| {
         let log = fs::read(logs.join(HOST).join(format!("{name}.log"))).unwrap_or_default();
@@ -2024,7 +2118,7 @@ pub fn trial(
  * The host checks, as one result, and every required workflow at once, as on GitHub, with
  * `max_parallel` shared by all their jobs
  **/
-fn run_all(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, String> {
+fn run_all(ctx: &Ctx<'_>, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, String> {
     let plan = ctx.plan;
     let host = ctx.runners.host.is_some() && ctx.only.is_none_or(|o| o.contains_key(HOST));
     std::thread::scope(|s| {
@@ -2082,7 +2176,11 @@ pub const UNTRUSTED: &str = "this repository asks to run it with sandbox = false
 /// What a run and doctor say about a check with `sandbox = false`
 pub const UNSANDBOXED: &str = "runs outside the sandbox, as `sandbox = false` on the base says, with this user's full access to the home, its keys and tokens. For trusted repositories only";
 
-fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, String> {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one host run, from the checks to its result, read top to bottom"
+)]
+fn run_host(ctx: &Ctx<'_>, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, String> {
     let checks = &ctx.plan.config.host.checks;
     let (templates, checkouts) = (ctx.templates.join(HOST), ctx.slot.join(HOST));
     fs::create_dir_all(&templates).map_err(|e| e.to_string())?;
@@ -2112,8 +2210,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
     }
 
     let kept_trees: BTreeMap<String, String> = kept_from(ctx)
-        .map(|tree| kept.keys().map(|n| (n.clone(), tree.to_string())).collect())
-        .unwrap_or_default();
+        .map_or_default(|tree| kept.keys().map(|n| (n.clone(), tree.to_string())).collect());
 
     let mut runs: Vec<(String, Result<JobRun, String>, [u64; 2])> = std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<Msg>();
@@ -2238,7 +2335,7 @@ fn run_host(ctx: &Ctx, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, Stri
  * The host checks that passed in the failed result this full run keeps, with their logs copied into
  * this run. A pass from a run of the same inputs is kept, a failure always runs again
  **/
-fn kept_checks(ctx: &Ctx) -> BTreeMap<String, (JobRun, [u64; 2])> {
+fn kept_checks(ctx: &Ctx<'_>) -> BTreeMap<String, (JobRun, [u64; 2])> {
     let Some(prev) = &ctx.previous else {
         return BTreeMap::new();
     };
@@ -2272,7 +2369,7 @@ fn kept_checks(ctx: &Ctx) -> BTreeMap<String, (JobRun, [u64; 2])> {
 }
 
 /// A kept job's log from the result it passed in, copied into this run's logs
-fn keep_log(ctx: &Ctx, from: &Path, file: &str, job: &str) -> Option<String> {
+fn keep_log(ctx: &Ctx<'_>, from: &Path, file: &str, job: &str) -> Option<String> {
     let name = format!("{job}.log");
     let log = fs::read_to_string(from.join(file).join(&name)).ok()?;
 
@@ -2317,7 +2414,7 @@ fn keep_jobs(graph: &[(String, Vec<String>)], states: &BTreeMap<String, String>)
 }
 
 /// The tree a kept job passed on, when it is another tree than this run's
-fn kept_from<'a>(ctx: &'a Ctx) -> Option<&'a str> {
+fn kept_from<'a>(ctx: &'a Ctx<'_>) -> Option<&'a str> {
     ctx.previous
         .as_ref()
         .map(|p| p.entry.tree.as_str())
@@ -2325,7 +2422,7 @@ fn kept_from<'a>(ctx: &'a Ctx) -> Option<&'a str> {
 }
 
 /// What a run says about a job it kept
-fn kept_line(ctx: &Ctx, file: &str, job: &str) -> String {
+fn kept_line(ctx: &Ctx<'_>, file: &str, job: &str) -> String {
     match kept_from(ctx) {
         Some(tree) => format!(
             "{file}/{job}: passed on tree {}, kept",
@@ -2401,10 +2498,16 @@ impl Slots {
 
     /// Waits for a free slot, which goes back when the returned guard drops
     fn take(&self) -> SlotGuard<'_> {
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         while *free == 0 {
-            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+            free = self
+                .freed
+                .wait(free)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
 
         *free -= 1;
@@ -2416,7 +2519,11 @@ struct SlotGuard<'a>(&'a Slots);
 
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
-        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        *self
+            .0
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         self.0.freed.notify_one();
     }
 }
@@ -2430,7 +2537,7 @@ struct Ctx<'a> {
     plan: &'a Plan,
     runners: &'a Runners,
     /// The jobs act runs per workflow file, for every job of the run
-    acts: &'a crate::check::Jobs,
+    acts: &'a Jobs,
     repo_id: &'a str,
     slot: &'a Path,
     templates: &'a Path,
@@ -2464,8 +2571,12 @@ struct JobRun {
 }
 
 /// Runs the jobs of one workflow, each once every job in its `needs` has passed, as GitHub does
+#[expect(
+    clippy::too_many_lines,
+    reason = "the job loop of one workflow, its order is the scheduling"
+)]
 fn run_workflow(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     file: &str,
     say: &mut dyn FnMut(&str),
 ) -> Result<WorkflowResult, String> {
@@ -2618,14 +2729,19 @@ fn run_workflow(
                     let state = match result {
                         Ok(run) => {
                             let marks = workflow::read_marks(&run.log, ctx.nonce);
-                            let state = job_state(
-                                &job,
-                                run.exit,
-                                run.skipped,
-                                !run.unsupported.is_empty(),
-                                &marks,
-                                allowed.contains(&job),
-                            );
+                            let act = if !run.unsupported.is_empty() {
+                                ActRun::NoImage
+                            } else if run.skipped {
+                                ActRun::Skipped
+                            } else {
+                                ActRun::Ran
+                            };
+                            let on_error = if allowed.contains(&job) {
+                                OnError::Continue
+                            } else {
+                                OnError::Fail
+                            };
+                            let state = job_state(&job, run.exit, act, &marks, on_error);
                             let state = act_skip(state, &job, &skip_on_prs);
                             let allow = state.ends_with(ALLOWED);
 
@@ -2704,25 +2820,44 @@ fn run_workflow(
     })
 }
 
+/// What act said of one job's run
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActRun {
+    Ran,
+    /// Its `if:` skipped the job
+    Skipped,
+    /// No image for its runs-on label
+    NoImage,
+}
+
+/// Whether a job's failure fails its workflow, or `continue-on-error` allows it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnError {
+    Fail,
+    Continue,
+}
+
 /// Turns the act exit code of one job's run and the markers in its log into the job's state
 fn job_state(
     job: &str,
     exit: Option<i32>,
-    skipped: bool,
-    unsupported: bool,
+    act: ActRun,
     marks: &BTreeMap<String, workflow::JobMarks>,
-    allowed: bool,
+    on_error: OnError,
 ) -> String {
-    let state = if unsupported {
+    let state = if act == ActRun::NoImage {
         "no image for its runs-on label on this host"
     } else if exit.is_none() {
         "timed out"
-    } else if exit == Some(0) && marks.is_empty() && skipped {
+    } else if exit == Some(0) && marks.is_empty() && act == ActRun::Skipped {
         "skipped"
     } else if exit == Some(0) && marks.is_empty() {
         // act ran none of it and never said its `if:` skipped it
         "failure, act ran nothing"
-    } else if exit == Some(0) && marks.contains_key(job) && marks.values().all(|m| m.passed()) {
+    } else if exit == Some(0)
+        && marks.contains_key(job)
+        && marks.values().all(super::workflow::JobMarks::passed)
+    {
         "success"
     } else if marks.get(job).is_some_and(|m| m.ended < m.started) {
         "killed"
@@ -2731,7 +2866,7 @@ fn job_state(
     };
 
     // A run that never finished, or hit shipcheck's deadline, is not the job failing
-    if allowed && state == "failure" {
+    if on_error == OnError::Continue && state == "failure" {
         format!("{state}{ALLOWED}")
     } else {
         state.to_string()
@@ -2825,7 +2960,7 @@ fn workflow_passed(states: &BTreeMap<String, String>) -> bool {
 
 /// A job shipcheck could not run gets why at the end of its log, so it has a tail like any failure
 fn run_job(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     file: &str,
     job: &str,
     needs: &BTreeMap<String, BTreeMap<String, String>>,
@@ -2840,15 +2975,18 @@ fn run_job(
 }
 
 fn note_error(log: &Path, error: &str) {
-    use std::io::Write as _;
     let _ = log.parent().map(fs::create_dir_all);
     let file = fs::OpenOptions::new().create(true).append(true).open(log);
     let _ = file.and_then(|mut f| writeln!(f, "shipcheck: {error}"));
 }
 
 /// Runs one job in its own clone at a fixed path per slot and job, and a failure again in a new one
+#[expect(
+    clippy::too_many_lines,
+    reason = "one job attempt, from its clone to its state, read top to bottom"
+)]
 fn try_job(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     file: &str,
     job: &str,
     needs: &BTreeMap<String, BTreeMap<String, String>>,
@@ -2899,7 +3037,7 @@ fn try_job(
             let _git = git_lock(ctx.repo_id)?;
             timing(file, job, "git lock wait", at);
             let at = Instant::now();
-            checkout(ctx, file == HOST, &template, &dir, &say)?;
+            checkout(ctx, runner_of(file), &template, &dir, &say)?;
             timing(file, job, "git-cow clone", at);
         }
 
@@ -2953,7 +3091,7 @@ fn try_job(
         }
 
         let at = Instant::now();
-        let outcome = written.and_then(|_| runner.run(&request, &log_path));
+        let outcome = written.and_then(|()| runner.run(&request, &log_path));
         timing(file, job, "runner", at);
 
         // A container left running, after a timeout or otherwise, could rewrite the checkout's `.git`
@@ -3013,9 +3151,9 @@ fn try_job(
         if failed && !host {
             let log = fs::read(&log_path).map_err(|e| e.to_string())?;
             let log = String::from_utf8_lossy(&log);
-            invalid = crate::runner::act::invalid_workflow(&log);
+            invalid = act::invalid_workflow(&log);
 
-            if !invalid && infra_left > 0 && crate::runner::act::never_started(&log) {
+            if !invalid && infra_left > 0 && act::never_started(&log) {
                 (infra_left, before) = (infra_left - 1, before + 1);
             }
         }
@@ -3080,7 +3218,7 @@ fn mark_ended(stamp: &Path) {
 
 /**
  * Docker Desktop shows a path as the last container saw it for about a second, so a job, a retry or
- * the next run's, starts no sooner than ENGINE_VIEW after the last containers at its path ended
+ * the next run's, starts no sooner than `ENGINE_VIEW` after the last containers at its path ended
  **/
 fn wait_for_engine(stamp: &Path) {
     std::thread::sleep(engine_wait(stamp, SystemTime::now()));
@@ -3139,8 +3277,8 @@ fn finish_job(dir: &Path, template: &Path, link: Option<&str>, say: &dyn Fn(Stri
 }
 
 fn checkout(
-    ctx: &Ctx,
-    host: bool,
+    ctx: &Ctx<'_>,
+    kind: RunnerKind,
     template: &Path,
     dir: &Path,
     say: &dyn Fn(String),
@@ -3154,7 +3292,7 @@ fn checkout(
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     // Host checks build as the developer does, so git-cow warms their template from the
     // developer's checkout, with the repository's `cow.share` and `cow.warmInterval`
-    let opts = if host {
+    let opts = if kind == RunnerKind::Host {
         git_cow::Options::from_repo(&ctx.plan.repo)
     } else {
         // Host builds in the developer's checkout break in a Linux container, so git-cow never warms from it
@@ -3192,8 +3330,6 @@ fn checkout(
  * made newer than any build output, so each run builds its own tree in its own slot
  **/
 fn touch_tracked(dir: &Path) -> Result<(), String> {
-    use std::os::unix::ffi::OsStrExt;
-
     let out = Command::new("git")
         .args(["ls-files", "-z"])
         .current_dir(dir)
@@ -3379,7 +3515,7 @@ fn remove_planted_links(dir: &Path) -> Result<(), String> {
 }
 
 /// Puts the workflows and config from the base into the checkout, so the commit cannot change what runs
-fn write_run_files(ctx: &Ctx, dir: &Path, file: &str, workflow: &Path) -> Result<(), String> {
+fn write_run_files(ctx: &Ctx<'_>, dir: &Path, file: &str, workflow: &Path) -> Result<(), String> {
     let wf_dir = dir.join(WORKFLOWS);
     remove_planted_links(dir)?;
     fs::create_dir_all(&wf_dir).map_err(|e| e.to_string())?;
@@ -3445,20 +3581,27 @@ pub fn prune(home: &Path, now: SystemTime) {
     }
 }
 
-const KEEP_RESULTS: Duration = Duration::from_secs(14 * 24 * 3600);
-const KEEP_LOGS: Duration = Duration::from_secs(90 * 24 * 3600);
+const KEEP_RESULTS: Duration = Duration::from_hours(336);
+const KEEP_LOGS: Duration = Duration::from_hours(2160);
+
+/// What `clean` removes: one repository's state, or every repository's
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope<'a> {
+    Repo(&'a Path),
+    All,
+}
 
 /**
  * Removes what shipcheck keeps for one repository: its Docker volumes, warm template and run slots,
- * or for every repository with `all`, which also clears results, logs and records. Everything but
+ * or for every repository with `All`, which also clears results, logs and records. Everything but
  * the records rebuilds on the next run, which is only slower. Refuses while a run holds a slot
  **/
-pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
+pub fn clean(scope: Scope<'_>) -> Result<Vec<String>, String> {
     let home = home();
     let mut done = Vec::new();
-    let id = match repo {
-        Some(path) if !all => Some(repo_id(path)?),
-        _ => None,
+    let (repo, id) = match scope {
+        Scope::Repo(path) => (Some(path), Some(repo_id(path)?)),
+        Scope::All => (None, None),
     };
     let runs = match &id {
         Some(id) => home.join("runs").join(id),
@@ -3468,7 +3611,7 @@ pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
     let locks = glob_locks(&runs)
         .unwrap_or_default()
         .into_iter()
-        .chain(crate::runner::host::run_locks(id.as_deref()));
+        .chain(host::run_locks(id.as_deref()));
 
     for lock in locks {
         // A lock that cannot be opened is no run's
@@ -3481,10 +3624,8 @@ pub fn clean(repo: Option<&Path>, all: bool) -> Result<Vec<String>, String> {
         }
     }
 
-    done.extend(crate::runner::act::Act::default().clean(id.as_deref()));
-    done.extend(
-        crate::runner::host::Host::new(Default::default(), Path::new(".")).clean(id.as_deref()),
-    );
+    done.extend(Act::default().clean(id.as_deref()));
+    done.extend(Host::new(config::Host::default(), Path::new(".")).clean(id.as_deref()));
     let mut dirs = vec![runs];
 
     match &id {
@@ -3559,6 +3700,9 @@ fn glob_locks(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::check;
+    use crate::record;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
     fn keeps_passed_jobs_that_no_job_running_again_needs() {
@@ -3686,7 +3830,7 @@ mod tests {
             ("t2", "other", "b3"),
         ] {
             let line = serde_json::json!({"event": "run", "tree": tree, "key": key, "base": base});
-            crate::record::append(home.path(), "o/r", &line).unwrap();
+            record::append(home.path(), "o/r", &line).unwrap();
         }
 
         assert_eq!(
@@ -3702,8 +3846,6 @@ mod tests {
 
     #[test]
     fn home_moves_once_and_never_merges() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let old = dir.path().join("Library/Application Support/shipcheck");
         let new = dir.path().join(".local/state/shipcheck");
@@ -3871,7 +4013,12 @@ mod tests {
     fn a_partial_run_picks_jobs_legs_workflows_and_their_needs() {
         let g = |jobs: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
             jobs.iter()
-                .map(|(j, n)| (j.to_string(), n.iter().map(|s| s.to_string()).collect()))
+                .map(|(j, n)| {
+                    (
+                        j.to_string(),
+                        n.iter().map(std::string::ToString::to_string).collect(),
+                    )
+                })
                 .collect()
         };
         let graphs = BTreeMap::from([
@@ -3888,8 +4035,16 @@ mod tests {
             ),
             ("docs.yml".to_string(), g(&[("docs", &[])])),
         ]);
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let set = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<BTreeSet<_>>();
+        let s = |v: &[&str]| {
+            v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let set = |v: &[&str]| {
+            v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<BTreeSet<_>>()
+        };
 
         let picked = select(&graphs, &s(&["test"]), &[]).unwrap();
         assert_eq!(picked.len(), 1, "only the workflow with the job runs");
@@ -3933,11 +4088,20 @@ mod tests {
     fn a_config_places_each_job_on_one_runner() {
         let g = |jobs: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
             jobs.iter()
-                .map(|(j, n)| (j.to_string(), n.iter().map(|s| s.to_string()).collect()))
+                .map(|(j, n)| {
+                    (
+                        j.to_string(),
+                        n.iter().map(std::string::ToString::to_string).collect(),
+                    )
+                })
                 .collect()
         };
         let ci = "jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  e2e:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n";
-        let set = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<BTreeSet<_>>();
+        let set = |v: &[&str]| {
+            v.iter()
+                .map(std::string::ToString::to_string)
+                .collect::<BTreeSet<_>>()
+        };
         let jobs = |text: &str| {
             let cfg = RepoConfig::parse(text).unwrap();
             expected_jobs(&cfg, |f| (f == "ci.yml").then(|| ci.to_string()))
@@ -3948,10 +4112,7 @@ mod tests {
         assert_eq!(mixed.len(), 2);
         assert_eq!(mixed[HOST], set(&["lint"]));
         assert_eq!(mixed["ci.yml"], set(&["build", "e2e"]));
-        let names: Vec<String> = crate::check::job_names(&mixed)
-            .into_iter()
-            .map(|n| n.2)
-            .collect();
+        let names: Vec<String> = check::job_names(&mixed).into_iter().map(|n| n.2).collect();
         assert_eq!(
             names,
             ["shipcheck/build", "shipcheck/e2e", "shipcheck/lint"]
@@ -3968,10 +4129,7 @@ mod tests {
         // A host entry takes a job out of a listed workflow, and a host check of that name stands in
         let out = jobs("workflows = [\"ci.yml\"]\n[host.checks]\nlint = \"make lint\"\n[jobs.\"ci.yml/lint\"]\nrunner = \"host\"").unwrap();
         assert_eq!(out["ci.yml"], set(&["build", "e2e"]));
-        let names: Vec<String> = crate::check::job_names(&out)
-            .into_iter()
-            .map(|n| n.2)
-            .collect();
+        let names: Vec<String> = check::job_names(&out).into_iter().map(|n| n.2).collect();
         assert_eq!(
             names,
             ["shipcheck/build", "shipcheck/e2e", "shipcheck/lint"]
@@ -4087,7 +4245,6 @@ mod tests {
 
     #[test]
     fn a_checkout_passes_only_with_the_tested_tree_on_disk() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("job");
         fs::create_dir(&repo).unwrap();
@@ -4117,7 +4274,7 @@ mod tests {
             ("edited", &|| fs::write(repo.join("a"), "b").unwrap()),
             ("deleted", &|| fs::remove_file(repo.join("a")).unwrap()),
             ("mode", &|| {
-                fs::set_permissions(repo.join("e"), fs::Permissions::from_mode(0o644)).unwrap()
+                fs::set_permissions(repo.join("e"), fs::Permissions::from_mode(0o644)).unwrap();
             }),
             ("relinked", &|| {
                 fs::remove_file(repo.join("l")).unwrap();
@@ -4154,8 +4311,6 @@ mod tests {
 
     #[test]
     fn asks_the_remote_for_its_default_branch_once_per_process() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let (origin, repo) = (dir.path().join("origin.git"), dir.path().join("repo"));
         sh(
@@ -4280,8 +4435,6 @@ mod tests {
 
     #[test]
     fn what_a_job_writes_in_its_checkout_runs_nothing_on_the_host() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-
         let tmp = tempfile::tempdir().unwrap();
         let (repo, host) = (tmp.path().join("repo"), tmp.path().join("host"));
         let (template, job) = (tmp.path().join("template"), tmp.path().join("job"));
@@ -4407,8 +4560,12 @@ mod tests {
         fs::write(repo.join(".gitignore"), "junk\n").unwrap();
         sh(repo, &["add", "-A"]);
         sh(repo, &["commit", "-qm", "main"]);
-        assert_eq!(snapshot(repo, false).unwrap(), None, "clean means HEAD");
-        assert_eq!(snapshot(repo, true).unwrap(), None);
+        assert_eq!(
+            snapshot(repo, Tree::Working).unwrap(),
+            None,
+            "clean means HEAD"
+        );
+        assert_eq!(snapshot(repo, Tree::Staged).unwrap(), None);
 
         fs::write(repo.join("a.txt"), "stashed").unwrap();
         sh(repo, &["stash", "-q"]);
@@ -4429,7 +4586,7 @@ mod tests {
         let before = state();
         assert_eq!(untracked(repo).unwrap(), ["new.txt"], "junk is ignored");
 
-        let wc = snapshot(repo, false).unwrap().unwrap();
+        let wc = snapshot(repo, Tree::Working).unwrap().unwrap();
         let files = sh(repo, &["ls-tree", "-r", "--name-only", &wc]);
         assert_eq!(files, ".gitignore\na.txt\nnew.txt");
         assert_eq!(sh(repo, &["show", &format!("{wc}:a.txt")]), "a3");
@@ -4438,7 +4595,7 @@ mod tests {
             sh(repo, &["rev-parse", "HEAD"])
         );
 
-        let staged = snapshot(repo, true).unwrap().unwrap();
+        let staged = snapshot(repo, Tree::Staged).unwrap().unwrap();
         let files = sh(repo, &["ls-tree", "-r", "--name-only", &staged]);
         assert_eq!(files, ".gitignore\na.txt\nb.txt");
         assert_eq!(sh(repo, &["show", &format!("{staged}:a.txt")]), "a2");
@@ -4449,7 +4606,7 @@ mod tests {
         );
         let left: Vec<_> = fs::read_dir(repo.join(".git"))
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
@@ -4465,7 +4622,7 @@ mod tests {
             sh(repo, &["rev-parse", "HEAD^{tree}"]),
             sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")])
         );
-        assert_eq!(snapshot(repo, false).unwrap(), None);
+        assert_eq!(snapshot(repo, Tree::Working).unwrap(), None);
     }
 
     #[test]
@@ -4517,7 +4674,7 @@ mod tests {
         fs::write(&hook, format!("#!/bin/sh\nhusky-tool {}\n", ran.display())).unwrap();
         Command::new("chmod").arg("+x").arg(&hook).status().unwrap();
         fs::write(repo.join("a.txt"), "a").unwrap();
-        let wc = snapshot(&repo, false).unwrap().unwrap();
+        let wc = snapshot(&repo, Tree::Working).unwrap().unwrap();
         let tested = Tested {
             tree: sh(&repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
             staged: false,
@@ -4530,7 +4687,7 @@ mod tests {
         .unwrap();
         CALLER_PATH.set(path).unwrap();
 
-        commit(&repo, &tested, &["-m".into(), "a".into()], false).unwrap();
+        commit(&repo, &tested, &["-m".into(), "a".into()], Failed::Refuse).unwrap();
         assert!(ran.exists(), "the hook found its tool on the caller's PATH");
         assert!(!faked.exists(), "git came from the trusted PATH");
     }
@@ -4547,7 +4704,7 @@ mod tests {
         // A signer that always fails, as a locked key agent does
         sh(repo, &["config", "gpg.program", "false"]);
         fs::write(repo.join("a.txt"), "a").unwrap();
-        let wc = snapshot(repo, false).unwrap().unwrap();
+        let wc = snapshot(repo, Tree::Working).unwrap().unwrap();
         let tested = Tested {
             tree: sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
             staged: false,
@@ -4555,7 +4712,7 @@ mod tests {
             partial: false,
         };
 
-        commit(repo, &tested, &["-m".into(), "a".into()], false).unwrap();
+        commit(repo, &tested, &["-m".into(), "a".into()], Failed::Refuse).unwrap();
     }
 
     #[test]
@@ -4583,7 +4740,7 @@ mod tests {
         sh(repo, &["add", "a.txt"]);
         fs::write(repo.join("a.txt"), "a3").unwrap();
         fs::write(repo.join("b.txt"), "b").unwrap();
-        let wc = snapshot(repo, false).unwrap().unwrap();
+        let wc = snapshot(repo, Tree::Working).unwrap().unwrap();
         let tested = Tested {
             tree: sh(repo, &["rev-parse", &format!("{wc}^{{tree}}")]),
             staged: false,
@@ -4600,7 +4757,7 @@ mod tests {
             ..tested.clone()
         };
         assert!(
-            commit(repo, &failed, &msg, false)
+            commit(repo, &failed, &msg, Failed::Refuse)
                 .unwrap_err()
                 .contains("failed")
         );
@@ -4610,17 +4767,17 @@ mod tests {
             partial: true,
             ..tested.clone()
         };
-        let err = commit(repo, &partial, &msg, true).unwrap_err();
+        let err = commit(repo, &partial, &msg, Failed::Allow).unwrap_err();
         assert!(err.starts_with("the last run was partial"), "{err}");
 
         fs::write(repo.join("c.txt"), "after the run").unwrap();
-        let err = commit(repo, &tested, &msg, false).unwrap_err();
+        let err = commit(repo, &tested, &msg, Failed::Refuse).unwrap_err();
         assert!(err.contains("files changed since the run"), "{err}");
         assert_eq!(sh(repo, &["rev-parse", "HEAD"]), head);
         assert!(index() == before, "a refusal keeps the staged state");
         fs::remove_file(repo.join("c.txt")).unwrap();
 
-        let sha = commit(repo, &tested, &msg, false).unwrap();
+        let sha = commit(repo, &tested, &msg, Failed::Refuse).unwrap();
         assert_eq!(sh(repo, &["rev-parse", "HEAD"]), sha);
         assert_eq!(sh(repo, &["rev-parse", "HEAD^{tree}"]), tested.tree);
         assert_eq!(sh(repo, &["rev-parse", "HEAD^"]), head);
@@ -4636,14 +4793,14 @@ mod tests {
         fs::write(repo.join("a.txt"), "a4").unwrap();
         sh(repo, &["add", "a.txt"]);
         fs::write(repo.join("d.txt"), "left out").unwrap();
-        let staged = snapshot(repo, true).unwrap().unwrap();
+        let staged = snapshot(repo, Tree::Staged).unwrap().unwrap();
         let tested = Tested {
             tree: sh(repo, &["rev-parse", &format!("{staged}^{{tree}}")]),
             staged: true,
             passed: true,
             partial: false,
         };
-        commit(repo, &tested, &msg, false).unwrap();
+        commit(repo, &tested, &msg, Failed::Refuse).unwrap();
         assert_eq!(sh(repo, &["rev-parse", "HEAD^{tree}"]), tested.tree);
         assert_eq!(sh(repo, &["status", "--porcelain"]), "?? d.txt");
     }
@@ -4684,7 +4841,10 @@ mod tests {
                 "`shipcheck.toml` is added",
             ]
         );
-        assert!(ci_changes(repo, "main", "main").unwrap().is_empty());
+        assert_eq!(
+            ci_changes(repo, "main", "main").unwrap(),
+            Vec::<std::string::String>::new()
+        );
     }
 
     #[test]
@@ -4942,7 +5102,7 @@ mod tests {
 
     type Marks<'a> = &'a [(&'a str, u32, u32, bool)];
 
-    fn marks(of: Marks) -> BTreeMap<String, workflow::JobMarks> {
+    fn marks(of: Marks<'_>) -> BTreeMap<String, workflow::JobMarks> {
         of.iter()
             .map(|&(job, started, ended, failed)| {
                 let m = workflow::JobMarks {
@@ -4963,7 +5123,7 @@ mod tests {
             ("test", 1, 1, true),
         );
         let no_image = "no image for its runs-on label on this host";
-        let cases: &[(Option<i32>, bool, Marks, bool, &str)] = &[
+        let cases: &[(Option<i32>, bool, Marks<'_>, bool, &str)] = &[
             (Some(0), false, &[ok], false, "success"),
             (Some(0), false, &[("test", 2, 2, false)], false, "success"),
             // A job whose `if:` is false prints no markers
@@ -4997,15 +5157,20 @@ mod tests {
         ];
 
         for (exit, unsupported, of, allow, want) in cases {
+            let act = if *unsupported {
+                ActRun::NoImage
+            } else if of.is_empty() {
+                ActRun::Skipped
+            } else {
+                ActRun::Ran
+            };
+            let on_error = if *allow {
+                OnError::Continue
+            } else {
+                OnError::Fail
+            };
             assert_eq!(
-                job_state(
-                    "test",
-                    *exit,
-                    of.is_empty(),
-                    *unsupported,
-                    &marks(of),
-                    *allow
-                ),
+                job_state("test", *exit, act, &marks(of), on_error),
                 *want,
                 "exit {exit:?}, unsupported {unsupported}, marks {of:?}, allowed {allow}"
             );
@@ -5013,7 +5178,7 @@ mod tests {
 
         // A job act ran none of, with no word that its `if:` skipped it, is not skipped
         assert_eq!(
-            job_state("test", Some(0), false, false, &marks(&[]), false),
+            job_state("test", Some(0), ActRun::Ran, &marks(&[]), OnError::Fail),
             "failure, act ran nothing"
         );
     }
@@ -5044,7 +5209,7 @@ mod tests {
         let skip_on_prs = skipped_on_every_pr(&job_ifs(&wf));
         let state = |job: &str| {
             act_skip(
-                job_state(job, Some(0), true, false, &marks(&[]), false),
+                job_state(job, Some(0), ActRun::Skipped, &marks(&[]), OnError::Fail),
                 job,
                 &skip_on_prs,
             )
@@ -5080,7 +5245,7 @@ mod tests {
     #[test]
     fn continue_on_error_never_allows_a_timeout() {
         // AGENTS.md: a timeout is a failure, and this deadline is shipcheck's own
-        let timed_out = job_state("test", None, false, false, &marks(&[]), true);
+        let timed_out = job_state("test", None, ActRun::Ran, &marks(&[]), OnError::Continue);
         let states = BTreeMap::from([
             ("lint".to_string(), "success".to_string()),
             ("test".to_string(), timed_out.clone()),
@@ -5101,10 +5266,9 @@ mod tests {
         let killed = job_state(
             "test",
             Some(1),
-            false,
-            false,
+            ActRun::Ran,
             &marks(&[("test", 1, 0, false)]),
-            true,
+            OnError::Continue,
         );
         let states = BTreeMap::from([
             ("lint".to_string(), "success".to_string()),
@@ -5188,7 +5352,7 @@ mod tests {
         assert_eq!(plan.config.host.checks["test"], "true");
         assert_eq!(
             plan.workflows,
-            BTreeMap::from([(ci.clone(), main_ci.as_bytes().to_vec())])
+            BTreeMap::from([(ci, main_ci.as_bytes().to_vec())])
         );
     }
 }

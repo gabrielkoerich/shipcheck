@@ -1,10 +1,12 @@
 //! Repositories whose `sandbox = false` host checks this machine lets run outside the sandbox
 
+use crate::run;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 fn file() -> PathBuf {
-    crate::run::home().join("trusted")
+    run::home().join("trusted")
 }
 
 /// The origin URL exactly as git has it, so a clone whose path ends in the same owner/name is not the same repository
@@ -35,17 +37,31 @@ pub fn trusted(repo: &Path) -> bool {
     origin(repo).is_ok_and(|o| listed().contains(&o))
 }
 
-/// Adds or removes this repository's origin, and returns it
-pub fn set(repo: &Path, on: bool) -> Result<String, String> {
+/// Adds this repository's origin, and returns it
+pub fn add(repo: &Path) -> Result<String, String> {
     let origin = origin(repo)?;
-    let mut list: Vec<String> = listed().into_iter().filter(|o| *o != origin).collect();
-
-    if on {
-        list.push(origin.clone());
-    }
-
-    fs::create_dir_all(crate::run::home()).map_err(|e| e.to_string())?;
-    let text: String = list.iter().map(|o| format!("{o}\n")).collect();
-    fs::write(file(), text).map_err(|e| e.to_string())?;
+    let mut list = others(&origin);
+    list.push(origin.clone());
+    save(&list)?;
     Ok(origin)
+}
+
+/// Removes this repository's origin, and returns it
+pub fn remove(repo: &Path) -> Result<String, String> {
+    let origin = origin(repo)?;
+    save(&others(&origin))?;
+    Ok(origin)
+}
+
+fn others(origin: &str) -> Vec<String> {
+    listed().into_iter().filter(|o| o != origin).collect()
+}
+
+fn save(list: &[String]) -> Result<(), String> {
+    fs::create_dir_all(run::home()).map_err(|e| e.to_string())?;
+    let text = list.iter().fold(String::new(), |mut s, o| {
+        let _ = writeln!(s, "{o}");
+        s
+    });
+    fs::write(file(), text).map_err(|e| e.to_string())
 }

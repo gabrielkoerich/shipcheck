@@ -1,21 +1,23 @@
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 /// A volume unused this long goes, as results and logs do
-pub const KEEP: Duration = Duration::from_secs(14 * 24 * 3600);
+pub const KEEP: Duration = Duration::from_hours(336);
 
 /// An image only an older release pins goes after a day, unless a config still names it
-const KEEP_OLD_PIN: Duration = Duration::from_secs(24 * 3600);
+const KEEP_OLD_PIN: Duration = Duration::from_hours(24);
 
 /// Platform and busybox digests that earlier releases pinned and this one does not. Add each digest
 /// a release stops pinning, so the image leaves machines that never stamped it
 pub const OLD_PINS: &[&str] = &[];
 
 /// A gone home's volume goes only when Docker made it longer ago than this
-const ORPHAN_AGE: Duration = Duration::from_secs(24 * 3600);
+const ORPHAN_AGE: Duration = Duration::from_hours(24);
 
 /// An empty volume no run used this long goes, the wait keeps one a run just made for its mount
 const KEEP_EMPTY: Duration = Duration::from_secs(3600);
@@ -32,6 +34,7 @@ pub struct Volume {
 }
 
 /// Where this process runs, so the prune can tell its own volumes from another home's
+#[derive(Debug)]
 pub struct Here<'a> {
     pub home: &'a Path,
     pub prefix: &'a str,
@@ -57,6 +60,7 @@ pub trait Engine {
     fn remove(&self, kind: &str, name: &str) -> bool;
 }
 
+#[derive(Debug)]
 pub struct Docker;
 
 fn docker(args: &[&str]) -> Option<String> {
@@ -102,6 +106,10 @@ impl Engine for Docker {
 }
 
 /// Docker's `CreatedAt`, RFC 3339 such as `2026-10-25T23:40:46Z` or with an offset
+#[expect(
+    clippy::many_single_char_names,
+    reason = "the names of Hinnant's `days_from_civil`"
+)]
 fn parse_created(text: &str) -> Option<SystemTime> {
     let (date, rest) = text.trim().split_once('T')?;
     let mut ymd = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
@@ -276,7 +284,7 @@ fn volume_due(v: &Volume, prefix: &str, age: Option<Duration>) -> bool {
  * too may be an unmounted disk or another mount namespace. A volume without labels never goes, it
  * may be a live home's that an older binary made
  **/
-fn orphan(v: &Volume, here: &Here) -> bool {
+fn orphan(v: &Volume, here: &Here<'_>) -> bool {
     if !shipcheck_named(&v.name) || v.name.starts_with(here.prefix) {
         return false;
     }
@@ -288,8 +296,6 @@ fn orphan(v: &Volume, here: &Here) -> bool {
 }
 
 fn gone(home: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
     // `components` drops a `.` inside the path, so the bytes are read
     let bytes = home.as_os_str().as_bytes();
     let plain = home.is_absolute() && !bytes.split(|&b| b == b'/').any(|c| c == b"." || c == b"..");
@@ -323,7 +329,7 @@ fn remove_image(engine: &dyn Engine, reference: &str) -> Option<bool> {
  **/
 pub fn prune(
     engine: &dyn Engine,
-    here: &Here,
+    here: &Here<'_>,
     tags: &[String],
     old_pins: &[&str],
     now: SystemTime,
@@ -365,7 +371,7 @@ pub fn prune(
         }
     }
 
-    for reference in old_pins.iter().map(|r| r.to_string()) {
+    for reference in old_pins.iter().map(std::string::ToString::to_string) {
         if !image_due(&reference, age(home, "images", &reference, now), old_pins) {
             continue;
         }
@@ -388,7 +394,7 @@ pub fn prune(
 fn remove_orphans(
     engine: &dyn Engine,
     listed: &[Volume],
-    here: &Here,
+    here: &Here<'_>,
     now: SystemTime,
 ) -> Vec<String> {
     let old = |name: &str| {
@@ -403,9 +409,16 @@ fn remove_orphans(
         .collect()
 }
 
-/// Removes the volumes that start with `prefix`, and with `orphans` also those `orphan` picks when
-/// `here` may sweep. Whatever a container references stays
-pub fn clean(engine: &dyn Engine, here: &Here, prefix: &str, orphans: bool) -> Vec<String> {
+/// Whether `clean` also removes the volumes `orphan` picks
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Orphans {
+    Remove,
+    Keep,
+}
+
+/// Removes the volumes that start with `prefix`, and with `Orphans::Remove` also those `orphan`
+/// picks when `here` may sweep. Whatever a container references stays
+pub fn clean(engine: &dyn Engine, here: &Here<'_>, prefix: &str, orphans: Orphans) -> Vec<String> {
     let listed = engine.volumes().unwrap_or_default();
     let mut done = Vec::new();
 
@@ -416,7 +429,7 @@ pub fn clean(engine: &dyn Engine, here: &Here, prefix: &str, orphans: bool) -> V
         }
     }
 
-    if orphans {
+    if orphans == Orphans::Remove {
         done.extend(remove_orphans(engine, &listed, here, SystemTime::now()));
     }
 
@@ -461,7 +474,7 @@ pub fn images_in_log(log: &str) -> BTreeSet<String> {
 
 /// Count and size of this home's volumes, of the volumes other live homes keep, of act's that no
 /// run dir of this home names, and of this home's stamped images
-pub fn usage(here: &Here, tags: &[String]) -> Result<String, String> {
+pub fn usage(here: &Here<'_>, tags: &[String]) -> Result<String, String> {
     let listed = Docker.volumes().ok_or("docker system df failed")?;
     let tally = |keep: &dyn Fn(&Volume) -> bool| {
         (listed.iter().filter(|v| keep(v)))
@@ -505,21 +518,24 @@ pub fn usage(here: &Here, tags: &[String]) -> Result<String, String> {
     );
 
     if gone > 0 {
-        text += &format!(
+        let _ = write!(
+            text,
             ". Volumes of gone homes: {gone}, {}, removed after a run of the default home, or with `shipcheck clean --all` there",
             gigabytes(gone_bytes)
         );
     }
 
     if others > 0 {
-        text += &format!(
+        let _ = write!(
+            text,
             ". Volumes of other homes, hosts or older releases: {others}, {}, kept",
             gigabytes(other_bytes)
         );
     }
 
     if act > 0 {
-        text += &format!(
+        let _ = write!(
+            text,
             ". {act} act volumes, {}, are not from a run of this home and stay",
             gigabytes(act_bytes)
         );
@@ -542,9 +558,20 @@ fn size(text: &str) -> Option<u64> {
         "TB" => 1e12,
         _ => return None,
     };
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Docker's sizes are positive and far below u64::MAX, and saturate if not"
+    )]
     Some((n.parse::<f64>().ok()? * scale) as u64)
 }
 
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "a size shown in GB to one decimal"
+)]
 fn gigabytes(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
 }
@@ -552,10 +579,11 @@ fn gigabytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache;
     use std::cell::RefCell;
 
     const P: &str = "shipcheck-abc123-";
-    const DAY: Duration = Duration::from_secs(24 * 3600);
+    const DAY: Duration = Duration::from_hours(24);
 
     /// Volumes and images on a fake machine, the filters of its containers, and what Docker refuses
     #[derive(Default)]
@@ -614,7 +642,7 @@ mod tests {
     }
 
     fn strings(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| n.to_string()).collect()
+        names.iter().map(std::string::ToString::to_string).collect()
     }
 
     /// A volume with the labels of `home` on host `h1`, 1 kB
@@ -635,12 +663,19 @@ mod tests {
         }
     }
 
-    fn here(home: &Path, sweep: bool) -> Here<'_> {
+    fn here(home: &Path) -> Here<'_> {
         Here {
             home,
             prefix: P,
             host: "h1",
-            sweep,
+            sweep: true,
+        }
+    }
+
+    fn here_without_sweep(home: &Path) -> Here<'_> {
+        Here {
+            sweep: false,
+            ..here(home)
         }
     }
 
@@ -694,7 +729,7 @@ mod tests {
         let live = tmp.path().join("live");
         fs::create_dir(&live).unwrap();
         let gone = tmp.path().join("gone");
-        let h = here(&live, true);
+        let h = here(&live);
         assert!(orphan(&labeled("shipcheck-111111-a", &gone), &h));
         assert!(!orphan(&labeled("shipcheck-111111-a", &live), &h));
         // Another host's home may exist there, so its volumes stay
@@ -750,17 +785,23 @@ mod tests {
         };
 
         // A test's or an agent's home, as `home_overridden` says
-        prune(&fake, &here(&home, false), &[], &[], SystemTime::now());
-        clean(&fake, &here(&home, false), P, true);
+        prune(
+            &fake,
+            &here_without_sweep(&home),
+            &[],
+            &[],
+            SystemTime::now(),
+        );
+        clean(&fake, &here_without_sweep(&home), P, Orphans::Remove);
         assert_eq!(*fake.removed.borrow(), [format!("{P}x")]);
 
         fake.removed.borrow_mut().clear();
-        clean(&fake, &here(&home, true), P, false);
+        clean(&fake, &here(&home), P, Orphans::Keep);
         assert!(!fake.removed.borrow().contains(&gone.name));
-        clean(&fake, &here(&home, true), P, true);
+        clean(&fake, &here(&home), P, Orphans::Remove);
         assert!(fake.removed.borrow().contains(&gone.name));
         fake.removed.borrow_mut().clear();
-        prune(&fake, &here(&home, true), &[], &[], SystemTime::now());
+        prune(&fake, &here(&home), &[], &[], SystemTime::now());
         assert_eq!(*fake.removed.borrow(), [gone.name]);
     }
 
@@ -790,10 +831,10 @@ mod tests {
             ..Fake::default()
         };
 
-        prune(&fake, &here(&home, true), &[], &[], SystemTime::now());
+        prune(&fake, &here(&home), &[], &[], SystemTime::now());
         assert_eq!(*fake.removed.borrow(), ["shipcheck-111111-old"]);
         fake.removed.borrow_mut().clear();
-        clean(&fake, &here(&home, true), P, true);
+        clean(&fake, &here(&home), P, Orphans::Remove);
         assert_eq!(*fake.removed.borrow(), ["shipcheck-111111-old"]);
     }
 
@@ -832,7 +873,7 @@ mod tests {
 
         prune(
             &fake,
-            &here(home, true),
+            &here(home),
             &[],
             &[old_pin, used_pin],
             SystemTime::now(),
@@ -852,7 +893,10 @@ mod tests {
             ..Fake::default()
         };
 
-        assert!(prune(&fake, &here(home, true), &[], &["a/b:1"], SystemTime::now()).is_empty());
+        assert_eq!(
+            prune(&fake, &here(home), &[], &["a/b:1"], SystemTime::now()),
+            Vec::<std::string::String>::new()
+        );
         assert!(home.join("images").join(encode("a/b:1")).exists());
     }
 
@@ -920,7 +964,7 @@ mod tests {
         };
 
         let tags = strings(&["13f69a23"]);
-        let done = prune(&fake, &here(home, true), &tags, &[], SystemTime::now());
+        let done = prune(&fake, &here(home), &tags, &[], SystemTime::now());
         assert_eq!(
             *fake.removed.borrow(),
             [
@@ -1003,7 +1047,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (live, gone) = (tmp.path().join("live"), tmp.path().join("gone"));
         fs::create_dir(&live).unwrap();
-        let id = &crate::cache::hex(&rand_bytes())[..16];
+        let id = &cache::hex(&rand_bytes())[..16];
         let before = others(id);
         // `shipcheck-` and six hex digits make a name shipcheck's, the whole id makes it this test's
         let p = &id[..6];
@@ -1093,7 +1137,7 @@ mod tests {
             ..Fake::default()
         };
 
-        clean(&fake, &here(home.path(), true), P, true);
+        clean(&fake, &here(home.path()), P, Orphans::Remove);
         assert_eq!(*fake.removed.borrow(), [format!("{P}x")]);
     }
 

@@ -1,3 +1,5 @@
+//! A failing and a timed out job on the colima engine, and the VMs they leave behind
+
 mod common;
 
 use std::fs;
@@ -18,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -55,7 +57,7 @@ fn ours() -> Vec<String> {
     let out = Command::new("colima")
         .args(["list", "-j"])
         .output()
-        .unwrap();
+        .expect("run the command");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -67,14 +69,12 @@ fn ours() -> Vec<String> {
 
 /// Passed results in the home's cache, which only a full run that passed writes
 fn passes(home: &Path) -> usize {
-    fs::read_dir(home.join("cache"))
-        .map(|d| {
-            d.filter_map(|e| fs::read(e.ok()?.path()).ok())
-                .filter_map(|t| serde_json::from_slice::<serde_json::Value>(&t).ok())
-                .filter(|e| e["passed"] == true)
-                .count()
-        })
-        .unwrap_or(0)
+    fs::read_dir(home.join("cache")).map_or(0, |d| {
+        d.filter_map(|e| fs::read(e.ok()?.path()).ok())
+            .filter_map(|t| serde_json::from_slice::<serde_json::Value>(&t).ok())
+            .filter(|e| e["passed"] == true)
+            .count()
+    })
 }
 
 fn no_vm_left() {

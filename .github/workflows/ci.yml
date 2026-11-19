@@ -35,6 +35,18 @@ jobs:
           cache-all-crates: true
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-dylint@6.3.2,dylint-link@6.3.2
+      # The nightly that rust-toolchain.toml in the dylint-lints repository pins for the lint
+      - run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component llvm-tools-preview
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.dylint_drivers
+          key: dylint-drivers-${{ runner.os }}-nightly-2026-08-20-6.3.2
+      - env:
+          DYLINT_RUSTFLAGS: "-D warnings"
+        run: cargo dylint --all -- --all-targets
       # Ubuntu's AppArmor stops bubblewrap making user namespaces. These are the install docs' commands,
       # so CI proves them, a sysctl that lifts the restriction is fine here but never on a user's machine
       - timeout-minutes: 5

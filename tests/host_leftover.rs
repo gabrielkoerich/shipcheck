@@ -1,3 +1,6 @@
+//! A process a host check leaves behind cannot change the next run
+
+use shipcheck::runner::host;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -17,7 +20,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("run the command");
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -41,7 +44,7 @@ fn a_process_a_check_leaves_cannot_change_the_next_run() {
         std::env::set_var("SHIPCHECK_HOME", tmp.path().join(".local/state/shipcheck"));
     }
 
-    if shipcheck::runner::host::in_a_jail() {
+    if host::in_a_jail() {
         // A jail of shipcheck's own tests has no launchd to reach, and its checks never post
         return;
     }
