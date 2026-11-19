@@ -1,3 +1,6 @@
+use crate::autostart;
+use crate::config::RepoConfig;
+use crate::service;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,20 +11,22 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::background;
+use crate::background::{self, Posting, Runs};
+use crate::check::{Tails, Wait};
 use crate::github::{Checks, OpenPr};
 use crate::record::{self, Run};
+use crate::run::MovedHome;
 use crate::service::Sender;
 use crate::{check, run};
 
 /// How long a run can last: each workflow's deadline, once per attempt, and 10 minutes to set up and
 /// post. A claim older than this is a run that died, so this machine may take the PR
-fn stale_after(config: &crate::config::RepoConfig) -> u64 {
+fn stale_after(config: &RepoConfig) -> u64 {
     config.timeout_minutes * 60 * (u64::from(config.retries) + 1) + 600
 }
 
 /// How long a run may make no progress, no log growing and no wait for a run slot, before it counts as stuck
-const QUIET: Duration = Duration::from_secs(15 * 60);
+const QUIET: Duration = Duration::from_mins(15);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +42,7 @@ pub struct DaemonConfig {
     pub repos: BTreeMap<String, RepoEntry>,
     /// A person's `--home-ok` on the daemon, passed on to the runs it starts
     #[serde(skip)]
-    pub home_ok: bool,
+    pub home_ok: MovedHome,
     /// How shipcheck's own fetches reach a GitHub remote, `https` to skip an SSH key that asks for a touch
     #[serde(default, skip_serializing_if = "Fetch::is_origin")]
     pub fetch: Fetch,
@@ -54,6 +59,10 @@ pub enum Fetch {
 }
 
 impl Fetch {
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if passes a reference"
+    )]
     fn is_origin(&self) -> bool {
         *self == Fetch::Origin
     }
@@ -79,10 +88,7 @@ impl Fetch {
 
 /// The options for every fetch and `ls-remote` shipcheck runs, from `fetch` in daemon.toml
 pub fn fetch_options() -> Vec<String> {
-    DaemonConfig::load()
-        .map(|c| c.fetch)
-        .unwrap_or_default()
-        .options()
+    DaemonConfig::load().map_or_default(|c| c.fetch).options()
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -197,7 +203,7 @@ pub fn registered(repo: &Path) -> bool {
 
 /// The daemon's entry for this repository, when it names this checkout and not another clone
 fn entry_in(file: &Path, repo: &Path) -> Option<RepoEntry> {
-    let checkout = |p: &Path| crate::autostart::main_checkout(p).canonicalize().ok();
+    let checkout = |p: &Path| autostart::main_checkout(p).canonicalize().ok();
     let here = checkout(repo)?;
     run::repo_id(repo)
         .ok()
@@ -243,7 +249,7 @@ fn posts_from_in(file: &Path, base: &str, repo: &Path) -> bool {
  * post, so a later `shipcheck login` is enough
  **/
 /// `home_ok` is a person's `--home-ok`, passed on to the runs it starts
-pub fn serve(home_ok: bool) -> ! {
+pub fn serve(home_ok: MovedHome) -> ! {
     let mut senders: BTreeMap<String, Sender> = BTreeMap::new();
     let mut done: HashSet<(String, String)> = HashSet::new();
     let mut waiting: HashMap<(String, String), Instant> = HashMap::new();
@@ -315,23 +321,20 @@ pub fn serve(home_ok: bool) -> ! {
                 }
             }
 
-            let streaming = live.get(repo).is_some_and(|l| l.load(Ordering::Relaxed));
+            let (socket, settled) = (Socket::of(&live, repo), Heads::of(&unsettled, repo));
             let since = polled.get(repo).map(Instant::elapsed);
             let interval = Duration::from_secs(config.interval_seconds);
 
-            if !woken.remove(repo) && !due(streaming, !unsettled.contains(repo), since, interval) {
+            if !woken.remove(repo) && !due(socket, settled, since, interval) {
                 continue;
             }
 
             polled.insert(repo.clone(), Instant::now());
             unsettled.insert(repo.clone());
 
-            // A push straight to the base, such as a release bump, comes with no PR to say so
-            let look = looked
-                .get(repo)
-                .is_none_or(|at| at.elapsed() >= STREAMED_POLL);
+            let look = Tip::of(&looked, repo);
 
-            if look {
+            if look == Tip::Look {
                 looked.insert(repo.clone(), Instant::now());
             }
 
@@ -416,9 +419,41 @@ fn listen(repo: String, tx: mpsc::Sender<String>, open: Arc<AtomicBool>) {
     });
 }
 
+/// Whether a repository's PR events socket is open
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Socket {
+    Open,
+    Closed,
+}
+
+impl Socket {
+    fn of(live: &BTreeMap<String, Arc<AtomicBool>>, repo: &str) -> Socket {
+        live.get(repo)
+            .filter(|l| l.load(Ordering::Relaxed))
+            .map_or(Socket::Closed, |_| Socket::Open)
+    }
+}
+
+/// Whether a repository has a head still to settle
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heads {
+    Settled,
+    Unsettled,
+}
+
+impl Heads {
+    fn of(unsettled: &HashSet<String>, repo: &str) -> Heads {
+        if unsettled.contains(repo) {
+            Heads::Unsettled
+        } else {
+            Heads::Settled
+        }
+    }
+}
+
 /// Whether a repository no event named is read now, `since` its last read
-fn due(streaming: bool, settled: bool, since: Option<Duration>, interval: Duration) -> bool {
-    let every = if streaming && settled {
+fn due(socket: Socket, heads: Heads, since: Option<Duration>, interval: Duration) -> bool {
+    let every = if socket == Socket::Open && heads == Heads::Settled {
         STREAMED_POLL
     } else {
         interval
@@ -545,13 +580,30 @@ fn git(entry: &RepoEntry, args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Whether a cycle fetches the base to look for a tip no PR announced
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tip {
+    Look,
+    Skip,
+}
+
+impl Tip {
+    /// A push straight to the base, such as a release bump, comes with no PR to say so
+    fn of(looked: &HashMap<String, Instant>, repo: &str) -> Tip {
+        looked
+            .get(repo)
+            .filter(|at| at.elapsed() < STREAMED_POLL)
+            .map_or(Tip::Look, |_| Tip::Skip)
+    }
+}
+
 fn cycle(
     config: &DaemonConfig,
     repo: &str,
     entry: &RepoEntry,
     sender: &Sender,
-    (done, waiting, heads, waits, unconfigured): State,
-    look: bool,
+    (done, waiting, heads, waits, unconfigured): State<'_>,
+    look: Tip,
     tips: &mut HashMap<String, String>,
 ) -> Result<bool, String> {
     let base_branch = entry.base.strip_prefix("origin/").unwrap_or(&entry.base);
@@ -559,7 +611,7 @@ fn cycle(
     let merged = merges(repo, sender, &open, heads, base_branch);
 
     // A merge or a push moved the base, whose tip gets checks of its own, the ones a status badge reads
-    if (merged || look)
+    if (merged || look == Tip::Look)
         && git(entry, &["fetch", "-q", "origin", base_branch])
         && (merged || tips.get(repo) != Some(&base_tip(entry)))
     {
@@ -569,10 +621,10 @@ fn cycle(
                 plan,
                 &entry.base,
                 name,
-                true,
+                Posting::On,
                 "daemon",
                 config.home_ok,
-            )
+            );
         };
 
         match handle_main(config, entry, sender, &start) {
@@ -633,10 +685,10 @@ fn cycle(
                 plan,
                 &entry.base,
                 name,
-                true,
+                Posting::On,
                 "daemon",
                 config.home_ok,
-            )
+            );
         };
 
         match handle(config, repo, entry, sender, &pr, since, waits, &start) {
@@ -695,8 +747,7 @@ fn base_tip(entry: &RepoEntry) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 /// Checks again the heads of `repo` marked with no config once the base moved, as a merge of shipcheck.toml does
@@ -938,10 +989,7 @@ fn refusal(verdict: &Pushed) -> Option<(&'static str, &'static str, bool)> {
 
 /// The login whose PRs run: `login` in daemon.toml, else the one `shipcheck login` signed in
 fn me(config: &DaemonConfig) -> Option<String> {
-    config
-        .login
-        .clone()
-        .or_else(crate::service::signed_in_login)
+    config.login.clone().or_else(service::signed_in_login)
 }
 
 /// Posts the PR comment after the checks, so a comment GitHub refuses costs one line, never the
@@ -988,7 +1036,7 @@ enum Action {
 /// Whether a check went in progress before `cutoff`, as GitHub writes times
 /// Fails every check of a run the daemon stopped, so no later poll runs that head again
 fn fail_stuck(
-    send: &background::Send,
+    send: &background::Send<'_>,
     existing: &Checks,
     names: &[String],
     sha: &str,
@@ -1008,20 +1056,35 @@ fn overdue(existing: &Checks, cutoff: &str) -> bool {
     })
 }
 
+/// What this machine has for a head's tree
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Here {
+    Running,
+    Result,
+    Nothing,
+}
+
+/// Whether this machine may run a head that no machine claimed
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Miss {
+    Run,
+    Queue,
+}
+
 /// What to do with a head that has no completed `shipcheck` check. `cutoff` is the time before
 /// which an in-progress claim is stale, as GitHub writes times
-fn decide(existing: &Checks, local: bool, result: bool, may_run: bool, cutoff: &str) -> Action {
+fn decide(existing: &Checks, here: Here, miss: Miss, cutoff: &str) -> Action {
     let claimed = existing
         .values()
         .any(|c| c.status == "in_progress" && c.started_at.as_str() >= cutoff);
 
-    if local {
+    if here == Here::Running {
         Action::Local
-    } else if result {
+    } else if here == Here::Result {
         Action::Post
     } else if claimed {
         Action::Claimed
-    } else if may_run {
+    } else if miss == Miss::Run {
         Action::Run
     } else {
         Action::Queue
@@ -1138,7 +1201,14 @@ impl Remote for Sender {
 
 /// Posts the checks for one PR, or returns None while it waits for a run. `start` starts the
 /// background run of a plan, with its name
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate input of one PR"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one PR's decision, from its checks to the post, read top to bottom"
+)]
 fn handle(
     config: &DaemonConfig,
     repo: &str,
@@ -1194,13 +1264,17 @@ fn handle(
 
     let names = check::names(&plan);
     let send = |body: &serde_json::Value, id| sender.send(body, id);
-    let local = run::running(&plan.key) || background::running_here(repo, sha, false);
+    let local = run::running(&plan.key) || background::running_here(repo, sha, Runs::Any);
     let result = if local { None } else { run::lookup(&plan) };
     let cutoff = check::iso(run::unix_now().saturating_sub(stale_after(&plan.config)));
 
     // A fork's code would run on this machine with its secrets, so only its own author runs it
     let me = me(config);
-    let may_run = config.run_misses && same_repo && me.is_some();
+    let miss = if config.run_misses && same_repo && me.is_some() {
+        Miss::Run
+    } else {
+        Miss::Queue
+    };
 
     // A claim this machine's own run left when it died holds nothing, so the head runs again now
     let claims = if !local && background::died_here(repo, sha) {
@@ -1209,11 +1283,19 @@ fn handle(
         existing.clone()
     };
 
-    match decide(&claims, local, result.is_some(), may_run, &cutoff) {
+    let here = if local {
+        Here::Running
+    } else if result.is_some() {
+        Here::Result
+    } else {
+        Here::Nothing
+    };
+
+    match decide(&claims, here, miss, &cutoff) {
         Action::Local => {
             // A run past the time its jobs could take, or with no progress for a while, is stuck.
             // It fails, a run again would hang the same way, and a new push runs the PR again
-            if background::running_here(repo, sha, false) {
+            if background::running_here(repo, sha, Runs::Any) {
                 let why = if overdue(&existing, &cutoff) {
                     Some("ran past the time its jobs could take".to_string())
                 } else if background::stuck_here(repo, sha, QUIET) {
@@ -1237,8 +1319,8 @@ fn handle(
             }
 
             // A run that posts marks its own checks, a mark from here could land after its result
-            if !background::running_here(repo, sha, true) {
-                background::mark(&send, &existing, sha, &names, true)?;
+            if !background::running_here(repo, sha, Runs::Posting) {
+                background::mark(&send, &existing, sha, &names, Wait::Running)?;
             }
 
             Ok(None)
@@ -1246,7 +1328,15 @@ fn handle(
         Action::Post => {
             let result = result.ok_or("no result")?;
             // A fork's log could show what its own code printed of this machine, so only same-repo PRs get one
-            let bodies = check::final_bodies(&plan, &result, same_repo);
+            let bodies = check::final_bodies(
+                &plan,
+                &result,
+                if same_repo {
+                    Tails::Shown
+                } else {
+                    Tails::Withheld
+                },
+            );
             let ids = existing.iter().map(|(n, c)| (n.clone(), c.id)).collect();
             rec.cache_hit = true;
             rec.first_check = Some(run::unix_now());
@@ -1300,7 +1390,7 @@ fn handle(
                     &bad[..bad.len().min(12)]
                 );
                 note(repo, "skipped", pr, "contains_refused_head");
-                background::mark(&send, &existing, sha, &names, false)?;
+                background::mark(&send, &existing, sha, &names, Wait::Queued)?;
                 return Ok(Some("not run, it contains a head this machine refused"));
             }
 
@@ -1334,7 +1424,7 @@ fn handle(
                 }
 
                 waits.insert((repo.to_string(), number), sha.clone());
-                background::mark(&send, &existing, sha, &names, false)?;
+                background::mark(&send, &existing, sha, &names, Wait::Queued)?;
                 return Ok(None);
             }
 
@@ -1349,18 +1439,18 @@ fn handle(
                 }
 
                 note(repo, "skipped", pr, reason);
-                background::mark(&send, &existing, sha, &names, false)?;
+                background::mark(&send, &existing, sha, &names, Wait::Queued)?;
                 return Ok(Some(why));
             }
 
             // A new `shipcheck` run is the claim, the latest one on the commit wins
             let ours = sender
-                .send(&check::waiting(check::NAME, sha, true), None)?
+                .send(&check::waiting(check::NAME, sha, Wait::Running), None)?
                 .0;
-            let mut jobs = existing.clone();
+            let mut jobs = existing;
             jobs.remove(check::NAME);
             let job_names: Vec<String> = names.into_iter().filter(|n| n != check::NAME).collect();
-            background::mark(&send, &jobs, sha, &job_names, true)?;
+            background::mark(&send, &jobs, sha, &job_names, Wait::Running)?;
 
             if sender.find_checks(sha)?.get(check::NAME).map(|c| c.id) != Some(ours) {
                 note(repo, "skipped", pr, "claimed_by_another_machine");
@@ -1382,7 +1472,7 @@ fn handle(
             Ok(None)
         }
         Action::Queue => {
-            background::mark(&send, &existing, sha, &names, false)?;
+            background::mark(&send, &existing, sha, &names, Wait::Queued)?;
 
             // It never runs here, so asking again every poll would only spend API calls until its head changes
             if !same_repo {
@@ -1396,6 +1486,9 @@ fn handle(
 
 #[cfg(test)]
 mod tests {
+    use crate::cache;
+    use crate::config::RepoConfig;
+    use crate::github::Check;
     use std::sync::Mutex;
 
     use serde_json::Value;
@@ -1411,8 +1504,8 @@ mod tests {
         assert_eq!(cfg.repos["acme/app"].base, "origin/main");
     }
 
-    fn check(status: &str, started_at: &str) -> crate::github::Check {
-        crate::github::Check {
+    fn check(status: &str, started_at: &str) -> Check {
+        Check {
             id: 1,
             status: status.into(),
             started_at: started_at.into(),
@@ -1421,7 +1514,7 @@ mod tests {
 
     #[test]
     fn a_claim_goes_stale_once_every_attempt_could_have_timed_out() {
-        let mut config: crate::config::RepoConfig = toml::from_str("").unwrap();
+        let mut config: RepoConfig = toml::from_str("").unwrap();
         assert_eq!(
             stale_after(&config),
             70 * 60,
@@ -1449,25 +1542,31 @@ mod tests {
         let mut queued = Checks::new();
         queued.insert("shipcheck".into(), check("queued", ""));
 
-        assert_eq!(decide(&none, true, true, true, cutoff), Action::Local);
         assert_eq!(
-            decide(&claimed, false, true, true, cutoff),
+            decide(&none, Here::Running, Miss::Run, cutoff),
+            Action::Local
+        );
+        assert_eq!(
+            decide(&claimed, Here::Result, Miss::Run, cutoff),
             Action::Post,
             "a stored result posts with no run"
         );
         assert_eq!(
-            decide(&claimed, false, false, true, cutoff),
+            decide(&claimed, Here::Nothing, Miss::Run, cutoff),
             Action::Claimed,
             "another machine runs it"
         );
         assert_eq!(
-            decide(&stale, false, false, true, cutoff),
+            decide(&stale, Here::Nothing, Miss::Run, cutoff),
             Action::Run,
             "a claim from a run that died is taken over"
         );
-        assert_eq!(decide(&queued, false, false, true, cutoff), Action::Run);
         assert_eq!(
-            decide(&none, false, false, false, cutoff),
+            decide(&queued, Here::Nothing, Miss::Run, cutoff),
+            Action::Run
+        );
+        assert_eq!(
+            decide(&none, Here::Nothing, Miss::Queue, cutoff),
             Action::Queue,
             "a fork's PR or run_misses = false never runs"
         );
@@ -1525,7 +1624,7 @@ mod tests {
             Pushed::Wait,
             "no push event yet"
         );
-        assert_eq!(pushed("", Some(""), "", &["".to_string()]), Pushed::Other);
+        assert_eq!(pushed("", Some(""), "", &[String::new()]), Pushed::Other);
     }
 
     #[test]
@@ -1565,7 +1664,7 @@ mod tests {
         let file = repo.join("refused.json");
         refuse(&file, &theirs, 1_000_000);
         let marks = refused(&file, 1_000_000);
-        assert_eq!(tainted(repo, &update, &marks), Some(theirs.clone()));
+        assert_eq!(tainted(repo, &update, &marks), Some(theirs));
         assert_eq!(
             tainted(repo, &unrelated, &marks),
             None,
@@ -1578,7 +1677,7 @@ mod tests {
         // A head whose tree has a result posts before the gate is read
         let mut queued = Checks::new();
         queued.insert("shipcheck".into(), check("queued", ""));
-        assert_eq!(decide(&queued, false, true, true, ""), Action::Post);
+        assert_eq!(decide(&queued, Here::Result, Miss::Run, ""), Action::Post);
     }
 
     #[test]
@@ -1642,7 +1741,10 @@ mod tests {
             abandoned(&waits, "acme/app", &prs),
             vec![(1, "old".to_string())]
         );
-        assert!(abandoned(&waits, "acme/lib", &prs).is_empty());
+        assert_eq!(
+            abandoned(&waits, "acme/lib", &prs),
+            Vec::<(u64, std::string::String)>::new()
+        );
     }
 
     #[test]
@@ -1878,7 +1980,10 @@ mod tests {
         fn send(&self, body: &Value, id: Option<u64>) -> Result<(u64, String), String> {
             let mut sent = self.sent.lock().unwrap();
             sent.push((body.clone(), id));
-            Ok((id.unwrap_or(100 + sent.len() as u64), String::new()))
+            Ok((
+                id.unwrap_or(100 + u64::try_from(sent.len()).expect("a count fits a u64")),
+                String::new(),
+            ))
         }
 
         fn find_checks(&self, _sha: &str) -> Result<Checks, String> {
@@ -1887,7 +1992,7 @@ mod tests {
 
             for (i, (body, id)) in sent.iter().enumerate() {
                 let mut c = check(body["status"].as_str().unwrap(), "");
-                c.id = id.unwrap_or(101 + i as u64);
+                c.id = id.unwrap_or(101 + u64::try_from(i).expect("a count fits a u64"));
                 found.insert(body["name"].as_str().unwrap().into(), c);
             }
 
@@ -1957,7 +2062,7 @@ mod tests {
             run_misses: true,
             login: Some("ann".into()),
             repos: BTreeMap::new(),
-            home_ok: false,
+            home_ok: MovedHome::Refused,
             fetch: Fetch::Origin,
         };
         let entry = RepoEntry {
@@ -2113,7 +2218,7 @@ mod tests {
                     base: "origin/main".into(),
                 },
             )]),
-            home_ok: false,
+            home_ok: MovedHome::Refused,
             fetch: Fetch::Origin,
         };
         let mut seen = HashSet::new();
@@ -2129,7 +2234,7 @@ mod tests {
             run_misses: true,
             login: Some("ann".into()),
             repos: BTreeMap::new(),
-            home_ok: false,
+            home_ok: MovedHome::Refused,
             fetch: Fetch::Origin,
         };
         let entry = RepoEntry {
@@ -2155,7 +2260,7 @@ mod tests {
             .insert(check::NAME.into(), check("completed", ""));
         let (got, started) = run_main(&checked, dir.path());
         assert_eq!(got, Ok("already checked"));
-        assert!(started.is_empty());
+        assert_eq!(started, Vec::<std::string::String>::new());
 
         // A release bump on main carries the skip-CI marker
         run_git(
@@ -2179,20 +2284,23 @@ mod tests {
         let (bare, _) = checkout("https://github.com/acme/app.git", "");
         let (got, started) = run_main(&Fake::default(), bare.path());
         assert_eq!(got, Ok(NO_CONFIG));
-        assert!(started.is_empty());
+        assert_eq!(started, Vec::<std::string::String>::new());
     }
 
     #[test]
     fn a_repository_whose_events_socket_is_open_and_settled_is_read_every_five_minutes() {
         let ten = Duration::from_secs(10);
         let s = Duration::from_secs;
-        assert!(due(true, true, None, ten), "never read yet");
-        assert!(!due(true, true, Some(s(60)), ten));
-        assert!(due(true, true, Some(s(300)), ten));
+        assert!(
+            due(Socket::Open, Heads::Settled, None, ten),
+            "never read yet"
+        );
+        assert!(!due(Socket::Open, Heads::Settled, Some(s(60)), ten));
+        assert!(due(Socket::Open, Heads::Settled, Some(s(300)), ten));
         // A head waiting, such as for its pusher, or no socket, polls as before
-        assert!(due(true, false, Some(ten), ten));
-        assert!(!due(true, false, Some(s(9)), ten));
-        assert!(due(false, true, Some(ten), ten));
+        assert!(due(Socket::Open, Heads::Unsettled, Some(ten), ten));
+        assert!(!due(Socket::Open, Heads::Unsettled, Some(s(9)), ten));
+        assert!(due(Socket::Closed, Heads::Settled, Some(ten), ten));
     }
 
     #[test]
@@ -2337,7 +2445,7 @@ mod tests {
                 file: "ci.yml".into(),
                 exit: Some(1),
                 attempts: 1,
-                log_sha256: crate::cache::hex(&<sha2::Sha256 as sha2::Digest>::digest(
+                log_sha256: cache::hex(&<sha2::Sha256 as sha2::Digest>::digest(
                     b"boom from the head\n",
                 )),
                 jobs: BTreeMap::from([("test".into(), "failure".into())]),
@@ -2373,7 +2481,7 @@ mod tests {
             "a fork's PR would be polled again every cycle"
         );
         assert!(started.is_empty(), "a fork's PR started a run");
-        assert!(!fake.statuses().is_empty());
+        assert_ne!(fake.statuses(), Vec::<std::string::String>::new());
         assert!(
             fake.statuses().iter().all(|s| s == "queued"),
             "{:?}",
@@ -2385,7 +2493,7 @@ mod tests {
         let fake = Fake::by("ann");
         let (got, started) = run_handle(&fake, "acme/app", dir.path(), &fork);
         assert_eq!(got, Ok(Some("posted failure")));
-        assert!(started.is_empty());
+        assert_eq!(started, Vec::<std::string::String>::new());
         assert!(!tail(&fake), "a fork's check holds its log tail");
 
         let fake = Fake::by("ann");
@@ -2512,9 +2620,9 @@ mod tests {
         let pr = open_pr(5, &sha, "main", "acme/app");
         let (got, started) = run_handle(&fake, "acme/app", dir.path(), &pr);
         assert!(got.unwrap().unwrap().starts_with("not run"));
-        assert!(started.is_empty());
+        assert_eq!(started, Vec::<std::string::String>::new());
         assert_eq!(skips("acme/app"), vec!["pusher_not_allowed"]);
-        assert!(!fake.statuses().is_empty());
+        assert_ne!(fake.statuses(), Vec::<std::string::String>::new());
         assert!(
             fake.statuses().iter().all(|s| s == "queued"),
             "{:?}",

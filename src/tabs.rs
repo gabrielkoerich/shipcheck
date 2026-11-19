@@ -1,5 +1,8 @@
 //! `shipcheck init` at a terminal: its steps as tabs, which the person moves between freely
 
+use crate::onboard;
+use crate::setup;
+use ratatui::layout::Rect;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -73,7 +76,7 @@ pub fn rows(root: &Path, d: &Detected, machine: &Machine) -> Vec<Row> {
     for c in &d.checks {
         if let Some((file, job)) = job_of(&c.from) {
             // act must run it as GitHub does, by the rules init placed the other jobs with
-            let act = crate::setup::act_engine_for(root, machine, &file, &job);
+            let act = setup::act_engine_for(root, machine, &file, &job);
             rows.push(Row {
                 file,
                 job,
@@ -182,6 +185,7 @@ pub enum End {
 }
 
 /// The wizard's state, which renders and takes keys without a terminal, so tests drive it
+#[derive(Debug)]
 pub struct Wizard<'a> {
     root: &'a Path,
     pub plan: Plan,
@@ -194,7 +198,7 @@ pub struct Wizard<'a> {
     pub cursor: usize,
     /// How far the detail is scrolled down, since a diff can be longer than the screen
     pub scroll: u16,
-    /// How far the detail can scroll at the size it was last drawn, so PgDn stops at its end
+    /// How far the detail can scroll at the size it was last drawn, so `PgDn` stops at its end
     most: std::cell::Cell<u16>,
     pub error: Option<String>,
     pub end: Option<End>,
@@ -210,8 +214,7 @@ impl<'a> Wizard<'a> {
         let first = plan
             .detected
             .as_ref()
-            .map(|d| rows(root, d, machine))
-            .unwrap_or_default();
+            .map_or_default(|d| rows(root, d, machine));
         Wizard {
             root,
             base: plan.detected.clone(),
@@ -285,8 +288,7 @@ impl<'a> Wizard<'a> {
             .plan
             .detected
             .as_ref()
-            .map(|d| rows(self.root, d, &Machine::default()))
-            .unwrap_or_default();
+            .map_or_default(|d| rows(self.root, d, &Machine::default()));
 
         for r in &mut now {
             if let Some(f) = self
@@ -367,7 +369,10 @@ impl<'a> Wizard<'a> {
         match code {
             KeyCode::Right | KeyCode::Tab => self.go((self.tab + 1) % tabs),
             KeyCode::Left | KeyCode::BackTab => self.go((self.tab + tabs - 1) % tabs),
-            KeyCode::Char(c) if ('1'..='5').contains(&c) => self.go(c as usize - '1' as usize),
+            KeyCode::Char(c @ '1'..='5') => self.go(c
+                .to_digit(10)
+                .and_then(|d| usize::try_from(d).ok())
+                .map_or(0, |d| d - 1)),
             KeyCode::Down if self.cursor + 1 < count => {
                 self.cursor += 1;
                 self.scroll = 0;
@@ -448,7 +453,7 @@ impl<'a> Wizard<'a> {
             .zip(self.answers.workflows.iter().copied())
             .collect();
 
-        match crate::onboard::replan(self.root, &mut self.plan, d) {
+        match onboard::replan(self.root, &mut self.plan, d) {
             Ok(()) => self.error = None,
             Err(e) => self.error = Some(e),
         }
@@ -478,7 +483,7 @@ impl<'a> Wizard<'a> {
         }
     }
 
-    pub fn draw(&self, f: &mut Frame) {
+    pub fn draw(&self, f: &mut Frame<'_>) {
         let [top, body, help] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
@@ -501,9 +506,13 @@ impl<'a> Wizard<'a> {
 
         let items = self.items();
         let [list, detail] = if items.is_empty() {
-            [ratatui::layout::Rect::default(), body]
+            [Rect::default(), body]
         } else {
-            let height = (items.len() as u16 + 2).min(body.height / 2).max(3);
+            let height = u16::try_from(items.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(2)
+                .min(body.height / 2)
+                .max(3);
             Layout::vertical([Constraint::Length(height), Constraint::Min(3)]).areas(body)
         };
 
@@ -516,7 +525,7 @@ impl<'a> Wizard<'a> {
             f.render_stateful_widget(list_widget, list, &mut state);
         }
 
-        let mut text: Vec<Line> = self.detail().into_iter().map(Line::from).collect();
+        let mut text: Vec<Line<'_>> = self.detail().into_iter().map(Line::from).collect();
 
         if let Some(e) = &self.error {
             text.insert(0, Line::from(format!("! {e}")));
@@ -526,7 +535,7 @@ impl<'a> Wizard<'a> {
             .block(Block::default().borders(Borders::ALL))
             .wrap(Wrap { trim: false });
         // line_count counts the borders, two lines, and the inside is two shorter than the area
-        let lines = detail_widget.line_count(detail.width) as u16;
+        let lines = u16::try_from(detail_widget.line_count(detail.width)).unwrap_or(u16::MAX);
         self.most.set(lines.saturating_sub(detail.height));
         let detail_widget = detail_widget.scroll((self.scroll.min(self.most.get()), 0));
         f.render_widget(detail_widget, detail);
@@ -574,14 +583,19 @@ pub fn run(root: &Path, plan: Plan) -> std::io::Result<Option<(Plan, Answers)>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboard;
     use crate::onboard::Report;
+    use crate::setup;
+    use crate::setup::Machine;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Cell;
     use std::fs;
 
     struct Quiet;
 
     impl Report for Quiet {
         fn start(&mut self, _: &str) {}
-        fn done(&mut self, _: bool, _: &str) {}
+        fn done(&mut self, _: onboard::Mark, _: &str) {}
     }
 
     const CI: &str = "on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  heredoc:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat <<EOF > a\n          x\n          EOF\n          make test\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker build .\n";
@@ -590,21 +604,21 @@ mod tests {
     fn wizard(dir: &Path) -> Wizard<'_> {
         fs::create_dir_all(dir.join(".github/workflows")).unwrap();
         fs::write(dir.join(".github/workflows/ci.yml"), CI).unwrap();
-        let mut plan = crate::onboard::plan_at(dir, "main", App::NotPublic, &mut Quiet).unwrap();
-        let machine = crate::setup::Machine {
+        let mut plan = onboard::plan_at(dir, "main", App::NotPublic, &mut Quiet).unwrap();
+        let machine = Machine {
             docker: true,
             colima: true,
             ..Default::default()
         };
-        crate::onboard::replan(dir, &mut plan, crate::setup::detect_on(dir, &machine)).unwrap();
+        onboard::replan(dir, &mut plan, setup::detect_on(dir, &machine)).unwrap();
         Wizard::on(dir, plan, &machine)
     }
 
-    fn config(w: &Wizard) -> String {
+    fn config(w: &Wizard<'_>) -> String {
         w.plan.config.as_ref().unwrap().0.clone()
     }
 
-    fn select(w: &mut Wizard, job: &str) {
+    fn select(w: &mut Wizard<'_>, job: &str) {
         w.go(0);
         let at = w
             .items()
@@ -725,8 +739,7 @@ mod tests {
     fn every_step_draws_in_a_small_terminal() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = wizard(dir.path());
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
 
         for tab in 0..TABS.len() {
             w.go(tab);
@@ -736,7 +749,7 @@ mod tests {
                 .buffer()
                 .content()
                 .iter()
-                .map(|c| c.symbol())
+                .map(Cell::symbol)
                 .collect();
             assert!(
                 screen.contains("1 Checks") && screen.contains("5 Review"),
@@ -758,12 +771,13 @@ mod tests {
 mod review {
     use super::*;
     use crate::onboard::Report;
+    use ratatui::backend::TestBackend;
     use std::fs;
 
     struct Quiet;
     impl Report for Quiet {
         fn start(&mut self, _: &str) {}
-        fn done(&mut self, _: bool, _: &str) {}
+        fn done(&mut self, _: onboard::Mark, _: &str) {}
     }
 
     const W: &str = "on: pull_request\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n  envpr:\n    runs-on: ubuntu-latest\n    env:\n      BASE: ${{ github.base_ref }}\n    steps:\n      - run: make c\n  heredoc:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          cat <<EOF > a\n          x\n          EOF\n          make test\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - run: docker build .\n";
@@ -771,17 +785,17 @@ mod review {
     fn wiz(dir: &Path) -> Wizard<'_> {
         fs::create_dir_all(dir.join(".github/workflows")).unwrap();
         fs::write(dir.join(".github/workflows/ci.yml"), W).unwrap();
-        let mut plan = crate::onboard::plan_at(dir, "main", App::NotPublic, &mut Quiet).unwrap();
-        let m = crate::setup::Machine {
+        let mut plan = onboard::plan_at(dir, "main", App::NotPublic, &mut Quiet).unwrap();
+        let m = Machine {
             docker: true,
             colima: true,
             ..Default::default()
         };
-        crate::onboard::replan(dir, &mut plan, crate::setup::detect_on(dir, &m)).unwrap();
+        onboard::replan(dir, &mut plan, setup::detect_on(dir, &m)).unwrap();
         Wizard::on(dir, plan, &m)
     }
 
-    fn sel(w: &mut Wizard, job: &str) {
+    fn sel(w: &mut Wizard<'_>, job: &str) {
         w.go(0);
         w.cursor = w
             .items()
@@ -860,7 +874,7 @@ mod review {
         let dir = tempfile::tempdir().unwrap();
         let mut w = wiz(dir.path());
         w.go(2);
-        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        let mut t = ratatui::Terminal::new(TestBackend::new(80, 12)).unwrap();
         t.draw(|f| w.draw(f)).unwrap();
 
         for _ in 0..50 {
@@ -918,7 +932,7 @@ mod review {
             (79, 23),
             (60, 15),
         ] {
-            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(x, y)).unwrap();
+            let mut t = ratatui::Terminal::new(TestBackend::new(x, y)).unwrap();
             for tab in 0..TABS.len() {
                 w.go(tab);
                 let n = w.items().len().max(1);

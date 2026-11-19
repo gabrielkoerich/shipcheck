@@ -1,6 +1,8 @@
+use crate::workflow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -63,7 +65,7 @@ pub fn pytest_command(line: &str) -> Option<String> {
 
     let words: Vec<&str> = line.split_whitespace().collect();
     let mut at = match words.as_slice() {
-        ["uv", "run", ..] | ["poetry" | "pdm", "run", ..] | ["python" | "python3", "-m", ..] => 2,
+        ["uv" | "poetry" | "pdm", "run", ..] | ["python" | "python3", "-m", ..] => 2,
         _ => 0,
     };
 
@@ -130,7 +132,7 @@ pub fn shard_steps(jobs: &mut Hash, root_shell: Option<&str>, shards: ShardTests
         };
         let count = match shards {
             ShardTests::Fixed(n) => format!("{n} shards"),
-            _ => format!("up to {MAX_SHARDS} shards"),
+            ShardTests::On(_) => format!("up to {MAX_SHARDS} shards"),
         };
         step.insert(key("name"), key(&format!("{name} (shipcheck: {count})")));
         step.insert(key("shell"), key("bash"));
@@ -140,15 +142,15 @@ pub fn shard_steps(jobs: &mut Hash, root_shell: Option<&str>, shards: ShardTests
 
 /// Whether any job of a workflow has a step shipcheck would shard
 pub fn shardable(source: &str) -> bool {
-    let Ok(mut root) = crate::workflow::load(source) else {
+    let Ok(mut root) = workflow::load(source) else {
         return false;
     };
     let shell = default_shell(&root);
-    let Ok(jobs) = crate::workflow::jobs_mut(&mut root) else {
+    let Ok(jobs) = workflow::jobs_mut(&mut root) else {
         return false;
     };
     shard_steps(jobs, shell.as_deref(), ShardTests::On(true));
-    crate::workflow::emit(root).is_ok_and(|w| w.contains(MARK))
+    workflow::emit(root).is_ok_and(|w| w.contains(MARK))
 }
 
 /**
@@ -219,7 +221,7 @@ pub fn shard_command(check: &str, script: &str) -> Option<String> {
     let [at] = found.as_slice() else {
         return None;
     };
-    let mut out: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+    let mut out: Vec<String> = parts.iter().map(std::string::ToString::to_string).collect();
     let lead = &parts[*at][..parts[*at].len() - parts[*at].trim_start().len()];
     let trail = &parts[*at][parts[*at].trim_end().len()..];
     out[*at] = format!("{lead}bash '{script}'{trail}");
@@ -256,20 +258,20 @@ const SHARD_MEMORY: u64 = 3 << 29;
 
 /**
  * How many shards a sharded attempt runs: the fixed number, or as many as the engine's CPUs and
- * memory allow at 1.5 GiB each, at most MAX_SHARDS. Memory runs out before CPUs on a Mac's default
+ * memory allow at 1.5 GiB each, at most `MAX_SHARDS`. Memory runs out before CPUs on a Mac's default
  * Docker VM
  **/
 pub fn count(shards: ShardTests, engine: Option<(u32, u64)>) -> u32 {
     let Some((cpus, memory)) = engine else {
         return match shards {
             ShardTests::Fixed(n) => n,
-            _ => 1,
+            ShardTests::On(_) => 1,
         };
     };
 
     match shards {
         ShardTests::Fixed(n) => n,
-        _ => cpus
+        ShardTests::On(_) => cpus
             .min(u32::try_from(memory / SHARD_MEMORY).unwrap_or(u32::MAX))
             .clamp(1, MAX_SHARDS),
     }
@@ -283,12 +285,18 @@ pub fn write_plugin(run_dir: &Path, n: u32) -> Result<(), String> {
     fs::write(dir.join("shipcheck_shard.py"), PLUGIN).map_err(|e| e.to_string())
 }
 
-/// Opens `name` inside `dir` without following a link at any step, and refuses a FIFO or device
-pub(crate) fn open_at(dir: &fs::File, name: &str, directory: bool) -> std::io::Result<fs::File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+/// What `open_at` expects to find
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Dir,
+    File,
+}
 
+/// Opens `name` inside `dir` without following a link at any step, and refuses a FIFO or device
+pub(crate) fn open_at(dir: &fs::File, name: &str, want: Kind) -> std::io::Result<fs::File> {
     let name = std::ffi::CString::new(name)?;
     let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let directory = want == Kind::Dir;
 
     if directory {
         flags |= libc::O_DIRECTORY;
@@ -301,6 +309,7 @@ pub(crate) fn open_at(dir: &fs::File, name: &str, directory: bool) -> std::io::R
         return Err(std::io::Error::last_os_error());
     }
 
+    // SAFETY: fd is the new descriptor from openat, and the File is its only owner
     let file = unsafe { fs::File::from_raw_fd(fd) };
     let kind = file.metadata()?.file_type();
 
@@ -318,16 +327,16 @@ pub(crate) fn open_at(dir: &fs::File, name: &str, directory: bool) -> std::io::R
  **/
 pub fn read_reports(run_dir: &Path, n: u32) -> Vec<Option<Vec<u8>>> {
     let dir = fs::File::open(run_dir)
-        .and_then(|d| open_at(&d, ".git", true))
-        .and_then(|g| open_at(&g, REPORT_DIR, true));
+        .and_then(|d| open_at(&d, ".git", Kind::Dir))
+        .and_then(|g| open_at(&g, REPORT_DIR, Kind::Dir));
     let mut left = MAX_REPORTS;
 
     (0..n.min(MAX_FIXED))
         .map(|i| {
-            let file = open_at(dir.as_ref().ok()?, &format!("{i}.json"), false).ok()?;
+            let file = open_at(dir.as_ref().ok()?, &format!("{i}.json"), Kind::File).ok()?;
             let mut body = Vec::new();
             file.take(left + 1).read_to_end(&mut body).ok()?;
-            left = left.checked_sub(body.len() as u64)?;
+            left = left.checked_sub(u64::try_from(body.len()).ok()?)?;
             Some(body)
         })
         .collect()
@@ -360,7 +369,7 @@ pub enum Rejected {
 }
 
 impl std::fmt::Display for Rejected {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Rejected::JobFailed => write!(f, "the job failed"),
             Rejected::Missing(i) => write!(f, "shard {i} wrote no report"),
@@ -387,7 +396,7 @@ pub fn check(reports: &[Option<Vec<u8>>], n: u32) -> Result<u64, Rejected> {
 
     for i in 0..n {
         let body = reports
-            .get(i as usize)
+            .get(usize::try_from(i).unwrap_or(usize::MAX))
             .and_then(Option::as_ref)
             .ok_or(Rejected::Missing(i))?;
         let r: Report = serde_json::from_slice(body).map_err(|_| Rejected::Malformed(i))?;
@@ -434,9 +443,11 @@ pub fn check(reports: &[Option<Vec<u8>>], n: u32) -> Result<u64, Rejected> {
     let joined: Vec<&str> = ran.iter().copied().collect();
     let ran_digest = cache::hex(&Sha256::digest(joined.join("\n")));
 
-    if ran.len() as u64 != collected || ran_digest != digest {
+    let ran_count = u64::try_from(ran.len()).unwrap_or(u64::MAX);
+
+    if ran_count != collected || ran_digest != digest {
         return Err(Rejected::Incomplete {
-            ran: ran.len() as u64,
+            ran: ran_count,
             collected,
         });
     }
@@ -447,6 +458,7 @@ pub fn check(reports: &[Option<Vec<u8>>], n: u32) -> Result<u64, Rejected> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow;
 
     fn step(run: &str) -> Hash {
         let mut h = Hash::new();
@@ -508,9 +520,9 @@ mod tests {
     }
 
     fn jobs(src: &str) -> Hash {
-        let mut root = crate::workflow::load(src).unwrap();
+        let mut root = workflow::load(src).unwrap();
         let shell = default_shell(&root);
-        let jobs = crate::workflow::jobs_mut(&mut root).unwrap();
+        let jobs = workflow::jobs_mut(&mut root).unwrap();
         shard_steps(jobs, shell.as_deref(), ShardTests::On(true));
         jobs.clone()
     }
@@ -548,6 +560,10 @@ mod tests {
         ));
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "a shard's report as the reader gets it, None when missing"
+    )]
     fn report(
         shard: u32,
         shards: u32,
@@ -556,7 +572,7 @@ mod tests {
         exit: i32,
     ) -> Option<Vec<u8>> {
         let mut sorted: Vec<&str> = all.to_vec();
-        sorted.sort();
+        sorted.sort_unstable();
         let digest = cache::hex(&Sha256::digest(sorted.join("\n")));
         let items: BTreeMap<_, _> = items
             .iter()
@@ -638,16 +654,11 @@ mod tests {
         // A report cannot pick the shard count, however large
         let huge = report(0, 4_000_000_000, &all, &[], 0);
         fail(&[huge], 1, Rejected::WrongShard(0));
-        let extra = String::from_utf8(b.clone().unwrap()).unwrap().replacen(
-            '{',
-            "{\"verdict\": \"pass\", ",
-            1,
-        );
-        fail(
-            &[a.clone(), Some(extra.into_bytes())],
-            2,
-            Rejected::Malformed(1),
-        );
+        let extra =
+            String::from_utf8(b.unwrap())
+                .unwrap()
+                .replacen('{', "{\"verdict\": \"pass\", ", 1);
+        fail(&[a, Some(extra.into_bytes())], 2, Rejected::Malformed(1));
         fail(&[report(0, 1, &[], &[], 5)], 1, Rejected::NoTests);
     }
 
@@ -670,6 +681,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("secret"), reports.join("1.json")).unwrap();
         let fifo =
             std::ffi::CString::new(reports.join("2.json").to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: fifo is a NUL-terminated string that outlives the call
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         fs::create_dir(reports.join("3.json")).unwrap();
         assert_eq!(
@@ -760,7 +772,7 @@ mod tests {
         assert_eq!(count(ShardTests::Fixed(10), Some((2, gib))), 10);
         assert_eq!(
             read_reports(Path::new("/nonexistent"), 1000).len(),
-            MAX_FIXED as usize
+            usize::try_from(MAX_FIXED).unwrap()
         );
     }
 }

@@ -1,3 +1,5 @@
+//! Jobs that GitHub skips on a PR with an `if` are skipped in act too
+
 mod common;
 
 use std::fs;

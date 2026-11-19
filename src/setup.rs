@@ -1,5 +1,22 @@
+use crate::agents;
+use crate::autostart;
+use crate::config::Act;
+use crate::daemon;
+use crate::java;
+use crate::java::Jdk;
+use crate::ruby;
+use crate::ruby::Ruby;
+use crate::run;
+use crate::runner::act;
+use crate::workflow;
+use crate::workflow::Job;
+use crate::workflow::RunStep;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -26,12 +43,12 @@ exit 0
 
 pub const HOOK_LINE: &str = "shipcheck on-push \"$local_ref\" \"$local_sha\" \"$remote_ref\"";
 
-pub const POST_COMMIT: &str = r#"#!/bin/sh
+pub const POST_COMMIT: &str = r"#!/bin/sh
 # Installed by `shipcheck install`. Starts a background run of each commit when shipcheck.toml lists commit in on
 if command -v shipcheck >/dev/null 2>&1; then
   shipcheck on-commit
 fi
-"#;
+";
 
 pub const COMMIT_LINE: &str = "shipcheck on-commit";
 
@@ -49,7 +66,7 @@ pub fn config_for(workflows: &[String]) -> String {
 }
 
 /// A host check `init` found, and where it came from
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Found {
     pub name: String,
     pub command: String,
@@ -57,7 +74,7 @@ pub struct Found {
 }
 
 /// A job that keeps running on GitHub for PRs, since shipcheck cannot run it here
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Kept {
     pub file: String,
     pub job: String,
@@ -68,7 +85,7 @@ pub struct Kept {
     pub act: Option<String>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct Detected {
     pub checks: Vec<Found>,
     pub versions: Vec<String>,
@@ -86,7 +103,7 @@ pub struct Detected {
 }
 
 /// What `init` needs to know of the machine it runs on
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Machine {
     pub docker: bool,
     /// colima answers, so a job that runs Docker can get a VM of its own
@@ -94,10 +111,10 @@ pub struct Machine {
     pub mac: bool,
     /// The rustup toolchains installed, such as `1.94.1` or `nightly`
     pub toolchains: Vec<String>,
-    pub jdks: Vec<crate::java::Jdk>,
-    /// The CRuby version `ruby` runs, such as `4.0.9`
+    pub jdks: Vec<Jdk>,
+    /// The `CRuby` version `ruby` runs, such as `4.0.9`
     pub ruby: Option<String>,
-    pub rubies: Vec<crate::ruby::Ruby>,
+    pub rubies: Vec<Ruby>,
     /// The Xcode apps installed, such as `/Applications/Xcode_26.6.app`
     pub xcodes: Vec<String>,
 }
@@ -110,9 +127,9 @@ impl Machine {
             colima: responds("colima", &["version"]),
             mac: cfg!(target_os = "macos"),
             toolchains: toolchains(),
-            jdks: crate::java::installed(),
+            jdks: java::installed(),
             ruby: ruby(),
-            rubies: crate::ruby::installed(),
+            rubies: ruby::installed(),
             xcodes: xcodes(),
         }
     }
@@ -131,8 +148,7 @@ fn toolchains() -> Vec<String> {
         Command::new(cmd)
             .args(args)
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default()
+            .map_or_default(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     };
     let host = out("rustc", &["-vV"])
         .lines()
@@ -146,7 +162,7 @@ fn toolchains() -> Vec<String> {
         .collect()
 }
 
-/// `RUBY_VERSION` when `ruby` is CRuby
+/// `RUBY_VERSION` when `ruby` is `CRuby`
 #[cfg(not(test))]
 fn ruby() -> Option<String> {
     let out = Command::new("ruby")
@@ -165,7 +181,12 @@ fn xcodes() -> Vec<String> {
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with("Xcode") && n.ends_with(".app"))
+        .filter(|n| {
+            n.starts_with("Xcode")
+                && std::path::Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+        })
         .map(|n| format!("/Applications/{n}"))
         .collect()
 }
@@ -242,7 +263,7 @@ pub fn init_on(root: &Path, machine: &Machine) -> Result<Option<String>, String>
         return Ok(Some(said));
     };
 
-    crate::agents::write_in_repo(root, &config, &text)?;
+    agents::write_in_repo(root, &config, &text)?;
     Ok(Some(format!("wrote shipcheck.toml with {said}")))
 }
 
@@ -260,7 +281,7 @@ pub fn propose(root: &Path, machine: &Machine) -> Result<(Option<String>, String
             .into_iter()
             .partition(|f| {
                 fs::read_to_string(root.join(".github/workflows").join(f))
-                    .is_ok_and(|s| crate::workflow::runs_for_branches(&s))
+                    .is_ok_and(|s| workflow::runs_for_branches(&s))
             });
         // A job that runs only off the base branch would be a check that never runs on GitHub's main
         let (pr_only, workflows): (Vec<String>, Vec<String>) = workflows
@@ -271,11 +292,11 @@ pub fn propose(root: &Path, machine: &Machine) -> Result<(Option<String>, String
             let mut said = NOTHING_LOCAL.to_string();
 
             for k in &found.github {
-                said.push_str(&format!("\n  {}, job {}: {}", k.file, k.job, k.why));
+                let _ = write!(said, "\n  {}, job {}: {}", k.file, k.job, k.why);
             }
 
             for file in unrun {
-                said.push_str(&format!("\n  {file}: it runs on no PR or branch push"));
+                let _ = write!(said, "\n  {file}: it runs on no PR or branch push");
             }
 
             return Ok((None, said));
@@ -285,10 +306,11 @@ pub fn propose(root: &Path, machine: &Machine) -> Result<(Option<String>, String
 
         for file in pr_only {
             for k in found.github.iter().filter(|k| k.file == file) {
-                said.push_str(&format!(
+                let _ = write!(
+                    said,
                     "\n{file} stays on GitHub as it is, since act runs a workflow whole: job {}: {}",
                     k.job, k.why
-                ));
+                );
             }
         }
 
@@ -335,7 +357,7 @@ pub fn host_config(checks: &[Found], versions: &[String]) -> String {
         .filter_map(|w| w.split_once('=').map(|(name, _)| name))
         .filter(|n| n.ends_with("_VERSION") && n.len() > "_VERSION".len())
         .collect();
-    pinned.sort();
+    pinned.sort_unstable();
     pinned.dedup();
     let note = if pinned.is_empty() {
         String::new()
@@ -399,7 +421,7 @@ pub fn config_text(d: &Detected) -> String {
 
     for (k, engine) in &d.acts {
         let name = toml::Value::String(format!("{}/{}", k.file, k.job));
-        text.push_str(&format!("\n[jobs.{name}]\nrunner = \"act\"\n"));
+        let _ = write!(text, "\n[jobs.{name}]\nrunner = \"act\"\n");
 
         if *engine == Engine::Colima {
             text.push_str("# A VM of its own, with its own Docker. It reaches this machine's loopback, for trusted code only\nengine = \"colima\"\n");
@@ -480,7 +502,7 @@ fn launched(words: &[String]) -> &[String] {
     let mut rest = words;
 
     loop {
-        let first = rest.first().map(String::as_str).unwrap_or_default();
+        let first = rest.first().map_or_default(String::as_str);
         let values = value_flags(first);
         rest = match first {
             "npx" | "bunx" | "pnpx" => past_flags(&rest[1..], values),
@@ -734,7 +756,7 @@ fn started(run: &str) -> Vec<Vec<String>> {
         let shell = ["sh", "bash", "zsh", "dash"].contains(&words[0].as_str());
 
         match words.iter().position(|w| w == "-c").filter(|_| shell) {
-            Some(c) => out.extend(words.get(c + 1).map(|s| started(s)).unwrap_or_default()),
+            Some(c) => out.extend(words.get(c + 1).map_or_default(|s| started(s))),
             None => out.push(words),
         }
     }
@@ -760,7 +782,7 @@ fn command_word(word: &str) -> Option<&str> {
 }
 
 /// What a job runs that only a VM gives it: a container runtime, or a change to the kernel
-fn needs_vm(job: &crate::workflow::Job) -> Option<String> {
+fn needs_vm(job: &Job) -> Option<String> {
     if job.runs_docker {
         return Some("docker".into());
     }
@@ -801,8 +823,8 @@ fn needs_vm(job: &crate::workflow::Job) -> Option<String> {
  * reads, that reads the event or the refs. Or HEAD in a workflow that runs on PRs, which there is
  * the merge commit, with HEAD^ the base, and here the branch's own commit
  **/
-fn reads_the_pr(job: &crate::workflow::Job, source: &str, root: &Path) -> Option<String> {
-    let on_prs = crate::workflow::runs_on_prs(source);
+fn reads_the_pr(job: &Job, source: &str, root: &Path) -> Option<String> {
+    let on_prs = workflow::runs_on_prs(source);
     // A path that stays in the repository, else None
     let inside = |dir: &Path, word: &str| -> Option<PathBuf> {
         let word = word.strip_prefix("./").unwrap_or(word);
@@ -814,7 +836,7 @@ fn reads_the_pr(job: &crate::workflow::Job, source: &str, root: &Path) -> Option
         small
             .then(|| fs::read_to_string(file).ok())
             .flatten()
-            .and_then(|text| crate::workflow::reads_what_act_lacks(&text))
+            .and_then(|text| workflow::reads_what_act_lacks(&text))
     };
 
     for step in &job.steps {
@@ -885,8 +907,8 @@ fn reads_the_pr(job: &crate::workflow::Job, source: &str, root: &Path) -> Option
 }
 
 /// Why act would run a job otherwise than GitHub does: what it reads, reports or publishes
-fn act_differs(job: &crate::workflow::Job, source: &str, root: &Path) -> Option<String> {
-    if let Some(why) = crate::workflow::act_lacks_context(source, &job.id) {
+fn act_differs(job: &Job, source: &str, root: &Path) -> Option<String> {
+    if let Some(why) = workflow::act_lacks_context(source, &job.id) {
         return Some(why);
     }
 
@@ -928,18 +950,13 @@ fn act_differs(job: &crate::workflow::Job, source: &str, root: &Path) -> Option<
  * label act has no image for, one whose `if:` or values read the PR, one that reports to GitHub, or
  * one that needs a VM, since colima reaches this machine's loopback and is for its owner to choose
  **/
-fn act_engine(
-    job: &crate::workflow::Job,
-    machine: &Machine,
-    source: &str,
-    root: &Path,
-) -> Result<Engine, String> {
+fn act_engine(job: &Job, machine: &Machine, source: &str, root: &Path) -> Result<Engine, String> {
     // act checks Docker before any job, a colima job's too
     if !machine.docker {
         return Err("Docker is not running".into());
     }
 
-    let labels = crate::runner::act::platforms(&crate::config::Act::default());
+    let labels = act::platforms(&Act::default());
 
     if job.runs_on.is_empty() || job.runs_on.iter().any(|l| l.contains("${{")) {
         return Err("its runs-on is not a label act has an image for".into());
@@ -971,19 +988,15 @@ fn act_engine(
  * only with that job. A job act cannot run keeps its reason, with why act cannot either
  **/
 pub fn place(root: &Path, machine: &Machine, d: &mut Detected) {
-    type File = (
-        String,
-        Vec<crate::workflow::Job>,
-        std::cell::OnceCell<Result<(), String>>,
-    );
+    type File = (String, Vec<Job>, OnceCell<Result<(), String>>);
     let mut files: BTreeMap<String, File> = BTreeMap::new();
 
     for k in &d.github {
         files.entry(k.file.clone()).or_insert_with(|| {
             let source = fs::read_to_string(root.join(".github/workflows").join(&k.file))
                 .unwrap_or_default();
-            let jobs = crate::workflow::job_runs(&source);
-            (source, jobs, Default::default())
+            let jobs = workflow::job_runs(&source);
+            (source, jobs, OnceCell::default())
         });
     }
 
@@ -1029,7 +1042,7 @@ pub fn place(root: &Path, machine: &Machine, d: &mut Detected) {
 fn engine_of(
     root: &Path,
     source: &str,
-    jobs: &[crate::workflow::Job],
+    jobs: &[Job],
     id: &str,
     machine: &Machine,
 ) -> Result<Engine, String> {
@@ -1055,13 +1068,7 @@ pub fn act_engine_for(
 ) -> Result<Engine, String> {
     let source =
         fs::read_to_string(root.join(".github/workflows").join(file)).map_err(|e| e.to_string())?;
-    let engine = engine_of(
-        root,
-        &source,
-        &crate::workflow::job_runs(&source),
-        id,
-        machine,
-    )?;
+    let engine = engine_of(root, &source, &workflow::job_runs(&source), id, machine)?;
     act_parses(root, file)?;
     Ok(engine)
 }
@@ -1111,7 +1118,15 @@ pub fn workflow_files(root: &Path) -> Option<Vec<String>> {
     let mut files: Vec<String> = fs::read_dir(root.join(".github/workflows"))
         .ok()?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|n| (n.ends_with(".yml") || n.ends_with(".yaml")) && !n.contains(char::is_control))
+        .filter(|n| {
+            (std::path::Path::new(n)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("yml"))
+                || std::path::Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml")))
+                && !n.contains(char::is_control)
+        })
         .collect();
     files.sort();
     Some(files)
@@ -1127,7 +1142,7 @@ pub fn detect(root: &Path) -> Detected {
 }
 
 /// Whether a job has a `run` step, which is what host mode or act would run of it
-fn runs_something(job: &crate::workflow::Job) -> bool {
+fn runs_something(job: &Job) -> bool {
     job.steps.iter().any(|s| !s.run.is_empty())
 }
 
@@ -1136,7 +1151,7 @@ const DOCKER: &str = "runs Docker, which shipcheck never gives a job";
 const BASE_ONLY: &str = "runs only on the base branch, so it is no PR check and stays as it is";
 
 /// The jobs of a file GitHub runs only on the base branch: an `if:` that requires it, or a need that does
-pub fn base_only(jobs: &[crate::workflow::Job]) -> BTreeSet<String> {
+pub fn base_only(jobs: &[Job]) -> BTreeSet<String> {
     let mut only: BTreeSet<String> = jobs
         .iter()
         .filter(|j| j.base_only)
@@ -1161,8 +1176,15 @@ pub fn base_only(jobs: &[crate::workflow::Job]) -> BTreeSet<String> {
 
 const PR_ONLY: &str = "its `if:` reads the PR, such as its labels, or the default branch, so only GitHub can tell if it runs";
 
+/// Whether any job of the workflows runs on macOS or Windows
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Jobs {
+    AllOnLinux,
+    SomeOffLinux,
+}
+
 /// Why a job stays on GitHub for PRs in host mode, or None when shipcheck may run it here
-fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) -> Option<String> {
+fn stays(job: &Job, machine: &Machine, jobs: Jobs) -> Option<String> {
     let os = job.os;
 
     if job.pr_only {
@@ -1195,7 +1217,7 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
                 ));
             }
             // act would run it, but not beside the other jobs, which stay
-            _ if others_off_linux => {
+            _ if jobs == Jobs::SomeOffLinux => {
                 return Some(format!(
                     "runs a matrix ({axis}), and host mode runs only this machine's toolchain"
                 ));
@@ -1217,7 +1239,7 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
 
     // A job with `if:` is left out anyway, and says so
     if !job.conditional
-        && let Err(why) = crate::java::pick(job, &machine.jdks)
+        && let Err(why) = java::pick(job, &machine.jdks)
     {
         return Some(why);
     }
@@ -1236,7 +1258,7 @@ fn stays(job: &crate::workflow::Job, machine: &Machine, others_off_linux: bool) 
     None
 }
 
-fn sets_up_xcode(step: &crate::workflow::RunStep) -> bool {
+fn sets_up_xcode(step: &RunStep) -> bool {
     step.uses
         .as_deref()
         .is_some_and(|u| u.split('@').next() == Some("maxim-lobanov/setup-xcode"))
@@ -1312,7 +1334,7 @@ fn xcode_select(words: &[String]) -> Option<&str> {
  * The Xcode app a job picks with `DEVELOPER_DIR`, `xcode-select -s` or `setup-xcode`, such as
  * `/Applications/Xcode_26.6.app`, empty for any Xcode. Err, why it stays, for a pick init cannot read
  **/
-fn xcode(job: &crate::workflow::Job) -> Option<Result<String, String>> {
+fn xcode(job: &Job) -> Option<Result<String, String>> {
     let expression = || Some(Err("picks its Xcode with an expression".to_string()));
     // None for a path that is not an Xcode, such as the Command Line Tools
     let pick = |path: &str| {
@@ -1335,11 +1357,11 @@ fn xcode(job: &crate::workflow::Job) -> Option<Result<String, String>> {
         for line in step.run.lines() {
             let words = words(line);
             // `export DEVELOPER_DIR=` and `echo "DEVELOPER_DIR=..." >> $GITHUB_ENV` pick one too
-            let set = words
+            let mut set = words
                 .iter()
                 .filter_map(|w| w.strip_prefix("DEVELOPER_DIR="))
                 .chain(xcode_select(&words));
-            picks.extend(set.filter_map(pick).next());
+            picks.extend(set.find_map(pick));
         }
 
         if sets_up_xcode(step) {
@@ -1381,8 +1403,8 @@ fn picks_xcode_only(run: &str) -> bool {
 }
 
 /// A job's or step's `DEVELOPER_DIR` pick, which becomes the check's own, or none when this machine lacks it
-fn picked(name: &str, value: &Option<String>) -> bool {
-    name == "DEVELOPER_DIR" && value.as_deref().is_none_or(|v| v.contains(".app"))
+fn picked(name: &str, value: Option<&String>) -> bool {
+    name == "DEVELOPER_DIR" && value.is_none_or(|v| v.contains(".app"))
 }
 
 /**
@@ -1418,6 +1440,10 @@ fn without_xcode_pick(line: &str) -> Result<String, String> {
  * when act can run every job, since host mode tests only this machine's toolchain. Otherwise such
  * jobs, and jobs on a platform this machine cannot run, stay on GitHub
  **/
+#[expect(
+    clippy::too_many_lines,
+    reason = "one rule per kind of job, read as one table"
+)]
 pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
     let mut d = Detected::default();
     let ruby_file = fs::read_to_string(root.join(".ruby-version")).ok();
@@ -1428,8 +1454,8 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
         let source =
             fs::read_to_string(root.join(".github/workflows").join(&file)).unwrap_or_default();
 
-        if !crate::workflow::runs_for_branches(&source) {
-            d.skipped.push(if crate::workflow::on_pull_request_target(&source) {
+        if !workflow::runs_for_branches(&source) {
+            d.skipped.push(if workflow::on_pull_request_target(&source) {
                 format!("{file}: it runs on pull_request_target, from the base branch with its secrets, so it stays on GitHub")
             } else {
                 format!("{file}: GitHub does not run it for feature branches")
@@ -1437,7 +1463,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             continue;
         }
 
-        files.push((file.clone(), crate::workflow::job_runs(&source)));
+        files.push((file.clone(), workflow::job_runs(&source)));
         sources.insert(file, source);
     }
 
@@ -1446,7 +1472,11 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             .iter()
             .flat_map(|(f, jobs)| jobs.iter().map(move |j| (f, j)))
     };
-    let off_linux = all().any(|(_, j)| j.os.mac || j.os.windows);
+    let platforms = if all().any(|(_, j)| j.os.mac || j.os.windows) {
+        Jobs::SomeOffLinux
+    } else {
+        Jobs::AllOnLinux
+    };
     let matrix =
         all().find(|(_, j)| j.matrix.is_some() && runs_something(j) && !ships(&j.id, &['-', '_']));
     // act runs every job of a listed workflow, and a job that runs Docker fails there every time
@@ -1454,7 +1484,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
 
     let in_act = |_: &_| {
         machine.docker
-            && !off_linux
+            && platforms == Jobs::AllOnLinux
             && !docker_job
             && files.iter().all(|(f, _)| act_parses(root, f).is_ok())
     };
@@ -1497,7 +1527,7 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
             .filter(|j| !only.contains(&j.id))
             .filter_map(|j| {
                 // A check without one of its steps would test less than the job, so it stays whole
-                let why = stays(j, machine, off_linux)
+                let why = stays(j, machine, platforms)
                     .or_else(|| reads_the_pr(j, &sources[file], root))
                     .or_else(|| {
                         dropped_step(j).map(|s| format!("a check would leave out its {s}"))
@@ -1790,9 +1820,9 @@ pub fn detect_on(root: &Path, machine: &Machine) -> Detected {
 
 /**
  * The literal `python-version` of the job's `setup-python` step, such as `3.13` or `3.14t`, when a
- * step runs uv, which takes it from `UV_PYTHON`. None for `3.x`, a list, PyPy or an expression
+ * step runs uv, which takes it from `UV_PYTHON`. None for `3.x`, a list, `PyPy` or an expression
  **/
-fn setup_python(job: &crate::workflow::Job) -> Option<String> {
+fn setup_python(job: &Job) -> Option<String> {
     let runs_uv = job.steps.iter().any(|s| {
         s.run
             .split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
@@ -1970,8 +2000,6 @@ fn answers(_: &str) -> bool {
 /// Whether an executable file of that name is in a directory of `PATH`
 #[cfg(not(test))]
 fn on_path(tool: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
     std::env::var_os("PATH").is_some_and(|p| {
         std::env::split_paths(&p).any(|d| {
             fs::metadata(d.join(tool))
@@ -1986,12 +2014,7 @@ fn on_path(_: &str) -> bool {
 }
 
 /// The jobs `needs` names, and the jobs those need, each once, every job after the ones it needs
-fn needed(
-    jobs: &[crate::workflow::Job],
-    needs: &[String],
-    out: &mut Vec<String>,
-    path: &mut Vec<String>,
-) {
+fn needed(jobs: &[Job], needs: &[String], out: &mut Vec<String>, path: &mut Vec<String>) {
     for need in needs {
         // A cycle is GitHub's error, and this stops at it
         if out.contains(need) || path.contains(need) {
@@ -2031,17 +2054,16 @@ fn sets_up(words: &[&str]) -> bool {
     ];
 
     match words {
-        ["pip" | "pip3", "install", ..]
+        ["pip" | "pip3" | "go" | "cargo", "install", ..]
         | ["python" | "python3", "-m", "pip", "install", ..]
-        | ["go", "install", ..]
-        | ["npm", "config", ..]
-        | ["git", "config", ..]
-        | ["rustup", ..]
-        | ["cargo", "install", ..]
-        | ["brew", "install" | "update" | "upgrade" | "tap" | "bundle", ..]
-        // A guard before an install, as in `command -v jq || apt-get install jq`
-        | ["command", "-v", ..]
-        | ["which", ..] => true,
+        | ["npm" | "git", "config", ..]
+        | ["rustup" | "which", ..]
+        | [
+            "brew",
+            "install" | "update" | "upgrade" | "tap" | "bundle",
+            ..,
+        ]
+        | ["command", "-v", ..] => true,
         ["apt" | "apt-get" | "dnf" | "yum", rest @ ..] => rest.iter().any(|w| package.contains(w)),
         _ => false,
     }
@@ -2230,7 +2252,7 @@ fn assigned<'a>(command: &'a str, name: &str) -> Option<&'a str> {
  * which is how GitHub's `bash -e` stops at the first failure. A line with `|` or `&` is grouped
  * so `&&` cannot bind into it. Ok(None) for nothing to run, Err(fatal, why) to leave it out
  **/
-fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool, String)> {
+fn step_command(step: &RunStep) -> Result<Option<String>, (bool, String)> {
     let leave = |why: &str| Err((false, why.to_string()));
 
     if step.conditional {
@@ -2319,7 +2341,7 @@ fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool
             return Err((true, "a step deploys, publishes or releases".into()));
         }
 
-        lines.push(line.to_string());
+        lines.push(line.clone());
     }
 
     // A step that only changes its own shell, such as a lone `cd` after its install was left out, does nothing
@@ -2346,14 +2368,14 @@ fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool
 
     Ok(match lines.as_slice() {
         [] => None,
-        [one] => Some(one.to_string()),
+        [one] => Some(one.clone()),
         many => Some(
             many.iter()
                 .map(|l| {
                     if l.contains(['|', '&']) {
                         format!("{{ {l}; }}")
                     } else {
-                        l.to_string()
+                        l.clone()
                     }
                 })
                 .collect::<Vec<_>>()
@@ -2366,7 +2388,7 @@ fn step_command(step: &crate::workflow::RunStep) -> Result<Option<String>, (bool
  * The commands of a job that check something, each with its step's directory, for `init` to
  * compare with the checks of a shipcheck.toml. Steps a check could not run are left out
  **/
-pub fn job_commands(job: &crate::workflow::Job) -> Vec<(Option<String>, String)> {
+pub fn job_commands(job: &Job) -> Vec<(Option<String>, String)> {
     let Ok((parts, _, _)) = steps_of(job) else {
         return Vec::new();
     };
@@ -2386,7 +2408,7 @@ pub fn job_commands(job: &crate::workflow::Job) -> Vec<(Option<String>, String)>
  * command, or an action that is not checkout, a cache, an artifact or a setup. Without that step
  * the check would test less than the job does, so it does not stand for the job
  **/
-pub fn dropped_step(job: &crate::workflow::Job) -> Option<String> {
+pub fn dropped_step(job: &Job) -> Option<String> {
     let (_, dropped, _) = steps_of(job).ok()?;
     let (step, why) = dropped.into_iter().next()?;
 
@@ -2446,9 +2468,12 @@ fn drops_nothing(uses: &str) -> bool {
  * A job's steps as commands, each with its directory, and the steps left out as their name and
  * why. Err for a step that makes the whole job no check, such as a deploy
  **/
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::type_complexity,
+    reason = "a tuple read once by its only caller"
+)]
 fn steps_of(
-    job: &crate::workflow::Job,
+    job: &Job,
 ) -> Result<
     (
         Vec<(Option<String>, String)>,
@@ -2480,7 +2505,7 @@ fn steps_of(
         let mut step = if !step.run.is_empty() {
             step.clone()
         } else if let Some(run) = action_install(step) {
-            crate::workflow::RunStep {
+            RunStep {
                 run,
                 dir: input(step, "working-directory"),
                 shell: None,
@@ -2498,7 +2523,8 @@ fn steps_of(
             continue;
         };
 
-        step.env.retain(|(name, value)| !picked(name, value));
+        step.env
+            .retain(|(name, value)| !picked(name, value.as_ref()));
         step.env.retain(|(name, _)| {
             let sandbox = SANDBOX_VARS.contains(&name.as_str());
 
@@ -2548,7 +2574,7 @@ pub fn commands(command: &str) -> Vec<String> {
 }
 
 /// A `uses` step's input, when it is not an expression
-fn input(step: &crate::workflow::RunStep, name: &str) -> Option<String> {
+fn input(step: &RunStep, name: &str) -> Option<String> {
     step.with
         .iter()
         .find(|(k, _)| k == name)
@@ -2561,7 +2587,7 @@ fn input(step: &crate::workflow::RunStep, name: &str) -> Option<String> {
  * `pnpm/action-setup` with `run_install: true` and `ruby/setup-ruby` with `bundler-cache: true`,
  * and `gitleaks dir` for `gitleaks/gitleaks-action`. `setup-node`'s and `setup-uv`'s caches install nothing
  **/
-fn action_install(step: &crate::workflow::RunStep) -> Option<String> {
+fn action_install(step: &RunStep) -> Option<String> {
     let action = step.uses.as_deref()?.split('@').next()?;
     let set = |name: &str| {
         step.with
@@ -2613,7 +2639,7 @@ fn action_install(step: &crate::workflow::RunStep) -> Option<String> {
  * `rustup`, or a `dtolnay/rust-toolchain` or `actions-rust-lang/setup-rust-toolchain` other than
  * stable or with targets. A check without it fails on a machine that lacks it, where GitHub passes
  **/
-fn rust_need(step: &crate::workflow::RunStep) -> Option<String> {
+fn rust_need(step: &RunStep) -> Option<String> {
     for line in step.run.lines() {
         let words: Vec<&str> = line
             .split_whitespace()
@@ -2678,9 +2704,12 @@ fn rust_need(step: &crate::workflow::RunStep) -> Option<String> {
  * own shell, so a step of several commands, with `|` or `&`, or with its own directory runs in a
  * subshell. A rustup toolchain this machine has is pinned with `RUSTUP_TOOLCHAIN`, a JDK with `JAVA_HOME`
  **/
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one rule per kind of step, read as one table"
+)]
 fn job_check(
-    job: &crate::workflow::Job,
+    job: &Job,
     machine: &Machine,
     ruby_file: Option<&str>,
 ) -> Result<(String, Vec<String>, Vec<String>), String> {
@@ -2751,14 +2780,14 @@ fn job_check(
         .collect();
 
     // As `setup-java` leaves it, so gradlew and mvnw find the JDK through `JAVA_HOME`
-    if let Some(jdk) = crate::java::pick(job, &machine.jdks)? {
+    if let Some(jdk) = java::pick(job, &machine.jdks)? {
         let home = jdk.home.display();
         exports.push(format!("JAVA_HOME={home}"));
         exports.push(format!("PATH={home}/bin:\"$PATH\""));
     }
 
     // As chruby leaves it, so `ruby`, `gem` and `bundle` are the workflow's Ruby
-    let ruby = crate::ruby::pick(job, ruby_file, machine.ruby.as_deref(), &machine.rubies)?;
+    let ruby = ruby::pick(job, ruby_file, machine.ruby.as_deref(), &machine.rubies)?;
     // The Ruby this machine has runs it, the workflow's version only when this machine has that one
     notes.extend(ruby.note.map(|n| format!("{WARNING}{n}")));
 
@@ -2774,7 +2803,7 @@ fn job_check(
     }
 
     for (name, value) in &job.env {
-        if picked(name, value) {
+        if picked(name, value.as_ref()) {
             continue;
         }
 
@@ -2833,7 +2862,7 @@ fn job_check(
             {
                 format!("({run})")
             }
-            _ => run.to_string(),
+            _ => run.clone(),
         })
         .collect::<Vec<_>>()
         .join(" && ");
@@ -2895,7 +2924,10 @@ fn runs_command(shell: &str, command: &str) -> bool {
  * package manager its lockfile names, Cargo.toml, pyproject.toml and go.mod. Each check is its
  * name, its tool, which names it when the name is taken, its command and its file
  **/
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::type_complexity,
+    reason = "a tuple read once by its only caller"
+)]
 fn project_checks(root: &Path) -> (Vec<(String, String, String, String)>, Vec<String>) {
     let has = |f: &str| root.join(f).exists();
     let mut checks = Vec::new();
@@ -2912,8 +2944,7 @@ fn project_checks(root: &Path) -> (Vec<(String, String, String, String)>, Vec<St
     let scripts = fs::read_to_string(root.join("package.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .map(|v| v["scripts"].clone())
-        .unwrap_or_default();
+        .map_or_default(|v| v["scripts"].clone());
     // npm init's placeholder fails on purpose
     let script = |name: &str| {
         scripts[name]
@@ -2934,7 +2965,7 @@ fn project_checks(root: &Path) -> (Vec<(String, String, String, String)>, Vec<St
         // `bun test` is bun's own test runner, not the script
         let run = |name: &str| match (pm, name) {
             ("npm", "test") => "npm test".to_string(),
-            ("npm", _) | ("bun", _) => format!("{pm} run {name}"),
+            ("npm" | "bun", _) => format!("{pm} run {name}"),
             _ => format!("{pm} {name}"),
         };
 
@@ -3017,31 +3048,54 @@ pub fn install(root: &Path) -> Result<String, String> {
 /**
  * What `shipcheck install` would fix in this clone, which `run`, `commit` and `doctor` say: no daemon
  * entry, so a head pushed from elsewhere, such as a rebase on GitHub, gets no run, or hooks an older
- * install wrote. Nothing under a moved home or SHIPCHECK_NO_DAEMON, where install leaves the daemon
+ * install wrote. Nothing under a moved home or `SHIPCHECK_NO_DAEMON`, where install leaves the daemon
  **/
 pub fn install_gap(root: &Path) -> Option<String> {
-    if crate::run::home_overridden()
-        || std::env::var_os("SHIPCHECK_NO_DAEMON").is_some_and(|v| v == "1")
-    {
+    if run::home_overridden() || std::env::var_os("SHIPCHECK_NO_DAEMON").is_some_and(|v| v == "1") {
         return None;
     }
 
-    let unregistered = !crate::daemon::registered(root) && crate::autostart::daemon_on_main(root);
-    let name = crate::run::repo_id(root)
+    let entry = if !daemon::registered(root) && autostart::daemon_on_main(root) {
+        Entry::Missing
+    } else {
+        Entry::Registered
+    };
+    let hooks = if stale_hooks(root) {
+        Hooks::Stale
+    } else {
+        Hooks::Current
+    };
+    let name = run::repo_id(root)
         .ok()
         .and_then(|id| id.rsplit('/').next().map(String::from))
         .unwrap_or_else(|| "this repository".into());
-    gap_line(&name, unregistered, stale_hooks(root))
+    gap_line(&name, entry, hooks)
 }
 
-fn gap_line(name: &str, unregistered: bool, stale: bool) -> Option<String> {
-    let what = match (unregistered, stale) {
-        (true, true) => "is not registered with the daemon and has outdated hooks",
-        (true, false) => {
+/// Whether the clone has the daemon entry it needs
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    Registered,
+    Missing,
+}
+
+/// Whether the hooks shipcheck wrote match the ones this version writes
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hooks {
+    Current,
+    Stale,
+}
+
+fn gap_line(name: &str, entry: Entry, hooks: Hooks) -> Option<String> {
+    let what = match (entry, hooks) {
+        (Entry::Missing, Hooks::Stale) => {
+            "is not registered with the daemon and has outdated hooks"
+        }
+        (Entry::Missing, Hooks::Current) => {
             "is not registered with the daemon, so a PR pushed from elsewhere gets no run"
         }
-        (false, true) => "has outdated hooks",
-        (false, false) => return None,
+        (Entry::Registered, Hooks::Stale) => "has outdated hooks",
+        (Entry::Registered, Hooks::Current) => return None,
     };
     Some(format!("{name} {what}, run `shipcheck install` to fix"))
 }
@@ -3083,7 +3137,6 @@ fn write_hook(hook: &Path, script: &str, line: &str) -> Result<String, String> {
 
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
 }
 
@@ -3097,7 +3150,8 @@ pub(crate) mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::config::RepoConfig;
+    use crate::config::{Network, RepoConfig, RunnerKind};
+    use crate::runner::host;
 
     #[test]
     fn generated_config_parses() {
@@ -3119,6 +3173,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one case per kind of job, read as one table"
+    )]
     fn init_turns_workflow_jobs_into_host_checks() {
         let ci = r#"on: [push, pull_request]
 defaults:
@@ -3195,7 +3253,7 @@ jobs:
             ("Cargo.toml", ""),
             ("package.json", r#"{"scripts": {"lint": "eslint ."}}"#),
         ]);
-        assert_eq!(cfg.runner, crate::config::RunnerKind::Host);
+        assert_eq!(cfg.runner, RunnerKind::Host);
         assert_eq!(
             checks(&cfg),
             [
@@ -3277,7 +3335,7 @@ jobs:
 
     #[test]
     fn multi_line_steps_take_only_simple_commands() {
-        let ci = r#"on: push
+        let ci = r"on: push
 jobs:
   ok:
     steps:
@@ -3306,7 +3364,7 @@ jobs:
       - run: |
           f() { make; }
           f
-"#;
+";
         let (cfg, _, said) = init_with(&[(".github/workflows/ci.yml", ci)]);
         assert_eq!(
             checks(&cfg),
@@ -3324,7 +3382,7 @@ jobs:
 
     #[test]
     fn a_job_runs_the_jobs_it_needs_first() {
-        let ci = r#"on: push
+        let ci = r"on: push
 jobs:
   e2e:
     needs: [integration, build]
@@ -3342,7 +3400,7 @@ jobs:
   setup:
     steps:
       - run: pip install -r r.txt
-"#;
+";
         let (cfg, _, said) = init_with(&[(".github/workflows/ci.yml", ci)]);
         assert_eq!(
             cfg.host.checks["e2e"],
@@ -3426,7 +3484,7 @@ jobs:
         run: cargo check --all-targets --all-features --target armv5te-unknown-linux-musleabi
 "#;
         // rails' check-markdown-api.yml and gin's gin.yml, trimmed
-        let rails = r#"on: pull_request
+        let rails = r"on: pull_request
 jobs:
   markdown_api:
     steps:
@@ -3440,7 +3498,7 @@ jobs:
       TESTTAGS: ${{ matrix.test-tags }}
     steps:
       - run: make test
-"#;
+";
         let (cfg, _, said) = init_with(&[
             (".github/workflows/ci.yml", ci),
             (".github/workflows/rails.yml", rails),
@@ -3528,7 +3586,7 @@ jobs:
     #[test]
     fn a_step_cd_stays_in_its_step() {
         // fastapi's test-redistribute.yml, trimmed: the install after the `cd` is left out
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   test-redistribute:
     steps:
@@ -3541,7 +3599,7 @@ jobs:
           bash scripts/test.sh
       - run: cd dist
       - run: pip wheel --no-deps fastapi*.tar.gz
-"#;
+";
         let (cfg, _, _) = init_with(&[(".github/workflows/ci.yml", ci)]);
         assert_eq!(
             checks(&cfg),
@@ -3573,7 +3631,7 @@ jobs:
 "#;
         let found = detect_with(
             &[(".github/workflows/ci.yml", ci), ("Cargo.toml", "")],
-            false,
+            Docker::Stopped,
         );
         assert!(found.act.is_none());
         let said = found.explain();
@@ -3647,7 +3705,7 @@ jobs:
             (".github/workflows/CI.yml", AXUM),
             (".github/workflows/release-plz.yml", release),
         ];
-        let found = detect_with(&files, true);
+        let found = detect_with(&files, Docker::Running);
         assert_eq!(
             found.act.as_deref(),
             Some(
@@ -3669,7 +3727,7 @@ jobs:
         let cfg =
             RepoConfig::parse(&fs::read_to_string(dir.path().join("shipcheck.toml")).unwrap())
                 .unwrap();
-        assert_eq!(cfg.runner, crate::config::RunnerKind::Act);
+        assert_eq!(cfg.runner, RunnerKind::Act);
         assert_eq!(cfg.workflows, ["CI.yml"]);
         assert!(
             said.contains("runs a matrix (workspace: ., examples)"),
@@ -3679,7 +3737,7 @@ jobs:
 
     #[test]
     fn without_docker_a_matrix_stays_on_github_and_toolchains_are_left_out() {
-        let found = detect_with(&[(".github/workflows/CI.yml", AXUM)], false);
+        let found = detect_with(&[(".github/workflows/CI.yml", AXUM)], Docker::Stopped);
         assert!(found.act.is_none());
         let checks: Vec<&str> = found.checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(checks, ["check-docs", "external-types"]);
@@ -3701,7 +3759,7 @@ jobs:
     #[test]
     fn a_matrix_with_macos_or_windows_entries_stays_on_github() {
         // flask's tests.yaml and express's ci.yml, trimmed
-        let flask = r#"on:
+        let flask = r"on:
   pull_request:
 jobs:
   tests:
@@ -3729,8 +3787,8 @@ jobs:
     steps:
       - uses: astral-sh/setup-uv@v9
       - run: uv run --locked --no-default-groups --group dev tox run -e typing
-"#;
-        let express = r#"on: [push, pull_request]
+";
+        let express = r"on: [push, pull_request]
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -3754,14 +3812,14 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - run: npm install
       - run: npm run test-ci
-"#;
+";
         // Docker cannot help: act runs no macOS or Windows entry
         let found = detect_with(
             &[
                 (".github/workflows/tests.yaml", flask),
                 (".github/workflows/ci.yml", express),
             ],
-            true,
+            Docker::Running,
         );
         assert!(found.act.is_none());
         let checks: Vec<(&str, &str)> = found
@@ -3807,7 +3865,7 @@ jobs:
     #[test]
     fn windows_and_macos_jobs_stay_on_github() {
         // cobra's test.yml and ripgrep's ci.yml, trimmed
-        let cobra = r#"on:
+        let cobra = r"on:
   push:
   pull_request:
 jobs:
@@ -3834,8 +3892,8 @@ jobs:
     runs-on: macos-14
     steps:
       - run: make test
-"#;
-        let ripgrep = r#"on:
+";
+        let ripgrep = r"on:
   pull_request:
 jobs:
   wasm:
@@ -3854,12 +3912,12 @@ jobs:
         toolchain: stable
         components: rustfmt
     - run: cargo fmt --all --check
-"#;
+";
         let files = [
             (".github/workflows/test.yml", cobra),
             (".github/workflows/ci.yml", ripgrep),
         ];
-        let found = detect_with(&files, false);
+        let found = detect_with(&files, Docker::Stopped);
         let kept: Vec<(&str, &str)> = found
             .github
             .iter()
@@ -3932,7 +3990,7 @@ jobs:
     steps:
       - run: make docs
 "#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Stopped);
         let kept: Vec<(&str, &str)> = found
             .github
             .iter()
@@ -3962,7 +4020,7 @@ jobs:
                 (".github/workflows/codeql.yml", codeql),
                 (".github/workflows/ci.yml", ci),
             ],
-            true,
+            Docker::Running,
         );
         assert!(found.act.is_none());
         // Its only step is an action no command stands for
@@ -3973,7 +4031,7 @@ jobs:
     #[test]
     fn setup_actions_that_install_keep_their_install() {
         // vite's ci.yml lint and rails' ci.yml, trimmed
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   lint:
     steps:
@@ -4009,7 +4067,7 @@ jobs:
         with:
           enable-cache: true
       - run: npm test
-"#;
+";
         let (cfg, _, _) = init_with(&[(".github/workflows/ci.yml", ci)]);
         assert_eq!(
             checks(&cfg),
@@ -4025,7 +4083,7 @@ jobs:
 
     #[test]
     fn a_job_runs_on_the_workflows_ruby_or_stays_without_one() {
-        let ci = r#"
+        let ci = r"
 on: pull_request
 jobs:
   latest:
@@ -4057,8 +4115,8 @@ jobs:
     steps:
       - uses: ruby/setup-ruby@v1
       - run: bundle exec rake d
-"#;
-        let rubies = [crate::ruby::Ruby {
+";
+        let rubies = [Ruby {
             engine: "ruby".into(),
             version: "2.7.8".into(),
             root: "/rubies/2.7.8".into(),
@@ -4119,6 +4177,10 @@ jobs:
 
     /// What `init` finds in these files on a Linux machine with or without Docker
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one case per kind of job, read as one table"
+    )]
     fn a_job_no_host_check_runs_as_github_does_goes_to_act_unless_act_differs() {
         let job = |id: &str, extra: &str, steps: &str| {
             format!("  {id}:\n    runs-on: ubuntu-latest\n{extra}    steps:\n{steps}")
@@ -4276,17 +4338,14 @@ jobs:
         );
 
         // What init writes runs those jobs with act, beside the host check
-        let cfg = crate::config::RepoConfig::parse(&text).unwrap();
+        let cfg = RepoConfig::parse(&text).unwrap();
         cfg.validate(&["ci.yml".to_string()].into()).unwrap();
-        let jobs = crate::run::expected_jobs(&cfg, |_| Some(ci.clone())).unwrap();
+        let jobs = run::expected_jobs(&cfg, |_| Some(ci.clone())).unwrap();
         assert_eq!(
             jobs["ci.yml"],
             ["heredoc", "own", "wasm", "words"].map(String::from).into()
         );
-        assert_eq!(
-            jobs[crate::runner::host::HOST],
-            ["lint"].map(String::from).into()
-        );
+        assert_eq!(jobs[host::HOST], ["lint"].map(String::from).into());
 
         // A colima job the owner chose needs no network line, which covers Docker's jobs only
         let mut vm = place(true, true);
@@ -4358,7 +4417,7 @@ jobs:
                 Some("`github.event`"),
             ),
         ] {
-            let found = detect_with(&[(".github/workflows/ci.yml", &source)], true);
+            let found = detect_with(&[(".github/workflows/ci.yml", &source)], Docker::Running);
             let act = found
                 .github
                 .iter()
@@ -4396,7 +4455,7 @@ jobs:
         let cfg = RepoConfig::parse(&text).unwrap();
         assert_eq!(cfg.workflows, ["ci.yml"], "{said}");
         // Its jobs download what their actions and steps set up
-        assert_eq!(cfg.network, crate::config::Network::Internet, "{text}");
+        assert_eq!(cfg.network, Network::Internet, "{text}");
         for line in [
             "pr.yml stays on GitHub as it is, since act runs a workflow whole: job changed: tj-actions/changed-files@v46 reads the PR",
             "pr.yml stays on GitHub as it is, since act runs a workflow whole: job title: it reads `github.event`",
@@ -4485,7 +4544,7 @@ jobs:
                     "set shell := [\"bash\", \"-c\"]\nexport A := \"b\"\ndanger:\n    yarn danger ci\n",
                 ),
             ],
-            true,
+            Docker::Running,
         );
         // A local run reads no PR, so those two are checks
         let checks: Vec<&str> = found.checks.iter().map(|c| c.name.as_str()).collect();
@@ -4521,8 +4580,7 @@ jobs:
                 .github
                 .iter()
                 .find(|k| k.job == id)
-                .map(|k| k.why.clone())
-                .unwrap_or_default();
+                .map_or_default(|k| k.why.clone());
             assert_eq!(
                 why,
                 format!(
@@ -4592,7 +4650,7 @@ jobs:
                 ),
                 ("scripts/lint.sh", "lint .\n"),
             ],
-            false,
+            Docker::Stopped,
         );
         let checks: Vec<&str> = found.checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(checks, ["plain"], "{}", found.explain());
@@ -4601,8 +4659,7 @@ jobs:
                 .github
                 .iter()
                 .find(|k| k.job == id)
-                .map(|k| k.why.clone())
-                .unwrap_or_default()
+                .map_or_default(|k| k.why.clone())
         };
         for (id, file, what) in [
             ("changed", "scripts/lint-changed.sh", "GITHUB_BASE_REF"),
@@ -4637,11 +4694,18 @@ jobs:
             .collect()
     }
 
-    fn detect_with(files: &[(&str, &str)], docker: bool) -> Detected {
+    /// Whether Docker runs on the test's machine
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Docker {
+        Running,
+        Stopped,
+    }
+
+    fn detect_with(files: &[(&str, &str)], docker: Docker) -> Detected {
         detect_on(
             repo(files).path(),
             &Machine {
-                docker,
+                docker: docker == Docker::Running,
                 ..Machine::default()
             },
         )
@@ -4649,7 +4713,7 @@ jobs:
 
     #[test]
     fn a_literal_setup_python_version_pins_uv_and_goes_into_the_key() {
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -4665,8 +4729,8 @@ jobs:
         with:
           python-version-file: pyproject.toml
       - run: uv run mypy
-"#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+";
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Stopped);
         let command = |name: &str| {
             let check = found.checks.iter().find(|c| c.name == name).unwrap();
             check.command.clone()
@@ -4692,7 +4756,7 @@ jobs:
             let ci = format!(
                 "on: push\njobs:\n  t:\n    steps:\n      - uses: actions/setup-python@v6\n        with:\n          python-version: {version}\n      - run: {run}\n"
             );
-            let jobs = crate::workflow::job_runs(&ci);
+            let jobs = workflow::job_runs(&ci);
             setup_python(&jobs[0])
         };
         assert_eq!(job("'3.14t'", "uv run pytest").as_deref(), Some("3.14t"));
@@ -4708,7 +4772,7 @@ jobs:
 
     #[test]
     fn a_jdk_this_machine_has_is_pinned_and_a_missing_one_keeps_the_job_on_github() {
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -4727,8 +4791,8 @@ jobs:
         with:
           java-version: 25
       - run: ./gradlew nativeTest
-"#;
-        let jdk = |version: &str, home: &str, native| crate::java::Jdk {
+";
+        let jdk = |version: &str, home: &str, native| Jdk {
             version: version.into(),
             home: home.into(),
             native,
@@ -4757,7 +4821,7 @@ jobs:
         );
 
         // Without a JDK both stay on GitHub
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Stopped);
         assert!(found.checks.is_empty());
         assert_eq!(
             found.github[0].why,
@@ -4767,7 +4831,7 @@ jobs:
 
     #[test]
     fn an_echo_into_a_file_of_the_tree_stays_in_the_check() {
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   latest:
     runs-on: ubuntu-latest
@@ -4775,8 +4839,8 @@ jobs:
       - run: echo 'kotlin.jvm.target.validation.mode=ignore' >> ./gradle.properties
       - run: echo building 2>&1 > /dev/null
       - run: make test
-"#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+";
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Stopped);
         assert_eq!(
             found.checks[0].command,
             "echo 'kotlin.jvm.target.validation.mode=ignore' >> ./gradle.properties && make test"
@@ -4785,15 +4849,15 @@ jobs:
 
     #[test]
     fn a_label_gated_job_that_also_runs_on_main_is_not_said_to_never_run_there() {
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   providers:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'providers')
     steps:
       - run: make test
-"#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+";
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Stopped);
         assert_eq!(found.github[0].why, PR_ONLY);
         assert!(!PR_ONLY.contains("never runs"), "{PR_ONLY}");
     }
@@ -4813,7 +4877,7 @@ jobs:
 
         // Without the comment the SHA names no toolchain, so the check runs on this machine's, said so
         let bare = CI_WITH_RELEASE.replace(" # stable", "");
-        let d = detect_with(&[(".github/workflows/ci.yml", &bare)], true);
+        let d = detect_with(&[(".github/workflows/ci.yml", &bare)], Docker::Running);
         assert!(d.checks.iter().any(|c| c.name == "test"));
         assert!(
             d.explain().contains("job test: needs toolchain"),
@@ -4822,7 +4886,7 @@ jobs:
         );
     }
 
-    pub(crate) const CI_WITH_RELEASE: &str = r#"on: [push, pull_request]
+    pub(crate) const CI_WITH_RELEASE: &str = r"on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -4848,7 +4912,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - run: cargo build --release
-"#;
+";
 
     fn init_with(files: &[(&str, &str)]) -> (RepoConfig, String, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -4908,7 +4972,7 @@ jobs:
             ("bun.lock", "bun run test", "bun run lint", "bun --version"),
         ] {
             let (cfg, text, said) = init_with(&[("package.json", pkg), (lock, "")]);
-            assert_eq!(cfg.runner, crate::config::RunnerKind::Host);
+            assert_eq!(cfg.runner, RunnerKind::Host);
             assert!(text.contains("runner = \"host\""));
             assert_eq!(checks(&cfg), [("lint", lint), ("test", test)], "{lock}");
             assert!(cfg.host.versions.contains(&version.to_string()));
@@ -4971,7 +5035,7 @@ jobs:
             (".github/workflows/ci.yml", "on: push"),
             ("package.json", r#"{"scripts": {"build": "tsc"}}"#),
         ]);
-        assert_eq!(cfg.runner, crate::config::RunnerKind::Act);
+        assert_eq!(cfg.runner, RunnerKind::Act);
         assert!(text.starts_with("runner = \"act\"\n"));
         assert_eq!(cfg.workflows, ["ci.yml"]);
         assert!(said.contains("runner = \"act\": no check found"), "{said}");
@@ -5087,7 +5151,7 @@ jobs:
       - run: brew install jq
       - run: make echoed
 "#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], true);
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Running);
         let checks: Vec<(&str, &str)> = found
             .checks
             .iter()
@@ -5163,7 +5227,7 @@ jobs:
     #[test]
     fn a_step_in_an_unusual_directory_keeps_its_job_on_github() {
         let ci = "on: push\njobs:\n  up:\n    steps:\n      - run: make\n        working-directory: ../other\n      - run: make test\n";
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], true);
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Running);
         assert!(found.checks.is_empty());
         assert_eq!(
             not_host(&found)[0].why,
@@ -5259,7 +5323,7 @@ jobs:
         }
 
         // Without the toolchain the check runs on the default one, with a warning
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Stopped);
         assert!(
             found.warnings.contains(
                 &"ci.yml, job check: needs toolchain 1.94.1, which rustup does not have here, so the check runs on the default toolchain until `rustup toolchain install 1.94.1`".to_string()
@@ -5273,7 +5337,7 @@ jobs:
     #[test]
     fn a_job_its_check_would_run_only_part_of_stays_on_github() {
         // curl's checkdocs.yml, checksrc.yml and linux-old.yml, trimmed
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   proselint:
     steps:
@@ -5316,8 +5380,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: make lint
-"#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], true);
+";
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Running);
         let checks: Vec<&str> = found.checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(checks, ["plain"], "{}", found.explain());
         let kept: Vec<(&str, &str)> = not_host(&found)
@@ -5361,7 +5425,7 @@ jobs:
     #[test]
     fn a_matrix_of_one_combination_is_a_plain_job() {
         // A Python app's ci.yml and git-cow's, trimmed
-        let ci = r#"on: push
+        let ci = r"on: push
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -5379,8 +5443,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - run: make test FS=${{matrix.fs}}
-"#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], true);
+";
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Running);
         assert!(found.act.is_none() && found.github.is_empty());
         let checks: Vec<(&str, &str)> = found
             .checks
@@ -5394,12 +5458,12 @@ jobs:
                 ("one", "make test FS=ext4")
             ]
         );
-        let jobs = crate::workflow::job_runs(ci);
+        let jobs = workflow::job_runs(ci);
         assert_eq!(jobs[0].check_names, Some(vec!["test (3.13)".to_string()]));
 
         // Two values are a matrix, and the reason shows them
         let two = ci.replace("[3.13]", "[3.12, 3.13]");
-        let found = detect_with(&[(".github/workflows/ci.yml", &two)], true);
+        let found = detect_with(&[(".github/workflows/ci.yml", &two)], Docker::Running);
         assert!(
             found
                 .act
@@ -5411,7 +5475,7 @@ jobs:
     }
 
     // orch's orch-review.yml, trimmed
-    const REVIEW: &str = r#"on:
+    const REVIEW: &str = r"on:
   push:
 jobs:
   review-gate:
@@ -5419,7 +5483,7 @@ jobs:
     if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
     steps:
       - run: ./scripts/lint-frontmatter.sh
-"#;
+";
 
     #[test]
     fn a_job_that_runs_only_off_the_base_branch_stays_on_github() {
@@ -5429,7 +5493,7 @@ jobs:
                 (".github/workflows/ci.yml", ci),
                 (".github/workflows/orch-review.yml", REVIEW),
             ],
-            false,
+            Docker::Stopped,
         );
         assert_eq!(found.checks[0].command, "make lint");
         assert_eq!(found.github.len(), 1);
@@ -5464,7 +5528,7 @@ jobs:
     #[test]
     fn a_project_check_a_job_on_github_runs_says_so() {
         // git-cow's ci.yml, trimmed
-        let ci = r#"on: [push, pull_request]
+        let ci = r"on: [push, pull_request]
 jobs:
   test:
     strategy:
@@ -5475,10 +5539,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - run: cargo test
-"#;
+";
         let found = detect_with(
             &[(".github/workflows/ci.yml", ci), ("Cargo.toml", "")],
-            false,
+            Docker::Stopped,
         );
         let said = found.explain();
         assert!(
@@ -5498,7 +5562,7 @@ jobs:
     #[test]
     fn gitleaks_action_becomes_gitleaks_dir() {
         // orch's release.yml secrets job, trimmed
-        let ci = r#"on: push
+        let ci = r"on: push
 jobs:
   secrets:
     steps:
@@ -5512,7 +5576,7 @@ jobs:
   leaks:
     steps:
       - uses: gitleaks/gitleaks-action@v2
-"#;
+";
         let (cfg, _, _) = init_with(&[(".github/workflows/ci.yml", ci)]);
         assert_eq!(
             checks(&cfg),
@@ -5609,17 +5673,17 @@ jobs:
 
     #[test]
     fn the_install_gap_names_the_repository_and_the_fix() {
-        assert_eq!(gap_line("homelab", false, false), None);
+        assert_eq!(gap_line("homelab", Entry::Registered, Hooks::Current), None);
         assert_eq!(
-            gap_line("homelab", true, false).unwrap(),
+            gap_line("homelab", Entry::Missing, Hooks::Current).unwrap(),
             "homelab is not registered with the daemon, so a PR pushed from elsewhere gets no run, run `shipcheck install` to fix"
         );
         assert_eq!(
-            gap_line("homelab", false, true).unwrap(),
+            gap_line("homelab", Entry::Registered, Hooks::Stale).unwrap(),
             "homelab has outdated hooks, run `shipcheck install` to fix"
         );
         assert!(
-            gap_line("homelab", true, true)
+            gap_line("homelab", Entry::Missing, Hooks::Stale)
                 .unwrap()
                 .contains("not registered with the daemon and has outdated hooks")
         );
@@ -5679,7 +5743,10 @@ jobs:
             repo(&[(".github/workflows/ci.yml", XCODE)]).path(),
             &Machine {
                 mac: true,
-                xcodes: xcodes.iter().map(|x| x.to_string()).collect(),
+                xcodes: xcodes
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
                 ..Machine::default()
             },
         )
@@ -5807,7 +5874,7 @@ jobs:
     #[test]
     fn a_quoted_semicolon_is_part_of_its_word() {
         let ci = "on: pull_request\njobs:\n  quoted:\n    steps:\n      - run: sed -i'' 's;@MainActor;;g' Tests/*.swift\n      - run: swift build\n  bare:\n    steps:\n      - run: make; make test\n  android:\n    steps:\n      - run: sed -i'' 's;@MainActor;;g' Tests/*.swift\n      - uses: skiptools/swift-android-action@v2\n";
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], false);
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Stopped);
         assert_eq!(
             commands_of(&found),
             [(
@@ -5832,7 +5899,7 @@ jobs:
 
     #[test]
     fn a_stays_reason_is_about_its_own_job() {
-        let ci = r#"on: pull_request
+        let ci = r"on: pull_request
 jobs:
   visionOS:
     runs-on: ${{ matrix.runsOn }}
@@ -5850,8 +5917,8 @@ jobs:
         image: [swift:6.2, swift:6.3]
     steps:
       - run: swift build
-"#;
-        let found = detect_with(&[(".github/workflows/ci.yml", ci)], true);
+";
+        let found = detect_with(&[(".github/workflows/ci.yml", ci)], Docker::Running);
         let why: Vec<&str> = not_host(&found).iter().map(|k| k.why.as_str()).collect();
         assert_eq!(
             why,

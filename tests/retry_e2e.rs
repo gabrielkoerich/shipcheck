@@ -1,3 +1,5 @@
+//! Each retry of a job gets its own checkout
+
 mod common;
 
 use std::fs;

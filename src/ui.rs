@@ -1,5 +1,31 @@
+use ratatui::crossterm::terminal;
+use std::fmt;
 use std::io::{IsTerminal, Write};
 use std::sync::Mutex;
+
+/// Whether a stream shows on a terminal or goes to a pipe or a file
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    Terminal,
+    Piped,
+}
+
+impl Screen {
+    pub fn of(stream: &impl IsTerminal) -> Screen {
+        if stream.is_terminal() {
+            Screen::Terminal
+        } else {
+            Screen::Piped
+        }
+    }
+}
+
+/// The stream a command's output goes to
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
 
 /// Braille frames of the live line's spinner
 const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -10,28 +36,37 @@ const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
  * Piped, there is no live line and every line is plain text
  **/
 pub struct Live {
-    pub terminal: bool,
+    pub screen: Screen,
     width: usize,
     /// The stream and the live line on it now
     out: Mutex<(Box<dyn Write + Send>, String)>,
 }
 
+impl fmt::Debug for Live {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Live")
+            .field("screen", &self.screen)
+            .field("width", &self.width)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Live {
     /// On stderr when stdout holds only a JSON result
-    pub fn new(stderr: bool) -> Live {
-        let (terminal, out): (bool, Box<dyn Write + Send>) = if stderr {
-            (std::io::stderr().is_terminal(), Box::new(std::io::stderr()))
-        } else {
-            (std::io::stdout().is_terminal(), Box::new(std::io::stdout()))
+    pub fn new(stream: Stream) -> Live {
+        let (screen, out): (Screen, Box<dyn Write + Send>) = match stream {
+            Stream::Stderr => (Screen::of(&std::io::stderr()), Box::new(std::io::stderr())),
+            Stream::Stdout => (Screen::of(&std::io::stdout()), Box::new(std::io::stdout())),
         };
         let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
-        let width = ratatui::crossterm::terminal::size().map_or(80, |(w, _)| usize::from(w));
-        Live::on(out, terminal && !dumb, width)
+        let width = terminal::size().map_or(80, |(w, _)| usize::from(w));
+        let screen = if dumb { Screen::Piped } else { screen };
+        Live::on(out, screen, width)
     }
 
-    pub fn on(out: Box<dyn Write + Send>, terminal: bool, width: usize) -> Live {
+    pub fn on(out: Box<dyn Write + Send>, screen: Screen, width: usize) -> Live {
         Live {
-            terminal,
+            screen,
             width,
             out: Mutex::new((out, String::new())),
         }
@@ -39,7 +74,10 @@ impl Live {
 
     /// Prints a line that stays, above the live one
     pub fn line(&self, text: &str) {
-        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = self
+            .out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (stream, shown) = &mut *out;
 
         let _ = if shown.is_empty() {
@@ -52,7 +90,7 @@ impl Live {
 
     /// Draws the live line with the spinner's `frame`, cut to the terminal's width so it never wraps
     pub fn show(&self, frame: usize, text: &str) {
-        if self.terminal {
+        if self.screen == Screen::Terminal {
             let line = format!("{} {text}", FRAMES[frame % FRAMES.len()]);
             self.draw(line.chars().take(self.width.saturating_sub(1)).collect());
         }
@@ -64,9 +102,12 @@ impl Live {
     }
 
     fn draw(&self, line: String) {
-        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = self
+            .out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if self.terminal && (!line.is_empty() || !out.1.is_empty()) {
+        if self.screen == Screen::Terminal && (!line.is_empty() || !out.1.is_empty()) {
             let _ = write!(out.0, "\r\x1b[2K{line}");
             let _ = out.0.flush();
             out.1 = line;
@@ -75,27 +116,27 @@ impl Live {
 }
 
 /// Colors for a person at a terminal. Off, every method returns its text unchanged, which agents parse
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Style {
     pub on: bool,
 }
 
 impl Style {
     pub fn stdout() -> Self {
-        Self::detect(std::io::stdout().is_terminal())
+        Self::detect(Screen::of(&std::io::stdout()))
     }
 
     pub fn stderr() -> Self {
-        Self::detect(std::io::stderr().is_terminal())
+        Self::detect(Screen::of(&std::io::stderr()))
     }
 
-    fn detect(terminal: bool) -> Self {
+    fn detect(screen: Screen) -> Self {
         Style {
-            on: wanted(terminal, |name| std::env::var(name).ok()),
+            on: wanted(screen, |name| std::env::var(name).ok()),
         }
     }
 
-    fn paint(&self, code: &str, text: &str) -> String {
+    fn paint(self, code: &str, text: &str) -> String {
         if self.on {
             format!("\x1b[{code}m{text}\x1b[0m")
         } else {
@@ -166,9 +207,9 @@ impl Style {
     }
 }
 
-/// Color only on a terminal, unless NO_COLOR is set, CLICOLOR is 0 or TERM is dumb
-fn wanted(terminal: bool, var: impl Fn(&str) -> Option<String>) -> bool {
-    terminal
+/// Color only on a terminal, unless `NO_COLOR` is set, CLICOLOR is 0 or TERM is dumb
+fn wanted(screen: Screen, var: impl Fn(&str) -> Option<String>) -> bool {
+    screen == Screen::Terminal
         && var("NO_COLOR").is_none()
         && var("CLICOLOR").as_deref() != Some("0")
         && var("TERM").as_deref() != Some("dumb")
@@ -181,11 +222,11 @@ mod tests {
     #[test]
     fn color_only_on_a_terminal_that_wants_it() {
         let none = |_: &str| None;
-        assert!(wanted(true, none));
-        assert!(!wanted(false, none));
-        assert!(!wanted(true, |n| (n == "NO_COLOR").then(|| "1".into())));
-        assert!(!wanted(true, |n| (n == "CLICOLOR").then(|| "0".into())));
-        assert!(!wanted(true, |n| (n == "TERM").then(|| "dumb".into())));
+        assert!(wanted(Screen::Terminal, none));
+        assert!(!wanted(Screen::Piped, none));
+        assert!(!wanted(Screen::Terminal, |n| (n == "NO_COLOR").then(|| "1".into())));
+        assert!(!wanted(Screen::Terminal, |n| (n == "CLICOLOR").then(|| "0".into())));
+        assert!(!wanted(Screen::Terminal, |n| (n == "TERM").then(|| "dumb".into())));
     }
 
     /// A stream the test reads back
@@ -212,7 +253,7 @@ mod tests {
     #[test]
     fn piped_output_is_plain_lines_with_no_live_line() {
         let seen = Seen::default();
-        let live = Live::on(Box::new(seen.clone()), false, 80);
+        let live = Live::on(Box::new(seen.clone()), Screen::Piped, 80);
         live.line("ci.yml/test: running, attempt 1");
         live.show(0, "running ci.yml/test, 5s");
         live.line("ci.yml/test: success, 1m24s");
@@ -226,7 +267,7 @@ mod tests {
     #[test]
     fn a_terminal_keeps_one_live_line_under_the_lines_that_stay() {
         let seen = Seen::default();
-        let live = Live::on(Box::new(seen.clone()), true, 12);
+        let live = Live::on(Box::new(seen.clone()), Screen::Terminal, 12);
         live.show(0, "running ci.yml/test, 5s");
         // Cut to the width, so the carriage return always reaches its start
         assert_eq!(seen.text(), "\r\x1b[2K⠋ running c");

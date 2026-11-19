@@ -1,8 +1,11 @@
+use crate::config::Check;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 
 /// Everything that decides a run's result, and nothing else
+#[derive(Debug)]
 pub struct KeyInputs<'a> {
     pub tree: &'a str,
     pub config: &'a [u8],
@@ -10,14 +13,14 @@ pub struct KeyInputs<'a> {
     /// `act` or `host`
     pub runner_kind: &'a str,
     /// The `[host]` checks by name, empty under act
-    pub checks: &'a BTreeMap<String, crate::config::Check>,
+    pub checks: &'a BTreeMap<String, Check>,
     /// `act --version`, or for host each `versions` command with its output
     pub runner_version: &'a str,
     pub shipcheck_version: &'a str,
     pub platforms: &'a BTreeMap<String, String>,
 }
 
-pub fn key(inputs: &KeyInputs) -> String {
+pub fn key(inputs: &KeyInputs<'_>) -> String {
     let mut h = Sha256::new();
     h.update(format!("tree\0{}\n", inputs.tree));
     h.update(format!("config\0{}\n", hex(&Sha256::digest(inputs.config))));
@@ -52,14 +55,18 @@ pub fn key(inputs: &KeyInputs) -> String {
 }
 
 pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Check;
 
-    static NO_CHECKS: BTreeMap<String, crate::config::Check> = BTreeMap::new();
+    static NO_CHECKS: BTreeMap<String, Check> = BTreeMap::new();
 
     fn inputs<'a>(
         tree: &'a str,
@@ -127,13 +134,13 @@ mod tests {
         let base = key(&inputs("t1", &workflows, &platforms));
         assert_ne!(base, key(&inputs("t2", &workflows, &platforms)));
 
-        let mut other_wf = workflows.clone();
-        other_wf.insert(".github/workflows/ci.yml".into(), b"on: push\n".to_vec());
-        assert_ne!(base, key(&inputs("t1", &other_wf, &platforms)));
+        let mut other_workflows = workflows.clone();
+        other_workflows.insert(".github/workflows/ci.yml".into(), b"on: push\n".to_vec());
+        assert_ne!(base, key(&inputs("t1", &other_workflows, &platforms)));
 
-        let mut other_pf = platforms.clone();
-        other_pf.insert("ubuntu-latest".into(), "img@sha256:def".into());
-        assert_ne!(base, key(&inputs("t1", &workflows, &other_pf)));
+        let mut other_platforms = platforms.clone();
+        other_platforms.insert("ubuntu-latest".into(), "img@sha256:def".into());
+        assert_ne!(base, key(&inputs("t1", &workflows, &other_platforms)));
 
         let mut other = inputs("t1", &workflows, &platforms);
         other.config = b"required = []\n";

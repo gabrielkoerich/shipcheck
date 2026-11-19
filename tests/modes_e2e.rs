@@ -1,3 +1,5 @@
+//! The run modes of the binary against a base on `main`
+
 mod common;
 
 use std::fs;
@@ -79,14 +81,12 @@ fn said(out: &Output) -> String {
 
 /// Passed results in the home's cache, which only a full run that passed writes
 fn passes(home: &Path) -> usize {
-    fs::read_dir(home.join("cache"))
-        .map(|d| {
-            d.filter_map(|e| fs::read(e.ok()?.path()).ok())
-                .filter_map(|t| serde_json::from_slice::<serde_json::Value>(&t).ok())
-                .filter(|e| e["passed"] == true)
-                .count()
-        })
-        .unwrap_or(0)
+    fs::read_dir(home.join("cache")).map_or(0, |d| {
+        d.filter_map(|e| fs::read(e.ok()?.path()).ok())
+            .filter_map(|t| serde_json::from_slice::<serde_json::Value>(&t).ok())
+            .filter(|e| e["passed"] == true)
+            .count()
+    })
 }
 
 /// Sends SIGINT, as Ctrl-C does, once `ready` holds, and waits for the run to end
@@ -342,8 +342,8 @@ fn a_host_check_takes_a_jobs_place_in_a_listed_workflow() {
     // Interrupted while a job runs, the run leaves no container and no result
     commit(&work, &["hang.txt"]);
     let child = shipcheck(&work, &home, &[]).spawn().unwrap();
-    let status = interrupt(child, || containers().iter().any(|c| c.contains("hang")));
-    assert!(!status.success());
+    let exit = interrupt(child, || containers().iter().any(|c| c.contains("hang")));
+    assert!(!exit.success());
     wait_until("a job container outlived shipcheck", || {
         containers().is_empty()
     });

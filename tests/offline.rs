@@ -1,3 +1,5 @@
+//! Tests never reach the internet
+
 use std::time::Duration;
 
 /// `.cargo/config.toml` routes every request a test makes to a dead port, so nothing leaves the machine

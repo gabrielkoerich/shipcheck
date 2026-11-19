@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(test))]
+use crate::run;
 use crate::workflow::Job;
 
 /// A JDK this machine has
@@ -9,7 +11,7 @@ pub struct Jdk {
     /// As its `release` file names it, with JDK 8's `1.8.0_242` read as `8.0.242`
     pub version: String,
     pub home: PathBuf,
-    /// It has `native-image`, as a GraalVM has
+    /// It has `native-image`, as a `GraalVM` has
     pub native: bool,
 }
 
@@ -39,7 +41,7 @@ pub fn installed() -> Vec<Jdk> {
         homes.extend(dir.flatten().map(|e| e.path()));
     }
 
-    from_homes(&homes, &crate::run::user_dir())
+    from_homes(&homes, &run::user_dir())
 }
 
 fn from_homes(homes: &[PathBuf], user: &Path) -> Vec<Jdk> {
@@ -193,13 +195,21 @@ pub fn pick<'a>(job: &Job, jdks: &'a [Jdk]) -> Result<Option<&'a Jdk>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow;
 
-    fn jdk(dir: &Path, name: &str, version: &str, native: bool) -> PathBuf {
+    /// Whether a test JDK ships `native-image`
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Native {
+        Image,
+        None,
+    }
+
+    fn jdk(dir: &Path, name: &str, version: &str, native: Native) -> PathBuf {
         let home = dir.join(name);
         fs::create_dir_all(home.join("bin")).unwrap();
         fs::write(home.join("bin/java"), "").unwrap();
 
-        if native {
+        if native == Native::Image {
             fs::write(home.join("bin/native-image"), "").unwrap();
         }
 
@@ -215,7 +225,7 @@ mod tests {
         let ci = format!(
             "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}      - run: ./gradlew check\n"
         );
-        crate::workflow::job_runs(&ci).remove(0)
+        workflow::job_runs(&ci).remove(0)
     }
 
     #[test]
@@ -223,9 +233,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
         let homes = [
-            jdk(dir.path(), "8", "1.8.0_242", false),
-            jdk(dir.path(), "graal", "25.0.1", true),
-            jdk(user.path(), "mine", "21.0.5", false),
+            jdk(dir.path(), "8", "1.8.0_242", Native::None),
+            jdk(dir.path(), "graal", "25.0.1", Native::Image),
+            jdk(user.path(), "mine", "21.0.5", Native::None),
             dir.path().join("missing"),
         ];
         let found = from_homes(&homes, &user.path().canonicalize().unwrap());

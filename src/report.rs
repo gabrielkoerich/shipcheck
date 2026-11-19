@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,8 +6,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::check;
+use crate::config::RunnerKind;
 use crate::run::{Entry, printable};
-use crate::runner::host::HOST;
+use crate::runner::host::{HOST, runner_of};
 use crate::runner::shard::ShardRun;
 
 pub const MAX_TESTS: usize = 30;
@@ -315,14 +317,14 @@ pub fn failure_blocks(lines: &[String]) -> Vec<(String, Vec<String>)> {
 }
 
 /// The failing tests a job's log names and each one's own output, for its check
-pub fn failures(log: &str, host: bool) -> (Vec<String>, Vec<(String, Vec<String>)>) {
-    let output = job_output(log, host).output;
+pub fn failures(log: &str, kind: RunnerKind) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+    let output = job_output(log, kind).output;
     (failing_tests(&output), failure_blocks(&output))
 }
 
 /// A host check's log is its command's raw output, with no act steps to find
-fn job_output(log: &str, host: bool) -> StepFailure {
-    if host {
+fn job_output(log: &str, kind: RunnerKind) -> StepFailure {
+    if kind == RunnerKind::Host {
         StepFailure {
             output: log.lines().map(clean).collect(),
             ..StepFailure::default()
@@ -361,17 +363,20 @@ fn job_report(
     id: &str,
     status: &str,
     shards: Option<ShardRun>,
-    host: bool,
+    kind: RunnerKind,
 ) -> JobReport {
     let log = dir.join(format!("{id}.log"));
     let prefix = format!("{id}.attempt-");
     let mut attempt_logs: Vec<PathBuf> = fs::read_dir(dir)
         .into_iter()
         .flatten()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            name.starts_with(&prefix) && name.ends_with(".log")
+            name.starts_with(&prefix)
+                && std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
         })
         .map(|e| e.path())
         .collect();
@@ -395,7 +400,7 @@ fn job_report(
     if status == "success" {
         for attempt in &report.attempt_logs {
             let text = fs::read(attempt).unwrap_or_default();
-            let found = job_output(&String::from_utf8_lossy(&text), host);
+            let found = job_output(&String::from_utf8_lossy(&text), kind);
 
             for test in failing_tests(&found.output) {
                 if !report.retried_tests.contains(&test) && report.retried_tests.len() < MAX_TESTS {
@@ -412,7 +417,7 @@ fn job_report(
 
     let text = fs::read(&log).unwrap_or_default();
     let text = String::from_utf8_lossy(&text);
-    let found = job_output(&text, host);
+    let found = job_output(&text, kind);
     let tests = failing_tests(&found.output);
     report.note = note(status, found.step.as_deref());
     report.failing_tests_total = tests.len();
@@ -439,7 +444,13 @@ pub fn workflows(entry: &Entry, log_dir: &Path) -> Vec<WorkflowReport> {
                 .iter()
                 .map(|(id, status)| {
                     let shards = wf.shards.get(id).cloned();
-                    job_report(&log_dir.join(&wf.file), id, status, shards, wf.file == HOST)
+                    job_report(
+                        &log_dir.join(&wf.file),
+                        id,
+                        status,
+                        shards,
+                        runner_of(&wf.file),
+                    )
                 })
                 .collect(),
         })
@@ -448,6 +459,10 @@ pub fn workflows(entry: &Entry, log_dir: &Path) -> Vec<WorkflowReport> {
 
 /// The text `shipcheck run` prints: one line per workflow that passed, and for each failed job the
 /// step, the tests and the end of its output. Job output stays on this machine, so none is redacted
+#[expect(
+    clippy::too_many_lines,
+    reason = "one section per part of the report, in the order it prints"
+)]
 pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String {
     let mut s = String::new();
 
@@ -455,12 +470,12 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
         s.push_str("this commit changes CI: workflow and shipcheck.toml changes did not run, the base's versions did, changes to what a command runs did run:\n");
 
         for change in &entry.ci_changes {
-            s.push_str(&format!("  {change}\n"));
+            let _ = writeln!(s, "  {change}");
         }
     }
 
     if let Some(reason) = &entry.skipped {
-        s.push_str(&format!("nothing to run: {reason}\n"));
+        let _ = writeln!(s, "nothing to run: {reason}");
     }
 
     for wf in workflows {
@@ -471,7 +486,7 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
         };
 
         if wf.passed {
-            s.push_str(&format!("{}: passed, {attempts}\n", check::name(&wf.file)));
+            let _ = writeln!(s, "{}: passed, {attempts}", check::name(&wf.file));
 
             // A pass after a failed attempt hides a test that fails at random, so it is named
             for job in wf
@@ -482,33 +497,32 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
                 let nth = job.attempts;
 
                 if job.retried_tests.is_empty() {
-                    s.push_str(&format!(
-                        "  {}: passed on attempt {nth}, the earlier attempts name no test\n",
+                    let _ = writeln!(
+                        s,
+                        "  {}: passed on attempt {nth}, the earlier attempts name no test",
                         job.id
-                    ));
+                    );
                 } else {
-                    s.push_str(&format!(
-                        "  {}: passed on attempt {nth}, these tests failed before:\n",
+                    let _ = writeln!(
+                        s,
+                        "  {}: passed on attempt {nth}, these tests failed before:",
                         job.id
-                    ));
+                    );
                 }
 
                 for t in &job.retried_tests {
-                    s.push_str(&format!("    {t}\n"));
+                    let _ = writeln!(s, "    {t}");
                 }
 
                 for log in &job.attempt_logs {
-                    s.push_str(&format!("    earlier attempt: {}\n", log.display()));
+                    let _ = writeln!(s, "    earlier attempt: {}", log.display());
                 }
             }
 
             continue;
         }
 
-        s.push_str(&format!(
-            "{}: failed, {exit}, {attempts}\n",
-            check::name(&wf.file)
-        ));
+        let _ = writeln!(s, "{}: failed, {exit}, {attempts}", check::name(&wf.file));
 
         for job in &wf.jobs {
             let shards = match &job.shards {
@@ -521,7 +535,7 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
                 }) => format!(", tests in {n} shards"),
                 _ => String::new(),
             };
-            s.push_str(&format!("  {}: {}{shards}\n", job.id, job.status));
+            let _ = writeln!(s, "  {}: {}{shards}", job.id, job.status);
 
             if !failed(&job.status) || job.status.starts_with("not run") {
                 continue;
@@ -529,28 +543,26 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
 
             if let Some(step) = &job.failed_step {
                 let exit = job.exit.map_or(String::new(), |c| format!(", exit {c}"));
-                s.push_str(&format!("    failed step: {step}{exit}\n"));
+                let _ = writeln!(s, "    failed step: {step}{exit}");
             }
 
             if let Some(note) = job.note {
-                s.push_str(&format!("    {note}\n"));
+                let _ = writeln!(s, "    {note}");
             }
 
             if !job.failing_tests.is_empty() {
-                s.push_str(&format!(
-                    "    failing tests ({}):\n",
-                    job.failing_tests_total
-                ));
+                let _ = writeln!(s, "    failing tests ({}):", job.failing_tests_total);
 
                 for t in &job.failing_tests {
-                    s.push_str(&format!("      {t}\n"));
+                    let _ = writeln!(s, "      {t}");
                 }
 
                 if job.failing_tests_total > job.failing_tests.len() {
-                    s.push_str(&format!(
-                        "      and {} more, in the log\n",
+                    let _ = writeln!(
+                        s,
+                        "      and {} more, in the log",
                         job.failing_tests_total - job.failing_tests.len()
-                    ));
+                    );
                 }
             }
 
@@ -560,42 +572,56 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
                     (None, true) => "the check",
                     (None, false) => "the job",
                 };
-                s.push_str(&format!("    last {} lines of {of}:\n", job.tail.len()));
+                let _ = writeln!(s, "    last {} lines of {of}:", job.tail.len());
 
                 for line in &job.tail {
-                    s.push_str(&format!("      {line}\n"));
+                    let _ = writeln!(s, "      {line}");
                 }
             }
 
-            s.push_str(&format!("    full log: {}\n", job.log.display()));
+            let _ = writeln!(s, "    full log: {}", job.log.display());
 
             for log in &job.attempt_logs {
-                s.push_str(&format!("    earlier attempt: {}\n", log.display()));
+                let _ = writeln!(s, "    earlier attempt: {}", log.display());
             }
         }
     }
 
     if entry.passed {
-        s.push_str(&format!("passed, tree {} from {tested}\n", entry.tree));
+        let _ = writeln!(s, "passed, tree {} from {tested}", entry.tree);
     } else if entry.could_not_run() {
-        s.push_str(&format!(
-            "could not run, tree {} from {tested}: the code did not run. Fix Docker or the sandbox, `shipcheck doctor` checks them, then run again\n",
+        let _ = writeln!(
+            s,
+            "could not run, tree {} from {tested}: the code did not run. Fix Docker or the sandbox, `shipcheck doctor` checks them, then run again",
             entry.tree
-        ));
+        );
     } else {
-        s.push_str(&format!(
-            "failed, tree {} from {tested}. `shipcheck logs` prints every log\n",
+        let _ = writeln!(
+            s,
+            "failed, tree {} from {tested}. `shipcheck logs` prints every log",
             entry.tree
-        ));
+        );
     }
 
     s
 }
 
+/// Whether a run ran every job or only some
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    Full,
+    Partial,
+}
+
 /// The object `shipcheck run --json` prints, a contract agents parse
-pub fn json(entry: &Entry, tested: &str, workflows: &[WorkflowReport], partial: bool) -> Value {
+pub fn json(
+    entry: &Entry,
+    tested: &str,
+    workflows: &[WorkflowReport],
+    coverage: Coverage,
+) -> Value {
     json!({
-        "partial": partial,
+        "partial": coverage == Coverage::Partial,
         "tree": entry.tree,
         "sha": tested,
         "passed": entry.passed,
@@ -619,24 +645,25 @@ mod tests {
         let mut log = format!("{PREFIX} ⭐ Run Set up job\n{PREFIX}   ✅  Success - Set up job\n");
 
         for (name, output, ok) in steps {
-            log.push_str(&format!("{PREFIX} ⭐ Run Main {name}\n"));
-            log.push_str(&format!(
-                "{PREFIX}   🐳  docker exec cmd=[bash -e /var/run/act/workflow/1] user= workdir=\n"
-            ));
+            let _ = writeln!(log, "{PREFIX} ⭐ Run Main {name}");
+            let _ = writeln!(
+                log,
+                "{PREFIX}   🐳  docker exec cmd=[bash -e /var/run/act/workflow/1] user= workdir="
+            );
 
             for line in *output {
-                log.push_str(&format!("{PREFIX}   | {line}\n"));
+                let _ = writeln!(log, "{PREFIX}   | {line}");
             }
 
             if *ok {
-                log.push_str(&format!("{PREFIX}   ✅  Success - Main {name} [1.2s]\n"));
+                let _ = writeln!(log, "{PREFIX}   ✅  Success - Main {name} [1.2s]");
             } else {
-                log.push_str(&format!("{PREFIX}   ❌  Failure - Main {name} [1.2s]\n"));
-                log.push_str(&format!("{PREFIX} exitcode '1': failure\n"));
+                let _ = writeln!(log, "{PREFIX}   ❌  Failure - Main {name} [1.2s]");
+                let _ = writeln!(log, "{PREFIX} exitcode '1': failure");
             }
         }
 
-        log.push_str(&format!("{PREFIX} 🏁  Job failed\n"));
+        let _ = writeln!(log, "{PREFIX} 🏁  Job failed");
         log
     }
 
@@ -787,9 +814,10 @@ mod tests {
 
     #[test]
     fn finds_cargo_test_failures_among_passes() {
-        let mut log: String = (0..40)
-            .map(|i| format!("test tests::ok_{i} ... ok\n"))
-            .collect();
+        let mut log = (0..40).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "test tests::ok_{i} ... ok");
+            s
+        });
         log.push_str(
             "test tests::parses ... FAILED\n\
              test tests::divides ... FAILED\n\
@@ -986,7 +1014,7 @@ mod tests {
             ],
             false,
         )]);
-        let (names, found) = failures(&log, false);
+        let (names, found) = failures(&log, RunnerKind::Act);
         assert_eq!(names, ["a::b"]);
         assert_eq!(
             found,
@@ -1057,11 +1085,11 @@ mod tests {
         assert_eq!(test.tail.len(), TAIL_LINES);
         assert_eq!(test.tail.last().unwrap(), "FAILED t.py::test_39 - assert");
         assert_eq!(test.attempts, 2);
-        let text = text(&e, "abc", &wfs);
-        assert!(text.contains("    failing tests (40):\n      t.py::test_0\n"));
-        assert!(text.contains("      and 10 more, in the log\n"));
-        assert!(text.contains("  lint: success, tests in 4 shards\n"));
-        assert!(text.ends_with("failed, tree t from abc. `shipcheck logs` prints every log\n"));
+        let shown = text(&e, "abc", &wfs);
+        assert!(shown.contains("    failing tests (40):\n      t.py::test_0\n"));
+        assert!(shown.contains("      and 10 more, in the log\n"));
+        assert!(shown.contains("  lint: success, tests in 4 shards\n"));
+        assert!(shown.ends_with("failed, tree t from abc. `shipcheck logs` prints every log\n"));
     }
 
     #[test]
@@ -1094,7 +1122,7 @@ mod tests {
         e.workflows[0].exit = Some(0);
         e.workflows[0].attempts = 3;
         let wfs = workflows(&e, dir.path());
-        let v = json(&e, "abc", &wfs, false);
+        let v = json(&e, "abc", &wfs, Coverage::Full);
         // Each test once, however many attempts it failed
         assert_eq!(
             v["workflows"][0]["jobs"][2]["retried_tests"],
@@ -1119,7 +1147,12 @@ mod tests {
             ("test", "failure"),
             ("deps", "not run, a job it needs did not pass"),
         ]);
-        let v = json(&e, "working copy", &workflows(&e, dir.path()), false);
+        let v = json(
+            &e,
+            "working copy",
+            &workflows(&e, dir.path()),
+            Coverage::Full,
+        );
         assert_eq!(v["tree"], "t");
         assert_eq!(v["sha"], "working copy");
         assert_eq!(v["passed"], false);
@@ -1185,9 +1218,9 @@ mod tests {
             test.tail,
             lines("$ cargo test\n[INFO] start\ntest a::b ... FAILED")
         );
-        let text = text(&e, "abc", &wfs);
-        assert!(text.starts_with("host checks: failed, exit 1, 2 attempts\n  test: failure\n"));
-        assert!(text.contains("    last 3 lines of the check:\n      $ cargo test\n"));
+        let shown = text(&e, "abc", &wfs);
+        assert!(shown.starts_with("host checks: failed, exit 1, 2 attempts\n  test: failure\n"));
+        assert!(shown.contains("    last 3 lines of the check:\n      $ cargo test\n"));
     }
 
     #[test]

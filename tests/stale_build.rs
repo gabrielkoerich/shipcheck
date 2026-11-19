@@ -133,7 +133,7 @@ fn a_run_never_uses_build_output_another_tree_left() {
     held.lock().unwrap();
     let ran_b = shipcheck(&home, &b, &["run", "--no-fetch"]);
     drop(held);
-    let out = said(&ran_b) + &said(&shipcheck(&home, &b, &["logs"]));
+    let out = format!("{}{}", said(&ran_b), said(&shipcheck(&home, &b, &["logs"])));
     assert!(
         !out.contains("only_in_branch_a"),
         "b ran a test only branch a has, from a's build:\n{out}"

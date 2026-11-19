@@ -1,5 +1,9 @@
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "each test binary uses only part of the shared helpers"
+)]
 
+use shipcheck::runner::act;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,8 +31,7 @@ fn keychain_accounts() -> BTreeSet<String> {
     let out = Command::new("security")
         .arg("dump-keychain")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).into_owned());
     let mut found = BTreeSet::new();
 
     // Each item starts with a `keychain:` line, and its attributes follow
@@ -52,7 +55,7 @@ fn keychain_accounts() -> BTreeSet<String> {
  * profiles and shipcheck's launchd jobs. `docker_of` finds a test's Docker resources by name
  * instead, since tests that run at once each make their own
  **/
-pub fn outside() -> BTreeMap<&'static str, BTreeSet<String>> {
+pub(crate) fn outside() -> BTreeMap<&'static str, BTreeSet<String>> {
     let colima = lines("colima", &["list"])
         .iter()
         .skip(1)
@@ -73,7 +76,7 @@ pub fn outside() -> BTreeMap<&'static str, BTreeSet<String>> {
 }
 
 /// What `after` has that `before` did not
-pub fn new_since(
+pub(crate) fn new_since(
     before: &BTreeMap<&'static str, BTreeSet<String>>,
     after: &BTreeMap<&'static str, BTreeSet<String>>,
 ) -> BTreeMap<&'static str, Vec<String>> {
@@ -136,7 +139,7 @@ fn anothers_check(label: &str, home: &Path) -> bool {
 }
 
 /// Waits for the background runs of the home, also when an assertion fails, so none outlives the test
-pub struct WaitOnDrop(pub PathBuf);
+pub(crate) struct WaitOnDrop(pub PathBuf);
 
 impl Drop for WaitOnDrop {
     fn drop(&mut self) {
@@ -150,7 +153,7 @@ impl Drop for WaitOnDrop {
  * networks named with the home's prefix, and an `act-toolcache` that `before` did not have
  **/
 fn docker_of(home: &Path, before: &BTreeSet<String>) -> Vec<(&'static str, String)> {
-    let prefix = shipcheck::runner::act::prefix_of(home);
+    let prefix = act::prefix_of(home);
     let homes: Vec<String> = [home.to_path_buf(), home.canonicalize().unwrap_or_default()]
         .iter()
         .map(|h| h.to_string_lossy().into_owned())
@@ -167,12 +170,12 @@ fn docker_of(home: &Path, before: &BTreeSet<String>) -> Vec<(&'static str, Strin
 
         if homes.iter().any(|h| line.contains(h.as_str())) {
             let name = line.split_whitespace().next().unwrap_or_default();
-            found.push(("container", id.clone()));
+            found.push(("container", id));
             found.push(("volume", format!("{}-env", name.trim_start_matches('/'))));
         }
     }
 
-    let tags = shipcheck::runner::act::run_tags(home);
+    let tags = act::run_tags(home);
 
     for v in lines("docker", &["volume", "ls", "-q"]) {
         let act_env = v.starts_with("act-")
@@ -214,14 +217,14 @@ fn remove_docker(home: &Path, before: &BTreeSet<String>) {
  * background can still hold a slot, so it waits for that run first. Declare it after the temp dir,
  * so it drops first and cleans while the home still exists
  **/
-pub struct CleanOnDrop {
+pub(crate) struct CleanOnDrop {
     home: PathBuf,
     before: BTreeMap<&'static str, BTreeSet<String>>,
     volumes: BTreeSet<String>,
 }
 
 impl CleanOnDrop {
-    pub fn new(home: &Path) -> Self {
+    pub(crate) fn new(home: &Path) -> Self {
         Self {
             home: home.to_path_buf(),
             before: outside(),

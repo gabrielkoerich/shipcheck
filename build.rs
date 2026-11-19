@@ -1,3 +1,5 @@
+//! Build script of the `shipcheck` binary
+
 fn main() {
     // A shipcheck host check builds and runs the tests jailed, and macOS refuses a jail inside a jail
     println!("cargo::rerun-if-env-changed=SHIPCHECK_JAIL");

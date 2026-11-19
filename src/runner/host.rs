@@ -1,5 +1,11 @@
+use crate::run;
+use crate::runner;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,7 +21,25 @@ use crate::config;
 /// The one "workflow" of a host run, its jobs are the checks
 pub const HOST: &str = "host";
 
+/// What ran the jobs of the workflow `file`, host checks or act
+pub fn runner_of(file: &str) -> config::RunnerKind {
+    if file == HOST {
+        config::RunnerKind::Host
+    } else {
+        config::RunnerKind::Act
+    }
+}
+
+/// Whether a branch run's checks see the base's cache through an overlay, for tests of each way
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Overlay {
+    On,
+    Off,
+}
+
 /// Runs the owner's `[host]` checks natively, as the user, each in its own process group
+#[derive(Debug)]
 pub struct Host {
     config: config::Host,
     /// Where `versions` run, so a toolchain file in the repository picks the version
@@ -38,6 +62,7 @@ impl Host {
         }
     }
 
+    #[must_use]
     pub fn with_shards(self, shards: config::ShardTests) -> Self {
         Host { shards, ..self }
     }
@@ -88,8 +113,8 @@ impl Host {
 
     /// This host with the overlay forced on or off, for tests of each way
     #[cfg(test)]
-    fn with_overlay(self, on: bool) -> Self {
-        self.overlay.set(on).unwrap();
+    fn with_overlay(self, overlay: Overlay) -> Self {
+        self.overlay.set(overlay == Overlay::On).unwrap();
         self
     }
 
@@ -103,6 +128,7 @@ impl Host {
  * One run's copy of the base cache, `runs/run-N`, beside `runs/run-N.lock`, which the run holds
  * locked while it lives. A copy whose lock another run can take is unused, as when its run died
  **/
+#[derive(Debug)]
 struct RunCopy {
     dir: PathBuf,
     lock: PathBuf,
@@ -235,8 +261,6 @@ pub fn run_locks(repo_id: Option<&str>) -> Vec<PathBuf> {
 
 /// Whether `path` still names the inode `file` has open
 fn same_file(file: &fs::File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
     match (file.metadata(), fs::symlink_metadata(path)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
@@ -245,9 +269,7 @@ fn same_file(file: &fs::File, path: &Path) -> bool {
 
 /// Takes an exclusive lock on `file` without waiting, held until the file is closed
 fn locked(file: &fs::File) -> bool {
-    use std::os::fd::AsRawFd;
-
-    // Safe: flock only takes a lock on a descriptor this file owns
+    // SAFETY: flock only takes a lock on a descriptor this file owns
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
@@ -286,7 +308,7 @@ fn clone_dir(src: &Path, dst: &Path) -> Result<(), String> {
         let from = std::ffi::CString::new(src.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
         let to = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
 
-        // Safe: both strings outlive the call, which only reads them
+        // SAFETY: both strings outlive the call, which only reads them
         if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
             return Ok(());
         }
@@ -495,6 +517,7 @@ const TOOLCHAINS: &[&str] = &[
 
 /// What a check may touch: it writes its clone, a home made new for each run and the repository's
 /// tool caches, and reads the system, its toolchains and `readable`
+#[derive(Debug)]
 pub struct Jail {
     pub writable: Vec<PathBuf>,
     pub readable: Vec<PathBuf>,
@@ -514,7 +537,7 @@ fn resolved(path: PathBuf) -> PathBuf {
 impl Jail {
     /// The user's home, which a check cannot read but for its toolchains, an error when unknown
     fn user() -> Result<PathBuf, String> {
-        let user = crate::run::user_dir();
+        let user = run::user_dir();
 
         if user.as_os_str().is_empty() {
             return Err(
@@ -542,7 +565,7 @@ impl Jail {
 
     /// Credentials hidden even inside readable paths: the user's, shipcheck's own and the App key
     fn hidden(user: &Path) -> Vec<PathBuf> {
-        let home = crate::run::home();
+        let home = run::home();
         let mut hidden = known::credentials(user);
         hidden.extend(["token", "app.pem", "secrets"].map(|h| home.join(h)));
         hidden.extend(std::env::var_os("SHIPCHECK_APP_KEY_FILE").map(PathBuf::from));
@@ -598,7 +621,7 @@ impl Jail {
             mach_services: Access::Only(
                 known::BASIC_MACH_SERVICES
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect(),
             ),
             apple_events: false,
@@ -712,15 +735,17 @@ impl Jail {
             cmd.env("SDKROOT", sdk);
         }
 
-        // Safe: setsid is async-signal-safe and changes only this child's session
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
+        let hook = || {
+            // SAFETY: setsid changes only this child's session
+            if unsafe { libc::setsid() } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
 
-                Ok(())
-            });
+            Ok(())
+        };
+        // SAFETY: the hook only calls setsid, which is async-signal-safe
+        unsafe {
+            cmd.pre_exec(hook);
         }
         Ok(cmd)
     }
@@ -731,14 +756,14 @@ impl Jail {
  * write `base`, and every other run writes an overlay of it or a copy of it of its own, under `runs`
  **/
 fn cache_dir(repo_id: Option<&str>) -> PathBuf {
-    let dir = crate::run::home().join("hostcache");
+    let dir = run::home().join("hostcache");
     repo_id.map_or(dir.clone(), |id| dir.join(id))
 }
 
 /// The canonical path, which `sandbox-exec` matches against, of a directory shipcheck owns
 fn real_dir(dir: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(dir)
-        .and_then(|_| dir.canonicalize())
+        .and_then(|()| dir.canonicalize())
         .map_err(|e| format!("{}: {e}", dir.display()))
 }
 
@@ -750,7 +775,7 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
         .tempdir()
         .map_err(|e| format!("temp home: {e}"))?;
     let path = dir.path().canonicalize().map_err(|e| e.to_string())?;
-    toolchains(&path, &crate::run::user_dir())?;
+    toolchains(&path, &run::user_dir())?;
     rustup_home(&path, &user_tool("RUSTUP_HOME", ".rustup"))?;
     sbf_sdk(&path, &jail_path())?;
 
@@ -785,7 +810,7 @@ fn sdk_root() -> Option<&'static Path> {
 #[cfg(target_os = "macos")]
 fn xcrun_db() -> Option<PathBuf> {
     let mut buf = vec![0u8; 1024];
-    // Safe: confstr writes at most `buf.len()` bytes into a buffer this function owns
+    // SAFETY: confstr writes at most `buf.len()` bytes into a buffer this function owns
     let n = unsafe {
         libc::confstr(
             libc::_CS_DARWIN_USER_TEMP_DIR,
@@ -844,7 +869,6 @@ fn denied_by_name(path: &std::ffi::OsStr) -> Vec<String> {
 
 /// The jail's `mktemp`, and a command for each setuid binary that says why the jail denies it
 fn shims(home: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     let bin = home.join(SHIMS);
     fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
     let mut files = vec![("mktemp".to_string(), MKTEMP.to_string())];
@@ -896,13 +920,13 @@ const HOME_LINKS: &[&str] = &[".docker/cli-plugins", ".cache/solana"];
 pub fn jail_path() -> std::ffi::OsString {
     trusted_path(
         &std::env::var_os("PATH").unwrap_or_default(),
-        &crate::run::user_dir(),
+        &run::user_dir(),
     )
 }
 
 /// A toolchain manager's home from its variable when that is trusted, else the default in `~`
 fn user_tool(var: &str, dir: &str) -> PathBuf {
-    let user = crate::run::user_dir();
+    let user = run::user_dir();
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| trusted_dir(p, &user))
@@ -1006,35 +1030,38 @@ fn install() {
     HANDLER.call_once(|| {
         let mut fds = [0; 2];
 
-        // Safe: pipe writes two descriptors into `fds`
+        // SAFETY: pipe writes two descriptors into `fds`
         if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
             let read = fds[0];
             WAKE.store(fds[1], Ordering::SeqCst);
             std::thread::spawn(move || {
                 let mut sig = 0u8;
 
-                // Safe: one byte into `sig`, which outlives the call
-                if unsafe { libc::read(read, (&mut sig as *mut u8).cast(), 1) } == 1 {
+                // SAFETY: one byte into `sig`, which outlives the call
+                if unsafe { libc::read(read, (&raw mut sig).cast(), 1) } == 1 {
                     #[cfg(target_os = "macos")]
                     let _held = job::stop_all();
-                    die(sig as libc::c_int);
+                    die(libc::c_int::from(sig));
                 }
             });
         }
 
         for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            // Safe: the handler calls only async-signal-safe functions
+            #[expect(clippy::as_conversions, reason = "libc takes a handler as an integer")]
+            let handler = stop as *const () as libc::sighandler_t;
+            // SAFETY: the handler calls only async-signal-safe functions
             unsafe {
-                libc::signal(sig, stop as *const () as libc::sighandler_t);
+                libc::signal(sig, handler);
             }
         }
     });
 }
 
 fn register(pgid: u32) -> Option<usize> {
+    let pgid = i32::try_from(pgid).ok()?;
     install();
     GROUPS.iter().position(|g| {
-        g.compare_exchange(0, pgid as i32, Ordering::SeqCst, Ordering::SeqCst)
+        g.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     })
 }
@@ -1044,7 +1071,7 @@ fn kill_registered(groups: &[AtomicI32]) {
         let pgid = g.load(Ordering::SeqCst);
 
         if pgid > 0 {
-            // Safe: killpg only sends a signal
+            // SAFETY: killpg only sends a signal
             unsafe {
                 libc::killpg(pgid, libc::SIGKILL);
             }
@@ -1054,10 +1081,10 @@ fn kill_registered(groups: &[AtomicI32]) {
 
 extern "C" fn stop(sig: libc::c_int) {
     let wake = WAKE.load(Ordering::SeqCst);
-    let byte = sig as u8;
+    let byte = u8::try_from(sig).unwrap_or(0);
 
-    // Safe: write is async-signal-safe, and the byte outlives the call
-    if wake >= 0 && unsafe { libc::write(wake, (&byte as *const u8).cast(), 1) } == 1 {
+    // SAFETY: write is async-signal-safe, and the byte outlives the call
+    if wake >= 0 && unsafe { libc::write(wake, (&raw const byte).cast(), 1) } == 1 {
         return;
     }
 
@@ -1066,9 +1093,12 @@ extern "C" fn stop(sig: libc::c_int) {
 
 fn die(sig: libc::c_int) {
     kill_registered(&GROUPS);
-    // Safe: back to the default action, then die of the same signal
+    // SAFETY: back to the default action
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
+    }
+    // SAFETY: then die of the same signal
+    unsafe {
         libc::raise(sig);
     }
 }
@@ -1138,7 +1168,7 @@ mod job {
             reserved: [0; 3],
         };
         let size = std::mem::size_of::<CoalitionInfo>() as libc::c_int;
-        // Safe: the kernel writes at most `size` bytes into `info`
+        // SAFETY: the kernel writes at most `size` bytes into `info`
         let n = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -1153,10 +1183,10 @@ mod job {
     }
 
     fn state(pid: libc::pid_t) -> Option<u32> {
-        // Safe: a plain C struct of integers, which zero is a valid value of
+        // SAFETY: a plain C struct of integers, which zero is a valid value of
         let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
-        // Safe: the kernel writes at most `size` bytes into `info`
+        // SAFETY: the kernel writes at most `size` bytes into `info`
         let n = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -1171,14 +1201,14 @@ mod job {
 
     /// Every pid on the machine, in a buffer doubled until the list fits with room to spare
     fn all_pids() -> Vec<libc::pid_t> {
-        // Safe: a null buffer only asks for the count
+        // SAFETY: a null buffer only asks for the count
         let mut cap =
             unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) }.max(0) as usize + 256;
 
         loop {
             let mut pids: Vec<libc::pid_t> = vec![0; cap];
             let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
-            // Safe: the kernel writes at most `size` bytes into `pids`
+            // SAFETY: the kernel writes at most `size` bytes into `pids`
             let n =
                 unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) }.max(0) as usize;
 
@@ -1203,7 +1233,7 @@ mod job {
      * Returns every pid signaled, an error when a member cannot be stopped or keeps forking
      **/
     pub fn reap(coal: u64) -> Result<Vec<libc::pid_t>, String> {
-        // Safe: getpid cannot fail
+        // SAFETY: getpid cannot fail
         if coal <= 1 || coalition(unsafe { libc::getpid() }) == Some(coal) {
             return Err(format!(
                 "refused to reap coalition {coal}, which is not a check's own"
@@ -1230,7 +1260,7 @@ mod job {
                     continue;
                 }
 
-                // Safe: kill only sends a signal
+                // SAFETY: kill only sends a signal
                 if unsafe { libc::kill(pid, sig) } == -1
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
                 {
@@ -1252,7 +1282,7 @@ mod job {
     fn domain() -> &'static str {
         static DOMAIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         DOMAIN.get_or_init(|| {
-            // Safe: getuid cannot fail
+            // SAFETY: getuid cannot fail
             let uid = unsafe { libc::getuid() };
             let gui = format!("gui/{uid}");
             let found = Command::new(LAUNCHCTL)
@@ -1270,7 +1300,7 @@ mod job {
     fn boot() -> Option<String> {
         let mut buf = [0u8; 64];
         let mut len = buf.len();
-        // Safe: the kernel writes at most `len` bytes into `buf`
+        // SAFETY: the kernel writes at most `len` bytes into `buf`
         let ok = unsafe {
             libc::sysctlbyname(
                 c"kern.bootsessionuuid".as_ptr(),
@@ -1517,7 +1547,7 @@ mod job {
         let go = std::ffi::CString::new(ctl.join("go").as_os_str().as_bytes())
             .map_err(|e| e.to_string())?;
 
-        // Safe: the path is a valid C string that outlives the call
+        // SAFETY: the path is a valid C string that outlives the call
         if unsafe { libc::mkfifo(go.as_ptr(), 0o600) } != 0 {
             return Err(format!("mkfifo: {}", std::io::Error::last_os_error()));
         }
@@ -1661,7 +1691,7 @@ mod job {
 
     /// The coalition of a job's waiting script, None unless it is the only member, so never a shared one
     pub fn own_coalition(pid: libc::pid_t) -> Option<u64> {
-        // Safe: getpid cannot fail
+        // SAFETY: getpid cannot fail
         let own = coalition(unsafe { libc::getpid() });
         coalition(pid).filter(|&c| c > 1 && Some(c) != own && members(c) == [pid])
     }
@@ -1669,7 +1699,7 @@ mod job {
     /// Lets the job's script run the check, false when the deadline passed first
     fn release(go: &std::ffi::CStr, deadline: Instant) -> Result<bool, String> {
         loop {
-            // Safe: the path is a valid C string, and a nonblocking open fails until the script reads
+            // SAFETY: the path is a valid C string, and a nonblocking open fails until the script reads
             let fd = unsafe {
                 libc::open(
                     go.as_ptr(),
@@ -1678,7 +1708,7 @@ mod job {
             };
 
             if fd >= 0 {
-                // Safe: fd is ours, and the byte outlives the call
+                // SAFETY: fd is ours, and the byte outlives the call
                 unsafe {
                     libc::write(fd, b"\n".as_ptr().cast(), 1);
                     libc::close(fd);
@@ -1708,14 +1738,11 @@ const STEP_SUMMARY: &str = "step-summary.md";
  * regular file with one link is read, never through a link, and a refusal names nothing of it
  **/
 fn read_summary(home: &Path) -> String {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(home)
-        .and_then(|dir| crate::runner::shard::open_at(&dir, STEP_SUMMARY, false));
+        .and_then(|dir| shard::open_at(&dir, STEP_SUMMARY, shard::Kind::File));
     let file = match file {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return String::new(),
@@ -1729,14 +1756,14 @@ fn read_summary(home: &Path) -> String {
     let mut body = Vec::new();
 
     if file
-        .take(crate::runner::MAX_SUMMARY as u64 + 1)
+        .take(u64::try_from(runner::MAX_SUMMARY).expect("the limit fits a u64") + 1)
         .read_to_end(&mut body)
         .is_err()
     {
         return REFUSED.into();
     }
 
-    crate::runner::cap_summary(&String::from_utf8_lossy(&body))
+    runner::cap_summary(&String::from_utf8_lossy(&body))
 }
 
 const REFUSED: &str =
@@ -1817,7 +1844,7 @@ fn version(
     // The developer's checkout is readable so a toolchain file in it picks the version, never a home
     let repo = real_dir(dir).map_err(fail)?;
 
-    if crate::run::user_dir().starts_with(&repo) {
+    if run::user_dir().starts_with(&repo) {
         return Err(fail(format!(
             "runs in {}, which holds the home",
             repo.display()
@@ -1892,7 +1919,7 @@ impl Runner for Host {
 
         for command in &self.config.versions {
             let out = version(command, &self.repo, &self.config.env, VERSION_TIMEOUT)?;
-            id.push_str(&format!("\0{command}\0{}", out.trim()));
+            let _ = write!(id, "\0{command}\0{}", out.trim());
         }
 
         Ok(id)
@@ -1907,7 +1934,7 @@ impl Runner for Host {
     }
 
     /// The check in the sandbox: it writes only to its clone, a new home and the repository's cache
-    fn run(&self, request: &RunRequest, log: &Path) -> Result<Outcome, String> {
+    fn run(&self, request: &RunRequest<'_>, log: &Path) -> Result<Outcome, String> {
         let command = self
             .config
             .checks
@@ -1943,7 +1970,7 @@ impl Runner for Host {
 
         // A copy still holds the absolute paths into the base that tools such as pre-commit saved
         if cache != base {
-            readable.push(base.clone());
+            readable.push(base);
         }
 
         let jail = Jail {
@@ -1957,8 +1984,11 @@ impl Runner for Host {
         // As many shards as this machine's CPUs allow, since host checks share them with nothing else
         let shards = (request.shard && self.shards.enabled())
             .then(|| {
-                let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
-                shard::count(self.shards, Some((cpus as u32, u64::MAX)))
+                let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+                shard::count(
+                    self.shards,
+                    Some((u32::try_from(cpus).unwrap_or(u32::MAX), u64::MAX)),
+                )
             })
             .filter(|n| *n > 0);
         let sharded = match shards {
@@ -2064,15 +2094,17 @@ pub fn check_definition(path: &str, text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
 
     /// The ways a branch run can get the base's cache here: a copy, and an overlay where bwrap mounts one
-    fn modes() -> Vec<bool> {
+    fn modes() -> Vec<Overlay> {
         let dir = tempfile::tempdir().unwrap();
-        let mut modes = vec![false];
+        let mut modes = vec![Overlay::Off];
 
         if sandbox_jail::overlay_supported(dir.path()).is_ok() {
-            modes.push(true);
+            modes.push(Overlay::On);
         }
 
         modes
@@ -2322,7 +2354,8 @@ mod tests {
             .spawn()
             .unwrap();
         // A list of its own, since GROUPS holds the checks other tests run meanwhile
-        let groups = [AtomicI32::new(child.id() as i32), AtomicI32::new(0)];
+        let pid = i32::try_from(child.id()).expect("a pid fits an i32");
+        let groups = [AtomicI32::new(pid), AtomicI32::new(0)];
         kill_registered(&groups);
         let status = child.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
@@ -2355,12 +2388,9 @@ mod tests {
 
         let pid: i32 = fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        // Safe: signal 0 only checks that the process exists
-        assert_ne!(
-            unsafe { libc::kill(pid, 0) },
-            0,
-            "the grandchild still runs"
-        );
+        // SAFETY: signal 0 only checks that the process exists
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_ne!(alive, 0, "the grandchild still runs");
     }
 
     #[test]
@@ -2483,6 +2513,7 @@ mod tests {
         assert!(fs::read_to_string(&log).unwrap().contains("hi\n"));
         let pid: i32 = fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
         std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: signal 0 only checks that the process exists
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
     }
 
@@ -2491,7 +2522,7 @@ mod tests {
     fn the_check_sees_no_token() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        // Safe: tests in this module do not read these variables concurrently
+        // SAFETY: tests in this module do not read these variables concurrently
         unsafe {
             std::env::set_var("HOSTRUN_PROBE_TOKEN", "hunter2");
         }
@@ -2543,6 +2574,7 @@ mod tests {
         let fifo = home("fifo");
         let path =
             std::ffi::CString::new(fifo.join(STEP_SUMMARY).into_os_string().into_vec()).unwrap();
+        // SAFETY: path is a NUL-terminated string that outlives the call
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         // A home that is itself a link to a directory holding the secret as the summary
         let outside = home("outside");
@@ -2578,7 +2610,7 @@ mod tests {
             "(allow file-write* {paths} (literal \"/dev/null\")"
         )));
         assert!(!profile.contains("/dev/tty\""));
-        let user = resolved(crate::run::user_dir());
+        let user = resolved(run::user_dir());
         let denied = profile
             .lines()
             .find(|l| l.starts_with("(deny file-read-data"))
@@ -2658,7 +2690,7 @@ mod tests {
             }
         }
 
-        let user = resolved(crate::run::user_dir());
+        let user = resolved(run::user_dir());
         assert!(all.contains(&format!("--tmpfs {}", user.display())));
         assert!(!all.contains("--share-net") && !all.contains("--unshare-net"));
 
@@ -2814,17 +2846,19 @@ mod tests {
         );
         assert_eq!(pty.0, Some(0), "{}", pty.1);
         let (mut master, mut slave) = (0, 0);
-        let mut name = [0 as libc::c_char; 128];
+        let mut name: [libc::c_char; 128] = [0; 128];
+        // SAFETY: openpty writes the two descriptors and at most 128 bytes of name
         let opened = unsafe {
             libc::openpty(
-                &mut master,
-                &mut slave,
+                &raw mut master,
+                &raw mut slave,
                 name.as_mut_ptr(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
         };
         assert_eq!(opened, 0);
+        // SAFETY: openpty wrote a NUL-terminated name into the buffer
         let theirs = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
             .to_str()
             .unwrap()
@@ -2833,8 +2867,12 @@ mod tests {
         let open =
             format!("python3 -c 'import os; os.open(\"{theirs}\", os.O_WRONLY | os.O_NOCTTY)'");
         assert_ne!(run(&open).0, Some(0), "{theirs}");
+        // SAFETY: both descriptors came from openpty and nothing else owns them
         unsafe {
             libc::close(master);
+        }
+        // SAFETY: as above
+        unsafe {
             libc::close(slave);
         }
         // A Unix socket outside the jail, such as Docker's, refuses the connection
@@ -2847,16 +2885,15 @@ mod tests {
         let connected = run(&probe);
         assert_ne!(connected.0, Some(0), "{}", connected.1);
         // The user's home is unreadable but for toolchains, and unwritable
-        let secret = tempfile::NamedTempFile::new_in(crate::run::user_dir()).unwrap();
+        let secret = tempfile::NamedTempFile::new_in(run::user_dir()).unwrap();
         let read = run(&format!("cat '{}'", secret.path().display()));
         assert_ne!(read.0, Some(0), "{}", read.1);
-        let planted =
-            crate::run::user_dir().join(format!(".shipcheck-test-{}", std::process::id()));
+        let planted = run::user_dir().join(format!(".shipcheck-test-{}", std::process::id()));
         assert_ne!(run(&format!("touch '{}'", planted.display())).0, Some(0));
         assert!(!planted.exists());
 
         // Credentials, also beside a readable toolchain dir, whether or not this machine has them
-        let user = crate::run::user_dir();
+        let user = run::user_dir();
         let cargo = user.join(".cargo");
         let beside = cargo
             .exists()
@@ -2897,7 +2934,7 @@ mod tests {
             canary.display()
         );
         fs::write(dir.path().join("job.plist"), plist).unwrap();
-        // Safe: getuid cannot fail
+        // SAFETY: getuid cannot fail
         let uid = unsafe { libc::getuid() };
 
         for cmd in [
@@ -2942,7 +2979,7 @@ mod tests {
         }
     }
 
-    fn a_branch_run_sees_only_the_base(overlay: bool) {
+    fn a_branch_run_sees_only_the_base(overlay: Overlay) {
         let dir = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         let checks = BTreeMap::from([
@@ -3002,10 +3039,10 @@ mod tests {
         assert_eq!(
             exit,
             Some(0),
-            "overlay {overlay}: saw the other branch's file or missed the base's: {log}"
+            "overlay {overlay:?}: saw the other branch's file or missed the base's: {log}"
         );
-        assert!(!planted, "overlay {overlay}: a branch run wrote the base");
-        assert!(left.is_empty(), "overlay {overlay}: {left:?}");
+        assert!(!planted, "overlay {overlay:?}: a branch run wrote the base");
+        assert!(left.is_empty(), "overlay {overlay:?}: {left:?}");
     }
 
     /// A branch run's request for `job` in `clone`
@@ -3058,7 +3095,7 @@ mod tests {
             },
             dir.path(),
         )
-        .with_overlay(false);
+        .with_overlay(Overlay::Off);
         let empty = (BTreeMap::new(), dir.path().join("artifacts"));
         // One run, so both checks share the run's directory, as a retry does
         let run = |job: &str| {
@@ -3091,7 +3128,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
-        let host = Host::new(config::Host::default(), dir.path()).with_overlay(false);
+        let host = Host::new(config::Host::default(), dir.path()).with_overlay(Overlay::Off);
         let run = host.run_cache(&repo_id).unwrap();
         remove_tree(&run);
         std::os::unix::fs::symlink(target.path(), &run).unwrap();
@@ -3103,8 +3140,6 @@ mod tests {
 
     #[test]
     fn remove_tree_removes_a_symlink_and_never_touches_its_target() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim");
         fs::create_dir(&victim).unwrap();
@@ -3142,8 +3177,6 @@ mod tests {
 
     #[test]
     fn a_run_removes_dead_probes_unlinked_locks_and_the_old_shared_cache() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         let cache = cache_dir(Some(&repo_id));
@@ -3173,7 +3206,7 @@ mod tests {
         )
         .unwrap();
 
-        let host = Host::new(config::Host::default(), dir.path()).with_overlay(false);
+        let host = Host::new(config::Host::default(), dir.path()).with_overlay(Overlay::Off);
         host.run_cache(&repo_id).unwrap();
         let gone = |p: &str| fs::symlink_metadata(cache.join(p)).is_err();
         let (branches, old, new, dead, kept) = (
@@ -3346,7 +3379,7 @@ mod tests {
             },
             dir.path(),
         )
-        .with_overlay(false);
+        .with_overlay(Overlay::Off);
         let clone = tempfile::tempdir().unwrap();
         let log = dir.path().join("copy.log");
         let (needs, artifacts) = (BTreeMap::new(), dir.path().join("artifacts"));
@@ -3382,7 +3415,7 @@ mod tests {
         }
     }
 
-    fn a_run_leaves_a_live_runs_dir_alone(overlay: bool) {
+    fn a_run_leaves_a_live_runs_dir_alone(overlay: Overlay) {
         let dir = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         let base = cache_dir(Some(&repo_id)).join("base");
@@ -3407,8 +3440,8 @@ mod tests {
         let two = second.run_cache(&repo_id).unwrap();
         assert_ne!(one, two);
         assert!(
-            one.is_dir() && one.join("cargo").is_dir() != overlay,
-            "overlay {overlay}: the second run removed the first's copy"
+            one.is_dir() && one.join("cargo").is_dir() != (overlay == Overlay::On),
+            "overlay {overlay:?}: the second run removed the first's copy"
         );
         assert!(!dead.exists(), "a copy no run holds stays");
         drop((first, second));
@@ -3428,7 +3461,7 @@ mod tests {
         }
     }
 
-    fn racing_runs_keep_their_dirs(overlay: bool) {
+    fn racing_runs_keep_their_dirs(overlay: Overlay) {
         let dir = tempfile::tempdir().unwrap();
         let repo_id = format!("test/{}", dir.path().file_name().unwrap().to_string_lossy());
         fs::create_dir_all(cache_dir(Some(&repo_id)).join("base/cargo")).unwrap();
@@ -3452,10 +3485,9 @@ mod tests {
 
                     barrier.wait();
 
-                    if !copy
-                        .as_ref()
-                        .is_ok_and(|c| c.is_dir() && c.join("cargo").is_dir() != overlay)
-                    {
+                    if !copy.as_ref().is_ok_and(|c| {
+                        c.is_dir() && c.join("cargo").is_dir() != (overlay == Overlay::On)
+                    }) {
                         removed.lock().unwrap().push(copy);
                     }
                 });
@@ -3485,7 +3517,10 @@ mod tests {
             Host::new(
                 config::Host {
                     checks: BTreeMap::new(),
-                    versions: versions.iter().map(|v| v.to_string()).collect(),
+                    versions: versions
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                     env: Vec::new(),
                 },
                 dir.path(),
@@ -3569,7 +3604,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn alive(pid: i32) -> bool {
-        // Safe: signal 0 only checks that the process exists
+        // SAFETY: signal 0 only checks that the process exists
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
@@ -3640,7 +3675,7 @@ mod tests {
         let all = || {
             let mut pids: Vec<libc::pid_t> = vec![0; 16384];
             let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
-            // Safe: the kernel writes at most `size` bytes into `pids`
+            // SAFETY: the kernel writes at most `size` bytes into `pids`
             let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
             pids.truncate(n.max(0) as usize);
             pids
@@ -3674,7 +3709,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn a_reap_refuses_shipcheck_s_own_coalition() {
-        // Safe: getpid cannot fail
+        // SAFETY: getpid cannot fail
         let own = job::coalition(unsafe { libc::getpid() }).unwrap();
         assert!(job::reap(own).is_err());
         assert!(job::reap(0).is_err());
@@ -3784,7 +3819,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        // Safe: getuid cannot fail
+        // SAFETY: getuid cannot fail
         let uid = unsafe { libc::getuid() };
         let label = format!("run.shipcheck.probe.test-{}", std::process::id());
         let target = format!("gui/{uid}/{label}");
@@ -3836,7 +3871,7 @@ mod tests {
     fn a_reap_refuses_a_coalition_it_shares_or_the_kernels() {
         assert!(job::reap(1).is_err());
         // This process's coalition holds the test runner and its parents, so it is never a job's own
-        // Safe: getpid cannot fail
+        // SAFETY: getpid cannot fail
         assert_eq!(job::own_coalition(unsafe { libc::getpid() }), None);
         assert_eq!(job::own_coalition(1), None);
     }

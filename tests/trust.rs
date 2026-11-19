@@ -1,3 +1,5 @@
+//! A check with `sandbox = false` stays in the sandbox until `shipcheck trust` runs
+
 use std::fs;
 use std::process::Command;
 
@@ -55,7 +57,11 @@ fn a_check_with_sandbox_false_stays_in_the_sandbox_until_the_repository_is_trust
             .env("SHIPCHECK_NO_DAEMON", "1")
             .output()
             .unwrap();
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
     };
 
     let before = shipcheck(&["doctor"]);

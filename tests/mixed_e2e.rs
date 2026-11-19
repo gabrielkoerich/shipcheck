@@ -1,3 +1,5 @@
+//! Host checks and an act job run as one result
+
 mod common;
 
 use std::fs;

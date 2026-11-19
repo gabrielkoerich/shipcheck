@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -27,6 +28,7 @@ pub struct Run {
 }
 
 /// The note of a run that holds slot `n`, removed when the run ends
+#[derive(Debug)]
 pub struct Note {
     path: PathBuf,
     run: Mutex<Run>,
@@ -45,7 +47,10 @@ impl Note {
 
     /// The note is only for `shipcheck queue`, so a write that fails never fails the run
     fn change(&self, change: impl FnOnce(&mut Run)) {
-        let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        let mut run = self
+            .run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         change(&mut run);
         let temp = self.path.with_extension("run.new");
 
@@ -67,6 +72,7 @@ impl Drop for Note {
     }
 }
 
+#[derive(Debug)]
 pub struct Going<'a> {
     note: &'a Note,
     job: String,
@@ -149,7 +155,11 @@ pub fn list(dir: &Path, now: u64) -> Vec<Value> {
     };
     let mut running: Vec<Run> = names(dir)
         .iter()
-        .filter(|n| n.ends_with(".run"))
+        .filter(|n| {
+            std::path::Path::new(n)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("run"))
+        })
         .filter_map(|n| running(&dir.join(n)))
         .collect();
     running.sort_by_key(|r| r.started_unix);
@@ -214,15 +224,22 @@ pub struct Wait {
     pub known: bool,
 }
 
+/// Who starts the run [`forecast`] gives the wait of
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    Cli,
+    Background,
+}
+
 /**
  * Gives every row its repository's typical time as `estimate_s`, and every queued row the wait
  * until it starts as `wait_s`. Returns the wait of a run that arrives now: `shipcheck run` when
- * `cli`, which goes ahead of the queued runs the hooks and the daemon started
+ * `Arrival::Cli`, which goes ahead of the queued runs the hooks and the daemon started
  **/
 pub fn forecast(
     rows: &mut [Value],
     slots: usize,
-    cli: bool,
+    arrival: Arrival,
     typical: &mut dyn FnMut(&str) -> Option<u64>,
 ) -> Wait {
     for row in rows.iter_mut() {
@@ -246,7 +263,7 @@ pub fn forecast(
         .collect();
     let ahead: Vec<&&Value> = queued
         .iter()
-        .filter(|r| !cli || r["trigger"] == "cli")
+        .filter(|r| arrival == Arrival::Background || r["trigger"] == "cli")
         .collect();
     let first: Vec<u64> = ahead.iter().map(|r| takes(r).unwrap_or_default()).collect();
     let wait = Wait {
@@ -305,12 +322,13 @@ pub fn estimate_line(typical: &Typical, wait: &Wait) -> String {
     );
 
     if wait.wait_s > 0 || wait.ahead > 0 {
-        line.push_str(&format!(
+        let _ = write!(
+            line,
             ", after {} {} in the queue with {} ahead",
             if wait.known { "about" } else { "at least" },
             clock(wait.wait_s),
             wait.ahead
-        ));
+        );
     }
 
     line
@@ -343,8 +361,9 @@ pub fn table(rows: &[Value]) -> String {
             .flatten()
             .filter_map(Value::as_str)
             .collect();
-        out.push_str(&format!(
-            "{:<8} {:>3} {:<28} {:<24} {:<12} {:<7} {:>8} {:>8} {:>8}  {:<24} {}\n",
+        let _ = writeln!(
+            out,
+            "{:<8} {:>3} {:<28} {:<24} {:<12} {:<7} {:>8} {:>8} {:>8}  {:<24} {}",
             text("state"),
             r["position"]
                 .as_u64()
@@ -361,8 +380,8 @@ pub fn table(rows: &[Value]) -> String {
             } else {
                 jobs.join(",")
             },
-            text("path"),
-        ));
+            text("path")
+        );
     }
 
     out
@@ -460,7 +479,7 @@ mod tests {
         assert_eq!(standing(&rows, &of(7), 2), "starting, 2s");
         assert_eq!(rows[0]["id"], "a".repeat(12));
         let mut rows = rows;
-        let wait = forecast(&mut rows, 1, true, &mut |_| Some(100));
+        let wait = forecast(&mut rows, 1, Arrival::Cli, &mut |_| Some(100));
         // The running run has 80s left, and only the queued `shipcheck run` goes first
         assert_eq!(
             wait,
@@ -476,7 +495,7 @@ mod tests {
         );
         assert_eq!(rows[0]["estimate_s"], 100);
         assert!(table(&rows).lines().nth(2).unwrap().contains("  1m20s "));
-        assert!(!forecast(&mut rows, 1, true, &mut |_| None).known);
+        assert!(!forecast(&mut rows, 1, Arrival::Cli, &mut |_| None).known);
         let typical = Typical {
             median_s: 367,
             slowest_s: 552,
@@ -486,12 +505,12 @@ mod tests {
             estimate_line(&typical, &wait),
             "estimate: about 6m07s, the median of the last 10 full runs here, the slowest took 9m12s, after about 3m00s in the queue with 1 ahead"
         );
-        let none = Wait {
+        let idle = Wait {
             wait_s: 0,
             ahead: 0,
             known: true,
         };
-        assert!(estimate_line(&typical, &none).ends_with("took 9m12s"));
+        assert!(estimate_line(&typical, &idle).ends_with("took 9m12s"));
 
         drop(going);
         assert_eq!(list(dir.path(), 130)[0]["jobs"], json!([]));

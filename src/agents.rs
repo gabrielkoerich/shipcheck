@@ -1,4 +1,8 @@
+use std::fmt::Write as _;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,8 +62,6 @@ fn resolve(path: &Path) -> Option<PathBuf> {
 const MAX_LINKS: usize = 40;
 
 fn resolve_in(path: &Path, links: &mut usize) -> Option<PathBuf> {
-    use std::path::Component;
-
     let mut real = PathBuf::from("/");
     let mut exists = true;
 
@@ -133,9 +135,6 @@ pub fn check_in_repo(root: &Path, path: &Path) -> Result<(), String> {
 
 /// Writes without following a symlink at the last step, which a check before cannot rule out
 pub fn write_nofollow(path: &Path, text: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
     fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -348,7 +347,10 @@ fn strip(doc: &mut Value, homes: &[PathBuf]) -> bool {
         })
         .collect();
     drop_items(doc, "permissions", "deny", &deny);
-    let excluded: Vec<String> = OLD_EXCLUDED.iter().map(|c| c.to_string()).collect();
+    let excluded: Vec<String> = OLD_EXCLUDED
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
     drop_items(doc, "sandbox", "excludedCommands", &excluded);
 
     if *doc == before {
@@ -358,8 +360,7 @@ fn strip(doc: &mut Value, homes: &[PathBuf]) -> bool {
     let events: Vec<String> = doc
         .get("hooks")
         .and_then(Value::as_object)
-        .map(|h| h.keys().cloned().collect())
-        .unwrap_or_default();
+        .map_or_default(|h| h.keys().cloned().collect());
 
     for event in &events {
         prune(doc, &["hooks", event]);
@@ -401,8 +402,10 @@ fn unexclude(root: &Path, rel: &str) {
         let kept: String = text
             .lines()
             .filter(|l| *l != line)
-            .map(|l| format!("{l}\n"))
-            .collect();
+            .fold(String::new(), |mut s, l| {
+                let _ = writeln!(s, "{l}");
+                s
+            });
         let _ = write_nofollow(&file, &kept);
     }
 }
@@ -547,13 +550,16 @@ mod tests {
         );
         assert_eq!(read(&root.join(".gemini/settings.json")), "{}");
         assert!(!root.join(".github").exists());
-        assert!(notes(root).is_empty());
+        assert_eq!(notes(root), Vec::<std::string::String>::new());
 
         // `@AGENTS.md` in .claude/CLAUDE.md is .claude/AGENTS.md, not the root one
         assert!(imports_agents("CLAUDE.md", "@AGENTS.md\n"));
         assert!(!imports_agents(".claude/CLAUDE.md", "@AGENTS.md\n"));
         assert!(imports_agents(".claude/CLAUDE.md", "@../AGENTS.md\n"));
-        assert!(instructions(root).unwrap().is_empty());
+        assert_eq!(
+            instructions(root).unwrap(),
+            Vec::<std::string::String>::new()
+        );
     }
 
     #[test]
@@ -608,8 +614,15 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
-    /// The files older versions wrote, each with shipcheck's entries and, when `theirs`, one of the user's
-    fn old_files(home: &str, theirs: bool) -> Vec<(&'static str, Value)> {
+    /// Whose entries an old file holds
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Entries {
+        OnlyOurs,
+        WithTheirs,
+    }
+
+    /// The files older versions wrote, each with shipcheck's entries and, with `WithTheirs`, one of the user's
+    fn old_files(home: &str, entries: Entries) -> Vec<(&'static str, Value)> {
         let group = |agent: &str, event: &str, matcher: Option<&str>| {
             let mut g = json!({"hooks": [{"type": "command", "command": format!("shipcheck hook {agent} {event}")}]});
 
@@ -650,7 +663,7 @@ mod tests {
             "agentStop": [{"type": "command", "bash": "shipcheck hook copilot stop"}],
         }});
 
-        if theirs {
+        if entries == Entries::WithTheirs {
             claude["model"] = json!("x");
             claude["permissions"]["deny"]
                 .as_array_mut()
@@ -684,17 +697,17 @@ mod tests {
         ]
     }
 
-    fn repo(dir: &Path, home: &str, theirs: bool) -> PathBuf {
+    fn repo(dir: &Path, home: &str, entries: Entries) -> PathBuf {
         let root = dir.join("repo");
         fs::create_dir_all(&root).unwrap();
         assert!(git_ok(&root, &["init", "-q"]));
         let mut exclude = String::new();
 
-        for (rel, doc) in old_files(home, theirs) {
+        for (rel, doc) in old_files(home, entries) {
             let path = root.join(rel);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
-            exclude.push_str(&format!("/{rel}\n"));
+            let _ = writeln!(exclude, "/{rel}");
         }
 
         fs::create_dir_all(root.join(".codex/rules")).unwrap();
@@ -704,7 +717,7 @@ mod tests {
              prefix_rule(pattern=[\"shipcheck\", \"doctor\"], decision=\"allow\")\n",
         )
         .unwrap();
-        exclude.push_str(&format!("/{OLD_CODEX_RULES}\n"));
+        let _ = writeln!(exclude, "/{OLD_CODEX_RULES}");
         // git init makes info/ only when it finds its templates
         fs::create_dir_all(root.join(".git/info")).unwrap();
         fs::write(root.join(".git/info/exclude"), format!("# mine\n{exclude}")).unwrap();
@@ -715,25 +728,28 @@ mod tests {
     fn removes_files_that_hold_only_old_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let home = "/Users/a b/Library/Application Support/shipcheck";
-        let root = repo(dir.path(), home, false);
+        let root = repo(dir.path(), home, Entries::OnlyOurs);
 
         let done = remove_old_hooks(&root, &[PathBuf::from(home)]);
 
-        for (rel, _) in old_files(home, false) {
+        for (rel, _) in old_files(home, Entries::OnlyOurs) {
             assert!(!root.join(rel).exists(), "{rel}");
         }
 
         assert!(!root.join(OLD_CODEX_RULES).exists());
         assert_eq!(done.len(), 6, "{done:?}");
         assert_eq!(read(&root.join(".git/info/exclude")), "# mine\n");
-        assert!(remove_old_hooks(&root, &[PathBuf::from(home)]).is_empty());
+        assert_eq!(
+            remove_old_hooks(&root, &[PathBuf::from(home)]),
+            Vec::<std::string::String>::new()
+        );
     }
 
     #[test]
     fn keeps_the_users_entries_and_files() {
         let dir = tempfile::tempdir().unwrap();
         let home = "/h/shipcheck";
-        let root = repo(dir.path(), home, true);
+        let root = repo(dir.path(), home, Entries::WithTheirs);
         fs::write(
             root.join(OLD_CODEX_RULES),
             "prefix_rule(pattern=[\"ls\"])\n",
@@ -775,7 +791,7 @@ mod tests {
     #[test]
     fn leaves_a_tracked_file_and_one_that_does_not_parse() {
         let dir = tempfile::tempdir().unwrap();
-        let root = repo(dir.path(), "/h", false);
+        let root = repo(dir.path(), "/h", Entries::OnlyOurs);
         fs::write(root.join(".gemini/settings.json"), "{ not json").unwrap();
         assert!(git_ok(&root, &["add", "-f", ".cursor/hooks.json"]));
         let cursor = read(&root.join(".cursor/hooks.json"));

@@ -1,3 +1,14 @@
+//! The library behind the `shipcheck` binary and its integration tests.
+#![expect(
+    missing_docs,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::exhaustive_enums,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the binary and its tests are the only users of this lib, so it follows the rules of a binary as passbox does"
+)]
+
 pub mod agents;
 pub mod autostart;
 pub mod background;

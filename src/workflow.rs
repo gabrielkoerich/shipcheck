@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use yaml_rust2::parser::Parser;
 
 use yaml_rust2::yaml::Hash;
 use yaml_rust2::{Yaml, YamlEmitter, YamlLoader};
@@ -146,7 +147,7 @@ fn branch_patterns_match(patterns: &Yaml) -> bool {
 }
 
 /// One `run` or `uses` step, with the working directory and shell from the step, the job or the workflow
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RunStep {
     pub name: Option<String>,
     /// Empty for a `uses` step
@@ -163,6 +164,11 @@ pub struct RunStep {
     pub env: Vec<(String, Option<String>)>,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "separate facts about one job, not states of one thing"
+)]
+#[derive(Debug)]
 pub struct Job {
     pub id: String,
     pub needs: Vec<String>,
@@ -561,6 +567,10 @@ fn env_of(y: &Yaml) -> Vec<(String, Option<String>)> {
 }
 
 /// Each job's `run` steps, trimmed, in file order. `uses` steps are left out
+#[expect(
+    clippy::too_many_lines,
+    reason = "one field per key of a job, read as one table"
+)]
 pub fn job_runs(source: &str) -> Vec<Job> {
     let Ok(root) = load(source) else {
         return Vec::new();
@@ -579,7 +589,7 @@ pub fn job_runs(source: &str) -> Vec<Job> {
     };
     let mut out = Vec::new();
 
-    for (id, original) in jobs.iter() {
+    for (id, original) in jobs {
         // A matrix of one combination is a plain job, GitHub only adds the values to its name
         let filled = single_leg(&original["strategy"]["matrix"]).map(|leg| {
             let mut job = fill(original, &leg);
@@ -1065,12 +1075,12 @@ pub fn gate_jobs(source: &str, jobs: &[String], base: &str) -> Option<String> {
     let mut at = 0;
 
     for (s, e, line) in edits {
-        out.extend(lines[at..s].iter().map(|l| l.to_string()));
+        out.extend(lines[at..s].iter().map(std::string::ToString::to_string));
         out.push(line);
         at = e;
     }
 
-    out.extend(lines[at..].iter().map(|l| l.to_string()));
+    out.extend(lines[at..].iter().map(std::string::ToString::to_string));
     let mut text = out.join("\n");
 
     if source.ends_with('\n') {
@@ -1112,8 +1122,7 @@ fn entries(lines: &[&str]) -> (String, Vec<(String, usize, usize)>) {
     let indent = lines
         .iter()
         .find(|l| !blank(l))
-        .map(|l| l[..l.len() - l.trim_start().len()].to_string())
-        .unwrap_or_default();
+        .map_or_default(|l| l[..l.len() - l.trim_start().len()].to_string());
     let starts: Vec<usize> = (0..lines.len())
         .filter(|&i| {
             !blank(lines[i])
@@ -1198,11 +1207,11 @@ pub const MAX_COMPARED: u64 = 1 << 20;
 /// Whether a workflow from a commit is safe to load: yaml-rust2 copies each alias as it loads, so a
 /// few hundred bytes of nested aliases take gigabytes. The event scan does not expand them
 pub(crate) fn safe_to_load(src: &str) -> bool {
-    if src.len() as u64 > MAX_COMPARED {
+    if u64::try_from(src.len()).unwrap_or(u64::MAX) > MAX_COMPARED {
         return false;
     }
 
-    let mut parser = yaml_rust2::parser::Parser::new_from_str(src);
+    let mut parser = Parser::new_from_str(src);
 
     loop {
         match parser.next_token() {
@@ -1671,7 +1680,7 @@ jobs:
                 "job `d` is removed",
             ]
         );
-        assert!(weakened_jobs(old, old).is_empty());
+        assert_eq!(weakened_jobs(old, old), Vec::<std::string::String>::new());
     }
 
     #[test]

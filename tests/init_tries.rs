@@ -1,5 +1,7 @@
 //! `init --yes` tries each host check it would write in the jail, through the built binary
 
+use shipcheck::config::RepoConfig;
+use shipcheck::run;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -132,7 +134,7 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 type Snapshot = BTreeMap<PathBuf, Option<Vec<u8>>>;
 
 /// The paths whose contents differ between two snapshots
-fn changed(before: &Snapshot, after: Snapshot) -> Vec<PathBuf> {
+fn changed(before: &Snapshot, after: &Snapshot) -> Vec<PathBuf> {
     let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
     keys.into_iter()
         .filter(|k| before.get(k) != after.get(k))
@@ -159,12 +161,12 @@ fn init_without_a_terminal_or_yes_shows_the_plan_and_writes_nothing() {
     assert!(said.contains("Review"), "{said}");
     assert!(said.contains("rerun with --yes to apply"), "{said}");
     assert_eq!(
-        changed(&home_before, snapshot(&home)),
+        changed(&home_before, &snapshot(&home)),
         Vec::<PathBuf>::new(),
         "SHIPCHECK_HOME changed"
     );
     assert_eq!(
-        changed(&repo_before, snapshot(&work)),
+        changed(&repo_before, &snapshot(&work)),
         Vec::<PathBuf>::new(),
         "the repository changed"
     );
@@ -211,8 +213,9 @@ fn a_preview_stopped_mid_trial_leaves_nothing_behind() {
             assert!(started.elapsed().as_secs() < 120, "no trial started");
             std::thread::sleep(std::time::Duration::from_millis(100));
         };
-        // Safe: kill only sends a signal to the init this test started
-        unsafe { libc::kill(init.id() as i32, sig) };
+        let pid = libc::pid_t::try_from(init.id()).expect("a pid fits a pid_t");
+        // SAFETY: kill only sends a signal to the init this test started
+        unsafe { libc::kill(pid, sig) };
         let status = init.wait().unwrap();
         assert_eq!(status.code(), Some(128 + sig), "{sig}");
         // The scratch home holds the trial's templates or slots
@@ -230,12 +233,12 @@ fn a_preview_stopped_mid_trial_leaves_nothing_behind() {
             "{sig}: the scratch home {scratch_home:?} is left"
         );
         assert_eq!(
-            changed(&home_before, snapshot(&home)),
+            changed(&home_before, &snapshot(&home)),
             Vec::<PathBuf>::new(),
             "{sig}: SHIPCHECK_HOME changed"
         );
         assert_eq!(
-            changed(&repo_before, snapshot(&work)),
+            changed(&repo_before, &snapshot(&work)),
             Vec::<PathBuf>::new(),
             "{sig}: the repository changed"
         );
@@ -300,13 +303,13 @@ fn a_trial_tries_the_host_checks_and_never_an_act_job() {
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-q", "-m", "a"]);
     // An act job that names no job would fail the whole run if the trial ran it
-    let config = shipcheck::config::RepoConfig::parse(
+    let config = RepoConfig::parse(
         "runner = \"host\"\n[host.checks]\nok = \"true\"\n[jobs.\"ci.yml/missing\"]\nrunner = \"act\"\n",
     )
     .unwrap();
     // SAFETY: the only test in this binary that sets the environment, the other passes its own to a child
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
-    let tried = shipcheck::run::trial(&work, config, &mut |_| {}).unwrap();
+    let tried = run::trial(&work, config, &mut |_| {}).unwrap();
     assert_eq!(tried.keys().collect::<Vec<_>>(), ["ok"]);
     assert!(tried["ok"].passed, "{}", tried["ok"].log);
 }

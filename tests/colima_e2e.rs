@@ -1,3 +1,5 @@
+//! A job on the colima engine, in a VM shipcheck starts for it and removes after
+
 mod common;
 
 use std::fs;

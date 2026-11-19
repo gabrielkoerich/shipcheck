@@ -27,6 +27,10 @@ Every change must keep these.
 - Call `act` and `git` as processes. Do not embed or reimplement them.
 - The cache key needs a test with fixed inputs and a fixed expected digest.
 - Test `act` behaviour against a real workflow before claiming it works.
+- Lints are passbox's: `[lints]` in `Cargo.toml` and `clippy.toml`, plus `use_in_fn` from [dylint-lints](https://github.com/gabrielkoerich/dylint-lints), set in `dylint.toml`. Fix the code, or suppress with `#[expect(lint, reason = "...")]`, never `#[allow]`. The lib follows binary rules, so `lib.rs` turns off the doc and output lints that only a published library needs.
+- Every `use` goes at the top of its module or test module, never in a function body. Import the item or its parent module instead of writing `crate::a::b` inline.
+- A function takes no `bool` parameter. Use a two-variant enum or two functions.
+- Run dylint with `DYLINT_RUSTFLAGS="-D warnings" cargo dylint --all -- --all-targets`. Install it with `cargo +stable install cargo-dylint dylint-link --version 6.3.2 --locked`. The first run installs the nightly the lint pins.
 
 <!-- shipcheck:start v5 -->
 

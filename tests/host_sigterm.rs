@@ -1,3 +1,4 @@
+//! A stopped run reaps the host checks it started
 #![cfg(target_os = "macos")]
 
 use std::fs;
@@ -45,7 +46,7 @@ struct Stop(std::process::Child);
 impl Drop for Stop {
     fn drop(&mut self) {
         if self.0.try_wait().is_ok_and(|s| s.is_none()) {
-            // Safe: the run is this test's own child, not yet reaped
+            // SAFETY: the run is this test's own child, not yet reaped
             unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
             let _ = self.0.wait();
         }
@@ -106,7 +107,7 @@ fn a_stopped_run_reaps_its_running_check_at_once() {
         (m.len() >= 4).then_some(m)
     });
 
-    // Safe: the run is this test's own child
+    // SAFETY: the run is this test's own child
     assert_eq!(
         unsafe { libc::kill(run.0.id() as libc::pid_t, libc::SIGTERM) },
         0
@@ -128,7 +129,7 @@ fn a_stopped_run_reaps_its_running_check_at_once() {
     assert!(!loaded.status.success(), "{target} stayed loaded");
 
     for pid in members {
-        // Safe: signal 0 only checks that the process exists
+        // SAFETY: signal 0 only checks that the process exists
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "{pid} outlived the run");
     }
 }

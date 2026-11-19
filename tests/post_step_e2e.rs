@@ -1,3 +1,5 @@
+//! An action's post step runs from the copy act made for its main step
+
 mod common;
 
 use std::fs;

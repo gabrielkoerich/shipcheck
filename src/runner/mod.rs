@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ pub trait Runner: Sync {
 
     /// Runs one job of a prepared workflow in its own checkout, writes its log, and waits within the
     /// timeout. Jobs it needs have already passed, their outputs are in the request
-    fn run(&self, request: &RunRequest, log: &Path) -> Result<Outcome, String>;
+    fn run(&self, request: &RunRequest<'_>, log: &Path) -> Result<Outcome, String>;
 
     /// Removes what a dead run left in this job's checkout. Called with the slot's lock held
     fn reclaim(&self, run_dir: &Path);
@@ -39,6 +41,7 @@ pub trait Runner: Sync {
     }
 }
 
+#[derive(Debug)]
 pub struct RunRequest<'a> {
     /// The job's own checkout
     pub run_dir: &'a Path,
@@ -62,9 +65,12 @@ pub struct RunRequest<'a> {
 
 /// Sends `signal` to process group `pgid`, by its id, which is gone or reused once the group was reaped
 pub fn signal_group(pgid: u32, signal: libc::c_int) {
-    // Safe: killpg only sends a signal, ESRCH when the group is gone is fine
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    // SAFETY: killpg only sends a signal, ESRCH when the group is gone is fine
     unsafe {
-        libc::killpg(pgid as libc::pid_t, signal);
+        libc::killpg(pgid, signal);
     }
 }
 
@@ -75,25 +81,21 @@ pub fn signal_group(pgid: u32, signal: libc::c_int) {
  **/
 pub fn has_exited(pid: u32) -> Result<bool, String> {
     loop {
-        // Safe: waitid with WNOWAIT only reads the child's state into a zeroed struct
-        let (ret, info) = unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
-            (
-                libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags),
-                info,
-            )
-        };
+        // SAFETY: siginfo_t is plain C data, for which all zeroes is a valid value
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        // SAFETY: waitid with WNOWAIT only reads the child's state into info
+        let ret = unsafe { libc::waitid(libc::P_PID, pid, &raw mut info, flags) };
 
         if ret == 0 {
-            // Safe: waitid filled info, or left it zeroed when the child is still running
+            // SAFETY: waitid filled info, or left it zeroed when the child is still running
             return Ok(unsafe { info.si_pid() } != 0);
         }
 
         let err = std::io::Error::last_os_error();
 
         match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
+            Some(libc::EINTR) => {}
             Some(libc::ECHILD) => return Ok(true),
             _ => return Err(format!("waitid {pid}: {err}")),
         }
@@ -110,39 +112,41 @@ pub fn inherit(
     cmd: &mut std::process::Command,
     fds: Vec<std::os::fd::RawFd>,
 ) -> Vec<std::os::fd::RawFd> {
-    use std::os::unix::process::CommandExt;
-
     assert!(fds.len() <= 7, "only descriptors 3 to 9 are free for locks");
-    let targets: Vec<_> = (0..fds.len() as i32).map(|i| 9 - i).collect();
+    let targets: Vec<std::os::fd::RawFd> = (3..=9).rev().take(fds.len()).collect();
     let to = targets.clone();
 
-    // Safe: fcntl and dup2 are async-signal-safe and touch only the child's descriptor table
+    let hook = move || {
+        let mut high = [0; 7];
+
+        for (h, &fd) in high.iter_mut().zip(&fds) {
+            // SAFETY: fcntl touches only the child's descriptor table
+            *h = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+
+            if *h < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        // dup2 clears close-on-exec on the copy, the high ones still close on exec
+        for (&h, &t) in high.iter().zip(&to) {
+            // SAFETY: dup2 touches only the child's descriptor table
+            if unsafe { libc::dup2(h, t) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        Ok(())
+    };
+    // SAFETY: the hook calls only fcntl and dup2, which are async-signal-safe
     unsafe {
-        cmd.pre_exec(move || {
-            let mut high = [0; 7];
-
-            for (h, &fd) in high.iter_mut().zip(&fds) {
-                *h = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
-
-                if *h < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-
-            // dup2 clears close-on-exec on the copy, the high ones still close on exec
-            for (&h, &t) in high.iter().zip(&to) {
-                if libc::dup2(h, t) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-
-            Ok(())
-        });
+        cmd.pre_exec(hook);
     }
 
     targets
 }
 
+#[derive(Debug)]
 pub struct Outcome {
     /// None when the run timed out
     pub exit: Option<i32>,
@@ -184,27 +188,42 @@ pub struct Runners {
     pub host: Option<Box<dyn Runner>>,
 }
 
+impl fmt::Debug for Runners {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Runners")
+            .field("act", &self.act.is_some())
+            .field("host", &self.host.is_some())
+            .finish()
+    }
+}
+
 impl Runners {
     /// `repo` is the checkout the run reads git from, where host checks run their `versions`
     pub fn new(config: &RepoConfig, repo: &Path) -> Self {
         Runners {
             act: config.acts().then(|| {
-                Box::new(
+                let act: Box<dyn Runner> = Box::new(
                     act::Act::new(config.act.clone())
                         .with_network(config.network)
                         .with_shards(config.shard_tests)
                         .with_engines(config.engines()),
-                ) as Box<dyn Runner>
+                );
+                act
             }),
             host: config.hosts().then(|| {
-                Box::new(host::Host::new(config.host.clone(), repo).with_shards(config.shard_tests))
-                    as Box<dyn Runner>
+                let host: Box<dyn Runner> = Box::new(
+                    host::Host::new(config.host.clone(), repo).with_shards(config.shard_tests),
+                );
+                host
             }),
         }
     }
 
     pub fn all(&self) -> impl Iterator<Item = &dyn Runner> {
-        self.act.iter().chain(&self.host).map(|r| r.as_ref())
+        self.act
+            .iter()
+            .chain(&self.host)
+            .map(std::convert::AsRef::as_ref)
     }
 
     /// The host runner for [`host::HOST`]'s checks, act for a workflow's jobs
@@ -221,7 +240,7 @@ impl Runners {
 
     /// Each runner's identity, act's first, as the cache key holds it
     pub fn identity(&self) -> Result<String, String> {
-        let ids: Vec<String> = self.all().map(|r| r.identity()).collect::<Result<_, _>>()?;
+        let ids: Vec<String> = self.all().map(Runner::identity).collect::<Result<_, _>>()?;
         Ok(ids.join("\n"))
     }
 
@@ -248,14 +267,18 @@ pub(crate) fn posix_sh() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     /// The file at a descriptor of 10 or higher, which a shell cannot redirect, as a lock can be
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the original descriptor closes once the copy exists"
+    )]
     pub(crate) fn high(file: std::fs::File) -> std::fs::File {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        // Safe: F_DUPFD_CLOEXEC returns a new descriptor this File then owns alone
+        // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor this File then owns alone
         let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
         assert!(fd >= 10);
+        // SAFETY: fd is new, and the File is its only owner
         unsafe { std::fs::File::from_raw_fd(fd) }
     }
 
@@ -308,7 +331,7 @@ mod tests {
             Ok(workflow.to_string())
         }
 
-        fn run(&self, _request: &RunRequest, _log: &Path) -> Result<Outcome, String> {
+        fn run(&self, _request: &RunRequest<'_>, _log: &Path) -> Result<Outcome, String> {
             Err("not run".into())
         }
 

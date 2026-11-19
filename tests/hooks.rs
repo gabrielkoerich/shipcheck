@@ -217,13 +217,17 @@ fn fake_service(refuse: Arc<AtomicBool>) -> String {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end story, each step builds on the last"
+)]
 fn a_refused_post_shows_in_status_history_logs_and_the_hook_until_a_post_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let _runs = common::WaitOnDrop(home.clone());
     let (work, sha) = clone_with_feature(tmp.path());
     let refuse = Arc::new(AtomicBool::new(true));
-    let api = fake_service(refuse.clone());
+    let api = fake_service(Arc::clone(&refuse));
     let command = |args: &[&str]| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_shipcheck"));
         c.args(args)

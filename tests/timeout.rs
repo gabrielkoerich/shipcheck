@@ -1,3 +1,5 @@
+//! A timeout counts only the attempts that started
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;

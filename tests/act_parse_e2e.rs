@@ -1,3 +1,6 @@
+//! A workflow GitHub accepts but act's schema refuses, parsed by the real act
+
+use shipcheck::runner::act;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -68,7 +71,7 @@ fn a_workflow_act_cannot_parse_stays_on_github_and_fails_at_once() {
     let tmp = tempfile::tempdir().unwrap();
     // SAFETY: this is the only test in this binary
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
-    let _volumes = OwnVolumes(shipcheck::runner::act::home_prefix());
+    let _volumes = OwnVolumes(act::home_prefix());
 
     let origin = tmp.path().join("origin.git");
     fs::create_dir(&origin).unwrap();

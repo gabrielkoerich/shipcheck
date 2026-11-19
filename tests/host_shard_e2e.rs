@@ -1,3 +1,5 @@
+//! Host checks split into shards by test file
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;

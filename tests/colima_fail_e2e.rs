@@ -1,3 +1,5 @@
+//! A failing and a timed out job on the colima engine, and the VMs they leave behind
+
 mod common;
 
 use std::fs;
@@ -67,14 +69,12 @@ fn ours() -> Vec<String> {
 
 /// Passed results in the home's cache, which only a full run that passed writes
 fn passes(home: &Path) -> usize {
-    fs::read_dir(home.join("cache"))
-        .map(|d| {
-            d.filter_map(|e| fs::read(e.ok()?.path()).ok())
-                .filter_map(|t| serde_json::from_slice::<serde_json::Value>(&t).ok())
-                .filter(|e| e["passed"] == true)
-                .count()
-        })
-        .unwrap_or(0)
+    fs::read_dir(home.join("cache")).map_or(0, |d| {
+        d.filter_map(|e| fs::read(e.ok()?.path()).ok())
+            .filter_map(|t| serde_json::from_slice::<serde_json::Value>(&t).ok())
+            .filter(|e| e["passed"] == true)
+            .count()
+    })
 }
 
 fn no_vm_left() {

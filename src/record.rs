@@ -1,4 +1,8 @@
+use crate::background;
+use crate::runner::Runners;
+use crate::service;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,6 +19,11 @@ pub const VERSION: u64 = 1;
 const MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// What started a run and what it did on GitHub, which the entry does not hold
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "separate facts of one record line, not states of one thing"
+)]
+#[derive(Debug)]
 pub struct Run {
     /// `cli`, `hook-commit`, `hook-push` or `daemon`
     pub trigger: String,
@@ -82,7 +91,7 @@ pub fn line(
     for (wf, rep) in entry.workflows.iter().zip(&reports) {
         for job in &rep.jobs {
             let times = wf.times.get(&job.id);
-            let named = |tests: &[String]| -> Vec<String> {
+            let printable_tests = |tests: &[String]| -> Vec<String> {
                 tests
                     .iter()
                     .filter(|t| {
@@ -93,7 +102,7 @@ pub fn line(
                     .map(|t| printable(t))
                     .collect()
             };
-            let tests = named(&job.failing_tests);
+            let tests = printable_tests(&job.failing_tests);
             jobs.push(json!({
                 "workflow": wf.file,
                 "name": job.id,
@@ -105,12 +114,12 @@ pub fn line(
                 "duration_s": times.map(|t| t[1].saturating_sub(t[0])),
                 "failed_tests": tests,
                 "failed_tests_total": job.failing_tests_total,
-                "retried_tests": named(&job.retried_tests),
+                "retried_tests": printable_tests(&job.retried_tests),
             }));
         }
     }
 
-    let kind = crate::runner::Runners::new(&plan.config, &plan.repo).kind();
+    let kind = Runners::new(&plan.config, &plan.repo).kind();
     json!({
         "v": VERSION,
         "event": "run",
@@ -120,7 +129,7 @@ pub fn line(
         "duration_s": finished.saturating_sub(run.started),
         "queued_s": QUEUED_S.load(Ordering::Relaxed),
         "load_1m": load(),
-        "cpus": std::thread::available_parallelism().map_or(0, |n| n.get()),
+        "cpus": std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         "repo": repo,
         "base": plan.base,
         "branch": run.branch,
@@ -182,14 +191,14 @@ fn tools(identity: &str) -> Vec<String> {
 /// The machine's load average over the last minute, which a timing test that fails at random follows
 fn load() -> Option<f64> {
     let mut avg = [0f64; 1];
-    // Safe: getloadavg writes at most one value into avg
+    // SAFETY: getloadavg writes at most one value into avg
     let got = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
     (got == 1).then(|| (avg[0] * 100.0).round() / 100.0)
 }
 
 fn hostname() -> String {
     let mut buf = [0u8; 256];
-    // Safe: gethostname writes at most buf.len() bytes into buf
+    // SAFETY: gethostname writes at most buf.len() bytes into buf
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
 
     if rc != 0 {
@@ -239,9 +248,9 @@ pub fn keep(repo: &str, line: &Value) {
  **/
 pub fn share(plan: &Plan, repo: &str, line: &Value) {
     let shared = upload(
-        plan.config.team.records,
-        &crate::service::api(),
-        crate::service::machine_token,
+        Sharing::of(plan),
+        &service::api(),
+        service::machine_token,
         repo,
         line,
     );
@@ -251,20 +260,37 @@ pub fn share(plan: &Plan, repo: &str, line: &Value) {
     }
 }
 
+/// Whether `[team] records` is on in the base's shipcheck.toml
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sharing {
+    On,
+    Off,
+}
+
+impl Sharing {
+    fn of(plan: &Plan) -> Sharing {
+        if plan.config.team.records {
+            Sharing::On
+        } else {
+            Sharing::Off
+        }
+    }
+}
+
 // The token is read only when the switch is on, since on a Mac a read can ask the user
 fn upload(
-    on: bool,
+    sharing: Sharing,
     api: &str,
     token: impl FnOnce() -> Option<String>,
     repo: &str,
     line: &Value,
 ) -> Result<(), String> {
-    if !on {
+    if sharing == Sharing::Off {
         return Ok(());
     }
 
     let token = token().ok_or("no machine token, run `shipcheck login`")?;
-    crate::service::post_record(api, &token, repo, line)
+    service::post_record(api, &token, repo, line)
 }
 
 fn rotated_path(path: &Path, n: u64) -> PathBuf {
@@ -399,7 +425,7 @@ pub fn flaky(runs: &[Value]) -> Vec<Value> {
         .into_iter()
         .map(|((job, test), seen)| {
             let load = (!seen.loads.is_empty())
-                .then(|| seen.loads.iter().sum::<f64>() / seen.loads.len() as f64)
+                .then(|| seen.loads.iter().sum::<f64>() / f64::from(u32::try_from(seen.loads.len()).unwrap_or(u32::MAX)))
                 .map(|l| (l * 100.0).round() / 100.0);
             json!({"job": job, "test": test, "times": seen.times, "load_1m": load, "last": seen.last})
         })
@@ -417,8 +443,9 @@ pub fn flaky_table(rows: &[Value]) -> String {
     );
 
     for r in rows {
-        out.push_str(&format!(
-            "{:>5} {:>6} {:<20} {:<28} {}\n",
+        let _ = writeln!(
+            out,
+            "{:>5} {:>6} {:<20} {:<28} {}",
             r["times"].as_u64().unwrap_or_default(),
             r["load_1m"]
                 .as_f64()
@@ -429,8 +456,8 @@ pub fn flaky_table(rows: &[Value]) -> String {
                 .replace('T', " ")
                 .replace('Z', ""),
             r["job"].as_str().unwrap_or_default(),
-            r["test"].as_str().unwrap_or("(no test named)"),
-        ));
+            r["test"].as_str().unwrap_or("(no test named)")
+        );
     }
 
     out
@@ -467,8 +494,9 @@ pub fn table(runs: &[Value]) -> String {
             .replace('T', " ")
             .replace('Z', "");
         let sha = r["sha"].as_str().unwrap_or_default();
-        out.push_str(&format!(
-            "{:<20} {:<12} {:<4} {:<7} {:>7}s {:<5} {:<11} {}\n",
+        let _ = writeln!(
+            out,
+            "{:<20} {:<12} {:<4} {:<7} {:>7}s {:<5} {:<11} {}",
             when,
             &sha[..sha.len().min(12)],
             r["mode"].as_str().unwrap_or_default(),
@@ -476,8 +504,8 @@ pub fn table(runs: &[Value]) -> String {
             r["duration_s"].as_u64().unwrap_or_default(),
             if r["cache_hit"] == true { "hit" } else { "run" },
             r["trigger"].as_str().unwrap_or_default(),
-            posted_column(r),
-        ));
+            posted_column(r)
+        );
     }
 
     out
@@ -490,7 +518,7 @@ fn posted_column(r: &Value) -> String {
     }
 
     match r["posted"]["error"].as_str() {
-        Some(e) if crate::background::not_installed(e) => "not posted (no App)".into(),
+        Some(e) if background::not_installed(e) => "not posted (no App)".into(),
         Some(_) => "not posted (error)".into(),
         None => "-".into(),
     }
@@ -503,7 +531,7 @@ pub fn posting(runs: &[Value], repo: &str, sha: &str) -> Option<String> {
     })?;
 
     if let Some(e) = r["posted"]["error"].as_str() {
-        let (reason, fix) = crate::background::reason_and_fix(repo, e);
+        let (reason, fix) = background::reason_and_fix(repo, e);
         return Some(format!("posting: not posted, {reason}, fix: {fix}"));
     }
 
@@ -517,6 +545,8 @@ pub fn posting(runs: &[Value], repo: &str, sha: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn flaky_counts_the_tests_that_passed_on_a_retry_most_first() {
@@ -786,12 +816,10 @@ mod tests {
         status: &'static str,
         body: &'static str,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::io::{BufRead, BufReader, Read};
-        use std::sync::atomic::Ordering;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = seen.clone();
+        let count = std::sync::Arc::clone(&seen);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -826,7 +854,7 @@ mod tests {
         let (api, seen) = service("200 OK", "{}");
         assert!(!plan().config.team.records);
         let sent = upload(
-            plan().config.team.records,
+            Sharing::of(&plan()),
             &api,
             || panic!("the token is read with the switch off"),
             "acme/app",
@@ -855,7 +883,13 @@ mod tests {
             &[],
         );
         let before = (entry.passed, line.clone());
-        let sent = upload(true, &api, || Some("shc_x".into()), "acme/app", &line);
+        let sent = upload(
+            Sharing::On,
+            &api,
+            || Some("shc_x".into()),
+            "acme/app",
+            &line,
+        );
         assert_eq!(
             sent,
             Err("POST /v1/records: this account has no plan for team features".into())

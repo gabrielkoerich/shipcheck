@@ -4,6 +4,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -180,8 +181,6 @@ fn status_logs_commit_and_post_refuse_before_any_run() {
 
 #[test]
 fn history_never_asks_the_remote() {
-    use std::os::unix::fs::PermissionsExt;
-
     let repo = Repo::new(MARKER);
     // Each ls-remote of a local remote starts its upload-pack, which counts itself
     let count = repo.home.join("asked");

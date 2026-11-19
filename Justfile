@@ -6,6 +6,7 @@ default:
 test:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
+    DYLINT_RUSTFLAGS="-D warnings" cargo dylint --all -- --all-targets
     cargo test
 
 # The end-to-end test, which needs act and Docker

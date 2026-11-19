@@ -1,3 +1,5 @@
+//! The colima and lima versions in the cache key of a colima job
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
