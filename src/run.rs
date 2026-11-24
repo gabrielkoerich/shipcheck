@@ -357,13 +357,22 @@ pub enum MovedHome {
 /// The user's home directory from the passwd entry, empty when there is none, so a check against
 /// it fails closed
 pub fn user_dir() -> PathBuf {
+    passwd().map_or_default(|(_, dir)| dir)
+}
+
+/// The user's login name from the passwd entry, empty when there is none
+pub fn user_name() -> String {
+    passwd().map_or_default(|(name, _)| name)
+}
+
+fn passwd() -> Option<(String, PathBuf)> {
     let mut buf: Vec<libc::c_char> = vec![0; 16384];
     // SAFETY: passwd is plain C data, for which all zeroes is a valid value
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found = std::ptr::null_mut();
     // SAFETY: getuid cannot fail and touches no memory
     let uid = unsafe { libc::getuid() };
-    // SAFETY: getpwuid_r writes only into pwd and buf, and pw_dir points into buf on success
+    // SAFETY: getpwuid_r writes only into pwd and buf, and its strings point into buf on success
     let rc = unsafe {
         libc::getpwuid_r(
             uid,
@@ -374,13 +383,16 @@ pub fn user_dir() -> PathBuf {
         )
     };
 
-    if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
-        return PathBuf::new();
+    if rc != 0 || found.is_null() || pwd.pw_dir.is_null() || pwd.pw_name.is_null() {
+        return None;
     }
 
-    // SAFETY: on success pw_dir is a NUL-terminated string in buf, which outlives this borrow
-    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_bytes();
-    PathBuf::from(std::ffi::OsStr::from_bytes(dir))
+    // SAFETY: on success pw_name is a NUL-terminated string in buf, which outlives this borrow
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+    // SAFETY: as pw_name
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    let dir = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    Some((name.to_string_lossy().into_owned(), dir))
 }
 
 fn git_raw(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {

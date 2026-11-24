@@ -138,7 +138,8 @@ fn tail_of(log: &str) -> String {
     tail
 }
 
-/// Masks the secrets, and writes the home folder as `~`, since its path names the user
+/// Masks the secrets and every user name: this user's home folder becomes `~`, any other folder
+/// under `/Users` or `/home` becomes `/Users/***`, and the login name alone becomes `***`
 pub fn mask(mut text: String, secrets: &[String]) -> String {
     for secret in secrets {
         text = text.replace(secret.as_str(), "***");
@@ -153,26 +154,80 @@ pub fn mask(mut text: String, secrets: &[String]) -> String {
     homes.sort_by_key(|h| Reverse(h.len()));
 
     for home in &homes {
-        text = redact(&text, home);
+        text = replace_whole(&text, home, "~");
+    }
+
+    for parent in ["/Users/", "/home/"] {
+        text = hide_names(&text, parent);
+    }
+
+    let names = [
+        Some(run::user_name()),
+        env::var("USER").ok(),
+        env::var("LOGNAME").ok(),
+    ];
+
+    // One letter would cut words apart, and root names no one
+    for name in names
+        .into_iter()
+        .flatten()
+        .filter(|n| n.len() > 1 && n != "root")
+    {
+        text = replace_whole(&text, &name, "***");
     }
 
     text
 }
 
-// Only a whole folder, so `/Users/ann` leaves `/Users/anna` as it is
-fn redact(text: &str, home: &str) -> String {
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || "._-@+".contains(c)
+}
+
+// A `.` that ends a sentence is not part of the name before it
+fn continues(after: &str) -> bool {
+    let mut chars = after.chars();
+
+    match chars.next() {
+        Some('.') => chars.next().is_some_and(name_char),
+        Some(c) => name_char(c),
+        None => false,
+    }
+}
+
+// Only a whole word or folder, so `/Users/ann` leaves `/Users/anna` as it is
+fn replace_whole(text: &str, what: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+
+    for (at, _) in text.match_indices(what) {
+        let before = text[..at].chars().next_back();
+        let starts = what.starts_with('/') || !before.is_some_and(name_char);
+
+        if starts && !continues(&text[at + what.len()..]) {
+            out.push_str(&text[last..at]);
+            out.push_str(with);
+            last = at + what.len();
+        }
+    }
+
+    out.push_str(&text[last..]);
+    out
+}
+
+// The folder after each `parent`, which is a user name, becomes `***`
+fn hide_names(text: &str, parent: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
 
-    while let Some(at) = rest.find(home) {
-        let after = &rest[at + home.len()..];
-        let whole = !after
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || "._-".contains(c));
-        out.push_str(&rest[..at]);
-        out.push_str(if whole { "~" } else { home });
-        rest = after;
+    while let Some(at) = rest.find(parent) {
+        let start = at + parent.len();
+        let len = rest[start..]
+            .find(|c| !name_char(c))
+            .unwrap_or(rest.len() - start);
+        let len = len - usize::from(rest[start..start + len].ends_with('.'));
+        out.push_str(&rest[..start]);
+        out.push_str(if len == 0 { "" } else { "***" });
+        rest = &rest[start + len..];
     }
 
     out.push_str(rest);
@@ -1061,21 +1116,39 @@ mod tests {
     }
 
     #[test]
-    fn redacts_the_home_folder_only_as_a_whole_folder() {
-        let text = "unix:///Users/ann/.docker/run/docker.sock, /Users/anna/x and /Users/ann";
+    fn hides_every_user_name() {
         assert_eq!(
-            redact(text, "/Users/ann"),
-            "unix://~/.docker/run/docker.sock, /Users/anna/x and ~"
+            replace_whole(
+                "unix:///Users/ann/.docker, /Users/anna/x and /Users/ann",
+                "/Users/ann",
+                "~"
+            ),
+            "unix://~/.docker, /Users/anna/x and ~"
+        );
+        assert_eq!(
+            hide_names(
+                "/Users/anna/x, /home/bob.k, /home/, /Users/***/y",
+                "/Users/"
+            ),
+            "/Users/***/x, /home/bob.k, /home/, /Users/***/y"
+        );
+        assert_eq!(
+            replace_whole("user ann ran annual, ann.", "ann", "***"),
+            "user *** ran annual, ***."
+        );
+        assert_eq!(
+            mask("cache at /home/carol/.cargo and /Users/dave".into(), &[]),
+            "cache at /home/***/.cargo and /Users/***"
         );
     }
 
     #[test]
-    fn a_posted_error_names_no_home_folder() {
-        let home = run::user_dir();
+    fn a_posted_error_names_no_user() {
+        let (home, name) = (run::user_dir(), run::user_name());
         let home = home.to_str().unwrap();
 
         // A job sandbox can have no passwd entry
-        if home.len() < 2 {
+        if home.len() < 2 || name.len() < 2 {
             return;
         }
 
@@ -1083,11 +1156,14 @@ mod tests {
             "shipcheck",
             "abc",
             &format!(
-                "docker version failed, is a Docker engine running? Cannot connect to the Docker daemon at unix://{home}/.docker/run/docker.sock"
+                "docker version failed, is a Docker engine running? Cannot connect to the Docker daemon at unix://{home}/.docker/run/docker.sock, as {name}"
             ),
         );
         let text = body["output"]["text"].as_str().unwrap();
-        assert!(!text.contains(home), "{text}");
+        assert!(
+            !text.contains(home) && !text.contains(&format!(" {name}")),
+            "{text}"
+        );
         assert!(text.contains("unix://~/.docker/run/docker.sock"), "{text}");
     }
 
