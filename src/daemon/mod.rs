@@ -1,5 +1,11 @@
-use crate::autostart;
+use crate::base;
+use crate::clock;
 use crate::config::RepoConfig;
+use crate::daemon_config::DaemonConfig;
+use crate::daemon_config::RepoEntry;
+use crate::daemon_config::fetch_options;
+use crate::git;
+use crate::paths;
 use crate::service;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -9,15 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-
 use crate::background::{self, Posting, Runs};
 use crate::check::{Tails, Wait};
 use crate::github::{Checks, OpenPr};
+use crate::paths::MovedHome;
 use crate::record::{self, Run};
-use crate::run::MovedHome;
 use crate::service::Sender;
-use crate::{check, run};
+use crate::{check, comment, run};
 
 /// How long a run can last: each workflow's deadline, once per attempt, and 10 minutes to set up and
 /// post. A claim older than this is a run that died, so this machine may take the PR
@@ -28,220 +32,16 @@ fn stale_after(config: &RepoConfig) -> u64 {
 /// How long a run may make no progress, no log growing and no wait for a run slot, before it counts as stuck
 const QUIET: Duration = Duration::from_mins(15);
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DaemonConfig {
-    #[serde(default = "ten")]
-    pub interval_seconds: u64,
-    #[serde(default = "yes")]
-    pub run_misses: bool,
-    /// Whose PRs this daemon runs, for an App key, where no sign-in names the user
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub login: Option<String>,
-    #[serde(default)]
-    pub repos: BTreeMap<String, RepoEntry>,
-    /// A person's `--home-ok` on the daemon, passed on to the runs it starts
-    #[serde(skip)]
-    pub home_ok: MovedHome,
-    /// How shipcheck's own fetches reach a GitHub remote, `https` to skip an SSH key that asks for a touch
-    #[serde(default, skip_serializing_if = "Fetch::is_origin")]
-    pub fetch: Fetch,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum Fetch {
-    /// The remote's URL as the person set it up
-    #[default]
-    Origin,
-    /// HTTPS with git's credential helper, such as `gh auth git-credential`
-    Https,
-}
-
-impl Fetch {
-    #[expect(
-        clippy::trivially_copy_pass_by_ref,
-        reason = "serde's skip_serializing_if passes a reference"
-    )]
-    fn is_origin(&self) -> bool {
-        *self == Fetch::Origin
-    }
-
-    /// The `-c` options that send a fetch of a GitHub SSH URL over HTTPS. Remotes, pushes and the
-    /// person's own git stay as they are
-    fn options(self) -> Vec<String> {
-        if self == Fetch::Origin {
-            return Vec::new();
-        }
-
-        ["git@github.com:", "ssh://git@github.com/"]
-            .iter()
-            .flat_map(|from| {
-                [
-                    "-c".to_string(),
-                    format!("url.https://github.com/.insteadOf={from}"),
-                ]
-            })
-            .collect()
-    }
-}
-
-/// The options for every fetch and `ls-remote` shipcheck runs, from `fetch` in daemon.toml
-pub fn fetch_options() -> Vec<String> {
-    DaemonConfig::load().map_or_default(|c| c.fetch).options()
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct RepoEntry {
-    pub path: PathBuf,
-    #[serde(default = "origin_main")]
-    pub base: String,
-}
-
-fn ten() -> u64 {
-    10
-}
-
-fn yes() -> bool {
-    true
-}
-
-fn origin_main() -> String {
-    "origin/main".into()
-}
-
-impl DaemonConfig {
-    pub fn path() -> PathBuf {
-        run::home().join("daemon.toml")
-    }
-
-    pub fn load() -> Result<Self, String> {
-        Self::load_from(&Self::path())
-    }
-
-    /// No file is a daemon with no repositories yet
-    fn load_from(path: &Path) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        };
-        toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
-    }
-
-    /// Adds a repository or changes its entry, and says whether the file changed
-    pub fn add(repo: &str, path: &Path, base: &str) -> Result<bool, String> {
-        Self::add_to(&Self::path(), repo, path, base)
-    }
-
-    pub(crate) fn add_to(file: &Path, repo: &str, path: &Path, base: &str) -> Result<bool, String> {
-        let mut config = Self::load_from(file)?;
-        let entry = RepoEntry {
-            path: path.to_path_buf(),
-            base: base.to_string(),
-        };
-
-        if config.repos.get(repo) == Some(&entry) {
-            return Ok(false);
-        }
-
-        config.repos.insert(repo.to_string(), entry);
-        let text = toml::to_string(&config).map_err(|e| e.to_string())?;
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-
-        std::fs::write(file, text).map_err(|e| format!("{}: {e}", file.display()))?;
-        Ok(true)
-    }
-}
-
 /**
  * The base every command reads shipcheck.toml and the workflows from: this checkout's daemon entry,
  * then the default branch the remote reports, then `origin/main` with a warning. The hooks run in
  * git's foreground, so they skip the remote and only say when `origin/main` is likely wrong
  **/
-pub fn command_base(command: &str, repo: &Path) -> String {
-    command_base_in(&DaemonConfig::path(), command, repo)
-}
-
-fn command_base_in(file: &Path, command: &str, repo: &Path) -> String {
-    if let Some(entry) = entry_in(file, repo) {
-        return entry.base;
-    }
-
-    if matches!(command, "on-commit" | "on-push") {
-        if !main_is_default(repo) {
-            eprintln!(
-                "shipcheck: no daemon entry for this checkout, so the hook reads shipcheck.toml from origin/main. Run `shipcheck install` to use the default branch"
-            );
-        }
-
-        return origin_main();
-    }
-
-    run::remote_base(repo).unwrap_or_else(|| {
-        eprintln!(
-            "warning: origin did not say its default branch, so shipcheck reads shipcheck.toml from origin/main"
-        );
-        origin_main()
-    })
-}
-
-/// The base from this checkout's daemon entry or the remote, None when neither gives one
-pub fn known_base(repo: &Path) -> Option<String> {
-    entry_in(&DaemonConfig::path(), repo)
-        .map(|entry| entry.base)
-        .or_else(|| run::remote_base(repo))
-}
-
-/// Whether the daemon watches this checkout, so it sees a PR head that was pushed from elsewhere
-pub fn registered(repo: &Path) -> bool {
-    entry_in(&DaemonConfig::path(), repo).is_some()
-}
-
-/// The daemon's entry for this repository, when it names this checkout and not another clone
-fn entry_in(file: &Path, repo: &Path) -> Option<RepoEntry> {
-    let checkout = |p: &Path| autostart::main_checkout(p).canonicalize().ok();
-    let here = checkout(repo)?;
-    run::repo_id(repo)
-        .ok()
-        .and_then(|id| DaemonConfig::load_from(file).ok()?.repos.remove(&id))
-        .filter(|entry| checkout(&entry.path).as_ref() == Some(&here))
-}
-
-/// Whether the local refs agree main is the default branch, without asking the remote
-fn main_is_default(repo: &Path) -> bool {
-    let git = |args: &[&str]| {
-        Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    };
-    let head = git(&["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]);
-    head.is_none_or(|h| h == "origin/main")
-        && git(&["rev-parse", "--verify", "-q", "refs/remotes/origin/main"]).is_some()
-}
-
 /**
  * Whether a result on `base` may be posted: the daemon's base for this checkout, or the default
  * branch the remote reports, never a ref the caller picked, whose shipcheck.toml could run anything.
  * An entry counts only for the checkout it names, and a remote that does not answer allows nothing
  **/
-pub fn posts_from(base: &str, repo: &Path) -> bool {
-    posts_from_in(&DaemonConfig::path(), base, repo)
-}
-
-fn posts_from_in(file: &Path, base: &str, repo: &Path) -> bool {
-    entry_in(file, repo).is_some_and(|entry| entry.base == base)
-        || run::remote_base(repo).as_deref() == Some(base)
-}
-
 /**
  * Polls GitHub for open PR heads with no completed `shipcheck` check, posts a stored result at
  * once, and runs a same-repository head that has none. It reads `daemon.toml` again every cycle,
@@ -500,7 +300,7 @@ fn candidates(config: &DaemonConfig, seen: &mut HashSet<PathBuf>) -> Vec<(PathBu
                 continue;
             }
 
-            let Ok(repo) = run::repo_id(&dir) else {
+            let Ok(repo) = git::repo_id(&dir) else {
                 continue;
             };
 
@@ -532,7 +332,7 @@ fn discover(config: &DaemonConfig, seen: &mut HashSet<PathBuf>) -> Vec<String> {
     let mut said = Vec::new();
 
     for (dir, repo) in candidates(config, seen) {
-        let Some(base) = run::remote_base(&dir) else {
+        let Some(base) = base::remote_base(&dir) else {
             continue;
         };
         let entry = RepoEntry {
@@ -898,7 +698,7 @@ fn note(repo: &str, name: &str, pr: &OpenPr, reason: &str) {
 const REFUSED_DAYS: u64 = 30;
 
 fn refused_path(repo: &str) -> PathBuf {
-    run::home()
+    paths::home()
         .join("daemon/refused")
         .join(format!("{repo}.json"))
 }
@@ -1002,7 +802,7 @@ pub fn comment(
     entry: &run::Entry,
 ) -> bool {
     let branch = base.strip_prefix("origin/").unwrap_or(base);
-    let said = run::repo_id(&plan.repo)
+    let said = git::repo_id(&plan.repo)
         .and_then(|id| run::secret_values(&id))
         .and_then(|secrets| sender.comment(prs, branch, &plan.sha, entry, &secrets));
 
@@ -1195,7 +995,7 @@ impl Remote for Sender {
         entry: &run::Entry,
         secrets: &[String],
     ) -> Result<Vec<String>, String> {
-        Sender::comment(self, prs, base, sha, entry, secrets)
+        comment::post(self.route(), self.repo(), prs, base, sha, entry, secrets)
     }
 }
 
@@ -1220,7 +1020,7 @@ fn handle(
     start: &dyn Fn(&run::Plan, &str),
 ) -> Result<Option<&'static str>, String> {
     let (number, sha) = (pr.number, &pr.sha);
-    let mut rec = Run::new("daemon", run::unix_now());
+    let mut rec = Run::new("daemon", clock::unix_now());
     rec.pr = Some(number);
     rec.author = Some(pr.author.clone()).filter(|a| !a.is_empty());
     rec.branch = Some(pr.branch.clone()).filter(|b| !b.is_empty());
@@ -1266,7 +1066,7 @@ fn handle(
     let send = |body: &serde_json::Value, id| sender.send(body, id);
     let local = run::running(&plan.key) || background::running_here(repo, sha, Runs::Any);
     let result = if local { None } else { run::lookup(&plan) };
-    let cutoff = check::iso(run::unix_now().saturating_sub(stale_after(&plan.config)));
+    let cutoff = check::iso(clock::unix_now().saturating_sub(stale_after(&plan.config)));
 
     // A fork's code would run on this machine with its secrets, so only its own author runs it
     let me = me(config);
@@ -1339,11 +1139,11 @@ fn handle(
             );
             let ids = existing.iter().map(|(n, c)| (n.clone(), c.id)).collect();
             rec.cache_hit = true;
-            rec.first_check = Some(run::unix_now());
-            let secrets = run::repo_id(&plan.repo)
+            rec.first_check = Some(clock::unix_now());
+            let secrets = git::repo_id(&plan.repo)
                 .and_then(|id| run::secret_values(&id))
                 .unwrap_or_default();
-            let logs = run::log_dir(&plan.key);
+            let logs = paths::log_dir(&plan.key);
 
             if let Err(e) = background::finish(&send, &bodies, &ids) {
                 background::remember_post(repo, Some(&e));
@@ -1383,7 +1183,7 @@ fn handle(
         Action::Run => {
             let marks = refused_path(repo);
 
-            if let Some(bad) = tainted(&entry.path, sha, &refused(&marks, run::unix_now())) {
+            if let Some(bad) = tainted(&entry.path, sha, &refused(&marks, clock::unix_now())) {
                 println!(
                     "{repo}#{number}: {} contains {}, a head this machine refused",
                     &sha[..12],
@@ -1435,7 +1235,7 @@ fn handle(
             // Only a known pusher who is not allowed marks the head, heads on top of it inherit the mark
             if let Some((why, reason, mark)) = refused {
                 if mark {
-                    refuse(&marks, sha, run::unix_now());
+                    refuse(&marks, sha, clock::unix_now());
                 }
 
                 note(repo, "skipped", pr, reason);

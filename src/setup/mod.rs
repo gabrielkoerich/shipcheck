@@ -1,12 +1,13 @@
 use crate::agents;
 use crate::autostart;
+use crate::base;
 use crate::config::Act;
-use crate::daemon;
+use crate::git;
 use crate::java;
 use crate::java::Jdk;
+use crate::paths;
 use crate::ruby;
 use crate::ruby::Ruby;
-use crate::run;
 use crate::runner::act;
 use crate::workflow;
 use crate::workflow::Job;
@@ -3051,11 +3052,12 @@ pub fn install(root: &Path) -> Result<String, String> {
  * install wrote. Nothing under a moved home or `SHIPCHECK_NO_DAEMON`, where install leaves the daemon
  **/
 pub fn install_gap(root: &Path) -> Option<String> {
-    if run::home_overridden() || std::env::var_os("SHIPCHECK_NO_DAEMON").is_some_and(|v| v == "1") {
+    if paths::home_overridden() || std::env::var_os("SHIPCHECK_NO_DAEMON").is_some_and(|v| v == "1")
+    {
         return None;
     }
 
-    let entry = if !daemon::registered(root) && autostart::daemon_on_main(root) {
+    let entry = if !base::registered(root) && autostart::daemon_on_main(root) {
         Entry::Missing
     } else {
         Entry::Registered
@@ -3065,7 +3067,7 @@ pub fn install_gap(root: &Path) -> Option<String> {
     } else {
         Hooks::Current
     };
-    let name = run::repo_id(root)
+    let name = git::repo_id(root)
         .ok()
         .and_then(|id| id.rsplit('/').next().map(String::from))
         .unwrap_or_else(|| "this repository".into());

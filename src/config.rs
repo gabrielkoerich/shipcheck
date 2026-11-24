@@ -1,9 +1,16 @@
-use crate::runner::act;
-use crate::runner::host;
 use std::collections::{BTreeMap, BTreeSet};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use sandbox_jail::known;
 use serde::Deserialize;
+
+/// Names `[host] env` may not pass, since they carry credentials or point git at another repository
+pub fn refused_env(name: &str) -> bool {
+    known::secret_env(name) || name.to_ascii_uppercase().starts_with("SHIPCHECK_")
+}
+
+/// Where per-job tool homes live in the job container, a path in `cache_paths` by default
+pub const JOB_HOMES: &str = "/home/runner/.shipcheck";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,7 +282,7 @@ impl Default for Act {
             jobs: BTreeMap::new(),
             // Parallel jobs share these volumes. Tools that break under sharing get a home per job in JOB_HOMES
             cache_paths: [
-                act::JOB_HOMES,
+                JOB_HOMES,
                 "/home/runner/.npm",
                 "/home/runner/.bun/install/cache",
                 "/home/runner/.cache",
@@ -606,7 +613,7 @@ impl RepoConfig {
             let ok =
                 !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
 
-            if !ok || host::refused_env(name) {
+            if !ok || refused_env(name) {
                 problems.push(format!(
                     "host env {name:?} is refused: only plain names, and none that carries a credential"
                 ));

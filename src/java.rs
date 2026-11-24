@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[cfg(not(test))]
-use crate::run;
+use crate::paths;
 use crate::workflow::Job;
 
 /// A JDK this machine has
@@ -41,7 +41,7 @@ pub fn installed() -> Vec<Jdk> {
         homes.extend(dir.flatten().map(|e| e.path()));
     }
 
-    from_homes(&homes, &run::user_dir())
+    from_homes(&homes, &paths::user_dir())
 }
 
 fn from_homes(homes: &[PathBuf], user: &Path) -> Vec<Jdk> {

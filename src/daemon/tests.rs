@@ -1,6 +1,13 @@
 use crate::cache;
+use crate::clock;
 use crate::config::RepoConfig;
+use crate::daemon_config::DaemonConfig;
+use crate::daemon_config::Fetch;
+use crate::daemon_config::RepoEntry;
+use crate::git;
 use crate::github::Check;
+use crate::history;
+use crate::paths;
 use std::sync::Mutex;
 
 use serde_json::Value;
@@ -260,105 +267,6 @@ fn a_head_replaced_while_it_waited_is_abandoned() {
 }
 
 #[test]
-fn the_hooks_take_the_registered_base_and_never_ask_the_remote() {
-    let dir = tempfile::tempdir().unwrap();
-    let (repo, origin) = (dir.path().join("app"), dir.path().join("acme/app.git"));
-    std::fs::create_dir_all(&repo).unwrap();
-    std::fs::create_dir_all(&origin).unwrap();
-    let git = |at: &Path, args: &[&str]| {
-        assert!(
-            Command::new("git")
-                .args(args)
-                .current_dir(at)
-                .status()
-                .unwrap()
-                .success()
-        );
-    };
-    git(&origin, &["init", "-q", "--bare", "-b", "master"]);
-    git(&repo, &["init", "-q", "-b", "master"]);
-    git(
-        &repo,
-        &["remote", "add", "origin", origin.to_str().unwrap()],
-    );
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "a",
-        ],
-    );
-    git(&repo, &["push", "-q", "origin", "master"]);
-    let file = dir.path().join("daemon.toml");
-
-    // The remote says master, so only a call to it gives master here
-    assert_eq!(command_base_in(&file, "run", &repo), "origin/master");
-
-    for hook in ["on-commit", "on-push"] {
-        assert_eq!(command_base_in(&file, hook, &repo), "origin/main");
-    }
-
-    // Only the remote's default branch posts until the daemon names a base
-    assert!(posts_from_in(&file, "origin/master", &repo));
-    assert!(!posts_from_in(&file, "origin/main", &repo));
-    assert!(!posts_from_in(&file, "origin/dev", &repo));
-
-    DaemonConfig::add_to(&file, "acme/app", &repo, "origin/dev").unwrap();
-
-    // This checkout's entry comes first for every command
-    for command in ["on-commit", "on-push", "run", "post"] {
-        assert_eq!(command_base_in(&file, command, &repo), "origin/dev");
-    }
-
-    assert!(posts_from_in(&file, "origin/dev", &repo));
-    assert!(posts_from_in(&file, "origin/master", &repo));
-    assert!(!posts_from_in(&file, "origin/evil", &repo));
-    assert!(!posts_from_in(&file, "evil", &repo));
-
-    // Another clone of the same repository does not get the entry's base
-    let other = dir.path().join("other");
-    git(
-        dir.path(),
-        &[
-            "clone",
-            "-q",
-            origin.to_str().unwrap(),
-            other.to_str().unwrap(),
-        ],
-    );
-    assert!(!posts_from_in(&file, "origin/dev", &other));
-    assert!(posts_from_in(&file, "origin/master", &other));
-
-    // Offline, nothing posts, not even the fallback origin/main
-    git(
-        &repo,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            dir.path().join("gone").to_str().unwrap(),
-        ],
-    );
-    DaemonConfig::add_to(&file, "acme/app", &other, "origin/dev").unwrap();
-    assert!(!posts_from_in(&file, "origin/master", &repo));
-    assert!(!posts_from_in(&file, "origin/main", &repo));
-
-    // With no entry for this checkout and no answer, a command falls back to origin/main
-    assert_eq!(command_base_in(&file, "run", &repo), "origin/main");
-    assert_eq!(command_base_in(&file, "on-push", &repo), "origin/main");
-    assert!(!main_is_default(&repo));
-}
-
-#[test]
 fn add_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
     let file = home.path().join("home/daemon.toml");
@@ -598,7 +506,7 @@ fn run_handle(fake: &Fake, repo: &str, path: &Path, pr: &OpenPr) -> Handled {
 
 /// The `skipped` reasons in this home's records of `repo`
 fn skips(repo: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(record::file(&run::home(), repo)).unwrap_or_default();
+    let text = std::fs::read_to_string(history::file(&paths::home(), repo)).unwrap_or_default();
     text.lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
         .filter(|v| v["event"] == "skipped")
@@ -942,7 +850,7 @@ fn a_mixed_config_never_checks_a_forks_pr() {
 fn store_failure(path: &Path, sha: &str) {
     let plan = run::plan(path, sha, "origin/main").unwrap();
     let key = plan.key.clone();
-    let logs = run::log_dir(&key);
+    let logs = paths::log_dir(&key);
     std::fs::create_dir_all(logs.join("ci.yml")).unwrap();
     std::fs::write(logs.join("ci.yml/test.log"), "boom from the head\n").unwrap();
     std::fs::write(logs.join("ci.yml.log"), "boom from the head\n").unwrap();
@@ -970,7 +878,7 @@ fn store_failure(path: &Path, sha: &str) {
         skipped: None,
         ci_changes: Vec::new(),
     };
-    let cache = run::home().join("cache");
+    let cache = paths::home().join("cache");
     std::fs::create_dir_all(&cache).unwrap();
     let text = serde_json::to_string(&result).unwrap();
     std::fs::write(cache.join(format!("{key}.json")), text).unwrap();
@@ -1139,7 +1047,7 @@ fn a_refused_pusher_is_skipped_and_queued() {
         "{:?}",
         fake.statuses()
     );
-    assert!(refused(&refused_path("acme/app"), run::unix_now()).contains_key(&sha));
+    assert!(refused(&refused_path("acme/app"), clock::unix_now()).contains_key(&sha));
 }
 
 #[test]
@@ -1150,7 +1058,7 @@ fn a_same_repo_pr_matches_its_repository_in_any_case() {
 
     // The daemon keys a repository by its origin URL, GitHub names it in its own case
     let (dir, sha) = checkout("https://github.com/Acme/App.git", HOST);
-    let repo = run::repo_id(dir.path()).unwrap();
+    let repo = git::repo_id(dir.path()).unwrap();
     assert_eq!(repo, "Acme/App");
     let fake = Fake::by("ann");
     let pr = open_pr(5, &sha, "main", "acme/app");

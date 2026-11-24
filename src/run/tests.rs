@@ -1,6 +1,14 @@
 use super::*;
+use crate::base::remote_base;
 use crate::check;
-use crate::record;
+use crate::git::safe_git_env;
+use crate::history;
+use crate::paths::default_home;
+use crate::paths::home;
+use crate::paths::home_overridden;
+use crate::paths::log_dir;
+use crate::paths::user_dir;
+use crate::ui::printable;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[test]
@@ -129,7 +137,7 @@ fn last_run_finds_the_key_a_trial_base_gave_the_tree() {
         ("t2", "other", "b3"),
     ] {
         let line = serde_json::json!({"event": "run", "tree": tree, "key": key, "base": base});
-        record::append(home.path(), "o/r", &line).unwrap();
+        history::append(home.path(), "o/r", &line).unwrap();
     }
 
     assert_eq!(
@@ -141,28 +149,6 @@ fn last_run_finds_the_key_a_trial_base_gave_the_tree() {
         Some(("main".into(), "b1".into()))
     );
     assert_eq!(last_run(home.path(), "o/r", "t9", |_| true), None);
-}
-
-#[test]
-fn home_moves_once_and_never_merges() {
-    let dir = tempfile::tempdir().unwrap();
-    let old = dir.path().join("Library/Application Support/shipcheck");
-    let new = dir.path().join(".local/state/shipcheck");
-    assert_eq!(move_home(&old, &new).unwrap(), Migration::Nothing);
-
-    fs::create_dir_all(old.join("logs")).unwrap();
-    fs::write(old.join("logs/k"), "log").unwrap();
-    assert_eq!(move_home(&old, &new).unwrap(), Migration::Moved);
-    assert!(!old.exists());
-    assert_eq!(fs::read_to_string(new.join("logs/k")).unwrap(), "log");
-    assert_eq!(
-        fs::metadata(&new).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-
-    fs::create_dir_all(&old).unwrap();
-    assert_eq!(move_home(&old, &new).unwrap(), Migration::Both);
-    assert!(old.exists() && new.join("logs/k").exists());
 }
 
 #[test]
@@ -262,25 +248,6 @@ fn secrets_longest_first_with_each_line() {
 }
 
 #[test]
-fn repo_id_from_every_remote_form() {
-    for url in [
-        "git@github.com:acme/app.git",
-        "https://github.com/acme/app.git",
-        "https://github.com/acme/app",
-        "ssh://git@github.com/acme/app.git/",
-        "/tmp/x/acme/app.git",
-    ] {
-        assert_eq!(parse_repo_id(url).unwrap(), "acme/app", "{url}");
-    }
-
-    assert!(parse_repo_id("app").is_err());
-    assert!(
-        parse_repo_id("../app.git").is_err(),
-        "must not climb out of the state directory"
-    );
-}
-
-#[test]
 fn skip_variable_values() {
     assert!(env_skips(Some("1")));
     assert!(env_skips(Some("yes")));
@@ -288,24 +255,6 @@ fn skip_variable_values() {
     assert!(!env_skips(Some("")));
     assert!(!env_skips(Some("0")));
     assert!(!env_skips(Some("False")));
-}
-
-#[test]
-fn more_remote_forms() {
-    assert_eq!(
-        parse_repo_id("https://github.com:443/Acme/App.git").unwrap(),
-        "Acme/App"
-    );
-    assert_eq!(
-        parse_repo_id("git@github.com:acme/app").unwrap(),
-        "acme/app"
-    );
-    assert_eq!(
-        parse_repo_id("file:///srv/git/acme/app.git").unwrap(),
-        "acme/app"
-    );
-    assert!(parse_repo_id("").is_err());
-    assert!(parse_repo_id("/").is_err());
 }
 
 #[test]

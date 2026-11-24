@@ -1,4 +1,5 @@
-use crate::run;
+use crate::clock;
+use crate::paths;
 use crate::secret;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -16,10 +17,8 @@ use yaml_rust2::yaml::Hash;
 use super::{Outcome, RunRequest, Runner, gc, shard};
 use crate::cache;
 use crate::config;
+use crate::config::JOB_HOMES;
 use crate::workflow::{self, key, step};
-
-/// Where per-job tool homes live in the job container, a path in `cache_paths` by default
-pub const JOB_HOMES: &str = "/home/runner/.shipcheck";
 
 /// Runs workflows with nektos/act, each job in a Docker container
 #[derive(Default, Debug)]
@@ -420,7 +419,7 @@ fn step_guard(cond: &str, env: impl Fn(&str) -> Option<String>) -> Option<String
         .replace("always()", "true");
 
     if !reads
-        || run::false_on_every_pr(c)
+        || workflow::false_on_every_pr(c)
         || passing.contains("failure()")
         || passing.contains("cancelled()")
     {
@@ -529,7 +528,7 @@ impl Engine for Docker {
         };
         let mut cmd = Command::new("act");
         let port = free_port()?;
-        let home = run::home();
+        let home = paths::home();
 
         // Stamped first, so a parallel run's prune never takes it for an empty one no run used
         for (name, path) in volumes(&act.config, request.repo_id, &tag) {
@@ -576,7 +575,7 @@ impl Engine for Docker {
         }
 
         // On a Mac the secrets live in the keychain, so act reads a private copy that lives as long as it
-        let secrets = secret::read(&run::secrets_file(request.repo_id))?;
+        let secrets = secret::read(&paths::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         cmd.arg("--secret-file").arg(secrets_copy.path());
@@ -630,7 +629,7 @@ impl Engine for Docker {
 
         chown_tree(run_dir, Some(RUNNER_ID.into()));
 
-        run::timing(file, job, "act prepare", began);
+        clock::timing(file, job, "act prepare", began);
         let spawned = Instant::now();
         let mut reaper = reaper(run_dir, request.slot_lock);
         // A group of its own, so the reaper can stop act and the docker commands it runs
@@ -659,7 +658,7 @@ impl Engine for Docker {
                     let seen = text.contains(line);
 
                     if seen {
-                        run::timing(file, job, phase, spawned);
+                        clock::timing(file, job, phase, spawned);
                     }
 
                     !seen
@@ -670,7 +669,7 @@ impl Engine for Docker {
             let ended = super::has_exited(child.id());
 
             if matches!(ended, Ok(true)) {
-                run::timing(file, job, "act total", spawned);
+                clock::timing(file, job, "act total", spawned);
 
                 // act ended by itself and removed its containers, so the reaper has nothing to do
                 if let Some(stdin) = reaper.as_mut().and_then(|r| r.stdin.as_mut()) {
@@ -708,7 +707,7 @@ impl Engine for Docker {
 
         let at = Instant::now();
         hand_back(run_dir);
-        run::timing(file, job, "hand_back", at);
+        clock::timing(file, job, "hand_back", at);
         let log = fs::read(log_path).map_err(|e| e.to_string())?;
         let log = String::from_utf8_lossy(&log);
 
@@ -898,7 +897,7 @@ fn chown_tree(dir: &Path, owner: Option<String>) {
         return;
     };
 
-    gc::stamp(&run::home(), "images", BUSYBOX);
+    gc::stamp(&paths::home(), "images", BUSYBOX);
     let _ = Command::new("docker")
         .args(["run", "--rm", "--network", "none", "-v"])
         .arg(format!("{}:/w", dir.display()))
@@ -919,7 +918,7 @@ pub fn engine_resources() -> Option<(u32, u64)> {
 
 /// Where act keeps the actions it fetched, per job below this, for one repository or every one
 fn actions_dir(repo_id: Option<&str>) -> PathBuf {
-    let dir = run::home().join("actions");
+    let dir = paths::home().join("actions");
     repo_id.map_or(dir.clone(), |id| dir.join(id))
 }
 
@@ -961,7 +960,7 @@ pub(super) fn cached_actions_resolve(dir: &Path) -> bool {
 
 /// Where older versions kept act's `actions/cache` entries, which `shipcheck clean` still removes
 fn cache_dir(repo_id: Option<&str>) -> PathBuf {
-    let dir = run::home().join("actcache");
+    let dir = paths::home().join("actcache");
     repo_id.map_or(dir.clone(), |id| dir.join(id))
 }
 
@@ -1675,7 +1674,7 @@ fn isolate(
     *jobs = Hash::from_iter([(key(job), this)]);
     // act would name an unnamed workflow after the path it runs, which is outside the checkout
     root.entry(key("name"))
-        .or_insert_with(|| key(&format!("{}/{file}", run::WORKFLOWS)));
+        .or_insert_with(|| key(&format!("{}/{file}", workflow::WORKFLOWS)));
     workflow::emit(root)
 }
 
@@ -2199,7 +2198,7 @@ fn volume_prefix(repo_id: &str) -> String {
 /// The start of every volume name under this `SHIPCHECK_HOME`, so `clean --all` of one home leaves
 /// the volumes of another, such as a test's, alone
 pub fn home_prefix() -> String {
-    prefix_of(&run::home())
+    prefix_of(&paths::home())
 }
 
 pub fn prefix_of(home: &Path) -> String {
@@ -2209,7 +2208,7 @@ pub fn prefix_of(home: &Path) -> String {
 
 /// The home, its prefix and the host name, which `here` borrows
 pub fn here_parts() -> (PathBuf, String, String) {
-    let home = run::home();
+    let home = paths::home();
     let prefix = prefix_of(&home);
     (home, prefix, gc::hostname())
 }
@@ -2219,7 +2218,7 @@ pub fn here<'a>(home: &'a Path, prefix: &'a str, host: &'a str) -> gc::Here<'a> 
         home,
         prefix,
         host,
-        sweep: !run::home_overridden(),
+        sweep: !paths::home_overridden(),
     }
 }
 

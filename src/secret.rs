@@ -1,4 +1,4 @@
-use crate::run;
+use crate::paths;
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -58,8 +58,8 @@ fn accounts(path: &Path, default: Option<&Path>, legacy: &Path) -> (String, Opti
 }
 
 fn accounts_for(path: &Path) -> (String, Option<String>) {
-    let default = (!run::home_overridden()).then(run::default_home);
-    accounts(path, default.as_deref(), &run::legacy_home())
+    let default = (!paths::home_overridden()).then(paths::default_home);
+    accounts(path, default.as_deref(), &paths::legacy_home())
 }
 
 /// The item at `account`, else the one at `legacy`, which moves to `account` on this read

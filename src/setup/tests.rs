@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use super::*;
 use crate::config::{Network, RepoConfig, RunnerKind};
+use crate::run;
 use crate::runner::host;
 
 #[test]

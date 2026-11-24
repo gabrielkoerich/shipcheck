@@ -2,6 +2,7 @@
 
 mod common;
 
+use shipcheck::paths;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::Path;
@@ -63,7 +64,7 @@ fn run_branch(work: &Path, name: &str, files: &[(&str, &str)]) -> (run::Plan, ru
     let _ = writeln!(
         io::stderr(),
         "{}",
-        fs::read_to_string(run::log_dir(&plan.key).join("ci.yml.log")).unwrap_or_default()
+        fs::read_to_string(paths::log_dir(&plan.key).join("ci.yml.log")).unwrap_or_default()
     );
     (plan, entry)
 }

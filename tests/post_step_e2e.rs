@@ -2,6 +2,7 @@
 
 mod common;
 
+use shipcheck::paths;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -87,7 +88,7 @@ fn an_actions_post_step_runs_with_a_home_written_with_dots() {
         let plan = run::plan(&work, "HEAD", "origin/main").unwrap();
         let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
         let log =
-            fs::read_to_string(run::log_dir(&plan.key).join("ci.yml/go.log")).unwrap_or_default();
+            fs::read_to_string(paths::log_dir(&plan.key).join("ci.yml/go.log")).unwrap_or_default();
         assert!(entry.passed, "run {n}: {entry:?}\n{log}");
         assert!(
             log.contains("Success - Post actions/setup-go"),

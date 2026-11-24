@@ -1,5 +1,6 @@
 //! A process a host check leaves behind cannot change the next run
 
+use shipcheck::paths;
 use shipcheck::runner::host;
 use std::fs;
 use std::path::Path;
@@ -78,7 +79,7 @@ fn a_process_a_check_leaves_cannot_change_the_next_run() {
     git(&work, &["commit", "-q", "-m", "fails"]);
     let plan = run::plan(&work, "feature", "origin/main").unwrap();
     let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
-    let log = fs::read_to_string(run::log_dir(&plan.key).join("host.log")).unwrap_or_default();
+    let log = fs::read_to_string(paths::log_dir(&plan.key).join("host.log")).unwrap_or_default();
     assert!(
         !entry.passed,
         "the first run's leftover passed this tree\n{log}"

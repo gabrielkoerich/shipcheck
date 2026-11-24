@@ -4,6 +4,8 @@ use crate::background;
 use crate::check;
 use crate::config::Engine;
 use crate::config::Team;
+use crate::git;
+use crate::paths;
 use crate::run;
 use crate::secret;
 use crate::service;
@@ -115,7 +117,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             }),
     ));
 
-    let home = run::home();
+    let home = paths::home();
 
     let (_, prefix, host) = runner::act::here_parts();
     let here = runner::act::here(&home, &prefix, &host);
@@ -160,7 +162,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     });
 
     let mut secrets = vec![home.join("token"), home.join("app.pem")];
-    secrets.extend(run::repo_id(cwd).ok().map(|id| run::secrets_file(&id)));
+    secrets.extend(git::repo_id(cwd).ok().map(|id| paths::secrets_file(&id)));
     let secrets: Vec<_> = secrets.into_iter().filter(|p| secret::exists(p)).collect();
 
     if !secrets.is_empty() {
@@ -439,7 +441,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 
     // The post itself refuses a repository the App cannot reach, so ask GitHub here, before a push
     if service::can_post()
-        && let Ok(repo) = run::repo_id(Path::new(&top))
+        && let Ok(repo) = git::repo_id(Path::new(&top))
     {
         let answer = Sender::new(&repo).and_then(|s| s.open_prs().map(|_| ()));
         found.push(check("app", app_line(&repo, answer)));
@@ -456,16 +458,16 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         },
     });
 
-    let legacy = run::legacy_home();
+    let legacy = paths::legacy_home();
 
-    if cfg!(target_os = "macos") && legacy.is_dir() && legacy != run::home() {
+    if cfg!(target_os = "macos") && legacy.is_dir() && legacy != paths::home() {
         found.push(Check {
             name: "old home",
             ok: false,
             detail: format!(
                 "{} is still there next to {}, so shipcheck did not move it. Move what you need from it, then trash it",
                 legacy.display(),
-                run::home().display()
+                paths::home().display()
             ),
         });
     }
@@ -477,18 +479,18 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             detail: format!(
                 "the LaunchAgent logs to {}, run `shipcheck install` to point it at {}",
                 legacy.display(),
-                run::home().display()
+                paths::home().display()
             ),
         });
     }
 
-    if run::home_overridden() {
+    if paths::home_overridden() {
         found.push(Check {
             name: "home",
             ok: true,
             detail: format!(
                 "SHIPCHECK_HOME moves results to {}. `post` and the daemon refuse it without --home-ok",
-                run::home().display()
+                paths::home().display()
             ),
         });
     }

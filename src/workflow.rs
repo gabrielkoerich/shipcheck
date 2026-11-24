@@ -1403,6 +1403,32 @@ pub fn read_marks(log: &str, nonce: &str) -> BTreeMap<String, JobMarks> {
     marks
 }
 
+pub(crate) const WORKFLOWS: &str = ".github/workflows";
+
+pub(crate) fn false_on_every_pr(cond: &str) -> bool {
+    let c = cond.trim();
+    let c = c
+        .strip_prefix("${{")
+        .and_then(|c| c.strip_suffix("}}"))
+        .unwrap_or(c)
+        .trim();
+
+    if c == "false" {
+        return true;
+    }
+
+    !c.contains("||")
+        && !c.replace("!=", "").contains('!')
+        && [
+            "github.event_name == 'push'",
+            "github.ref == ",
+            "github.ref_name == ",
+            "startsWith(github.ref, 'refs/tags/",
+        ]
+        .iter()
+        .any(|p| c.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

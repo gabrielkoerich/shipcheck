@@ -2,6 +2,7 @@
 
 mod common;
 
+use shipcheck::paths;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -83,7 +84,7 @@ fn every_retry_sees_its_own_checkout() {
         let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
         assert!(!entry.passed);
         assert_eq!(entry.workflows[0].attempts, 3);
-        let dir = run::log_dir(&plan.key).join("ci.yml");
+        let dir = paths::log_dir(&plan.key).join("ci.yml");
 
         for name in ["test.attempt-1.log", "test.attempt-2.log", "test.log"] {
             let log = fs::read_to_string(dir.join(name)).unwrap();

@@ -1,12 +1,14 @@
-use crate::daemon;
+use crate::base;
+use crate::git;
+use crate::git::main_checkout;
+use crate::paths;
 use crate::runner::host;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::RepoConfig;
-use crate::daemon::DaemonConfig;
-use crate::run;
+use crate::daemon_config::DaemonConfig;
 
 const LABEL: &str = "run.shipcheck.daemon";
 const UNIT: &str = "shipcheck.service";
@@ -101,23 +103,10 @@ fn write(file: &Path, text: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The checkout the daemon fetches into: the main one, not a worktree that may go away
-pub(crate) fn main_checkout(root: &Path) -> PathBuf {
-    Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
-        .filter(|dir| dir.file_name().is_some_and(|n| n == ".git"))
-        .and_then(|dir| dir.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| root.to_path_buf())
-}
-
 /// Whether `shipcheck.toml` on the base branch leaves the daemon on, which it does when there is none yet
 fn wanted_on_main(root: &Path) -> bool {
     // Offline there is no base to read, and `register` then says why nothing was installed
-    let Some(base) = daemon::known_base(root) else {
+    let Some(base) = base::known_base(root) else {
         return true;
     };
 
@@ -126,7 +115,7 @@ fn wanted_on_main(root: &Path) -> bool {
 
 /// Whether the base branch has a `shipcheck.toml` that leaves the daemon on, so the daemon has work here
 pub(crate) fn daemon_on_main(root: &Path) -> bool {
-    daemon::known_base(root)
+    base::known_base(root)
         .and_then(|base| main_config(root, &base))
         .is_some_and(|c| c.daemon)
 }
@@ -151,10 +140,10 @@ pub fn install(root: &Path) -> String {
 
 /// Adds the checkout to the daemon at the base the remote names. Offline it stores no guess
 fn register(file: &Path, checkout: &Path) -> Result<bool, String> {
-    let base = run::remote_base(checkout).ok_or(
+    let base = base::remote_base(checkout).ok_or(
         "could not ask origin for its default branch, run `shipcheck install` again when online",
     )?;
-    DaemonConfig::add_to(file, &run::repo_id(checkout)?, checkout, &base)
+    DaemonConfig::add_to(file, &git::repo_id(checkout)?, checkout, &base)
 }
 
 fn try_install(root: &Path) -> Result<String, String> {
@@ -162,7 +151,7 @@ fn try_install(root: &Path) -> Result<String, String> {
         return Ok("daemon not installed, SHIPCHECK_NO_DAEMON=1".into());
     }
 
-    if !owns_service(run::which_home()) {
+    if !owns_service(paths::which_home()) {
         return Ok("daemon not installed, SHIPCHECK_HOME is not the default".into());
     }
 
@@ -177,8 +166,8 @@ fn try_install(root: &Path) -> Result<String, String> {
     let file = service_file();
 
     if cfg!(target_os = "macos") {
-        let log = run::home().join("logs/daemon.log");
-        fs::create_dir_all(run::home().join("logs")).map_err(|e| e.to_string())?;
+        let log = paths::home().join("logs/daemon.log");
+        fs::create_dir_all(paths::home().join("logs")).map_err(|e| e.to_string())?;
         let changed = write(&file, &plist(&exe, &path, &log))?;
         // SAFETY: getuid cannot fail and touches no memory
         let uid = unsafe { libc::getuid() };
@@ -210,19 +199,19 @@ fn try_install(root: &Path) -> Result<String, String> {
 
 /// Whether the `LaunchAgent` still logs into the home from before it left `~/Library`
 pub fn logs_to_legacy_home() -> bool {
-    let old = xml(&run::legacy_home().to_string_lossy());
+    let old = xml(&paths::legacy_home().to_string_lossy());
     fs::read_to_string(service_file()).is_ok_and(|t| t.contains(&old))
 }
 
 /// The one service belongs to the default home, so a moved `SHIPCHECK_HOME`, such as a test's,
 /// never installs or removes it
-fn owns_service(home: run::Home) -> bool {
-    home == run::Home::Default
+fn owns_service(home: paths::Home) -> bool {
+    home == paths::Home::Default
 }
 
 /// Stops the service and removes its file
 pub fn uninstall() -> Result<String, String> {
-    if !owns_service(run::which_home()) {
+    if !owns_service(paths::which_home()) {
         return Ok("daemon service left alone, SHIPCHECK_HOME is not the default".into());
     }
 
@@ -316,9 +305,9 @@ mod tests {
 
     #[test]
     fn only_the_default_home_installs_or_removes_the_service() {
-        assert!(owns_service(run::Home::Default));
+        assert!(owns_service(paths::Home::Default));
         assert!(
-            !owns_service(run::Home::Moved),
+            !owns_service(paths::Home::Moved),
             "a test's SHIPCHECK_HOME once ran `clean --all` and removed the developer's daemon"
         );
     }

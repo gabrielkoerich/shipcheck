@@ -1,5 +1,6 @@
 //! Host checks in the jail, on a clone of the tree, without the host's token
 
+use shipcheck::paths;
 use shipcheck::runner::host;
 use std::fmt::Write as _;
 use std::fs;
@@ -106,7 +107,7 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     } else {
         Clones::Plain
     };
-    let real_home = run::user_dir().join(format!(".shipcheck-canary-{}", std::process::id()));
+    let real_home = paths::user_dir().join(format!(".shipcheck-canary-{}", std::process::id()));
     let _canary = RemoveOnDrop(real_home.clone());
     let outside = tmp.path().join("outside");
     fs::write(
@@ -131,7 +132,7 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     let plan = run::plan(&work, "feature", "origin/main").unwrap();
     assert!(run::cached(&plan.key).is_none());
     let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
-    let log = || fs::read_to_string(run::log_dir(&plan.key).join("host.log")).unwrap_or_default();
+    let log = || fs::read_to_string(paths::log_dir(&plan.key).join("host.log")).unwrap_or_default();
     assert!(entry.passed, "{entry:?}\n{}", log());
     assert_eq!(entry.workflows.len(), 1);
     assert_eq!(entry.workflows[0].file, "host");

@@ -2,6 +2,7 @@
 
 mod common;
 
+use shipcheck::paths;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -168,7 +169,7 @@ fn a_step_act_skips_fails_the_job_when_a_pr_may_run_it() {
         !run::cached(&plan.key).is_some_and(|e| e.passed),
         "a skip GitHub would run must never be stored as a pass"
     );
-    let log = fs::read_to_string(run::log_dir(&plan.key).join("pr.yml/test.log")).unwrap();
+    let log = fs::read_to_string(paths::log_dir(&plan.key).join("pr.yml/test.log")).unwrap();
     assert!(
         log.contains("act skipped the step 'tests' by its if:"),
         "{log}"

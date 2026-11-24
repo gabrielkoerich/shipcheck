@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 #[cfg(not(test))]
-use crate::run;
+use crate::paths;
 use crate::workflow::Job;
 
 /// A Ruby a version manager installed
@@ -18,7 +18,7 @@ pub struct Ruby {
 /// The Rubies mise, rbenv, asdf and chruby installed, in the directories a check's jail can read
 #[cfg(not(test))]
 pub fn installed() -> Vec<Ruby> {
-    let user = run::user_dir();
+    let user = paths::user_dir();
     let var = |name: &str, default: &str| {
         std::env::var_os(name).map_or_else(|| user.join(default), PathBuf::from)
     };

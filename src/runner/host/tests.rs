@@ -1,5 +1,5 @@
 use super::*;
-use crate::run;
+use crate::paths;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 
@@ -512,7 +512,7 @@ fn the_profile_lets_a_check_write_only_in_its_jail() {
         "(allow file-write* {paths} (literal \"/dev/null\")"
     )));
     assert!(!profile.contains("/dev/tty\""));
-    let user = resolved(run::user_dir());
+    let user = resolved(paths::user_dir());
     let denied = profile
         .lines()
         .find(|l| l.starts_with("(deny file-read-data"))
@@ -592,7 +592,7 @@ fn bwrap_hides_the_hosts_sockets_and_home_and_binds_the_jail() {
         }
     }
 
-    let user = resolved(run::user_dir());
+    let user = resolved(paths::user_dir());
     assert!(all.contains(&format!("--tmpfs {}", user.display())));
     assert!(!all.contains("--share-net") && !all.contains("--unshare-net"));
 
@@ -786,15 +786,15 @@ fn a_check_writes_only_in_its_jail() {
     let connected = run(&probe);
     assert_ne!(connected.0, Some(0), "{}", connected.1);
     // The user's home is unreadable but for toolchains, and unwritable
-    let secret = tempfile::NamedTempFile::new_in(run::user_dir()).unwrap();
+    let secret = tempfile::NamedTempFile::new_in(paths::user_dir()).unwrap();
     let read = run(&format!("cat '{}'", secret.path().display()));
     assert_ne!(read.0, Some(0), "{}", read.1);
-    let planted = run::user_dir().join(format!(".shipcheck-test-{}", std::process::id()));
+    let planted = paths::user_dir().join(format!(".shipcheck-test-{}", std::process::id()));
     assert_ne!(run(&format!("touch '{}'", planted.display())).0, Some(0));
     assert!(!planted.exists());
 
     // Credentials, also beside a readable toolchain dir, whether or not this machine has them
-    let user = run::user_dir();
+    let user = paths::user_dir();
     let cargo = user.join(".cargo");
     let beside = cargo
         .exists()

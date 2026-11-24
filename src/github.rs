@@ -1,4 +1,4 @@
-use crate::run;
+use crate::paths;
 use crate::secret;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -41,7 +41,7 @@ impl App {
         {
             std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?
         } else {
-            let path = run::home().join("app.pem");
+            let path = paths::home().join("app.pem");
             secret::read(&path)?
                 .ok_or_else(|| format!("no App key: put it at {}", path.display()))?
         };

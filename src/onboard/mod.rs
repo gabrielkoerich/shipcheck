@@ -1,7 +1,8 @@
 use crate::agents;
+use crate::base;
 use crate::check;
 use crate::config;
-use crate::daemon;
+use crate::git;
 use crate::run;
 use crate::run::Trial;
 use crate::runner;
@@ -9,7 +10,6 @@ use crate::runner;
 use crate::runner::Runner;
 use crate::runner::host;
 use crate::setup;
-use crate::tabs;
 use crate::workflow;
 use crate::workflow::Job;
 use cliclack::log;
@@ -1015,9 +1015,6 @@ pub fn plain(
     Ok(true)
 }
 
-/// Set in init's preview process, whose trials then leave the repository's worktree entries alone
-pub const PREVIEW: &str = "SHIPCHECK_INIT_PREVIEW";
-
 /// The child's pid while `preview_apart` waits on it, for the signal handler
 static PREVIEW_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -1052,7 +1049,7 @@ pub fn preview_apart(root: &Path) -> Result<u8, String> {
         .arg("init")
         .current_dir(root)
         .env("SHIPCHECK_HOME", scratch.path())
-        .env(PREVIEW, "1")
+        .env(run::PREVIEW, "1")
         .stdin(std::process::Stdio::null())
         .process_group(0)
         .spawn()
@@ -1324,7 +1321,7 @@ fn wizard(
 
 /// The base the daemon, the hooks and `shipcheck run` use, as a branch name. Offline it refuses to guess
 fn base_branch(root: &Path) -> Result<String, String> {
-    let base = daemon::known_base(root).ok_or(
+    let base = base::known_base(root).ok_or(
         "origin did not say its default branch, so init cannot tell which branch to gate. Run `shipcheck init` again when online",
     )?;
     Ok(base.strip_prefix("origin/").unwrap_or(&base).to_string())
@@ -1868,7 +1865,7 @@ pub fn ruleset(app_id: &str, names: &[String], github: &[String]) -> serde_json:
 
 /// The repository's page for a new ruleset, else the docs that describe it
 fn rules_url(root: &Path) -> String {
-    run::repo_id(root).map_or_else(
+    git::repo_id(root).map_or_else(
         |_| PROTECTION_DOCS.to_string(),
         |id| format!("https://github.com/{id}/settings/rules/new?target=branch"),
     )
@@ -1925,6 +1922,8 @@ fn create_ruleset(root: &Path, rule: &Ruleset) -> Result<(), String> {
         )),
     }
 }
+
+pub mod tabs;
 
 #[cfg(test)]
 mod tests;

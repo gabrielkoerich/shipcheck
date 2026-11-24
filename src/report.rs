@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::check;
 use crate::config::RunnerKind;
-use crate::run::{Entry, printable};
+use crate::run::Entry;
 use crate::runner::host::{HOST, runner_of};
 use crate::runner::shard::ShardRun;
+use crate::ui::printable;
 
 pub const MAX_TESTS: usize = 30;
 const TAIL_LINES: usize = 60;
@@ -486,7 +486,7 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
         };
 
         if wf.passed {
-            let _ = writeln!(s, "{}: passed, {attempts}", check::name(&wf.file));
+            let _ = writeln!(s, "{}: passed, {attempts}", name(&wf.file));
 
             // A pass after a failed attempt hides a test that fails at random, so it is named
             for job in wf
@@ -522,7 +522,7 @@ pub fn text(entry: &Entry, tested: &str, workflows: &[WorkflowReport]) -> String
             continue;
         }
 
-        let _ = writeln!(s, "{}: failed, {exit}, {attempts}", check::name(&wf.file));
+        let _ = writeln!(s, "{}: failed, {exit}, {attempts}", name(&wf.file));
 
         for job in &wf.jobs {
             let shards = match &job.shards {
@@ -630,6 +630,11 @@ pub fn json(
         "ci_changes": entry.ci_changes,
         "workflows": workflows,
     })
+}
+
+/// How a result's file shows: a workflow file, or the host checks
+pub fn name(file: &str) -> &str {
+    if file == HOST { "host checks" } else { file }
 }
 
 #[cfg(test)]

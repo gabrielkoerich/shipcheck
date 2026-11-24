@@ -1,8 +1,15 @@
-use crate::check::Jobs;
+use crate::base::remote_base_sha;
+use crate::clock::timing;
+use crate::clock::unix_now;
 use crate::config::Check;
-use crate::daemon;
-use crate::onboard;
-use crate::record;
+use crate::git::repo_id;
+use crate::git::{git, git_raw};
+use crate::history;
+use crate::paths::git_lock_in;
+use crate::paths::home;
+use crate::paths::log_dir;
+use crate::paths::partial_log_dir;
+use crate::paths::secrets_file;
 use crate::runner::act;
 use crate::runner::act::Act;
 use crate::runner::host;
@@ -10,14 +17,14 @@ use crate::runner::host::Host;
 use crate::secret;
 use crate::templates;
 use crate::trust;
+use crate::ui::printable;
+use crate::workflow::{WORKFLOWS, false_on_every_pr};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read;
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,16 +35,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{self, KeyInputs};
+use crate::clock::clock;
 use crate::config::{self, RepoConfig, RunnerKind};
 use crate::queue;
-use crate::record::clock;
 use crate::runner::host::{self as host_runner, HOST, runner_of};
 use crate::runner::shard::{self, Rejected, ShardRun};
 use crate::runner::{RunRequest, Runner, Runners};
 use crate::workflow;
 
-pub(crate) const WORKFLOWS: &str = ".github/workflows";
 const CONFIG: &str = "shipcheck.toml";
+
+/// Job ids per file a run reports: the `[host]` checks under [`HOST`], or each required workflow's jobs
+pub type Jobs = BTreeMap<String, BTreeSet<String>>;
+
+/// Set in init's preview process, whose trials then leave the repository's worktree entries alone
+pub const PREVIEW: &str = "SHIPCHECK_INIT_PREVIEW";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Entry {
@@ -128,13 +140,6 @@ pub fn exit_code(entry: &Entry) -> u8 {
 /// A job whose need did not pass
 const NOT_RUN: &str = "not run, a job it needs did not pass";
 
-pub fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Everything about one commit that the cache key and a run need, read from git
 #[derive(Debug)]
 pub struct Plan {
@@ -156,109 +161,6 @@ pub struct Plan {
     pub inputs: String,
 }
 
-/// Config every git process shipcheck starts gets, since git checks out a branch's tree on the host
-/// with the user's global config. LFS read `.lfsconfig` from the tree and has written through its
-/// symlinks, and submodules ran hooks (CVE-2025-48384). Hooks themselves come from the user's own
-/// `.git`, never from the tree, and `shipcheck install` reads `core.hooksPath`, so it stays
-const SAFE_GIT: [(&str, &str); 6] = [
-    ("filter.lfs.process", ""),
-    ("filter.lfs.smudge", ""),
-    ("filter.lfs.clean", ""),
-    ("filter.lfs.required", "false"),
-    ("submodule.recurse", "false"),
-    ("core.fsmonitor", "false"),
-];
-
-/// The `GIT_CONFIG_*` variables for `SAFE_GIT`, after the `existing` entries the user already set
-pub fn safe_git_env(existing: usize) -> Vec<(String, String)> {
-    let mut vars = vec![(
-        "GIT_CONFIG_COUNT".to_string(),
-        (existing + SAFE_GIT.len()).to_string(),
-    )];
-
-    for (i, (key, value)) in SAFE_GIT.iter().enumerate() {
-        vars.push((format!("GIT_CONFIG_KEY_{}", existing + i), key.to_string()));
-        vars.push((
-            format!("GIT_CONFIG_VALUE_{}", existing + i),
-            value.to_string(),
-        ));
-    }
-
-    vars
-}
-
-pub fn home() -> PathBuf {
-    // A relative path would name another folder from every clone and git command that changes directory
-    let absolute =
-        |dir: std::ffi::OsString| std::path::absolute(&dir).unwrap_or_else(|_| dir.into());
-
-    // An empty value is unset, as XDG says, not the current directory
-    let set = |name| std::env::var_os(name).filter(|v| !v.is_empty());
-
-    if let Some(dir) = set("SHIPCHECK_HOME") {
-        return absolute(dir);
-    }
-
-    if let Some(state) = set("XDG_STATE_HOME") {
-        return absolute(state).join("shipcheck");
-    }
-
-    env_home().join(".local/state/shipcheck")
-}
-
-fn env_home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-}
-
-/// Where the home was on macOS before it moved to `~/.local/state`
-pub fn legacy_home() -> PathBuf {
-    env_home().join("Library/Application Support/shipcheck")
-}
-
-#[derive(Debug, PartialEq)]
-enum Migration {
-    Nothing,
-    Moved,
-    Both,
-}
-
-/// Renames `old` to `new` when only `old` exists. A rename, since the home holds clones a copy
-/// would inflate
-fn move_home(old: &Path, new: &Path) -> Result<Migration, String> {
-    match (old.is_dir(), new.exists()) {
-        (false, _) => return Ok(Migration::Nothing),
-        (true, true) => return Ok(Migration::Both),
-        (true, false) => {}
-    }
-
-    if let Some(parent) = new.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-
-    fs::rename(old, new)
-        .and_then(|()| fs::set_permissions(new, fs::Permissions::from_mode(0o700)))
-        .map_err(|e| format!("moving {} to {}: {e}", old.display(), new.display()))?;
-    Ok(Migration::Moved)
-}
-
-/// Moves the macOS home out of `~/Library` on first use. Leaves both alone when both exist, which
-/// `shipcheck doctor` reports
-pub fn migrate_home() {
-    if !cfg!(target_os = "macos") || std::env::var_os("SHIPCHECK_HOME").is_some() {
-        return;
-    }
-
-    let (old, new) = (legacy_home(), home());
-
-    match move_home(&old, &new) {
-        Ok(Migration::Moved) => {
-            eprintln!("shipcheck: moved {} to {}", old.display(), new.display());
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("shipcheck: {e}"),
-    }
-}
-
 /// Clones, run slots and tool caches, which every run can rebuild and which hold hundreds of GB
 #[cfg(target_os = "macos")]
 const REBUILT: [&str; 3] = ["templates", "runs", "hostcache"];
@@ -268,7 +170,7 @@ const REBUILT: [&str; 3] = ["templates", "runs", "hostcache"];
  * trials remove their own and must leave the repository's other entries as they are
  **/
 fn prune_worktrees(repo: &Path) {
-    if std::env::var_os(onboard::PREVIEW).is_none() {
+    if std::env::var_os(PREVIEW).is_none() {
         let _ = git(repo, &["worktree", "prune"]);
     }
 }
@@ -318,106 +220,6 @@ fn excluded(dir: &Path) -> bool {
             0,
         ) > 0
     }
-}
-
-/// The home of a user who set nothing, from the passwd entry, since an agent can set any variable
-pub fn default_home() -> PathBuf {
-    user_dir().join(".local/state/shipcheck")
-}
-
-/// Whether the results live somewhere else than the default, where an agent may have written them
-pub fn home_overridden() -> bool {
-    home() != default_home()
-}
-
-/// Whether the results live in the default home or in one `SHIPCHECK_HOME` moved
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Home {
-    Default,
-    Moved,
-}
-
-/// [`home_overridden`] as a [`Home`]
-pub fn which_home() -> Home {
-    if home_overridden() {
-        Home::Moved
-    } else {
-        Home::Default
-    }
-}
-
-/// Whether a person's `--home-ok` lets a moved home post
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum MovedHome {
-    Allowed,
-    #[default]
-    Refused,
-}
-
-/// The user's home directory from the passwd entry, empty when there is none, so a check against
-/// it fails closed
-pub fn user_dir() -> PathBuf {
-    passwd().map_or_default(|(_, dir)| dir)
-}
-
-/// The user's login name from the passwd entry, empty when there is none
-pub fn user_name() -> String {
-    passwd().map_or_default(|(name, _)| name)
-}
-
-fn passwd() -> Option<(String, PathBuf)> {
-    let mut buf: Vec<libc::c_char> = vec![0; 16384];
-    // SAFETY: passwd is plain C data, for which all zeroes is a valid value
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut found = std::ptr::null_mut();
-    // SAFETY: getuid cannot fail and touches no memory
-    let uid = unsafe { libc::getuid() };
-    // SAFETY: getpwuid_r writes only into pwd and buf, and its strings point into buf on success
-    let rc = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &raw mut pwd,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut found,
-        )
-    };
-
-    if rc != 0 || found.is_null() || pwd.pw_dir.is_null() || pwd.pw_name.is_null() {
-        return None;
-    }
-
-    // SAFETY: on success pw_name is a NUL-terminated string in buf, which outlives this borrow
-    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
-    // SAFETY: as pw_name
-    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-    let dir = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
-    Some((name.to_string_lossy().into_owned(), dir))
-}
-
-fn git_raw(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-
-    if !out.status.success() {
-        return Err(format!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-
-    Ok(out.stdout)
-}
-
-fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    Ok(String::from_utf8_lossy(&git_raw(repo, args)?)
-        .trim()
-        .to_string())
 }
 
 /// Reads the commit, and the config and workflows from `base`, never from the commit or the working copy
@@ -727,71 +529,6 @@ pub fn record_tested(repo: &Path, tested: &Tested) -> Result<(), String> {
  * per process for each checkout and origin URL. Never the local origin/HEAD, which anyone with the
  * clone can repoint at a branch whose shipcheck.toml and workflows would then run
  **/
-pub fn remote_base(repo: &Path) -> Option<String> {
-    remote_head(repo).map(|(branch, _)| format!("origin/{branch}"))
-}
-
-/// The commit the remote's default branch is at, which no local ref can move
-pub fn remote_base_sha(repo: &Path) -> Option<String> {
-    remote_head(repo).map(|(_, sha)| sha)
-}
-
-/// The remote's default branch and its commit, asked once per process for each checkout and URL
-fn remote_head(repo: &Path) -> Option<(String, String)> {
-    type Asked = BTreeMap<(PathBuf, String), Option<(String, String)>>;
-    static ASKED: Mutex<Asked> = Mutex::new(BTreeMap::new());
-    let url = git(repo, &["remote", "get-url", "origin"]).unwrap_or_default();
-    let mut asked = ASKED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    asked
-        .entry((repo.to_path_buf(), url))
-        .or_insert_with(|| remote_default(repo))
-        .clone()
-}
-
-/// `git ls-remote --symref origin HEAD`'s branch and commit, None when the remote does not answer in 5s
-fn remote_default(repo: &Path) -> Option<(String, String)> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(daemon::fetch_options())
-        .args(["ls-remote", "--symref", "origin", "HEAD"])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().ok()? {
-            break status;
-        }
-
-        if started.elapsed() > Duration::from_secs(5) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    status.success().then_some(())?;
-    let branch = out.lines().find_map(|l| {
-        let (branch, name) = l.strip_prefix("ref: refs/heads/")?.split_once('\t')?;
-        (name == "HEAD" && !branch.is_empty()).then(|| branch.to_string())
-    })?;
-    let sha = out.lines().find_map(|l| {
-        let (sha, name) = l.split_once('\t')?;
-        (name == "HEAD" && sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| sha.to_string())
-    })?;
-    Some((branch, sha))
-}
-
 /**
  * The default branch, `base` without `origin/`, when `commit` (no `sha`) runs with HEAD on it, or
  * when `post` names its tip, locally or on `base`. Both refuse there, PRs carry the checks
@@ -1158,32 +895,6 @@ fn file_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-pub fn repo_id(repo: &Path) -> Result<String, String> {
-    let url = git(repo, &["remote", "get-url", "origin"])?;
-
-    if url.starts_with('.') {
-        let abs = repo
-            .join(&url)
-            .canonicalize()
-            .map_err(|e| format!("origin {url}: {e}"))?;
-        return parse_repo_id(&abs.to_string_lossy());
-    }
-
-    parse_repo_id(&url)
-}
-
-/// `owner/repo` from an origin URL, for ssh, https and local path remotes alike
-fn parse_repo_id(url: &str) -> Result<String, String> {
-    let url = url.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts = url
-        .rsplit(['/', ':'])
-        .filter(|p| !p.is_empty() && *p != "." && *p != "..");
-    match (parts.next(), parts.next()) {
-        (Some(name), Some(owner)) => Ok(format!("{owner}/{name}")),
-        _ => Err(format!("cannot read owner/repo from origin {url}")),
-    }
-}
-
 /// Whether a commit message asks the hooks to start no run, with GitHub's own markers
 pub fn message_skips(message: &str) -> bool {
     let lower = message.to_lowercase();
@@ -1223,7 +934,7 @@ pub fn last_run(
     tree: &str,
     has: impl Fn(&str) -> bool,
 ) -> Option<(String, String)> {
-    record::runs(home, repo, usize::MAX)
+    history::runs(home, repo, usize::MAX)
         .into_iter()
         .rev()
         .find(|r| r["tree"] == tree && r["key"].as_str().is_some_and(&has))
@@ -1394,25 +1105,6 @@ pub fn skipped(plan: &Plan) -> Option<Entry> {
         )),
         ci_changes: plan.ci_changes.clone(),
     })
-}
-
-pub fn log_dir(key: &str) -> PathBuf {
-    home().join("logs").join(key)
-}
-
-/// Job output with its control characters escaped, so it cannot drive the terminal it is printed to
-pub fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            '\n' | '\t' => c.to_string(),
-            c if c.is_control() => c.escape_debug().to_string(),
-            c => c.to_string(),
-        })
-        .collect()
-}
-
-pub fn secrets_file(repo_id: &str) -> PathBuf {
-    home().join("secrets").join(format!("{repo_id}.env"))
 }
 
 /// The values in a repository's secrets file, longest first, to redact from anything posted. Each
@@ -1898,10 +1590,6 @@ pub fn select_host(
         HOST.to_string(),
         jobs.iter().cloned().collect(),
     )]))
-}
-
-pub fn partial_log_dir(key: &str) -> PathBuf {
-    home().join("logs").join(format!("{key}.partial"))
 }
 
 type Selection<'a> = Option<(&'a [String], &'a [String])>;
@@ -2937,30 +2625,6 @@ fn skipped_on_every_pr(ifs: &BTreeMap<String, String>) -> BTreeSet<String> {
  * A condition that and-s a term false on every PR: a push event, one branch or a tag. An `||` or a
  * `!` other than `!=` could make it hold, so a condition with one never counts
  **/
-pub(crate) fn false_on_every_pr(cond: &str) -> bool {
-    let c = cond.trim();
-    let c = c
-        .strip_prefix("${{")
-        .and_then(|c| c.strip_suffix("}}"))
-        .unwrap_or(c)
-        .trim();
-
-    if c == "false" {
-        return true;
-    }
-
-    !c.contains("||")
-        && !c.replace("!=", "").contains('!')
-        && [
-            "github.event_name == 'push'",
-            "github.ref == ",
-            "github.ref_name == ",
-            "startsWith(github.ref, 'refs/tags/",
-        ]
-        .iter()
-        .any(|p| c.contains(p))
-}
-
 /// A workflow passes when every job passed, was skipped or is an allowed failure, and one passed
 /// or was skipped, as act said its `if:` skipped it, so GitHub counts it as passed
 fn workflow_passed(states: &BTreeMap<String, String>) -> bool {
@@ -3196,16 +2860,6 @@ fn try_job(
 
 /// Attempts a job gets when Docker, not the job, failed it before its first step
 const INFRA_RETRIES: u32 = 2;
-
-/// With `SHIPCHECK_TIMINGS` set, prints how long a phase of a job took, for measuring overhead
-pub(crate) fn timing(file: &str, job: &str, phase: &str, since: Instant) {
-    if std::env::var_os("SHIPCHECK_TIMINGS").is_some() {
-        eprintln!(
-            "timing {file}/{job} {phase} {:.3}",
-            since.elapsed().as_secs_f64()
-        );
-    }
-}
 
 /// How long after a job's containers end the next one at that path waits, measured on Docker Desktop 4.x
 const ENGINE_VIEW: Duration = Duration::from_secs(2);
@@ -3553,15 +3207,6 @@ fn write_run_files(ctx: &Ctx<'_>, dir: &Path, file: &str, workflow: &Path) -> Re
 /// another job adds its worktree deletes that worktree's half-made admin files
 fn git_lock(repo_id: &str) -> Result<fs::File, String> {
     git_lock_in(&home(), repo_id)
-}
-
-pub(crate) fn git_lock_in(home: &Path, repo_id: &str) -> Result<fs::File, String> {
-    let dir = home.join("locks").join("git");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let name = repo_id.replace('/', "%2F");
-    let lock = fs::File::create(dir.join(format!("{name}.lock"))).map_err(|e| e.to_string())?;
-    lock.lock().map_err(|e| e.to_string())?;
-    Ok(lock)
 }
 
 /// Deletes results untouched for 14 days and logs untouched for 90, so a busy machine does not fill

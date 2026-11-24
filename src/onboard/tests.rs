@@ -1,5 +1,5 @@
 use super::*;
-use crate::run;
+use crate::base;
 use crate::setup::tests;
 use crate::workflow;
 
@@ -631,7 +631,7 @@ fn init_gates_to_the_branch_runs_and_the_daemon_use() {
         ],
     );
     assert_eq!(
-        run::remote_base(dir.path()).as_deref(),
+        base::remote_base(dir.path()).as_deref(),
         Some("origin/master")
     );
     let plan = super::plan(dir.path(), App::NotPublic, &mut Said::default()).unwrap();
@@ -640,7 +640,7 @@ fn init_gates_to_the_branch_runs_and_the_daemon_use() {
 
     // A remote that does not answer gives no base, never the local origin/HEAD, and init refuses
     git(dir.path(), &["remote", "set-url", "origin", "/nonexistent"]);
-    assert_eq!(run::remote_base(dir.path()), None);
+    assert_eq!(base::remote_base(dir.path()), None);
     assert!(
         base_branch(dir.path())
             .unwrap_err()

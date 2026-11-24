@@ -1,4 +1,4 @@
-use crate::run;
+use crate::paths;
 use crate::secret;
 use crate::workflow;
 use std::collections::BTreeMap;
@@ -272,7 +272,7 @@ fn is_base(name: &str) -> bool {
 /// The base of this home for colima, lima and `SETUP` as they are now
 fn base_name() -> Option<String> {
     let identity = Colima.identity().ok()?;
-    let home = run::home();
+    let home = paths::home();
     let hash = cache::hex(&Sha256::digest(format!("{}\n{identity}", home.display())));
     Some(format!("sc-base-{}", &hash[..12]))
 }
@@ -288,7 +288,7 @@ fn base(cpus: u64, log: &fs::File) -> Option<String> {
     let lock = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(run::home().join("locks").join("colima-base.lock"))
+        .open(paths::home().join("locks").join("colima-base.lock"))
         .ok()?;
     lock.lock().ok()?;
     let listed = profiles();
@@ -328,7 +328,7 @@ fn base(cpus: u64, log: &fs::File) -> Option<String> {
 
 /// Where this home records each VM it starts until the VM is deleted
 fn records() -> std::path::PathBuf {
-    run::home().join("colima")
+    paths::home().join("colima")
 }
 
 /// The VMs this home started and has not seen deleted, which colima still lists
@@ -360,7 +360,7 @@ fn leftovers(keep: Option<&str>) -> Vec<String> {
     let lock = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(run::home().join("locks").join("colima.lock"));
+        .open(paths::home().join("locks").join("colima.lock"));
 
     let Ok(lock) = lock else {
         return Vec::new();
@@ -561,7 +561,7 @@ impl Engine for Colima {
             ));
         }
 
-        let home = run::home().join("locks");
+        let home = paths::home().join("locks");
         fs::create_dir_all(&home).map_err(|e| e.to_string())?;
         let open = |name: String| {
             fs::OpenOptions::new()
@@ -615,7 +615,7 @@ impl Engine for Colima {
         if act::cached_actions_resolve(&actions) {
             args.push("--action-offline-mode".into());
         }
-        let secrets = secret::read(&run::secrets_file(request.repo_id))?;
+        let secrets = secret::read(&paths::secrets_file(request.repo_id))?;
         let secrets_copy = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::write(secrets_copy.path(), secrets.unwrap_or_default()).map_err(|e| e.to_string())?;
         let status = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
@@ -763,7 +763,7 @@ impl Engine for Colima {
             .create(true)
             .append(true)
             .open(
-                run::home()
+                paths::home()
                     .join("locks")
                     .join(format!("colima-{name}.lock")),
             )

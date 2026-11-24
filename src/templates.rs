@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use crate::run::git_lock_in;
+use crate::paths::git_lock_in;
 
 /// A template no run used for this long goes, the next run of its job clones it again
 pub const KEEP: Duration = Duration::from_hours(168);

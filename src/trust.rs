@@ -1,12 +1,12 @@
 //! Repositories whose `sandbox = false` host checks this machine lets run outside the sandbox
 
-use crate::run;
+use crate::paths;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 fn file() -> PathBuf {
-    run::home().join("trusted")
+    paths::home().join("trusted")
 }
 
 /// The origin URL exactly as git has it, so a clone whose path ends in the same owner/name is not the same repository
@@ -58,7 +58,7 @@ fn others(origin: &str) -> Vec<String> {
 }
 
 fn save(list: &[String]) -> Result<(), String> {
-    fs::create_dir_all(run::home()).map_err(|e| e.to_string())?;
+    fs::create_dir_all(paths::home()).map_err(|e| e.to_string())?;
     let text = list.iter().fold(String::new(), |mut s, o| {
         let _ = writeln!(s, "{o}");
         s

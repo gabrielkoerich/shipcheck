@@ -1,5 +1,8 @@
-use crate::daemon;
+use crate::clock;
+use crate::daemon_config;
+use crate::git;
 use crate::github::Check;
+use crate::paths;
 use crate::run::JobDone;
 use crate::runner;
 use std::collections::BTreeMap;
@@ -16,7 +19,8 @@ use serde_json::Value;
 
 use crate::check::{self, Wait};
 use crate::github::Checks;
-use crate::run::{self, Entry, Home, MovedHome, Plan};
+use crate::paths::{Home, MovedHome};
+use crate::run::{self, Entry, Plan};
 use crate::service::Credentials;
 
 /// Seconds between posts while GitHub does not have the pushed commit yet, about two minutes in all
@@ -24,7 +28,7 @@ pub const WAITS: [u64; 7] = [2, 4, 8, 16, 30, 30, 30];
 
 /// The record of one branch's or PR's background runs, as lines of `<process group> <sha> [post]`
 pub fn record(repo_id: &str, name: &str) -> PathBuf {
-    run::home()
+    paths::home()
         .join("background")
         .join(repo_id)
         .join(format!("{}.pid", name.replace('/', "%2F")))
@@ -55,7 +59,7 @@ pub fn home_allows_post(home: Home, moved: MovedHome) -> bool {
 
 /// Appends a line to the log the background runs write to
 pub fn note(line: &str) {
-    let dir = run::home().join("logs");
+    let dir = paths::home().join("logs");
     let _ = fs::create_dir_all(&dir);
 
     if let Ok(mut log) = fs::OpenOptions::new()
@@ -106,7 +110,7 @@ pub fn unposted_line(repo: &str, e: &str) -> String {
 }
 
 fn unposted_file(repo: &str) -> PathBuf {
-    run::home().join("background").join(repo).join("unposted")
+    paths::home().join("background").join(repo).join("unposted")
 }
 
 /// Keeps `repo`'s last failed post until a post succeeds, `error` is None for a success
@@ -153,7 +157,7 @@ pub fn start(
         return;
     }
 
-    let Ok(repo) = run::repo_id(&plan.repo) else {
+    let Ok(repo) = git::repo_id(&plan.repo) else {
         return;
     };
     let path = record(&repo, name);
@@ -228,7 +232,7 @@ pub fn fetch_base(cwd: &Path, base: &str) -> bool {
     };
 
     Command::new("git")
-        .args(daemon::fetch_options())
+        .args(daemon_config::fetch_options())
         .args(["fetch", "-q", "origin", branch])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -246,7 +250,7 @@ pub enum Runs {
 /// Whether a background run of `sha` goes on this machine, under any branch or PR
 /// `Runs::Posting` counts only the runs that post their own checks
 pub fn running_here(repo_id: &str, sha: &str, runs: Runs) -> bool {
-    let dir = run::home().join("background").join(repo_id);
+    let dir = paths::home().join("background").join(repo_id);
 
     fs::read_dir(dir)
         .into_iter()
@@ -264,7 +268,7 @@ pub fn running_here(repo_id: &str, sha: &str, runs: Runs) -> bool {
 
 /// The processes this machine's records list for `sha`, under any branch or PR
 fn listed_runs(repo_id: &str, sha: &str) -> Vec<String> {
-    let dir = run::home().join("background").join(repo_id);
+    let dir = paths::home().join("background").join(repo_id);
 
     fs::read_dir(dir)
         .into_iter()
@@ -372,7 +376,7 @@ pub const BEAT: Duration = Duration::from_secs(30);
 
 /// Where run `pid` notes the last time it made progress
 pub fn beat_path(repo_id: &str, pid: u32) -> PathBuf {
-    run::home()
+    paths::home()
         .join("background")
         .join(repo_id)
         .join(format!("{pid}.beat"))
@@ -402,7 +406,7 @@ fn newest(dir: &Path) -> Option<SystemTime> {
  **/
 pub fn heartbeat(path: &Path, logs: &[PathBuf], done: &AtomicBool, every: Duration) {
     let beat = || {
-        let _ = fs::write(path, run::unix_now().to_string());
+        let _ = fs::write(path, clock::unix_now().to_string());
     };
     let changed = || logs.iter().filter_map(|d| newest(d)).max();
     let mut last = changed();
@@ -438,7 +442,7 @@ fn went_quiet(at: u64, now: u64, quiet: Duration) -> bool {
 /// Whether a run of `sha` that still goes here made no progress for `quiet`. A run without a note
 /// is older than heartbeats, or just started
 pub fn stuck_here(repo_id: &str, sha: &str, quiet: Duration) -> bool {
-    let now = run::unix_now();
+    let now = clock::unix_now();
 
     listed_runs(repo_id, sha)
         .iter()
@@ -458,7 +462,7 @@ fn spawn(
     trigger: &str,
     moved: MovedHome,
 ) -> Result<Child, String> {
-    let log_dir = run::home().join("logs");
+    let log_dir = paths::home().join("logs");
     fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     let log = fs::OpenOptions::new()
         .create(true)

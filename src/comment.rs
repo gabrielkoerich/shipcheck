@@ -1,8 +1,10 @@
-use crate::check::{self, Jobs};
+use crate::check;
 use crate::config::Logs;
 use crate::github;
 use crate::run::Entry;
+use crate::run::Jobs;
 use crate::service;
+use crate::service::Route;
 use std::fmt::Write as _;
 
 /// The first line of the App's PR comment, how a post finds it again
@@ -164,6 +166,23 @@ pub fn merge(
     }
 
     Some(body)
+}
+
+/// Writes the PR comment of `sha`'s PRs into `base`, or of `prs` with an App key, and returns
+/// each comment's page
+pub fn post(
+    route: Route<'_>,
+    repo: &str,
+    prs: Option<&[u64]>,
+    base: &str,
+    sha: &str,
+    entry: &Entry,
+    secrets: &[String],
+) -> Result<Vec<String>, String> {
+    match route {
+        Route::Service(token) => post_with_service(token, repo, base, sha, entry, secrets),
+        Route::Key(app) => post_with_app(app, repo, prs, base, sha, entry, secrets),
+    }
 }
 
 /// Writes the comment on `sha`'s PRs with the App's own key, `prs` already checked to be into the base and not a fork's

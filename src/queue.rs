@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::record::{Typical, clock};
+use crate::clock::clock;
+use crate::history::Typical;
 
 /// What a run says of itself in the machine's queue, in its ticket while it waits and beside its
 /// slot's lock while it runs

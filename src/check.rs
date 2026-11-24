@@ -1,6 +1,10 @@
+use crate::clock;
 use crate::config::{Logs, RunnerKind};
+use crate::git;
+use crate::paths;
 use crate::run;
 use crate::run::JobDone;
+use crate::run::Jobs;
 use crate::run::Plan;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,11 +42,6 @@ fn clip_to(text: String, max: usize) -> String {
     }
 
     format!("[...cut...]\n{}", &text[cut..])
-}
-
-/// How a result's file shows: a workflow file, or the host checks
-pub fn name(file: &str) -> &str {
-    if file == HOST { "host checks" } else { file }
 }
 
 pub fn summary(entry: &Entry) -> String {
@@ -91,7 +90,7 @@ pub fn summary(entry: &Entry) -> String {
         let _ = writeln!(
             s,
             "| {} | {} | {exit} | {} | {jobs} | `{}` |",
-            name(&wf.file),
+            report::name(&wf.file),
             if wf.passed { "passed" } else { "failed" },
             wf.attempts,
             &wf.log_sha256[..12.min(wf.log_sha256.len())]
@@ -108,7 +107,7 @@ pub fn failure_text(entry: &Entry, log_dir: &Path, secrets: &[String]) -> String
 
     for wf in entry.workflows.iter().filter(|w| !w.passed) {
         let tail = tail(&log_dir.join(format!("{}.log", wf.file)), secrets);
-        let _ = write!(s, "### {}\n\n```\n{tail}\n```\n\n", name(&wf.file));
+        let _ = write!(s, "### {}\n\n```\n{tail}\n```\n\n", report::name(&wf.file));
     }
 
     clip(s)
@@ -145,7 +144,7 @@ pub fn mask(mut text: String, secrets: &[String]) -> String {
         text = text.replace(secret.as_str(), "***");
     }
 
-    let mut homes: Vec<String> = [Some(run::user_dir()), env::var_os("HOME").map(Into::into)]
+    let mut homes: Vec<String> = [Some(paths::user_dir()), env::var_os("HOME").map(Into::into)]
         .into_iter()
         .flatten()
         .filter_map(|p: PathBuf| p.to_str().map(|s| s.trim_end_matches('/').to_string()))
@@ -162,7 +161,7 @@ pub fn mask(mut text: String, secrets: &[String]) -> String {
     }
 
     let names = [
-        Some(run::user_name()),
+        Some(paths::user_name()),
         env::var("USER").ok(),
         env::var("LOGNAME").ok(),
     ];
@@ -302,9 +301,6 @@ fn failed_text(path: &Path, kind: RunnerKind, secrets: &[String]) -> String {
     s
 }
 
-/// Job ids per file a run reports: the `[host]` checks under [`HOST`], or each required workflow's jobs
-pub type Jobs = BTreeMap<String, BTreeSet<String>>;
-
 /**
  * Each job's check name, as `(file, job, name)`: `shipcheck/<job>`, or `shipcheck/<stem>/<job>`
  * for a job id that more than one workflow has, the stem being the file name without `.yml` or
@@ -424,7 +420,7 @@ pub fn job_bodies(
             "conclusion": conclusion,
             "output": {
                 "title": state,
-                "summary": format!("`{job}` of {}: {state}, tree `{}`{}", self::name(&file), entry.tree, kept),
+                "summary": format!("`{job}` of {}: {state}, tree `{}`{}", report::name(&file), entry.tree, kept),
                 "text": clip(text),
             },
         });
@@ -459,8 +455,8 @@ pub enum Tails {
 /// Every job check and then `shipcheck`, so a failed post leaves `shipcheck` open. Log tails go in
 /// only when `Shown` and the repository's secrets can be read, so none goes out unmasked
 pub fn final_bodies(plan: &Plan, entry: &Entry, tails: Tails) -> Vec<Value> {
-    let dir = run::log_dir(&plan.key);
-    let secrets = run::repo_id(&plan.repo).and_then(|id| run::secret_values(&id));
+    let dir = paths::log_dir(&plan.key);
+    let secrets = git::repo_id(&plan.repo).and_then(|id| run::secret_values(&id));
     let logs = match &secrets {
         Ok(secrets) if tails == Tails::Shown => Some((dir.as_path(), secrets.as_slice())),
         _ => None,
@@ -477,8 +473,8 @@ pub fn final_bodies(plan: &Plan, entry: &Entry, tails: Tails) -> Vec<Value> {
  * result of that job alone. The final post replaces it, so a run that fails closed still fails it
  **/
 pub fn job_body(plan: &Plan, done: &JobDone) -> Option<Value> {
-    let dir = run::log_dir(&plan.key);
-    let secrets = run::repo_id(&plan.repo).and_then(|id| run::secret_values(&id));
+    let dir = paths::log_dir(&plan.key);
+    let secrets = git::repo_id(&plan.repo).and_then(|id| run::secret_values(&id));
     let logs = secrets.as_ref().ok().map(|s| (dir.as_path(), s.as_slice()));
     let jobs = Jobs::from([(done.file.clone(), BTreeSet::from([done.job.clone()]))]);
     let entry = Entry {
@@ -531,7 +527,7 @@ pub fn waiting(name: &str, sha: &str, wait: Wait) -> Value {
     let mut body = waiting_body(name, sha, wait);
 
     if wait == Wait::Running {
-        body["started_at"] = iso(run::unix_now()).into();
+        body["started_at"] = iso(clock::unix_now()).into();
     }
 
     body
@@ -620,7 +616,7 @@ pub fn errored(name: &str, sha: &str, error: &str) -> Value {
         "head_sha": sha,
         "status": "completed",
         "conclusion": "failure",
-        "completed_at": iso(run::unix_now()),
+        "completed_at": iso(clock::unix_now()),
         "output": {
             "title": "could not run",
             "summary": "shipcheck stopped before this commit's checks ran. The text below says why.",
@@ -1144,7 +1140,7 @@ mod tests {
 
     #[test]
     fn a_posted_error_names_no_user() {
-        let (home, name) = (run::user_dir(), run::user_name());
+        let (home, name) = (paths::user_dir(), paths::user_name());
         let home = home.to_str().unwrap();
 
         // A job sandbox can have no passwd entry

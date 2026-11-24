@@ -1,10 +1,8 @@
-use crate::comment;
 use crate::github;
 use crate::github::App;
 use crate::github::Checks;
 use crate::github::OpenPr;
-use crate::run;
-use crate::run::Entry;
+use crate::paths;
 use crate::secret;
 use crate::ui::Screen;
 use std::fmt;
@@ -31,11 +29,11 @@ pub fn api() -> String {
 }
 
 fn token_path() -> PathBuf {
-    run::home().join("token")
+    paths::home().join("token")
 }
 
 fn login_path() -> PathBuf {
-    run::home().join("login")
+    paths::home().join("login")
 }
 
 /// The GitHub login `shipcheck login` signed in, None for a sign-in from before it was kept
@@ -97,7 +95,7 @@ pub fn can_post() -> bool {
 fn has_key() -> bool {
     std::env::var_os("SHIPCHECK_APP_ID").is_some()
         && (std::env::var_os("SHIPCHECK_APP_KEY_FILE").is_some()
-            || secret::exists(&run::home().join("app.pem")))
+            || secret::exists(&paths::home().join("app.pem")))
 }
 
 /// The `shipcheck login` token, from the keychain on macOS (`secret::read`)
@@ -479,6 +477,23 @@ impl fmt::Debug for Sender {
     }
 }
 
+/// What [`Sender::route`] posts a PR comment with
+#[derive(Clone, Copy)]
+pub enum Route<'a> {
+    Service(&'a str),
+    Key(&'a App),
+}
+
+// The token stays out of every log line, as in `Sender`
+impl fmt::Debug for Route<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Route::Service(_) => "Route::Service",
+            Route::Key(_) => "Route::Key",
+        })
+    }
+}
+
 enum How {
     /// The App key, its installation token, and this machine's `shipcheck login` token if any
     Key(
@@ -548,24 +563,16 @@ impl Sender {
         }
     }
 
-    /// Writes the PR comment of `sha`'s PRs into `base`, or of `prs` with an App key, and returns
-    /// each comment's page
-    pub fn comment(
-        &self,
-        prs: Option<&[u64]>,
-        base: &str,
-        sha: &str,
-        entry: &Entry,
-        secrets: &[String],
-    ) -> Result<Vec<String>, String> {
+    /// Where a PR comment goes: the service with this machine's token, or GitHub with the App key
+    pub fn route(&self) -> Route<'_> {
         match &self.how {
-            How::Service(token) => {
-                comment::post_with_service(token, &self.repo, base, sha, entry, secrets)
-            }
-            How::Key(app, _, _) => {
-                comment::post_with_app(app, &self.repo, prs, base, sha, entry, secrets)
-            }
+            How::Service(token) => Route::Service(token),
+            How::Key(app, _, _) => Route::Key(app),
         }
+    }
+
+    pub fn repo(&self) -> &str {
+        &self.repo
     }
 
     /// One PR, open or not, with an App key. None through the service, which reads no closed PR

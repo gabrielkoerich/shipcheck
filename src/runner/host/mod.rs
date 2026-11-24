@@ -1,4 +1,5 @@
-use crate::run;
+use crate::config::refused_env;
+use crate::paths;
 use crate::runner;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -343,11 +344,6 @@ fn clone_dir(src: &Path, dst: &Path) -> Result<(), String> {
 /// `HOME` and `TMPDIR` are replaced by the jail's
 pub const BASE_ENV: &[&str] = &["PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "SHELL", "TERM"];
 
-/// Names `[host] env` may not pass, since they carry credentials or point git at another repository
-pub fn refused_env(name: &str) -> bool {
-    known::secret_env(name) || name.to_ascii_uppercase().starts_with("SHIPCHECK_")
-}
-
 /// Whether a variable from the user's environment reaches a check: the base list and the owner's
 /// names, never a refused one
 pub fn keeps_var(name: &str, extra: &[String]) -> bool {
@@ -454,9 +450,9 @@ const NESTED: &str = "the host checks' sandbox cannot start inside another sandb
  **/
 #[cfg(target_os = "macos")]
 pub fn in_a_jail() -> bool {
-    let home = run::user_dir();
+    let home = paths::user_dir();
     // A sandbox that passes these is reused only where results never post, since any can pass them
-    run::home_overridden()
+    paths::home_overridden()
         && sandboxed()
         && denies("file-read-data", &home)
         && denies("file-write-data", &home.join(".shipcheck-probe"))
@@ -538,7 +534,7 @@ fn resolved(path: PathBuf) -> PathBuf {
 impl Jail {
     /// The user's home, which a check cannot read but for its toolchains, an error when unknown
     fn user() -> Result<PathBuf, String> {
-        let user = run::user_dir();
+        let user = paths::user_dir();
 
         if user.as_os_str().is_empty() {
             return Err(
@@ -566,7 +562,7 @@ impl Jail {
 
     /// Credentials hidden even inside readable paths: the user's, shipcheck's own and the App key
     fn hidden(user: &Path) -> Vec<PathBuf> {
-        let home = run::home();
+        let home = paths::home();
         let mut hidden = known::credentials(user);
         hidden.extend(["token", "app.pem", "secrets"].map(|h| home.join(h)));
         hidden.extend(std::env::var_os("SHIPCHECK_APP_KEY_FILE").map(PathBuf::from));
@@ -757,7 +753,7 @@ impl Jail {
  * write `base`, and every other run writes an overlay of it or a copy of it of its own, under `runs`
  **/
 fn cache_dir(repo_id: Option<&str>) -> PathBuf {
-    let dir = run::home().join("hostcache");
+    let dir = paths::home().join("hostcache");
     repo_id.map_or(dir.clone(), |id| dir.join(id))
 }
 
@@ -776,7 +772,7 @@ fn temp_home() -> Result<(tempfile::TempDir, PathBuf), String> {
         .tempdir()
         .map_err(|e| format!("temp home: {e}"))?;
     let path = dir.path().canonicalize().map_err(|e| e.to_string())?;
-    toolchains(&path, &run::user_dir())?;
+    toolchains(&path, &paths::user_dir())?;
     rustup_home(&path, &user_tool("RUSTUP_HOME", ".rustup"))?;
     sbf_sdk(&path, &jail_path())?;
 
@@ -921,13 +917,13 @@ const HOME_LINKS: &[&str] = &[".docker/cli-plugins", ".cache/solana"];
 pub fn jail_path() -> std::ffi::OsString {
     trusted_path(
         &std::env::var_os("PATH").unwrap_or_default(),
-        &run::user_dir(),
+        &paths::user_dir(),
     )
 }
 
 /// A toolchain manager's home from its variable when that is trusted, else the default in `~`
 fn user_tool(var: &str, dir: &str) -> PathBuf {
-    let user = run::user_dir();
+    let user = paths::user_dir();
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|p| trusted_dir(p, &user))
@@ -1143,6 +1139,7 @@ pub fn coalition_members(coal: u64) -> Vec<libc::pid_t> {
  **/
 #[cfg(target_os = "macos")]
 mod job {
+    use crate::paths;
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -1153,7 +1150,7 @@ mod job {
     use super::{
         BTreeMap, Command, Duration, Instant, LAUNCHCTL, Path, PathBuf, Stdio, fs, real_dir,
     };
-    use crate::{cache, run};
+    use crate::cache;
 
     // From XNU's proc_info_private.h, readable for any pid by any user
     const PROC_PIDCOALITIONINFO: libc::c_int = 20;
@@ -1362,11 +1359,11 @@ mod job {
     /// Where the coalition of the check that ran in `dir` is kept until it is reaped, outside every jail
     fn record(dir: &Path) -> PathBuf {
         let id = cache::hex(&Sha256::digest(dir.as_os_str().as_bytes())[..16]);
-        run::home().join("reap").join(id)
+        paths::home().join("reap").join(id)
     }
 
     pub(super) fn reap_slot(slot: &Path) -> Result<(), String> {
-        let dir = run::home().join("reap");
+        let dir = paths::home().join("reap");
 
         if fs::read_dir(&dir).map_or(true, |mut d| d.next().is_none()) {
             return Ok(());
@@ -1845,7 +1842,7 @@ fn version(
     // The developer's checkout is readable so a toolchain file in it picks the version, never a home
     let repo = real_dir(dir).map_err(fail)?;
 
-    if run::user_dir().starts_with(&repo) {
+    if paths::user_dir().starts_with(&repo) {
         return Err(fail(format!(
             "runs in {}, which holds the home",
             repo.display()
