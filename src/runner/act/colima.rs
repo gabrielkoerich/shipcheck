@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::act::{self, Act, Engine};
-use super::{Outcome, RunRequest};
+use super::{self as act, Engine, JobSettings};
 use crate::cache;
+use crate::runner::{self, Outcome, RunRequest};
 
 /**
  * Each job on a Colima VM of its own, started for the job and deleted after it. The VM has no shares
@@ -458,7 +458,12 @@ fn act_args(request: &RunRequest<'_>, labels: Vec<String>) -> Vec<String> {
  * container, so the image is a placeholder, and labels go to it and never to `-self-hosted`, which
  * would set up the job on the Mac itself
  **/
-fn skipped_by_if(act: &Act, request: &RunRequest<'_>, workflow: &str, actions: &Path) -> bool {
+fn skipped_by_if(
+    settings: &JobSettings<'_>,
+    request: &RunRequest<'_>,
+    workflow: &str,
+    actions: &Path,
+) -> bool {
     let has_if = workflow::load(workflow)
         .is_ok_and(|root| !yaml_rust2::Yaml::Hash(root)["jobs"][request.job]["if"].is_badvalue());
     let mut cmd = Command::new("act");
@@ -478,9 +483,10 @@ fn skipped_by_if(act: &Act, request: &RunRequest<'_>, workflow: &str, actions: &
         cmd.arg("--action-offline-mode");
     }
 
-    for label in act
-        .labels(request.file)
-        .into_iter()
+    for label in settings
+        .labels()
+        .iter()
+        .cloned()
         .chain(["self-hosted".into(), "linux".into()])
     {
         cmd.arg("-P").arg(format!("{label}=shipcheck/dry-run"));
@@ -524,7 +530,12 @@ impl Engine for Colima {
         clippy::too_many_lines,
         reason = "one VM's life, from start to removal, read top to bottom"
     )]
-    fn run(&self, act: &Act, request: &RunRequest<'_>, log_path: &Path) -> Result<Outcome, String> {
+    fn run(
+        &self,
+        settings: &JobSettings<'_>,
+        request: &RunRequest<'_>,
+        log_path: &Path,
+    ) -> Result<Outcome, String> {
         // The job's time starts now, waiting for a VM slot too
         let deadline = Instant::now() + request.timeout;
         let run_dir = request.run_dir;
@@ -533,7 +544,7 @@ impl Engine for Colima {
 
         let actions = act::job_actions(request)?;
 
-        if skipped_by_if(act, request, &isolated, &actions) {
+        if skipped_by_if(settings, request, &isolated, &actions) {
             fs::write(
                 log_path,
                 "shipcheck: the job's `if:` skips it, so no VM started\n",
@@ -609,7 +620,7 @@ impl Engine for Colima {
         }
 
         let slot = slot.expect("a VM slot");
-        let mut args = act_args(request, act.labels(request.file));
+        let mut args = act_args(request, settings.labels().to_vec());
 
         // The Mac's act just fetched every action, so the VM's never asks GitHub for one it has
         if act::cached_actions_resolve(&actions) {
@@ -636,7 +647,7 @@ impl Engine for Colima {
             .into_iter()
             .chain([&named, &jobs, &slot].map(std::os::fd::AsRawFd::as_raw_fd))
             .collect();
-        let held = super::inherit(&mut reaper, fds);
+        let held = runner::inherit(&mut reaper, fds);
         let record = records().join(&profile);
         fs::create_dir_all(records()).map_err(|e| e.to_string())?;
         fs::write(&record, "").map_err(|e| e.to_string())?;
@@ -686,7 +697,7 @@ impl Engine for Colima {
             };
 
             loop {
-                let ended = super::has_exited(child.id());
+                let ended = runner::has_exited(child.id());
 
                 if matches!(ended, Ok(true)) {
                     exited();
@@ -696,9 +707,9 @@ impl Engine for Colima {
                 // A child shipcheck cannot see end is stopped as on a timeout
                 if ended.is_err() || Instant::now() > deadline {
                     // The group, so `colima ssh` and act's side go too
-                    super::signal_group(child.id(), libc::SIGKILL);
+                    runner::signal_group(child.id(), libc::SIGKILL);
 
-                    while !super::has_exited(child.id()).unwrap_or(true) {
+                    while !runner::has_exited(child.id()).unwrap_or(true) {
                         std::thread::sleep(Duration::from_millis(20));
                     }
 
@@ -915,8 +926,7 @@ mod tests {
             fs::write(&record, "").unwrap();
             let _ = fs::remove_file(&log);
             let mut cmd = Command::new(runner::posix_sh());
-            let held =
-                super::super::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
+            let held = runner::inherit(&mut cmd, vec![std::os::fd::AsRawFd::as_raw_fd(&lock)]);
             assert_eq!(held, [9]);
             // It says its arguments and whether it got the lock, and when asked hangs in a child as limactl does
             let fake = format!(

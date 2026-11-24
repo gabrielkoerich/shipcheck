@@ -7,7 +7,6 @@ use std::time::Duration;
 use crate::config::RepoConfig;
 
 pub mod act;
-pub mod colima;
 pub mod gc;
 pub mod host;
 pub mod shard;

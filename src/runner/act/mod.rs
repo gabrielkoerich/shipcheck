@@ -45,9 +45,10 @@ impl Act {
         Act { engines, ..self }
     }
 
-    /// The labels this host has an image for, the default ones and each `[act.jobs]` job's own
-    pub(super) fn labels(&self, file: &str) -> Vec<String> {
-        platforms(&self.config)
+    /// What an engine reads of `[act]` to run a job of `file`
+    pub fn settings(&self, file: &str) -> JobSettings<'_> {
+        // The labels this host has an image for, the default ones and each `[act.jobs]` job's own
+        let labels = platforms(&self.config)
             .into_keys()
             .chain(
                 self.config
@@ -55,7 +56,13 @@ impl Act {
                     .into_keys()
                     .map(|j| job_label(&j)),
             )
-            .collect()
+            .collect();
+        JobSettings {
+            config: &self.config,
+            network: self.network,
+            shards: self.shards,
+            labels,
+        }
     }
 
     fn uses_colima(&self) -> bool {
@@ -78,6 +85,33 @@ pub fn job_label(job: &str) -> String {
     format!("shipcheck-{job}")
 }
 
+/// What an engine reads of `[act]` to run one job, so no engine needs the runner itself
+#[derive(Debug)]
+pub struct JobSettings<'a> {
+    config: &'a config::Act,
+    network: config::Network,
+    shards: config::ShardTests,
+    labels: Vec<String>,
+}
+
+impl JobSettings<'_> {
+    pub fn config(&self) -> &config::Act {
+        self.config
+    }
+
+    pub fn network(&self) -> config::Network {
+        self.network
+    }
+
+    pub fn shards(&self) -> config::ShardTests {
+        self.shards
+    }
+
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+}
+
 /**
  * What an act job's steps run on. Preparing the workflow, the markers and reading the results are
  * act's and the same on every engine, an engine starts act for one job and cleans up after it
@@ -94,7 +128,12 @@ pub trait Engine: Sync {
     fn preflight(&self) -> Result<(), String>;
 
     /// Runs one job of the prepared workflow with act, as [`Runner::run`]
-    fn run(&self, act: &Act, request: &RunRequest<'_>, log: &Path) -> Result<Outcome, String>;
+    fn run(
+        &self,
+        settings: &JobSettings<'_>,
+        request: &RunRequest<'_>,
+        log: &Path,
+    ) -> Result<Outcome, String>;
 
     /// Removes what a dead run left for this job's checkout
     fn reclaim(&self, run_dir: &Path);
@@ -116,7 +155,7 @@ impl Act {
         let base = job.split("__").next().unwrap_or(job);
 
         match self.engines.get(&format!("{file}/{base}")) {
-            Some(config::Engine::Colima) => &super::colima::Colima,
+            Some(config::Engine::Colima) => &colima::Colima,
             _ => &Docker,
         }
     }
@@ -128,7 +167,7 @@ impl Runner for Act {
         Docker.preflight()?;
 
         if self.uses_colima() {
-            super::colima::Colima.preflight()?;
+            colima::Colima.preflight()?;
         }
 
         // act before 0.2.86 served its cache on every interface and honoured ::set-env (CVE-2026-34041, -34042)
@@ -159,7 +198,7 @@ impl Runner for Act {
         }
 
         if self.uses_colima() {
-            let colima = &super::colima::Colima;
+            let colima = &colima::Colima;
             return Ok(format!(
                 "{version}\0{}\0{}",
                 colima.name(),
@@ -176,24 +215,24 @@ impl Runner for Act {
 
     fn run(&self, request: &RunRequest<'_>, log_path: &Path) -> Result<Outcome, String> {
         self.engine(request.file, request.job)
-            .run(self, request, log_path)
+            .run(&self.settings(request.file), request, log_path)
     }
 
     // colima's are checked on disk first, so a machine without its VMs pays nothing
     fn reclaim(&self, run_dir: &Path) {
         Docker.reclaim(run_dir);
-        super::colima::Colima.reclaim(run_dir);
+        colima::Colima.reclaim(run_dir);
     }
 
     fn prune(&self) -> Vec<String> {
         let mut done = Docker.prune();
-        done.extend(super::colima::Colima.prune());
+        done.extend(colima::Colima.prune());
         done
     }
 
     fn clean(&self, repo_id: Option<&str>) -> Vec<String> {
         let mut done = Docker.clean(repo_id);
-        done.extend(super::colima::Colima.clean(repo_id));
+        done.extend(colima::Colima.clean(repo_id));
         done
     }
 }
@@ -492,7 +531,12 @@ impl Engine for Docker {
         clippy::too_many_lines,
         reason = "one act process, from its arguments to its outcome"
     )]
-    fn run(&self, act: &Act, request: &RunRequest<'_>, log_path: &Path) -> Result<Outcome, String> {
+    fn run(
+        &self,
+        settings: &JobSettings<'_>,
+        request: &RunRequest<'_>,
+        log_path: &Path,
+    ) -> Result<Outcome, String> {
         let run_dir = request.run_dir;
         let began = Instant::now();
         let (file, job) = (request.file, request.job);
@@ -500,7 +544,7 @@ impl Engine for Docker {
         let tag = run_tag(run_dir);
         let isolated = isolated(request, &tag, Checkout::Shared)?;
         let shards = (request.shard && isolated.contains(shard::MARK))
-            .then(|| shard::count(act.shards, engine_resources()));
+            .then(|| shard::count(settings.shards(), engine_resources()));
 
         if let Some(n) = shards {
             shard::write_plugin(run_dir, n)?;
@@ -509,18 +553,10 @@ impl Engine for Docker {
         fs::write(wf_path, keep_caches(run_dir, &isolated)?).map_err(|e| e.to_string())?;
 
         let log = fs::File::create(log_path).map_err(|e| e.to_string())?;
-        let labels: BTreeSet<String> = platforms(&act.config)
-            .into_keys()
-            .chain(
-                act.config
-                    .job_images(request.file)
-                    .into_keys()
-                    .map(|j| job_label(&j)),
-            )
-            .collect();
+        let labels: BTreeSet<String> = settings.labels().iter().cloned().collect();
         // act skips a job with no image without starting a container, and Docker has only about
         // 30 address pools for bridges, which a matrix of macOS legs would take for nothing
-        let network = match act.network {
+        let network = match settings.network() {
             config::Network::Internet if runs_here(&isolated, request.job, &labels) => {
                 Some(create_network(run_dir, request.timeout)?)
             }
@@ -531,12 +567,12 @@ impl Engine for Docker {
         let home = paths::home();
 
         // Stamped first, so a parallel run's prune never takes it for an empty one no run used
-        for (name, path) in volumes(&act.config, request.repo_id, &tag) {
+        for (name, path) in volumes(settings.config(), request.repo_id, &tag) {
             gc::stamp(&home, "volumes", &name);
             gc::create_volume(&name, &home, request.repo_id, path)?;
         }
 
-        let volumes = mounts(&act.config, request.repo_id, &tag, run_dir)?;
+        let volumes = mounts(settings.config(), request.repo_id, &tag, run_dir)?;
 
         cmd.arg("workflow_dispatch")
             .arg("-W")
@@ -566,11 +602,11 @@ impl Engine for Docker {
             cmd.arg("--container-options").arg(volumes.join(" "));
         }
 
-        for (label, image) in platforms(&act.config) {
+        for (label, image) in platforms(settings.config()) {
             cmd.arg("-P").arg(format!("{label}={image}"));
         }
 
-        for (job, image) in act.config.job_images(request.file) {
+        for (job, image) in settings.config().job_images(request.file) {
             cmd.arg("-P").arg(format!("{}={image}", job_label(&job)));
         }
 
@@ -2517,6 +2553,8 @@ fn volume_name(repo_id: &str, path: &str) -> String {
         docker_safe(path.trim_start_matches('/'))
     )
 }
+
+pub mod colima;
 
 #[cfg(test)]
 mod tests;

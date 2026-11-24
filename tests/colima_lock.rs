@@ -5,8 +5,8 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use shipcheck::runner::RunRequest;
+use shipcheck::runner::act::colima::Colima;
 use shipcheck::runner::act::{Act, Engine};
-use shipcheck::runner::colima::Colima;
 
 #[test]
 fn a_colima_job_that_waits_past_its_time_for_the_vm_times_out() {
@@ -43,7 +43,9 @@ fn a_colima_job_that_waits_past_its_time_for_the_vm_times_out() {
         slot_lock: None,
     };
     let started = Instant::now();
-    let outcome = Colima.run(&Act::default(), &request, &log).unwrap();
+    let outcome = Colima
+        .run(&Act::default().settings(request.file), &request, &log)
+        .unwrap();
     assert_eq!(outcome.exit, None, "it timed out");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(
@@ -62,14 +64,16 @@ fn a_colima_job_that_waits_past_its_time_for_the_vm_times_out() {
             f
         })
         .collect();
-    let outcome = Colima.run(&Act::default(), &request, &log).unwrap();
+    let outcome = Colima
+        .run(&Act::default().settings(request.file), &request, &log)
+        .unwrap();
     assert_eq!(outcome.exit, None, "it timed out with every slot taken");
     assert!(fs::read_to_string(&log).unwrap().contains("in use"));
     drop(slots);
 
     // A job that passes artifacts is refused, rather than lose them in its VM
     fs::write(&workflow, "on: push\njobs:\n  e2e:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/upload-artifact@v4\n").unwrap();
-    let Err(err) = Colima.run(&Act::default(), &request, &log) else {
+    let Err(err) = Colima.run(&Act::default().settings(request.file), &request, &log) else {
         panic!("a colima job with artifacts ran");
     };
     assert!(err.contains("cannot pass artifacts"), "{err}");
