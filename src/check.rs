@@ -2,10 +2,12 @@ use crate::config::{Logs, RunnerKind};
 use crate::run;
 use crate::run::JobDone;
 use crate::run::Plan;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -136,12 +138,45 @@ fn tail_of(log: &str) -> String {
     tail
 }
 
+/// Masks the secrets, and writes the home folder as `~`, since its path names the user
 pub fn mask(mut text: String, secrets: &[String]) -> String {
     for secret in secrets {
         text = text.replace(secret.as_str(), "***");
     }
 
+    let mut homes: Vec<String> = [Some(run::user_dir()), env::var_os("HOME").map(Into::into)]
+        .into_iter()
+        .flatten()
+        .filter_map(|p: PathBuf| p.to_str().map(|s| s.trim_end_matches('/').to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    homes.sort_by_key(|h| Reverse(h.len()));
+
+    for home in &homes {
+        text = redact(&text, home);
+    }
+
     text
+}
+
+// Only a whole folder, so `/Users/ann` leaves `/Users/anna` as it is
+fn redact(text: &str, home: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(at) = rest.find(home) {
+        let after = &rest[at + home.len()..];
+        let whole = !after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || "._-".contains(c));
+        out.push_str(&rest[..at]);
+        out.push_str(if whole { "~" } else { home });
+        rest = after;
+    }
+
+    out.push_str(rest);
+    out
 }
 
 /**
@@ -522,7 +557,8 @@ pub fn body(sha: &str, entry: &Entry, logs: Option<(&Path, &[String])>) -> Value
     body
 }
 
-/// A failed check for a run that stopped before it had a result, with the error as its log
+/// A failed check for a run that stopped before it had a result, with the error as its log, which
+/// goes through `mask` like any posted log
 pub fn errored(name: &str, sha: &str, error: &str) -> Value {
     json!({
         "name": name,
@@ -533,7 +569,7 @@ pub fn errored(name: &str, sha: &str, error: &str) -> Value {
         "output": {
             "title": "could not run",
             "summary": "shipcheck stopped before this commit's checks ran. The text below says why.",
-            "text": clip(error.to_string()),
+            "text": clip(mask(error.to_string(), &[])),
         },
     })
 }
@@ -1022,6 +1058,37 @@ mod tests {
         assert!(text.len() <= MAX_FIELD, "{}", text.len());
         assert!(text.starts_with("```\n---- big stdout ----\nxxx"));
         assert!(!text.contains("left out"));
+    }
+
+    #[test]
+    fn redacts_the_home_folder_only_as_a_whole_folder() {
+        let text = "unix:///Users/ann/.docker/run/docker.sock, /Users/anna/x and /Users/ann";
+        assert_eq!(
+            redact(text, "/Users/ann"),
+            "unix://~/.docker/run/docker.sock, /Users/anna/x and ~"
+        );
+    }
+
+    #[test]
+    fn a_posted_error_names_no_home_folder() {
+        let home = run::user_dir();
+        let home = home.to_str().unwrap();
+
+        // A job sandbox can have no passwd entry
+        if home.len() < 2 {
+            return;
+        }
+
+        let body = errored(
+            "shipcheck",
+            "abc",
+            &format!(
+                "docker version failed, is a Docker engine running? Cannot connect to the Docker daemon at unix://{home}/.docker/run/docker.sock"
+            ),
+        );
+        let text = body["output"]["text"].as_str().unwrap();
+        assert!(!text.contains(home), "{text}");
+        assert!(text.contains("unix://~/.docker/run/docker.sock"), "{text}");
     }
 
     #[test]
