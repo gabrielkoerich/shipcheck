@@ -2,10 +2,12 @@ use crate::config::{Logs, RunnerKind};
 use crate::run;
 use crate::run::JobDone;
 use crate::run::Plan;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -136,12 +138,100 @@ fn tail_of(log: &str) -> String {
     tail
 }
 
+/// Masks the secrets and every user name: this user's home folder becomes `~`, any other folder
+/// under `/Users` or `/home` becomes `/Users/***`, and the login name alone becomes `***`
 pub fn mask(mut text: String, secrets: &[String]) -> String {
     for secret in secrets {
         text = text.replace(secret.as_str(), "***");
     }
 
+    let mut homes: Vec<String> = [Some(run::user_dir()), env::var_os("HOME").map(Into::into)]
+        .into_iter()
+        .flatten()
+        .filter_map(|p: PathBuf| p.to_str().map(|s| s.trim_end_matches('/').to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    homes.sort_by_key(|h| Reverse(h.len()));
+
+    for home in &homes {
+        text = replace_whole(&text, home, "~");
+    }
+
+    for parent in ["/Users/", "/home/"] {
+        text = hide_names(&text, parent);
+    }
+
+    let names = [
+        Some(run::user_name()),
+        env::var("USER").ok(),
+        env::var("LOGNAME").ok(),
+    ];
+
+    // One letter would cut words apart, and root names no one
+    for name in names
+        .into_iter()
+        .flatten()
+        .filter(|n| n.len() > 1 && n != "root")
+    {
+        text = replace_whole(&text, &name, "***");
+    }
+
     text
+}
+
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || "._-@+".contains(c)
+}
+
+// A `.` that ends a sentence is not part of the name before it
+fn continues(after: &str) -> bool {
+    let mut chars = after.chars();
+
+    match chars.next() {
+        Some('.') => chars.next().is_some_and(name_char),
+        Some(c) => name_char(c),
+        None => false,
+    }
+}
+
+// Only a whole word or folder, so `/Users/ann` leaves `/Users/anna` as it is
+fn replace_whole(text: &str, what: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+
+    for (at, _) in text.match_indices(what) {
+        let before = text[..at].chars().next_back();
+        let starts = what.starts_with('/') || !before.is_some_and(name_char);
+
+        if starts && !continues(&text[at + what.len()..]) {
+            out.push_str(&text[last..at]);
+            out.push_str(with);
+            last = at + what.len();
+        }
+    }
+
+    out.push_str(&text[last..]);
+    out
+}
+
+// The folder after each `parent`, which is a user name, becomes `***`
+fn hide_names(text: &str, parent: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(at) = rest.find(parent) {
+        let start = at + parent.len();
+        let len = rest[start..]
+            .find(|c| !name_char(c))
+            .unwrap_or(rest.len() - start);
+        let len = len - usize::from(rest[start..start + len].ends_with('.'));
+        out.push_str(&rest[..start]);
+        out.push_str(if len == 0 { "" } else { "***" });
+        rest = &rest[start + len..];
+    }
+
+    out.push_str(rest);
+    out
 }
 
 /**
@@ -522,7 +612,8 @@ pub fn body(sha: &str, entry: &Entry, logs: Option<(&Path, &[String])>) -> Value
     body
 }
 
-/// A failed check for a run that stopped before it had a result, with the error as its log
+/// A failed check for a run that stopped before it had a result, with the error as its log, which
+/// goes through `mask` like any posted log
 pub fn errored(name: &str, sha: &str, error: &str) -> Value {
     json!({
         "name": name,
@@ -533,7 +624,7 @@ pub fn errored(name: &str, sha: &str, error: &str) -> Value {
         "output": {
             "title": "could not run",
             "summary": "shipcheck stopped before this commit's checks ran. The text below says why.",
-            "text": clip(error.to_string()),
+            "text": clip(mask(error.to_string(), &[])),
         },
     })
 }
@@ -1022,6 +1113,58 @@ mod tests {
         assert!(text.len() <= MAX_FIELD, "{}", text.len());
         assert!(text.starts_with("```\n---- big stdout ----\nxxx"));
         assert!(!text.contains("left out"));
+    }
+
+    #[test]
+    fn hides_every_user_name() {
+        assert_eq!(
+            replace_whole(
+                "unix:///Users/ann/.docker, /Users/anna/x and /Users/ann",
+                "/Users/ann",
+                "~"
+            ),
+            "unix://~/.docker, /Users/anna/x and ~"
+        );
+        assert_eq!(
+            hide_names(
+                "/Users/anna/x, /home/bob.k, /home/, /Users/***/y",
+                "/Users/"
+            ),
+            "/Users/***/x, /home/bob.k, /home/, /Users/***/y"
+        );
+        assert_eq!(
+            replace_whole("user ann ran annual, ann.", "ann", "***"),
+            "user *** ran annual, ***."
+        );
+        assert_eq!(
+            mask("cache at /home/carol/.cargo and /Users/dave".into(), &[]),
+            "cache at /home/***/.cargo and /Users/***"
+        );
+    }
+
+    #[test]
+    fn a_posted_error_names_no_user() {
+        let (home, name) = (run::user_dir(), run::user_name());
+        let home = home.to_str().unwrap();
+
+        // A job sandbox can have no passwd entry
+        if home.len() < 2 || name.len() < 2 {
+            return;
+        }
+
+        let body = errored(
+            "shipcheck",
+            "abc",
+            &format!(
+                "docker version failed, is a Docker engine running? Cannot connect to the Docker daemon at unix://{home}/.docker/run/docker.sock, as {name}"
+            ),
+        );
+        let text = body["output"]["text"].as_str().unwrap();
+        assert!(
+            !text.contains(home) && !text.contains(&format!(" {name}")),
+            "{text}"
+        );
+        assert!(text.contains("unix://~/.docker/run/docker.sock"), "{text}");
     }
 
     #[test]
