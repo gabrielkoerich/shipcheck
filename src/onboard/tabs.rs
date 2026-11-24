@@ -205,6 +205,10 @@ pub struct Wizard<'a> {
 }
 
 impl<'a> Wizard<'a> {
+    fn quit(&mut self) {
+        self.end = Some(End::Quit);
+    }
+
     pub fn new(root: &'a Path, plan: Plan) -> Self {
         Self::on(root, plan, &Machine::this())
     }
@@ -384,7 +388,7 @@ impl<'a> Wizard<'a> {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10).min(self.most.get()),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::Char(' ') | KeyCode::Enter => self.choose(),
-            KeyCode::Char('q') | KeyCode::Esc => self.end = Some(End::Quit),
+            KeyCode::Char('q') | KeyCode::Esc => self.quit(),
             _ => {}
         }
     }
@@ -561,7 +565,7 @@ pub fn run(root: &Path, plan: Plan) -> std::io::Result<Option<(Plan, Answers)>> 
         match event::read() {
             Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
                 if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-                    w.end = Some(End::Quit);
+                    w.quit();
                 } else {
                     w.key(k.code);
                 }

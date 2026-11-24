@@ -92,9 +92,9 @@ impl Host {
                 .overlay
                 .get_or_init(|| sandbox_jail::overlay_supported(&runs).is_ok())
             {
-                fs::create_dir(&copy.dir).map_err(|e| format!("{}: {e}", copy.dir.display()))?;
+                fs::create_dir(copy.dir()).map_err(|e| format!("{}: {e}", copy.dir().display()))?;
             } else {
-                clone_dir(&base, &copy.dir)?;
+                clone_dir(&base, copy.dir())?;
             }
 
             Ok(copy)
@@ -142,6 +142,10 @@ struct RunCopy {
 }
 
 impl RunCopy {
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn new(runs: &Path) -> Result<Self, String> {
         let fail = |e: std::io::Error| format!("run cache in {}: {e}", runs.display());
 

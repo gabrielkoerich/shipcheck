@@ -1294,6 +1294,10 @@ impl Ticket {
         fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Ticket { path, _lock: lock })
     }
+
+    fn name(&self) -> &std::ffi::OsStr {
+        self.path.file_name().unwrap_or_default()
+    }
 }
 
 impl Drop for Ticket {
@@ -1314,7 +1318,7 @@ enum QueueStep {
  **/
 fn queue_step(dir: &Path, ticket: &Ticket, slots: usize) -> Result<QueueStep, String> {
     let queue = dir.join("queue");
-    let mine = ticket.path.file_name().unwrap_or_default();
+    let mine = ticket.name();
     let mut names: Vec<_> = fs::read_dir(&queue)
         .map_err(|e| format!("{}: {e}", queue.display()))?
         .filter_map(|e| e.ok().map(|e| e.file_name()))
@@ -1820,7 +1824,7 @@ pub fn trial(
  **/
 fn run_all(ctx: &Ctx<'_>, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResult>, String> {
     let plan = ctx.plan;
-    let host = ctx.runners.host.is_some() && ctx.only.is_none_or(|o| o.contains_key(HOST));
+    let host = ctx.runners.has_host() && ctx.only.is_none_or(|o| o.contains_key(HOST));
     std::thread::scope(|s| {
         let (tx, rx) = mpsc::channel::<String>();
         let host = host.then(|| {
