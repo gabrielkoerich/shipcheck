@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "shipcheck"
-version = "0.2.22"
+version = "0.2.23"
 dependencies = [
  "clap",
  "cliclack",
