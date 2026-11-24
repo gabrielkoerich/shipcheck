@@ -1,15 +1,14 @@
+use super::checkout::{job_git, remove_planted_links, standalone_git, verify_checkout};
+use super::plan::{act_jobs, ci_changes, copy_index, env_skips};
+use super::slots::{QueueStep, Ticket, claim_slot, queue_step};
 use super::*;
 use crate::base::remote_base;
-use crate::check;
 use crate::git::safe_git_env;
-use crate::history;
-use crate::paths::default_home;
-use crate::paths::home;
-use crate::paths::home_overridden;
-use crate::paths::log_dir;
-use crate::paths::user_dir;
+use crate::paths::{default_home, home, home_overridden, log_dir, user_dir};
 use crate::ui::printable;
+use crate::{check, history};
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::process::Command;
 
 #[test]
 fn keeps_passed_jobs_that_no_job_running_again_needs() {
