@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use crate::common;
 use shipcheck::runner::host;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -68,6 +69,7 @@ fn record(home: &Path) -> Option<(u64, String, PathBuf)> {
 
 #[test]
 fn a_stopped_run_reaps_its_running_check_at_once() {
+    let _serial = common::serial();
     if host::in_a_jail() {
         // A jail of shipcheck's own tests has no launchd to reach
         return;

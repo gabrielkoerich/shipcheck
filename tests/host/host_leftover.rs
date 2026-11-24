@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::common;
 use shipcheck::run;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -39,8 +40,9 @@ const CHECK: &str = r#"sleep 1; test -f marker.txt; r=$?; d=$PWD; set -m; ( i=0;
 
 #[test]
 fn a_process_a_check_leaves_cannot_change_the_next_run() {
+    let _serial = common::serial();
     let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: this is the only test in this binary, and it sets the environment before any thread
+    // SAFETY: every test in this binary holds `serial`, and this one sets the environment before any thread
     unsafe {
         std::env::set_var("SHIPCHECK_HOME", tmp.path().join(".local/state/shipcheck"));
     }

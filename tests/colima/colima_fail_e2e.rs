@@ -1,6 +1,6 @@
 //! A failing and a timed out job on the colima engine, and the VMs they leave behind
 
-mod common;
+use crate::common;
 
 use std::fs;
 use std::path::Path;
@@ -93,6 +93,7 @@ fn no_vm_left() {
 #[test]
 #[ignore = "needs colima, act, Docker and the internet"]
 fn a_colima_job_that_fails_or_times_out_fails_and_leaves_no_vm() {
+    let _serial = common::serial();
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let _clean = common::CleanOnDrop::new(&home);
@@ -180,6 +181,7 @@ engine = \"colima\"
 #[test]
 #[ignore = "needs colima, act and Docker"]
 fn a_skipped_colima_job_boots_no_vm_and_one_shipcheck_cannot_run_still_gets_a_log() {
+    let _serial = common::serial();
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let origin = tmp.path().join("origin.git");

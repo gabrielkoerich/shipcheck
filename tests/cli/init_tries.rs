@@ -307,7 +307,7 @@ fn a_trial_tries_the_host_checks_and_never_an_act_job() {
         "runner = \"host\"\n[host.checks]\nok = \"true\"\n[jobs.\"ci.yml/missing\"]\nrunner = \"act\"\n",
     )
     .unwrap();
-    // SAFETY: the only test in this binary that sets the environment, the other passes its own to a child
+    // SAFETY: the only test in this binary that sets the environment, the others pass their own to a child
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
     let tried = run::trial(&work, config, &mut |_| {}).unwrap();
     assert_eq!(tried.keys().collect::<Vec<_>>(), ["ok"]);

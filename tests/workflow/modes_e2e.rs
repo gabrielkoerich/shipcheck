@@ -1,6 +1,6 @@
 //! The run modes of the binary against a base on `main`
 
-mod common;
+use crate::common;
 
 use std::fs;
 use std::path::{Path, PathBuf};

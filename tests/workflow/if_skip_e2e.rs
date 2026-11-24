@@ -1,6 +1,6 @@
 //! Jobs that GitHub skips on a PR with an `if` are skipped in act too
 
-mod common;
+use crate::common;
 
 use std::fs;
 use std::path::Path;
@@ -102,8 +102,9 @@ jobs:
 #[test]
 #[ignore = "needs act and Docker"]
 fn a_skip_passes_only_when_github_skips_the_job_on_every_pr() {
+    let _serial = common::serial();
     let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: this is the only test in this binary
+    // SAFETY: every test in this binary that sets the environment holds `serial`
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
     let _clean = common::CleanOnDrop::new(&tmp.path().join("home"));
 

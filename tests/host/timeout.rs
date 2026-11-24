@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::common;
 use shipcheck::run;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -30,8 +31,9 @@ fn git(dir: &Path, args: &[&str]) {
 // With no time left the retries never start, so none of them counts as an attempt
 #[test]
 fn a_timeout_counts_only_attempts_that_started() {
+    let _serial = common::serial();
     let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: this is the only test in this binary
+    // SAFETY: every test in this binary holds `serial`
     unsafe { std::env::set_var("SHIPCHECK_HOME", tmp.path().join("home")) };
 
     let origin = tmp.path().join("origin.git");

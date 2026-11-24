@@ -6,6 +6,7 @@ use std::io::{self, Write as _};
 use std::path::Path;
 use std::process::Command;
 
+use crate::common;
 use shipcheck::run;
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -77,13 +78,14 @@ fn run_branch(work: &Path, name: &str, files: &[(&str, &str)]) -> run::Entry {
 
 #[test]
 fn shards_a_host_pytest_command_and_falls_back_to_one_run() {
+    let _serial = common::serial();
     if Command::new("uv").arg("--version").output().is_err() {
         eprintln!("skipped: no uv on PATH");
         return;
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: this is the only test in this binary, and it sets the environment before any thread
+    // SAFETY: every test in this binary holds `serial`, and this one sets the environment before any thread
     unsafe {
         std::env::set_var("SHIPCHECK_HOME", tmp.path().join(".local/state/shipcheck"));
     }

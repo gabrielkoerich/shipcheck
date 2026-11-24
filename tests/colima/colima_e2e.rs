@@ -1,6 +1,6 @@
 //! A job on the colima engine, in a VM shipcheck starts for it and removes after
 
-mod common;
+use crate::common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -158,6 +158,7 @@ fn shipcheck(work: &Path, home: &Path) -> Command {
 #[test]
 #[ignore = "needs colima, act, Docker and the internet"]
 fn a_colima_job_runs_in_its_own_vm_and_leaves_none_behind() {
+    let _serial = common::serial();
     let tmp = tempfile::tempdir().unwrap();
     let work = repo(tmp.path());
     let home = tmp.path().join("home");

@@ -1,6 +1,6 @@
 //! The commands the git hooks call, through the real binary with a home of their own
 
-mod common;
+use crate::common;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};

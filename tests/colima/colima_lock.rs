@@ -4,15 +4,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::time::{Duration, Instant};
 
+use crate::common;
 use shipcheck::runner::RunRequest;
 use shipcheck::runner::act::colima::Colima;
 use shipcheck::runner::act::{Act, Engine};
 
 #[test]
 fn a_colima_job_that_waits_past_its_time_for_the_vm_times_out() {
+    let _serial = common::serial();
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    // SAFETY: this is the only test in this binary
+    // SAFETY: every test in this binary holds `serial`
     unsafe { std::env::set_var("SHIPCHECK_HOME", &home) };
     fs::create_dir_all(home.join("locks")).unwrap();
     // The leftover cleanup holds the lock every colima job shares

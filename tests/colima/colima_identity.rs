@@ -4,12 +4,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
+use crate::common;
 use shipcheck::config::Engine;
 use shipcheck::runner::Runner;
 use shipcheck::runner::act::Act;
 
 #[test]
 fn a_colima_job_puts_colima_and_lima_in_the_key() {
+    let _serial = common::serial();
     let dir = tempfile::tempdir().unwrap();
 
     for (tool, out) in [
@@ -22,7 +24,7 @@ fn a_colima_job_puts_colima_and_lima_in_the_key() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    // SAFETY: this is the only test in this binary
+    // SAFETY: every test in this binary holds `serial`
     unsafe { std::env::set_var("PATH", format!("{}:/usr/bin:/bin", dir.path().display())) };
     assert_eq!(Act::default().identity().unwrap(), "act version 0.2.89");
     let vm = Act::default().with_engines(BTreeMap::from([("ci.yml/e2e".into(), Engine::Colima)]));

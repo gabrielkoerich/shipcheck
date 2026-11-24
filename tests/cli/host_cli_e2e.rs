@@ -1,7 +1,7 @@
 //! The command line flows of the act end-to-end test that need no Docker, run in host mode through
 //! the built binary, so `cargo test` catches a broken command before it reaches main
 
-mod common;
+use crate::common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
