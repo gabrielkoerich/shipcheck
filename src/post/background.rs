@@ -1,8 +1,8 @@
 use crate::clock;
 use crate::daemon_config;
 use crate::git;
-use crate::github::Check;
 use crate::paths;
+use crate::post::github::Check;
 use crate::run::JobDone;
 use crate::runner;
 use std::collections::BTreeMap;
@@ -17,11 +17,11 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::check::{self, Wait};
-use crate::github::Checks;
 use crate::paths::{Home, MovedHome};
+use crate::post::check::{self, Wait};
+use crate::post::github::Checks;
+use crate::post::service::Credentials;
 use crate::run::{self, Entry, Plan};
-use crate::service::Credentials;
 
 /// Seconds between posts while GitHub does not have the pushed commit yet, about two minutes in all
 pub const WAITS: [u64; 7] = [2, 4, 8, 16, 30, 30, 30];
@@ -758,7 +758,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::github::Check;
+    use crate::post::github::Check;
 
     fn entry() -> Entry {
         serde_json::from_value(json!({

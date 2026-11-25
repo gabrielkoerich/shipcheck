@@ -6,7 +6,7 @@ use crate::paths::{git_lock_in, home, log_dir, partial_log_dir, secrets_file};
 use crate::runner::{act, host};
 use crate::ui::printable;
 use crate::workflow::{WORKFLOWS, false_on_every_pr};
-use crate::{queue, secret, templates, workflow};
+use crate::{secret, workflow};
 use checkout::{checkout, empty_dir, remove_planted_links, standalone_git};
 use plan::{Graphs, act_jobs, as_run_body, file_name, names_job};
 use reuse::{Previous, Reuse, link_branch, previous};
@@ -48,6 +48,10 @@ pub use plan::{
     CALLER_PATH, Failed, Tested, Tree, commit, expected_jobs, jobs, last_tested, message_skips,
     on_default_branch, plan, record_tested, skip_requested, snapshot, untracked,
 };
+
+pub mod queue;
+pub mod templates;
+pub mod trust;
 
 const CONFIG: &str = "shipcheck.toml";
 

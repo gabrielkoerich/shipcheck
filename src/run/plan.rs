@@ -7,7 +7,7 @@ use crate::runner::act;
 use crate::runner::host::{self as host_runner, HOST};
 use crate::runner::{Runner, Runners};
 use crate::workflow::WORKFLOWS;
-use crate::{trust, workflow};
+use crate::{run::trust, workflow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};

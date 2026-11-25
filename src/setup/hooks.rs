@@ -1,5 +1,5 @@
 use super::git;
-use crate::{autostart, base, paths};
+use crate::{base, daemon::autostart, paths};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

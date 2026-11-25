@@ -6,7 +6,7 @@ use crate::daemon_config::RepoEntry;
 use crate::daemon_config::fetch_options;
 use crate::git;
 use crate::paths;
-use crate::service;
+use crate::post::service;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,13 +15,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::background::{self, Posting, Runs};
-use crate::check::{Tails, Wait};
-use crate::github::{Checks, OpenPr};
 use crate::paths::MovedHome;
-use crate::record::{self, Run};
-use crate::service::Sender;
-use crate::{check, comment, run};
+use crate::post::background::{self, Posting, Runs};
+use crate::post::check::{Tails, Wait};
+use crate::post::github::{Checks, OpenPr};
+use crate::post::record::{self, Run};
+use crate::post::service::Sender;
+use crate::{post::check, post::comment, run};
+
+pub mod autostart;
 
 /// How long a run can last: each workflow's deadline, once per attempt, and 10 minutes to set up and
 /// post. A claim older than this is a run that died, so this machine may take the PR

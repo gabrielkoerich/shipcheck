@@ -3,9 +3,9 @@
 mod common;
 
 use shipcheck::cache;
-use shipcheck::check;
 use shipcheck::git;
 use shipcheck::paths;
+use shipcheck::post::check;
 use shipcheck::secret;
 use std::fs;
 use std::path::Path;

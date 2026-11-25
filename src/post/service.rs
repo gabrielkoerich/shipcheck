@@ -1,8 +1,8 @@
-use crate::github;
-use crate::github::App;
-use crate::github::Checks;
-use crate::github::OpenPr;
 use crate::paths;
+use crate::post::github;
+use crate::post::github::App;
+use crate::post::github::Checks;
+use crate::post::github::OpenPr;
 use crate::secret;
 use crate::ui::Screen;
 use std::fmt;

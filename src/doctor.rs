@@ -1,23 +1,23 @@
 use crate::agents;
-use crate::autostart;
-use crate::background;
-use crate::check;
 use crate::config::Engine;
 use crate::config::Team;
+use crate::daemon::autostart;
 use crate::git;
 use crate::paths;
+use crate::post::background;
+use crate::post::check;
+use crate::post::service;
+use crate::post::service::Sender;
 use crate::run;
 use crate::secret;
-use crate::service;
-use crate::service::Sender;
 use crate::setup;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use crate::config::{Network, RepoConfig, RunnerKind};
+use crate::post::service::Poster;
 use crate::runner::{self, Runner};
-use crate::service::Poster;
 
 /// One thing shipcheck needs, and the command that fixes it when it is missing
 #[derive(Debug)]

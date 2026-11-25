@@ -6,7 +6,7 @@ use crate::base::remote_base;
 use crate::git::safe_git_env;
 use crate::paths::{default_home, home, home_overridden, log_dir, user_dir};
 use crate::ui::printable;
-use crate::{check, history};
+use crate::{history, post::check};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::Command;
 

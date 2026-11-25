@@ -3,7 +3,7 @@ use crate::cache;
 use crate::clock::unix_now;
 use crate::git::repo_id;
 use crate::paths::home;
-use crate::queue;
+use crate::run::queue;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;

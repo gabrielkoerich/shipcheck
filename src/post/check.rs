@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::report;
+use crate::post::report;
 use crate::run::{ALLOWED, Entry};
 use crate::runner::host::{HOST, runner_of};
 use crate::runner::shard::ShardRun;
@@ -647,7 +647,7 @@ pub fn iso(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::report;
+    use crate::post::report;
     use crate::run;
     use std::collections::BTreeMap;
 

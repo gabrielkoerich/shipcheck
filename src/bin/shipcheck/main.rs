@@ -16,21 +16,24 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-use shipcheck::background::Posting;
-use shipcheck::check::Tails;
 use shipcheck::config::Trigger;
 use shipcheck::daemon;
 use shipcheck::daemon_config::DaemonConfig;
 use shipcheck::onboard::{self, App};
 use shipcheck::paths::MovedHome;
-use shipcheck::queue::Arrival;
-use shipcheck::record::{self, Run as Record};
-use shipcheck::report::Coverage;
+use shipcheck::post::background::Posting;
+use shipcheck::post::check::Tails;
+use shipcheck::post::record::{self, Run as Record};
+use shipcheck::post::report::Coverage;
+use shipcheck::post::service::{self, Credentials, Poster, Revoke, Sender};
+use shipcheck::run::queue::Arrival;
 use shipcheck::run::{Failed, Tree};
 use shipcheck::runner::host;
-use shipcheck::service::{self, Credentials, Poster, Revoke, Sender};
 use shipcheck::ui::{Live, Screen, Stream, Style};
-use shipcheck::{agents, autostart, background, check, doctor, queue, report, run, setup, trust};
+use shipcheck::{
+    agents, daemon::autostart, doctor, post::background, post::check, post::report, run,
+    run::queue, run::trust, setup,
+};
 use shipcheck::{base, clock, git, history, paths, ui};
 
 const PARTIAL: &str = "partial run: not the check, run `shipcheck run` before committing";

@@ -1,9 +1,9 @@
 use crate::config::{Act, Engine};
-use crate::java::Jdk;
-use crate::ruby::Ruby;
 use crate::runner::act;
 use crate::workflow::{Job, RunStep};
-use crate::{agents, git, java, ruby, workflow};
+use crate::{agents, git, workflow};
+use java::Jdk;
+use ruby::Ruby;
 use shell::{
     CONTAINERS, JobCommand, KERNEL, PR_AWARE, REPORTERS, SANDBOX_VARS, STATEFUL, WARNING, answers,
     assigned, assignment, checks_nothing, command_word, event_in_tasks, missing_tools, needed,
@@ -24,6 +24,9 @@ mod hooks;
 mod shell;
 mod xcode;
 pub use hooks::{COMMIT_LINE, HOOK_LINE, POST_COMMIT, PRE_PUSH, install, install_gap};
+
+pub mod java;
+pub mod ruby;
 
 pub fn config_for(workflows: &[String]) -> String {
     let list = workflows

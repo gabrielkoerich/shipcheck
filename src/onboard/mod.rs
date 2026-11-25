@@ -1,8 +1,8 @@
 use crate::agents;
 use crate::base;
-use crate::check;
 use crate::config;
 use crate::git;
+use crate::post::check;
 use crate::run;
 use crate::run::Trial;
 use crate::runner;

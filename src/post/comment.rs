@@ -1,10 +1,10 @@
-use crate::check;
 use crate::config::Logs;
-use crate::github;
+use crate::post::check;
+use crate::post::github;
+use crate::post::service;
+use crate::post::service::Route;
 use crate::run::Entry;
 use crate::run::Jobs;
-use crate::service;
-use crate::service::Route;
 use std::fmt::Write as _;
 
 /// The first line of the App's PR comment, how a post finds it again

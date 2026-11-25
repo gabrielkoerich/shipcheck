@@ -5,9 +5,9 @@ use crate::daemon_config::DaemonConfig;
 use crate::daemon_config::Fetch;
 use crate::daemon_config::RepoEntry;
 use crate::git;
-use crate::github::Check;
 use crate::history;
 use crate::paths;
+use crate::post::github::Check;
 use std::sync::Mutex;
 
 use serde_json::Value;
