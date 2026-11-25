@@ -1,7 +1,15 @@
+use super::docker::{
+    Network, REAPER, artifact_addr, gateway, keep_caches, mounts, network_name, reaper,
+    until_pooled, venv_mount, volume_name, volume_prefix,
+};
+use super::matrix::{legs, matrix_condition, resolve_matrix};
 use super::*;
 use crate::runner;
 use crate::runner::tests;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::time::{Duration, Instant};
 use yaml_rust2::YamlLoader;
 
 fn load(s: &str) -> Yaml {
