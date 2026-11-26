@@ -624,17 +624,6 @@ fn cli(command: Cmd) -> Result<ExitCode, String> {
                 return Ok(code);
             }
 
-            if posts.is_some() && plan.config.hosts() && host::loose_sandbox() {
-                say(&format!("{}: not posted, {}", &plan.sha[..12], run::INSIDE));
-
-                if let Ok(repo) = git::repo_id(&plan.repo) {
-                    let fields = serde_json::json!({"sha": plan.sha, "reason": "sandboxed"});
-                    record::keep(&repo, &record::event(&repo, "skipped", fields));
-                }
-
-                posts = None;
-            }
-
             if posts.is_some() && !background::home_allows_post(paths::which_home(), moved_home) {
                 say(&format!(
                     "{}: not posted, SHIPCHECK_HOME is not the default, so its results may not come from runs. A person who set it can pass --home-ok",

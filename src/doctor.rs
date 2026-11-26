@@ -370,7 +370,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             runner::host::sandbox().map(|s| {
                 if runner::host::loose_sandbox() {
                     return format!(
-                        "{s}: macOS starts no sandbox inside another, so host checks get what this one allows, their results are not cached or posted, and processes they leave are not stopped"
+                        "{s}: macOS starts no sandbox inside another, so host checks get what this one allows, and processes they leave are not stopped"
                     );
                 }
 

@@ -490,11 +490,7 @@ pub fn already_sandboxed() -> bool {
     false
 }
 
-/**
- * Whether host checks run in a sandbox looser than one of their own, such as an agent's, whose
- * checks could write any result. One as strict as a check's own, as in shipcheck's tests of
- * itself, keeps its results
- **/
+/// Whether host checks run in a sandbox looser than one of their own, such as an agent's
 pub fn loose_sandbox() -> bool {
     already_sandboxed() && !in_a_jail()
 }
