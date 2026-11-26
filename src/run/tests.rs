@@ -995,11 +995,8 @@ fn commits_only_the_tree_that_ran() {
     // git init makes hooks/ only when it finds its templates
     fs::create_dir_all(repo.join(".git/hooks")).unwrap();
     let hook = repo.join(".git/hooks/pre-commit");
-    fs::write(
-        &hook,
-        "#!/bin/sh\ntouch \"$(git rev-parse --git-dir)/hook-ran\"\n",
-    )
-    .unwrap();
+    // No `git` in the hook: another test puts a fake one on the CALLER_PATH every commit shares
+    fs::write(&hook, "#!/bin/sh\ntouch .git/hook-ran\n").unwrap();
     Command::new("chmod").arg("+x").arg(&hook).status().unwrap();
 
     fs::write(repo.join("a.txt"), "a2").unwrap();
