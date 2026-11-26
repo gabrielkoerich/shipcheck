@@ -553,6 +553,18 @@ fn the_profile_lets_a_check_write_only_in_its_jail() {
 }
 
 #[test]
+fn checks_run_in_the_sandbox_around_them_only_when_the_kernel_says_there_is_one() {
+    let nested = || Err(sandbox_jail::Error::Nested);
+    assert_eq!(choose(nested(), Process::Sandboxed), Ok(AROUND));
+    assert_eq!(choose(nested(), Process::Free), Err(NO_START.to_string()));
+    assert_eq!(
+        choose(Ok(Backend::Seatbelt), Process::Sandboxed),
+        Ok("sandbox-exec")
+    );
+    assert_eq!(choose(Ok(Backend::Bwrap), Process::Free), Ok("bwrap"));
+}
+
+#[test]
 fn knows_it_runs_in_a_jail_only_inside_a_host_check() {
     let inside = std::env::var_os("SHIPCHECK_JAIL").is_some() && cfg!(target_os = "macos");
     assert_eq!(in_a_jail(), inside);

@@ -434,26 +434,69 @@ pub fn branch_cache() -> String {
 
 /// The OS sandbox host checks run in, an error naming the fix when this machine has none
 pub fn sandbox() -> Result<&'static str, String> {
-    match Backend::detect() {
+    choose(Backend::detect(), in_a_sandbox())
+}
+
+/// [`sandbox`] from what `Backend::detect` and the kernel said
+fn choose(
+    detected: Result<Backend, sandbox_jail::Error>,
+    process: Process,
+) -> Result<&'static str, String> {
+    match detected {
         Ok(Backend::Seatbelt) => Ok("sandbox-exec"),
         Ok(Backend::Bwrap) => Ok("bwrap"),
-        // macOS refuses a sandbox inside a sandbox, so inside one, such as an agent's, checks run in it
-        Err(sandbox_jail::Error::Nested) => Ok(AROUND),
+        // macOS starts no sandbox inside another, so inside one, such as an agent's, checks run in it
+        Err(sandbox_jail::Error::Nested) if process == Process::Sandboxed => Ok(AROUND),
+        // The probe fails for other reasons too, and outside a sandbox a check never runs without one
+        Err(sandbox_jail::Error::Nested) => Err(NO_START.into()),
         Err(e) => Err(format!("host mode needs an OS sandbox: {e}")),
     }
 }
 
 const AROUND: &str = "the sandbox shipcheck runs in";
 
-/// Whether shipcheck already runs in a sandbox, where macOS starts no other, so host checks run in it
+const NO_START: &str =
+    "sandbox-exec could not start a sandbox, and this process runs in none, so nothing ran";
+
+/// Whether the kernel puts this process in a sandbox, which job code cannot fake
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Process {
+    Sandboxed,
+    Free,
+}
+
+#[cfg(target_os = "macos")]
+fn in_a_sandbox() -> Process {
+    if sandboxed() {
+        Process::Sandboxed
+    } else {
+        Process::Free
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn in_a_sandbox() -> Process {
+    Process::Free
+}
+
+/// Whether host checks run in the sandbox shipcheck runs in, since macOS starts no other inside it
 #[cfg(target_os = "macos")]
 pub fn already_sandboxed() -> bool {
-    matches!(Backend::detect(), Err(sandbox_jail::Error::Nested))
+    sandbox() == Ok(AROUND)
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn already_sandboxed() -> bool {
     false
+}
+
+/**
+ * Whether host checks run in a sandbox looser than one of their own, such as an agent's, whose
+ * checks could write any result. One as strict as a check's own, as in shipcheck's tests of
+ * itself, keeps its results
+ **/
+pub fn loose_sandbox() -> bool {
+    already_sandboxed() && !in_a_jail()
 }
 
 /**
@@ -730,9 +773,12 @@ impl Jail {
             .env("GITHUB_STEP_SUMMARY", self.home.join(STEP_SUMMARY))
             .stdin(Stdio::null());
 
-        // Tests of the jail read it, since macOS refuses a sandbox inside a sandbox
         if self.sandboxed {
-            cmd.env("SHIPCHECK_JAIL", "1");
+            // Tests of the jail read it, so only a check in a sandbox of shipcheck's own gets it
+            if !already_sandboxed() {
+                cmd.env("SHIPCHECK_JAIL", "1");
+            }
+
             // libgit2's TLS on macOS needs securityd, which holds the keychain and the jail denies. git does not
             cmd.env("CARGO_NET_GIT_FETCH_WITH_CLI", "true");
         }
@@ -1133,7 +1179,9 @@ pub fn reap_slot(slot: &Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 pub fn launchd() -> Result<String, String> {
     if already_sandboxed() {
-        return Ok("not used inside a sandbox, which cannot reach launchd".into());
+        return Ok(
+            "not used inside another sandbox, since launchd would start checks outside it".into(),
+        );
     }
 
     job::probe()
@@ -1207,7 +1255,7 @@ pub fn run_command(
     std::io::Write::write_all(&mut file, format!("$ {command}\n").as_bytes())
         .map_err(|e| e.to_string())?;
 
-    // A sandbox, as an agent's or a check's own in shipcheck's tests of itself, cannot reach launchd
+    // launchd would start the check outside the sandbox shipcheck runs in, with no sandbox at all
     #[cfg(target_os = "macos")]
     if !already_sandboxed() {
         drop(file);

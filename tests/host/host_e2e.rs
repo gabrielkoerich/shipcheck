@@ -140,10 +140,14 @@ fn runs_host_checks_caches_by_tree_and_commits() {
     assert_eq!(entry.workflows[0].file, "host");
     assert_eq!(entry.workflows[0].jobs.len(), 4);
     assert!(entry.workflows[0].jobs.values().all(|s| s == "success"));
-    // The sandbox kept the check's writes in its clone. Nested in a host check, the outer jail
-    // stands in for it and lets its own temp folder be written, where `outside` is
+    // The sandbox kept the check's writes in its clone. Inside another sandbox that one stands in
+    // for it, and what it lets the check write depends on it
     assert!(!real_home.exists());
-    assert_eq!(outside.exists(), host::in_a_jail());
+
+    if !host::already_sandboxed() {
+        assert!(!outside.exists());
+    }
+
     assert!(!log().contains("hunter2"));
     // The checks ran in clones, never in the developer's checkout
     assert_eq!(git(&work, &["status", "--porcelain"]), "");

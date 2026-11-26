@@ -415,6 +415,11 @@ fn run_with(
         return Ok(entry);
     }
 
+    // Host checks in a sandbox not of shipcheck's own could have written any result, so none is kept
+    if plan.config.hosts() && host::loose_sandbox() {
+        return Ok(entry);
+    }
+
     let cache_dir = home().join("cache");
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?;
@@ -836,7 +841,10 @@ fn run_all(ctx: &Ctx<'_>, say: &mut dyn FnMut(&str)) -> Result<Vec<WorkflowResul
  * since the commands come from the plan and no workflow runs
  **/
 /// What a run and doctor say about a `sandbox = false` check this machine does not trust
-pub const UNTRUSTED: &str = "this repository asks to run it with sandbox = false, so it runs in the sandbox here. Run `shipcheck trust` to allow it if you trust the repository";
+pub const UNTRUSTED: &str = "this repository asks to run it with sandbox = false, so it runs in a sandbox here. Run `shipcheck trust` to allow it if you trust the repository";
+
+/// What a run says when its host checks run in the sandbox shipcheck runs in, which they could write any result from
+pub const INSIDE: &str = "host checks run in the sandbox shipcheck runs in, not one of their own, since macOS starts no sandbox inside another. They get what it allows, so this result is not cached or posted: the daemon's run outside is the check";
 
 /// What a run and doctor say about a check with `sandbox = false`
 pub const UNSANDBOXED: &str = "runs outside the sandbox, as `sandbox = false` on the base says, with this user's full access to the home, its keys and tokens. For trusted repositories only";
@@ -853,6 +861,10 @@ fn run_host(ctx: &Ctx<'_>, say: &mut dyn FnMut(&str)) -> Result<WorkflowResult, 
     fs::create_dir_all(ctx.logs.join(HOST)).map_err(|e| e.to_string())?;
     git_cow::can_clone(&templates, &checkouts);
     let deadline = Instant::now() + Duration::from_secs(ctx.plan.config.timeout_minutes * 60);
+
+    if host::loose_sandbox() {
+        say(&format!("{HOST}: {INSIDE}"));
+    }
 
     for (name, c) in checks {
         if !c.sandbox {

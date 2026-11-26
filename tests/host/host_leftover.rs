@@ -47,8 +47,8 @@ fn a_process_a_check_leaves_cannot_change_the_next_run() {
         std::env::set_var("SHIPCHECK_HOME", tmp.path().join(".local/state/shipcheck"));
     }
 
-    if host::in_a_jail() {
-        // A jail of shipcheck's own tests has no launchd to reach, and its checks never post
+    if host::already_sandboxed() {
+        // Inside another sandbox host checks start no launchd job, and their results never post
         return;
     }
 
