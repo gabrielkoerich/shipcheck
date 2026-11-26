@@ -437,14 +437,24 @@ pub fn sandbox() -> Result<&'static str, String> {
     match Backend::detect() {
         Ok(Backend::Seatbelt) => Ok("sandbox-exec"),
         Ok(Backend::Bwrap) => Ok("bwrap"),
-        // macOS refuses a sandbox inside a sandbox, such as an agent's, unless that one is as strict
-        Err(sandbox_jail::Error::Nested) if in_a_jail() => Ok("sandbox-exec"),
-        Err(sandbox_jail::Error::Nested) => Err(NESTED.into()),
+        // macOS refuses a sandbox inside a sandbox, so inside one, such as an agent's, checks run in it
+        Err(sandbox_jail::Error::Nested) => Ok(AROUND),
         Err(e) => Err(format!("host mode needs an OS sandbox: {e}")),
     }
 }
 
-const NESTED: &str = "the host checks' sandbox cannot start inside another sandbox, such as an agent's, so nothing ran: run shipcheck outside it, for example by exempting the `shipcheck` command in the agent's sandbox settings. A push still gets its checks from the hook's run and the daemon, which run outside it";
+const AROUND: &str = "the sandbox shipcheck runs in";
+
+/// Whether shipcheck already runs in a sandbox, where macOS starts no other, so host checks run in it
+#[cfg(target_os = "macos")]
+pub fn already_sandboxed() -> bool {
+    matches!(Backend::detect(), Err(sandbox_jail::Error::Nested))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn already_sandboxed() -> bool {
+    false
+}
 
 /**
  * Whether this process already runs in a jail as strict as a host check's, as shipcheck's own
@@ -645,8 +655,7 @@ impl Jail {
     fn wrapper(&self) -> Result<Vec<std::ffi::OsString>, String> {
         let backend = match sandbox()? {
             _ if !self.sandboxed => None,
-            // macOS refuses a sandbox inside a sandbox, and the one around this process is as strict
-            "sandbox-exec" if in_a_jail() => None,
+            AROUND => None,
             "sandbox-exec" => Some(Backend::Seatbelt),
             _ => Some(Backend::Bwrap),
         };
@@ -1123,8 +1132,8 @@ pub fn reap_slot(slot: &Path) -> Result<(), String> {
 /// Whether host checks can start as launchd jobs here, which they need to be stopped whole, for doctor
 #[cfg(target_os = "macos")]
 pub fn launchd() -> Result<String, String> {
-    if in_a_jail() {
-        return Ok("not used inside a host check's own jail".into());
+    if already_sandboxed() {
+        return Ok("not used inside a sandbox, which cannot reach launchd".into());
     }
 
     job::probe()
@@ -1198,9 +1207,9 @@ pub fn run_command(
     std::io::Write::write_all(&mut file, format!("$ {command}\n").as_bytes())
         .map_err(|e| e.to_string())?;
 
-    // A check's own jail, as in shipcheck's tests of itself, cannot reach launchd
+    // A sandbox, as an agent's or a check's own in shipcheck's tests of itself, cannot reach launchd
     #[cfg(target_os = "macos")]
-    if !in_a_jail() {
+    if !already_sandboxed() {
         drop(file);
         install();
         return job::run(&jail.shell(command, dir, extra)?, dir, log, timeout);

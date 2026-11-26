@@ -368,6 +368,12 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         found.push(check(
             "sandbox",
             runner::host::sandbox().map(|s| {
+                if runner::host::already_sandboxed() {
+                    return format!(
+                        "{s}: macOS starts no sandbox inside another, so host checks get what this one allows"
+                    );
+                }
+
                 format!(
                     "{s}: host checks write only to their clone, a new home and the repository's tool caches. {}",
                     runner::host::branch_cache()
