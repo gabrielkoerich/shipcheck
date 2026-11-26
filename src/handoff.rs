@@ -1,10 +1,12 @@
 //! Runs asked for from inside another sandbox, where a host check's own cannot start: the command
 //! leaves a request in the worktree's git dir and the daemon starts the run outside
 
+use crate::cache;
 use crate::daemon_config::{DaemonConfig, RepoEntry};
 use crate::paths;
 use crate::run;
-use crate::{cache, runner::host};
+#[cfg(target_os = "macos")]
+use crate::runner::host;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
