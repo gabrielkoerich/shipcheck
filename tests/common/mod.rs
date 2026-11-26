@@ -8,7 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+/// Runs the tests that hold it one at a time, since the tests of one binary share its environment
+pub(crate) fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The lines a command prints, none when it is missing or fails
 fn lines(cmd: &str, args: &[&str]) -> BTreeSet<String> {

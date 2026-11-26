@@ -3,7 +3,9 @@
 mod common;
 
 use shipcheck::cache;
-use shipcheck::check;
+use shipcheck::git;
+use shipcheck::paths;
+use shipcheck::post::check;
 use shipcheck::secret;
 use std::fs;
 use std::path::Path;
@@ -115,7 +117,7 @@ fn runs_caches_and_tests_the_working_copy() {
     assert!(
         entry.passed,
         "{entry:?}\n{}",
-        fs::read_to_string(run::log_dir(&plan.key).join("ci.yml.log")).unwrap_or_default()
+        fs::read_to_string(paths::log_dir(&plan.key).join("ci.yml.log")).unwrap_or_default()
     );
     assert_eq!(entry.workflows[0].jobs["check"], "success");
     assert!(run::cached(&plan.key).unwrap().passed);
@@ -133,7 +135,7 @@ fn runs_caches_and_tests_the_working_copy() {
         entry.workflows[0].jobs["check"],
         "failure",
         "{}",
-        fs::read_to_string(run::log_dir(&plan.key).join("ci.yml.log")).unwrap_or_default()
+        fs::read_to_string(paths::log_dir(&plan.key).join("ci.yml.log")).unwrap_or_default()
     );
     assert_eq!(entry.workflows[0].attempts, 2);
 
@@ -462,7 +464,7 @@ fn runs_caches_and_tests_the_working_copy() {
     let record = |branch: &str| {
         tmp.path()
             .join("home/background")
-            .join(run::repo_id(&work).unwrap())
+            .join(git::repo_id(&work).unwrap())
             .join(format!("{branch}.pid"))
     };
     assert!(!record("wip").exists(), "the commit hook must start no run");
@@ -624,11 +626,11 @@ fn runs_caches_and_tests_the_working_copy() {
         fs::write(work.join(file), text).unwrap();
     }
     // The secrets file of this repository reaches its jobs, another repository's does not
-    let id = run::repo_id(&work).unwrap();
-    let own = run::secrets_file(&id);
+    let id = git::repo_id(&work).unwrap();
+    let own = paths::secrets_file(&id);
     fs::create_dir_all(own.parent().unwrap()).unwrap();
     fs::write(&own, "OWN_SECRET=own-canary-5d1e\n").unwrap();
-    let other = run::secrets_file(&format!("{}/other", id.split('/').next().unwrap()));
+    let other = paths::secrets_file(&format!("{}/other", id.split('/').next().unwrap()));
     fs::write(&other, "OTHER_SECRET=canary-of-another-repository\n").unwrap();
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-qm", "isolation"]);
@@ -665,7 +667,7 @@ fn runs_caches_and_tests_the_working_copy() {
     assert!(
         entry.passed,
         "a job reached the host: {}",
-        fs::read_to_string(run::log_dir(&plan.key).join("isolation.yml.log")).unwrap_or_default()
+        fs::read_to_string(paths::log_dir(&plan.key).join("isolation.yml.log")).unwrap_or_default()
     );
     assert!(
         !work.join(".git/written-by-job").exists(),
@@ -686,10 +688,10 @@ fn runs_caches_and_tests_the_working_copy() {
     assert!(ran.is_empty(), "the job's checkout ran {ran:?} on the host");
     assert_eq!(fs::read_to_string(host.join("canary")).unwrap(), "mine");
     let log =
-        fs::read_to_string(run::log_dir(&plan.key).join("isolation.yml.log")).unwrap_or_default();
+        fs::read_to_string(paths::log_dir(&plan.key).join("isolation.yml.log")).unwrap_or_default();
     assert!(log.contains("secret is ***"), "{log}");
     // An output that names a secret never makes act read it for the job that gets the output
-    let used = fs::read_to_string(run::log_dir(&plan.key).join("isolation.yml/use.log")).unwrap();
+    let used = fs::read_to_string(paths::log_dir(&plan.key).join("isolation.yml/use.log")).unwrap();
     assert!(used.contains("shipcheck-end"), "{used}");
     assert!(
         !used.contains("own-canary") && !used.contains("***"),
@@ -700,7 +702,7 @@ fn runs_caches_and_tests_the_working_copy() {
     failed.workflows[0].passed = false;
     let tail = check::failure_text(
         &failed,
-        &run::log_dir(&plan.key),
+        &paths::log_dir(&plan.key),
         &run::secret_values(&id).unwrap(),
     );
     assert!(tail.contains("isolation.yml"), "{tail}");
@@ -739,7 +741,7 @@ fn runs_caches_and_tests_the_working_copy() {
     git(&work, &["add", "-A"]);
     git(&work, &["commit", "-qm", "plant"]);
     let state_log = |plan: &run::Plan| {
-        fs::read_to_string(run::log_dir(&plan.key).join("state.yml.log")).unwrap_or_default()
+        fs::read_to_string(paths::log_dir(&plan.key).join("state.yml.log")).unwrap_or_default()
     };
     let plan = run::plan(&work, "plant", "origin/main").unwrap();
     let entry = run::run(&plan, &mut |l| eprintln!("{l}")).unwrap();
@@ -844,7 +846,7 @@ fn runs_caches_and_tests_the_working_copy() {
         (entry, modes.join().unwrap())
     });
     let log =
-        fs::read_to_string(run::log_dir(&plan.key).join("artifacts.yml.log")).unwrap_or_default();
+        fs::read_to_string(paths::log_dir(&plan.key).join("artifacts.yml.log")).unwrap_or_default();
     assert!(
         entry.passed,
         "artifacts or the internet probe failed: {log}"

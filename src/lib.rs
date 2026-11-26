@@ -10,28 +10,21 @@
 )]
 
 pub mod agents;
-pub mod autostart;
-pub mod background;
+pub mod base;
 pub mod cache;
-pub mod check;
-pub mod comment;
+pub mod clock;
 pub mod config;
 pub mod daemon;
+pub mod daemon_config;
 pub mod doctor;
-pub mod github;
-pub mod java;
+pub mod git;
+pub mod history;
 pub mod onboard;
-pub mod queue;
-pub mod record;
-pub mod report;
-pub mod ruby;
+pub mod paths;
+pub mod post;
 pub mod run;
 pub mod runner;
 pub mod secret;
-pub mod service;
 pub mod setup;
-pub mod tabs;
-pub mod templates;
-pub mod trust;
 pub mod ui;
 pub mod workflow;

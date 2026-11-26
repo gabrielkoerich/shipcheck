@@ -1,21 +1,23 @@
 use crate::agents;
-use crate::autostart;
-use crate::background;
-use crate::check;
 use crate::config::Engine;
 use crate::config::Team;
+use crate::daemon::autostart;
+use crate::git;
+use crate::paths;
+use crate::post::background;
+use crate::post::check;
+use crate::post::service;
+use crate::post::service::Sender;
 use crate::run;
 use crate::secret;
-use crate::service;
-use crate::service::Sender;
 use crate::setup;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use crate::config::{Network, RepoConfig, RunnerKind};
+use crate::post::service::Poster;
 use crate::runner::{self, Runner};
-use crate::service::Poster;
 
 /// One thing shipcheck needs, and the command that fixes it when it is missing
 #[derive(Debug)]
@@ -115,7 +117,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             }),
     ));
 
-    let home = run::home();
+    let home = paths::home();
 
     let (_, prefix, host) = runner::act::here_parts();
     let here = runner::act::here(&home, &prefix, &host);
@@ -160,7 +162,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
     });
 
     let mut secrets = vec![home.join("token"), home.join("app.pem")];
-    secrets.extend(run::repo_id(cwd).ok().map(|id| run::secrets_file(&id)));
+    secrets.extend(git::repo_id(cwd).ok().map(|id| paths::secrets_file(&id)));
     let secrets: Vec<_> = secrets.into_iter().filter(|p| secret::exists(p)).collect();
 
     if !secrets.is_empty() {
@@ -407,7 +409,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         if !on_vm.is_empty() {
             found.push(check(
                 "colima",
-                runner::colima::version().map(|v| {
+                runner::act::colima::version().map(|v| {
                     format!(
                         "{v}, a VM of its own for each of {}. For trusted repositories only: the VM reaches this machine's 127.0.0.1 through 192.168.5.2 and the internet whatever `network` says, so also the artifact servers of docker runs going at the same time, and act runs beside the job's code. The cache key holds colima's and lima's versions, not the VM image's digest, so an image colima swaps under the same version is not seen",
                         on_vm.join(", ")
@@ -439,7 +441,7 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
 
     // The post itself refuses a repository the App cannot reach, so ask GitHub here, before a push
     if service::can_post()
-        && let Ok(repo) = run::repo_id(Path::new(&top))
+        && let Ok(repo) = git::repo_id(Path::new(&top))
     {
         let answer = Sender::new(&repo).and_then(|s| s.open_prs().map(|_| ()));
         found.push(check("app", app_line(&repo, answer)));
@@ -456,16 +458,16 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
         },
     });
 
-    let legacy = run::legacy_home();
+    let legacy = paths::legacy_home();
 
-    if cfg!(target_os = "macos") && legacy.is_dir() && legacy != run::home() {
+    if cfg!(target_os = "macos") && legacy.is_dir() && legacy != paths::home() {
         found.push(Check {
             name: "old home",
             ok: false,
             detail: format!(
                 "{} is still there next to {}, so shipcheck did not move it. Move what you need from it, then trash it",
                 legacy.display(),
-                run::home().display()
+                paths::home().display()
             ),
         });
     }
@@ -477,18 +479,18 @@ pub fn checks(cwd: &Path, base: &str) -> Vec<Check> {
             detail: format!(
                 "the LaunchAgent logs to {}, run `shipcheck install` to point it at {}",
                 legacy.display(),
-                run::home().display()
+                paths::home().display()
             ),
         });
     }
 
-    if run::home_overridden() {
+    if paths::home_overridden() {
         found.push(Check {
             name: "home",
             ok: true,
             detail: format!(
                 "SHIPCHECK_HOME moves results to {}. `post` and the daemon refuse it without --home-ok",
-                run::home().display()
+                paths::home().display()
             ),
         });
     }

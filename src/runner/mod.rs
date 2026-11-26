@@ -7,7 +7,6 @@ use std::time::Duration;
 use crate::config::RepoConfig;
 
 pub mod act;
-pub mod colima;
 pub mod gc;
 pub mod host;
 pub mod shard;
@@ -198,6 +197,10 @@ impl fmt::Debug for Runners {
 }
 
 impl Runners {
+    pub fn has_host(&self) -> bool {
+        self.host.is_some()
+    }
+
     /// `repo` is the checkout the run reads git from, where host checks run their `versions`
     pub fn new(config: &RepoConfig, repo: &Path) -> Self {
         Runners {

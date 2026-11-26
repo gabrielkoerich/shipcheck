@@ -215,6 +215,17 @@ fn wanted(screen: Screen, var: impl Fn(&str) -> Option<String>) -> bool {
         && var("TERM").as_deref() != Some("dumb")
 }
 
+/// Job output with its control characters escaped, so it cannot drive the terminal it is printed to
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c.to_string(),
+            c if c.is_control() => c.escape_debug().to_string(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

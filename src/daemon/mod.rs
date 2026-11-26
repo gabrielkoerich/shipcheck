@@ -1,0 +1,1290 @@
+use crate::base;
+use crate::clock;
+use crate::config::RepoConfig;
+use crate::daemon_config::DaemonConfig;
+use crate::daemon_config::RepoEntry;
+use crate::daemon_config::fetch_options;
+use crate::git;
+use crate::paths;
+use crate::post::service;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use crate::paths::MovedHome;
+use crate::post::background::{self, Posting, Runs};
+use crate::post::check::{Tails, Wait};
+use crate::post::github::{Checks, OpenPr};
+use crate::post::record::{self, Run};
+use crate::post::service::Sender;
+use crate::{post::check, post::comment, run};
+
+pub mod autostart;
+
+/// How long a run can last: each workflow's deadline, once per attempt, and 10 minutes to set up and
+/// post. A claim older than this is a run that died, so this machine may take the PR
+fn stale_after(config: &RepoConfig) -> u64 {
+    config.timeout_minutes * 60 * (u64::from(config.retries) + 1) + 600
+}
+
+/// How long a run may make no progress, no log growing and no wait for a run slot, before it counts as stuck
+const QUIET: Duration = Duration::from_mins(15);
+
+/**
+ * The base every command reads shipcheck.toml and the workflows from: this checkout's daemon entry,
+ * then the default branch the remote reports, then `origin/main` with a warning. The hooks run in
+ * git's foreground, so they skip the remote and only say when `origin/main` is likely wrong
+ **/
+/**
+ * Whether a result on `base` may be posted: the daemon's base for this checkout, or the default
+ * branch the remote reports, never a ref the caller picked, whose shipcheck.toml could run anything.
+ * An entry counts only for the checkout it names, and a remote that does not answer allows nothing
+ **/
+/**
+ * Polls GitHub for open PR heads with no completed `shipcheck` check, posts a stored result at
+ * once, and runs a same-repository head that has none. It reads `daemon.toml` again every cycle,
+ * so a repository `shipcheck install` adds needs no restart, and waits while this machine cannot
+ * post, so a later `shipcheck login` is enough
+ **/
+/// `home_ok` is a person's `--home-ok`, passed on to the runs it starts
+pub fn serve(home_ok: MovedHome) -> ! {
+    let mut senders: BTreeMap<String, Sender> = BTreeMap::new();
+    let mut done: HashSet<(String, String)> = HashSet::new();
+    let mut waiting: HashMap<(String, String), Instant> = HashMap::new();
+    let mut said: HashSet<String> = HashSet::new();
+    // The head each PR had when the daemon last checked it, to see merges and new heads
+    let mut heads: BTreeMap<(String, u64), String> = BTreeMap::new();
+    // The head each PR had while it waited for GitHub to list its push
+    let mut waits: BTreeMap<(String, u64), String> = BTreeMap::new();
+    // The heads checked while the base had no shipcheck.toml, with the base's tip then
+    let mut unconfigured: HashMap<(String, String), String> = HashMap::new();
+    // The clones already looked at, and when to look for new ones
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut next_look = Instant::now();
+    // Whether each repository's PR events socket is open, and the repositories an event named
+    let mut live: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut woken: HashSet<String> = HashSet::new();
+    // When each repository was last read, and the ones with a head still to settle
+    let mut polled: HashMap<String, Instant> = HashMap::new();
+    // The base tip each repository was last checked at, and when the base was last fetched to look
+    let mut tips: HashMap<String, String> = HashMap::new();
+    let mut looked: HashMap<String, Instant> = HashMap::new();
+    let mut unsettled: HashSet<String> = HashSet::new();
+
+    loop {
+        let config = match DaemonConfig::load() {
+            Ok(config) => DaemonConfig { home_ok, ..config },
+            Err(e) => {
+                eprintln!("{e}");
+                std::thread::sleep(Duration::from_secs(10));
+                continue;
+            }
+        };
+
+        // A repository it adds is in daemon.toml, which the next poll reads
+        if Instant::now() >= next_look {
+            for line in discover(&config, &mut seen) {
+                println!("{line}");
+            }
+
+            next_look = Instant::now() + DISCOVER_EVERY;
+        }
+
+        if config.run_misses && me(&config).is_none() && said.insert(String::new()) {
+            eprintln!(
+                "runs no PR, no login known for this machine: run `shipcheck login` again, or set login in daemon.toml"
+            );
+        }
+
+        for (repo, entry) in &config.repos {
+            if !senders.contains_key(repo) {
+                match Sender::new(repo) {
+                    Ok(sender) => {
+                        if sender.streams() {
+                            let open = Arc::new(AtomicBool::new(false));
+                            listen(repo.clone(), tx.clone(), Arc::clone(&open));
+                            live.insert(repo.clone(), open);
+                        }
+
+                        senders.insert(repo.clone(), sender);
+                    }
+                    Err(e) => {
+                        if said.insert(repo.clone()) {
+                            eprintln!("{repo}: waiting, {e}");
+                        }
+
+                        continue;
+                    }
+                }
+            }
+
+            let (socket, settled) = (Socket::of(&live, repo), Heads::of(&unsettled, repo));
+            let since = polled.get(repo).map(Instant::elapsed);
+            let interval = Duration::from_secs(config.interval_seconds);
+
+            if !woken.remove(repo) && !due(socket, settled, since, interval) {
+                continue;
+            }
+
+            polled.insert(repo.clone(), Instant::now());
+            unsettled.insert(repo.clone());
+
+            let look = Tip::of(&looked, repo);
+
+            if look == Tip::Look {
+                looked.insert(repo.clone(), Instant::now());
+            }
+
+            let state = (
+                &mut done,
+                &mut waiting,
+                &mut heads,
+                &mut waits,
+                &mut unconfigured,
+            );
+
+            let refused = format!("{repo} unposted");
+
+            match cycle(&config, repo, entry, &senders[repo], state, look, &mut tips) {
+                // Said once per repository, each poll gets the same answer until the App is added
+                Err(e) if background::not_installed(&e) => {
+                    if said.insert(refused) {
+                        background::remember_post(repo, Some(&e));
+                        eprintln!("{repo}: {}", background::unposted_line(repo, &e));
+                    }
+                }
+                Err(e) => eprintln!("{repo}: {e}"),
+                Ok(settled) => {
+                    said.remove(&refused);
+
+                    if settled {
+                        unsettled.remove(repo);
+                    }
+                }
+            }
+        }
+
+        background::reap();
+
+        // A PR event ends the wait early, and the ones that came with it are read in the same pass
+        if let Ok(repo) = rx.recv_timeout(Duration::from_secs(config.interval_seconds)) {
+            woken.insert(repo);
+            woken.extend(rx.try_iter());
+        }
+    }
+}
+
+/// How often a repository whose PR events socket is open and whose heads all settled is read anyway,
+/// for an event the socket missed
+const STREAMED_POLL: Duration = Duration::from_secs(300);
+
+/**
+ * Keeps `repo`'s PR events socket open on a thread of its own, and sends `repo` on `tx` for each
+ * event and each time the socket opens, since events can be missed while it is down. A socket that
+ * fails waits before it connects again, from 10 seconds up to 10 minutes, and says each new error once
+ **/
+fn listen(repo: String, tx: mpsc::Sender<String>, open: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut wait = FIRST_RETRY / 2;
+        let mut last = String::new();
+
+        loop {
+            let opened = || {
+                open.store(true, Ordering::Relaxed);
+                let _ = tx.send(repo.clone());
+            };
+            let wake = || {
+                let _ = tx.send(repo.clone());
+            };
+            let started = Instant::now();
+            let got = Sender::new(&repo).and_then(|s| s.listen(&opened, &wake));
+            open.store(false, Ordering::Relaxed);
+
+            wait = backoff(wait, started.elapsed());
+
+            match got {
+                Err(e) if e != last => {
+                    eprintln!("{repo}: {e}, reading the PRs every interval_seconds");
+                    last = e;
+                }
+                Err(_) => {}
+                Ok(()) => last.clear(),
+            }
+
+            std::thread::sleep(wait);
+        }
+    });
+}
+
+/// Whether a repository's PR events socket is open
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Socket {
+    Open,
+    Closed,
+}
+
+impl Socket {
+    fn of(live: &BTreeMap<String, Arc<AtomicBool>>, repo: &str) -> Socket {
+        live.get(repo)
+            .filter(|l| l.load(Ordering::Relaxed))
+            .map_or(Socket::Closed, |_| Socket::Open)
+    }
+}
+
+/// Whether a repository has a head still to settle
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heads {
+    Settled,
+    Unsettled,
+}
+
+impl Heads {
+    fn of(unsettled: &HashSet<String>, repo: &str) -> Heads {
+        if unsettled.contains(repo) {
+            Heads::Unsettled
+        } else {
+            Heads::Settled
+        }
+    }
+}
+
+/// Whether a repository no event named is read now, `since` its last read
+fn due(socket: Socket, heads: Heads, since: Option<Duration>, interval: Duration) -> bool {
+    let every = if socket == Socket::Open && heads == Heads::Settled {
+        STREAMED_POLL
+    } else {
+        interval
+    };
+    since.is_none_or(|since| since >= every)
+}
+
+/// How long to wait before the events socket connects again, after one that stayed open `lasted`
+fn backoff(wait: Duration, lasted: Duration) -> Duration {
+    if lasted > STREAMED_POLL {
+        return FIRST_RETRY;
+    }
+
+    (wait * 2).min(LAST_RETRY)
+}
+
+const FIRST_RETRY: Duration = Duration::from_secs(10);
+const LAST_RETRY: Duration = Duration::from_secs(600);
+
+/// How often the daemon looks for clones of repositories it does not watch yet
+const DISCOVER_EVERY: Duration = Duration::from_secs(300);
+
+/**
+ * The clones next to the checkouts the daemon watches, not watched and not looked at before, whose
+ * local refs show a shipcheck.toml. The hint only picks which remotes to ask, so a folder of many
+ * repositories costs no request each. A worktree is skipped, its main checkout is the one to add
+ **/
+fn candidates(config: &DaemonConfig, seen: &mut HashSet<PathBuf>) -> Vec<(PathBuf, String)> {
+    let mut watched: HashSet<String> = config.repos.keys().cloned().collect();
+    let roots: std::collections::BTreeSet<PathBuf> = config
+        .repos
+        .values()
+        .filter_map(|e| e.path.parent().map(Path::to_path_buf))
+        .collect();
+    let mut found = Vec::new();
+
+    for root in roots {
+        let Ok(dirs) = std::fs::read_dir(&root) else {
+            continue;
+        };
+
+        for dir in dirs.flatten().map(|d| d.path()) {
+            if !dir.join(".git").is_dir() || !seen.insert(dir.clone()) {
+                continue;
+            }
+
+            let Ok(repo) = git::repo_id(&dir) else {
+                continue;
+            };
+
+            let hint = ["refs/remotes/origin/HEAD", "refs/remotes/origin/main"]
+                .iter()
+                .any(|r| {
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&dir)
+                        .args(["cat-file", "-e", &format!("{r}:shipcheck.toml")])
+                        .output()
+                        .is_ok_and(|o| o.status.success())
+                });
+
+            if hint && watched.insert(repo.clone()) {
+                found.push((dir, repo));
+            }
+        }
+    }
+
+    found
+}
+
+/**
+ * Watches the candidates whose default branch, as the remote names it, has a shipcheck.toml and
+ * whose repository the App can read, so installing the App on a cloned repository is enough
+ **/
+fn discover(config: &DaemonConfig, seen: &mut HashSet<PathBuf>) -> Vec<String> {
+    let mut said = Vec::new();
+
+    for (dir, repo) in candidates(config, seen) {
+        let Some(base) = base::remote_base(&dir) else {
+            continue;
+        };
+        let entry = RepoEntry {
+            path: dir.clone(),
+            base: base.clone(),
+        };
+        let branch = base.strip_prefix("origin/").unwrap_or(&base);
+
+        if !git(&entry, &["fetch", "-q", "origin", branch])
+            || !git(
+                &entry,
+                &["cat-file", "-e", &format!("{base}:shipcheck.toml")],
+            )
+        {
+            continue;
+        }
+
+        if Sender::new(&repo).and_then(|s| s.open_prs()).is_err() {
+            continue;
+        }
+
+        if DaemonConfig::add(&repo, &dir, &base).is_ok() {
+            said.push(format!("{repo}: found at {}, watching it", dir.display()));
+        }
+    }
+
+    said
+}
+
+fn git(entry: &RepoEntry, args: &[&str]) -> bool {
+    let remote = if args.first() == Some(&"fetch") {
+        fetch_options()
+    } else {
+        Vec::new()
+    };
+
+    Command::new("git")
+        .arg("-C")
+        .arg(&entry.path)
+        .args(remote)
+        .args(args)
+        // A service has no terminal, so a credential prompt would hang the daemon
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether a cycle fetches the base to look for a tip no PR announced
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tip {
+    Look,
+    Skip,
+}
+
+impl Tip {
+    /// A push straight to the base, such as a release bump, comes with no PR to say so
+    fn of(looked: &HashMap<String, Instant>, repo: &str) -> Tip {
+        looked
+            .get(repo)
+            .filter(|at| at.elapsed() < STREAMED_POLL)
+            .map_or(Tip::Look, |_| Tip::Skip)
+    }
+}
+
+fn cycle(
+    config: &DaemonConfig,
+    repo: &str,
+    entry: &RepoEntry,
+    sender: &Sender,
+    (done, waiting, heads, waits, unconfigured): State<'_>,
+    look: Tip,
+    tips: &mut HashMap<String, String>,
+) -> Result<bool, String> {
+    let base_branch = entry.base.strip_prefix("origin/").unwrap_or(&entry.base);
+    let open = sender.open_prs()?;
+    let merged = merges(repo, sender, &open, heads, base_branch);
+
+    // A merge or a push moved the base, whose tip gets checks of its own, the ones a status badge reads
+    if (merged || look == Tip::Look)
+        && git(entry, &["fetch", "-q", "origin", base_branch])
+        && (merged || tips.get(repo) != Some(&base_tip(entry)))
+    {
+        let start = |plan: &run::Plan, name: &str| {
+            background::start(
+                &entry.path,
+                plan,
+                &entry.base,
+                name,
+                Posting::On,
+                "daemon",
+                config.home_ok,
+            );
+        };
+
+        match handle_main(config, entry, sender, &start) {
+            Ok(verdict) => {
+                println!("{repo} {base_branch}: {verdict}");
+                tips.insert(repo.to_string(), base_tip(entry));
+            }
+            Err(e) => eprintln!("{repo} {base_branch}: {e}"),
+        }
+    }
+
+    let prs = into_base(open, &entry.base);
+
+    track_heads(repo, &prs, heads, sender);
+
+    // Never refused: silence about who pushed it says nothing against them
+    for (number, old) in abandoned(waits, repo, &prs) {
+        println!(
+            "{repo}#{number}: {} replaced before GitHub named who pushed it",
+            &old[..old.len().min(12)]
+        );
+        let fields = serde_json::json!({"pr": number, "sha": old, "reason": "abandoned_while_waiting_for_push"});
+        record::keep(repo, &record::event(repo, "skipped", fields));
+        waits.remove(&(repo.to_string(), number));
+    }
+
+    let id = |pr: &OpenPr| (repo.to_string(), pr.sha.clone());
+    if prs
+        .iter()
+        .all(|pr| done.contains(&id(pr)) && !unconfigured.contains_key(&id(pr)))
+    {
+        return Ok(true);
+    }
+
+    if !git(entry, &["fetch", "-q", "origin", base_branch]) {
+        return Err(format!(
+            "could not fetch {base_branch}, so its config cannot be trusted"
+        ));
+    }
+
+    let tip = base_tip(entry);
+    recheck(unconfigured, done, repo, &tip);
+    let ids: Vec<(String, String)> = prs.iter().map(id).collect();
+
+    for pr in prs {
+        let id = (repo.to_string(), pr.sha.clone());
+
+        if done.contains(&id) {
+            continue;
+        }
+
+        // One PR that cannot be checked must not hold back the others
+        let since = waiting.get(&id).map_or(Duration::ZERO, Instant::elapsed);
+
+        let start = |plan: &run::Plan, name: &str| {
+            background::start(
+                &entry.path,
+                plan,
+                &entry.base,
+                name,
+                Posting::On,
+                "daemon",
+                config.home_ok,
+            );
+        };
+
+        match handle(config, repo, entry, sender, &pr, since, waits, &start) {
+            Ok(Some(verdict)) => {
+                println!("{repo}#{}: {verdict} on {}", pr.number, &pr.sha[..12]);
+                heads.insert((repo.to_string(), pr.number), pr.sha.clone());
+                waiting.remove(&id);
+
+                if verdict == NO_CONFIG {
+                    unconfigured.insert(id.clone(), tip.clone());
+                }
+
+                done.insert(id);
+            }
+            Ok(None) => {
+                if let std::collections::hash_map::Entry::Vacant(e) = waiting.entry(id) {
+                    e.insert(Instant::now());
+                    println!("{repo}#{}: waiting on {}", pr.number, &pr.sha[..12]);
+                }
+            }
+            Err(e) => eprintln!("{repo}#{}: {e}", pr.number),
+        }
+    }
+
+    Ok(ids.iter().all(|id| done.contains(id)))
+}
+
+/// The PRs into `base`, as `origin/main` or `main`
+fn into_base(open: Vec<OpenPr>, base: &str) -> Vec<OpenPr> {
+    let branch = base.strip_prefix("origin/").unwrap_or(base);
+    // shipcheck.toml on the configured branch only says what a PR into that branch must pass
+    open.into_iter().filter(|pr| pr.base == branch).collect()
+}
+
+type State<'a> = (
+    &'a mut HashSet<(String, String)>,
+    &'a mut HashMap<(String, String), Instant>,
+    &'a mut BTreeMap<(String, u64), String>,
+    &'a mut BTreeMap<(String, u64), String>,
+    &'a mut HashMap<(String, String), String>,
+);
+
+const NO_CONFIG: &str = "not checked, no shipcheck.toml on main";
+
+/// The commit the fetched base is at, empty when git cannot say
+fn base_tip(entry: &RepoEntry) -> String {
+    Command::new("git")
+        .arg("-C")
+        .arg(&entry.path)
+        .args([
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("{}^{{commit}}", entry.base),
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Checks again the heads of `repo` marked with no config once the base moved, as a merge of shipcheck.toml does
+fn recheck(
+    unconfigured: &mut HashMap<(String, String), String>,
+    done: &mut HashSet<(String, String)>,
+    repo: &str,
+    tip: &str,
+) {
+    unconfigured.retain(|id, at| {
+        let moved = id.0 == repo && at != tip;
+
+        if moved {
+            done.remove(id);
+        }
+
+        !moved
+    });
+}
+
+/// The heads that waited for their push event and that a new head on the same PR replaced
+fn abandoned(
+    waits: &BTreeMap<(String, u64), String>,
+    repo: &str,
+    prs: &[OpenPr],
+) -> Vec<(u64, String)> {
+    prs.iter()
+        .filter_map(|pr| {
+            let old = waits.get(&(repo.to_string(), pr.number))?;
+            (*old != pr.sha).then(|| (pr.number, old.clone()))
+        })
+        .collect()
+}
+
+/// Records `pr_merged` for each PR the daemon checked that left the open list merged, one GET each,
+/// and says whether one of them may have merged into `base_branch`
+fn merges(
+    repo: &str,
+    sender: &impl Remote,
+    open: &[OpenPr],
+    heads: &mut BTreeMap<(String, u64), String>,
+    base_branch: &str,
+) -> bool {
+    let mut into_base = false;
+    let gone: Vec<(String, u64)> = heads
+        .keys()
+        .filter(|(r, n)| r == repo && !open.iter().any(|pr| pr.number == *n))
+        .cloned()
+        .collect();
+
+    for key in gone {
+        let pr = match sender.pull(key.1) {
+            Ok(Some(pr)) => pr,
+            // The hosted service reads no closed PR, so any PR that left may have merged. A tip that
+            // has its check costs one read
+            Ok(None) => {
+                heads.remove(&key);
+                into_base = true;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("{repo}#{}: {e}", key.1);
+                continue;
+            }
+        };
+
+        // Past the first 100 open PRs, still open
+        if pr["state"] == "open" {
+            continue;
+        }
+
+        let sha = heads.remove(&key).unwrap_or_default();
+
+        if pr["merged_at"].is_string() {
+            into_base |= pr["base"]["ref"] == base_branch;
+            let fields = serde_json::json!({
+                "pr": key.1,
+                "sha": sha,
+                "merge_sha": pr["merge_commit_sha"],
+                "merged_by": pr["merged_by"]["login"],
+                "merged_at": pr["merged_at"],
+                "author": pr["user"]["login"],
+            });
+            record::keep(repo, &record::event(repo, "pr_merged", fields));
+        }
+    }
+
+    into_base
+}
+
+/**
+ * Checks the base's tip after it moves, for the badge and anyone who reads main's checks. Only
+ * people who can push to the base move it, so no pusher is asked, and a tree that passed as a PR head
+ * posts from the cache at once. A `[skip ci]` commit, such as a release bump, is checked too, since
+ * it is the tip the badge reads and shipcheck pushes nothing that could loop
+ **/
+fn handle_main(
+    config: &DaemonConfig,
+    entry: &RepoEntry,
+    sender: &impl Remote,
+    start: &dyn Fn(&run::Plan, &str),
+) -> Result<&'static str, String> {
+    let tip = base_tip(entry);
+
+    if tip.is_empty() {
+        return Err(format!("could not read {}", entry.base));
+    }
+
+    if sender
+        .find_checks(&tip)?
+        .get(check::NAME)
+        .is_some_and(|c| c.status == "completed")
+    {
+        return Ok("already checked");
+    }
+
+    if !git(
+        entry,
+        &["cat-file", "-e", &format!("{}:shipcheck.toml", entry.base)],
+    ) {
+        return Ok(NO_CONFIG);
+    }
+
+    let plan = run::plan(&entry.path, &tip, &entry.base)?;
+
+    if !plan.config.daemon {
+        return Ok("not checked, daemon = false on main");
+    }
+
+    if !config.run_misses && run::lookup(&plan).is_none() {
+        return Ok("not run, run_misses is off");
+    }
+
+    start(
+        &plan,
+        entry.base.strip_prefix("origin/").unwrap_or(&entry.base),
+    );
+    Ok("checking its tip")
+}
+
+/// A daemon event about one head, such as a rerun or a skip, with its reason
+fn note(repo: &str, name: &str, pr: &OpenPr, reason: &str) {
+    let fields = serde_json::json!({"pr": pr.number, "sha": pr.sha, "reason": reason});
+    record::keep(repo, &record::event(repo, name, fields));
+}
+
+// A refused head stops being a mark after this, the store stays small
+const REFUSED_DAYS: u64 = 30;
+
+fn refused_path(repo: &str) -> PathBuf {
+    paths::home()
+        .join("daemon/refused")
+        .join(format!("{repo}.json"))
+}
+
+/// The heads this machine refused to run, as sha and the time it refused, without old ones
+fn refused(file: &Path, now: u64) -> BTreeMap<String, u64> {
+    let mut found: BTreeMap<String, u64> = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    found.retain(|_, at| now.saturating_sub(*at) < REFUSED_DAYS * 86_400);
+    found
+}
+
+fn refuse(file: &Path, sha: &str, now: u64) {
+    let mut found = refused(file, now);
+    found.insert(sha.to_string(), now);
+
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let _ = std::fs::write(file, serde_json::json!(found).to_string());
+}
+
+/**
+ * A refused head that `head` contains. "Update branch" on GitHub is a push by whoever clicked it,
+ * and it can carry a teammate's commit that person never fetched, so a later head is only as
+ * allowed as the commits under it
+ **/
+fn tainted(checkout: &Path, head: &str, refused: &BTreeMap<String, u64>) -> Option<String> {
+    refused
+        .keys()
+        .find(|sha| {
+            Command::new("git")
+                .arg("-C")
+                .arg(checkout)
+                .args(["merge-base", "--is-ancestor", sha.as_str(), head])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+        .cloned()
+}
+
+#[derive(Debug, PartialEq)]
+enum Pushed {
+    Run,
+    /// No source names the pusher yet. GitHub lists events from 30 seconds to hours late, so the
+    /// head waits and every poll asks again, never giving up on a PR
+    Wait,
+    /// Another login pushed it, and main does not list them
+    Other,
+}
+
+/**
+ * Whether the daemon may run a head: both the PR's opener and the pusher of the head must be its
+ * own user or a login `daemon_authors` on main lists, since anyone with write access can push to
+ * any PR's branch. Never by a commit's author email, which anyone can set
+ **/
+fn pushed(opener: &str, pusher: Option<&str>, me: &str, listed: &[String]) -> Pushed {
+    let allowed = |login: &str| {
+        !login.is_empty()
+            && (login.eq_ignore_ascii_case(me)
+                || listed.iter().any(|l| l.eq_ignore_ascii_case(login)))
+    };
+
+    match pusher {
+        _ if !allowed(opener) => Pushed::Other,
+        Some(p) if allowed(p) => Pushed::Run,
+        Some(_) => Pushed::Other,
+        None => Pushed::Wait,
+    }
+}
+
+/// Why a head does not run, its `skipped` reason, and whether to mark it refused. None when it
+/// runs or still waits
+fn refusal(verdict: &Pushed) -> Option<(&'static str, &'static str, bool)> {
+    match verdict {
+        Pushed::Run | Pushed::Wait => None,
+        Pushed::Other => Some((
+            "not run, opened or pushed by a login that is not this machine's and daemon_authors on main does not list",
+            "pusher_not_allowed",
+            true,
+        )),
+    }
+}
+
+/// The login whose PRs run: `login` in daemon.toml, else the one `shipcheck login` signed in
+fn me(config: &DaemonConfig) -> Option<String> {
+    config.login.clone().or_else(service::signed_in_login)
+}
+
+/// Posts the PR comment after the checks, so a comment GitHub refuses costs one line, never the
+/// post. With no secrets to mask it posts none
+pub fn comment(
+    sender: &impl Remote,
+    prs: Option<&[u64]>,
+    plan: &run::Plan,
+    base: &str,
+    entry: &run::Entry,
+) -> bool {
+    let branch = base.strip_prefix("origin/").unwrap_or(base);
+    let said = git::repo_id(&plan.repo)
+        .and_then(|id| run::secret_values(&id))
+        .and_then(|secrets| sender.comment(prs, branch, &plan.sha, entry, &secrets));
+
+    match said {
+        Ok(urls) => {
+            for url in &urls {
+                println!("updated the PR comment: {url}");
+            }
+
+            !urls.is_empty()
+        }
+        Err(e) => {
+            eprintln!("{}: no PR comment, {e}", &plan.sha[..12]);
+            false
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Action {
+    /// A run of this tree goes on this machine
+    Local,
+    /// The tree has a result, post it with no run
+    Post,
+    /// Another machine shows a run in progress
+    Claimed,
+    Run,
+    Queue,
+}
+
+/// Whether a check went in progress before `cutoff`, as GitHub writes times
+/// Fails every check of a run the daemon stopped, so no later poll runs that head again
+fn fail_stuck(
+    send: &background::Send<'_>,
+    existing: &Checks,
+    names: &[String],
+    sha: &str,
+    why: &str,
+) -> Result<(), String> {
+    let why = format!(
+        "The run {why}, so the daemon stopped it. `shipcheck logs` on that machine shows where it hung"
+    );
+    let bodies: Vec<_> = names.iter().map(|n| check::errored(n, sha, &why)).collect();
+    let ids = existing.iter().map(|(n, c)| (n.clone(), c.id)).collect();
+    background::finish(send, &bodies, &ids).map(|_| ())
+}
+
+fn overdue(existing: &Checks, cutoff: &str) -> bool {
+    existing.values().any(|c| {
+        c.status == "in_progress" && !c.started_at.is_empty() && c.started_at.as_str() < cutoff
+    })
+}
+
+/// What this machine has for a head's tree
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Here {
+    Running,
+    Result,
+    Nothing,
+}
+
+/// Whether this machine may run a head that no machine claimed
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Miss {
+    Run,
+    Queue,
+}
+
+/// What to do with a head that has no completed `shipcheck` check. `cutoff` is the time before
+/// which an in-progress claim is stale, as GitHub writes times
+fn decide(existing: &Checks, here: Here, miss: Miss, cutoff: &str) -> Action {
+    let claimed = existing
+        .values()
+        .any(|c| c.status == "in_progress" && c.started_at.as_str() >= cutoff);
+
+    if here == Here::Running {
+        Action::Local
+    } else if here == Here::Result {
+        Action::Post
+    } else if claimed {
+        Action::Claimed
+    } else if miss == Miss::Run {
+        Action::Run
+    } else {
+        Action::Queue
+    }
+}
+
+/// Notes each PR's head as soon as it is seen, so a head replaced before any verdict still gets
+/// its unfinished checks cancelled
+fn track_heads(
+    repo: &str,
+    prs: &[OpenPr],
+    heads: &mut BTreeMap<(String, u64), String>,
+    remote: &dyn Remote,
+) {
+    for pr in prs {
+        let key = (repo.to_string(), pr.number);
+
+        if let Some(old) = heads.get(&key).filter(|old| **old != pr.sha) {
+            let fields = serde_json::json!({
+                "pr": pr.number,
+                "sha": pr.sha,
+                "previous_sha": old,
+                "reason": "head_changed_on_github",
+            });
+            record::keep(repo, &record::event(repo, "rerun", fields));
+
+            if !prs.iter().any(|p| p.sha == *old)
+                && let Err(e) = cancel_replaced(remote, old)
+            {
+                println!("{repo}#{}: {e}", pr.number);
+            }
+        }
+
+        heads.insert(key, pr.sha.clone());
+    }
+}
+
+/// Completes what a replaced head left queued or running, as Actions cancels a superseded run
+fn cancel_replaced(remote: &dyn Remote, sha: &str) -> Result<(), String> {
+    for (name, c) in remote.find_checks(sha)? {
+        if c.status == "completed" {
+            continue;
+        }
+
+        let body = serde_json::json!({
+            "name": name,
+            "head_sha": sha,
+            "status": "completed",
+            "conclusion": "cancelled",
+            "output": {"title": "replaced", "summary": "A newer commit replaced this one.", "text": ""},
+        });
+        remote.send(&body, Some(c.id))?;
+    }
+
+    Ok(())
+}
+
+/// What `handle` asks of GitHub, so a test can answer it
+pub trait Remote: Sync {
+    fn send(&self, body: &serde_json::Value, id: Option<u64>) -> Result<(u64, String), String>;
+    fn find_checks(&self, sha: &str) -> Result<Checks, String>;
+    fn pull(&self, number: u64) -> Result<Option<serde_json::Value>, String>;
+    fn pusher(
+        &self,
+        pr: u64,
+        branch: &str,
+        sha: &str,
+        trusted: &[String],
+    ) -> Result<Option<(String, String)>, String>;
+    fn comment(
+        &self,
+        prs: Option<&[u64]>,
+        base: &str,
+        sha: &str,
+        entry: &run::Entry,
+        secrets: &[String],
+    ) -> Result<Vec<String>, String>;
+}
+
+impl Remote for Sender {
+    fn send(&self, body: &serde_json::Value, id: Option<u64>) -> Result<(u64, String), String> {
+        Sender::send(self, body, id)
+    }
+
+    fn find_checks(&self, sha: &str) -> Result<Checks, String> {
+        Sender::find_checks(self, sha)
+    }
+
+    fn pull(&self, number: u64) -> Result<Option<serde_json::Value>, String> {
+        Sender::pull(self, number)
+    }
+
+    fn pusher(
+        &self,
+        pr: u64,
+        branch: &str,
+        sha: &str,
+        trusted: &[String],
+    ) -> Result<Option<(String, String)>, String> {
+        Sender::pusher(self, pr, branch, sha, trusted)
+    }
+
+    fn comment(
+        &self,
+        prs: Option<&[u64]>,
+        base: &str,
+        sha: &str,
+        entry: &run::Entry,
+        secrets: &[String],
+    ) -> Result<Vec<String>, String> {
+        comment::post(self.route(), self.repo(), prs, base, sha, entry, secrets)
+    }
+}
+
+/// Posts the checks for one PR, or returns None while it waits for a run. `start` starts the
+/// background run of a plan, with its name
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a separate input of one PR"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one PR's decision, from its checks to the post, read top to bottom"
+)]
+fn handle(
+    config: &DaemonConfig,
+    repo: &str,
+    entry: &RepoEntry,
+    sender: &impl Remote,
+    pr: &OpenPr,
+    since: Duration,
+    waits: &mut BTreeMap<(String, u64), String>,
+    start: &dyn Fn(&run::Plan, &str),
+) -> Result<Option<&'static str>, String> {
+    let (number, sha) = (pr.number, &pr.sha);
+    let mut rec = Run::new("daemon", clock::unix_now());
+    rec.pr = Some(number);
+    rec.author = Some(pr.author.clone()).filter(|a| !a.is_empty());
+    rec.branch = Some(pr.branch.clone()).filter(|b| !b.is_empty());
+    let existing = sender.find_checks(sha)?;
+
+    // `shipcheck` completes last, after every job check
+    if existing
+        .get(check::NAME)
+        .is_some_and(|c| c.status == "completed")
+    {
+        return Ok(Some("already checked"));
+    }
+
+    if !git(entry, &["cat-file", "-e", &format!("{sha}^{{commit}}")]) {
+        git(
+            entry,
+            &["fetch", "-q", "origin", &format!("pull/{number}/head")],
+        );
+    }
+
+    // The check reflects the owner's rules, so a repository with no shipcheck.toml on main gets none
+    if !git(
+        entry,
+        &["cat-file", "-e", &format!("{}:shipcheck.toml", entry.base)],
+    ) {
+        return Ok(Some(NO_CONFIG));
+    }
+
+    let plan = run::plan(&entry.path, sha, &entry.base)?;
+
+    if !plan.config.daemon {
+        return Ok(Some("not checked, daemon = false on main"));
+    }
+
+    let same_repo = pr.head_repo.eq_ignore_ascii_case(repo);
+
+    // A host check runs a commit's code as this user outside any container, so never a fork's, not even from the cache
+    if plan.config.hosts() && !same_repo {
+        return Ok(Some("not checked, host mode never checks a fork's PR"));
+    }
+
+    let names = check::names(&plan);
+    let send = |body: &serde_json::Value, id| sender.send(body, id);
+    let local = run::running(&plan.key) || background::running_here(repo, sha, Runs::Any);
+    let result = if local { None } else { run::lookup(&plan) };
+    let cutoff = check::iso(clock::unix_now().saturating_sub(stale_after(&plan.config)));
+
+    // A fork's code would run on this machine with its secrets, so only its own author runs it
+    let me = me(config);
+    let miss = if config.run_misses && same_repo && me.is_some() {
+        Miss::Run
+    } else {
+        Miss::Queue
+    };
+
+    // A claim this machine's own run left when it died holds nothing, so the head runs again now
+    let claims = if !local && background::died_here(repo, sha) {
+        Checks::new()
+    } else {
+        existing.clone()
+    };
+
+    let here = if local {
+        Here::Running
+    } else if result.is_some() {
+        Here::Result
+    } else {
+        Here::Nothing
+    };
+
+    match decide(&claims, here, miss, &cutoff) {
+        Action::Local => {
+            // A run past the time its jobs could take, or with no progress for a while, is stuck.
+            // It fails, a run again would hang the same way, and a new push runs the PR again
+            if background::running_here(repo, sha, Runs::Any) {
+                let why = if overdue(&existing, &cutoff) {
+                    Some("ran past the time its jobs could take".to_string())
+                } else if background::stuck_here(repo, sha, QUIET) {
+                    Some(format!(
+                        "made no progress for {} minutes",
+                        QUIET.as_secs() / 60
+                    ))
+                } else {
+                    None
+                };
+
+                if let Some(why) = why {
+                    println!(
+                        "{repo}#{number}: the run of {} {why}, failing it",
+                        &sha[..12]
+                    );
+                    background::stop_here(repo, sha);
+                    fail_stuck(&send, &existing, &names, sha, &why)?;
+                    return Ok(None);
+                }
+            }
+
+            // A run that posts marks its own checks, a mark from here could land after its result
+            if !background::running_here(repo, sha, Runs::Posting) {
+                background::mark(&send, &existing, sha, &names, Wait::Running)?;
+            }
+
+            Ok(None)
+        }
+        Action::Post => {
+            let result = result.ok_or("no result")?;
+            // A fork's log could show what its own code printed of this machine, so only same-repo PRs get one
+            let bodies = check::final_bodies(
+                &plan,
+                &result,
+                if same_repo {
+                    Tails::Shown
+                } else {
+                    Tails::Withheld
+                },
+            );
+            let ids = existing.iter().map(|(n, c)| (n.clone(), c.id)).collect();
+            rec.cache_hit = true;
+            rec.first_check = Some(clock::unix_now());
+            let secrets = git::repo_id(&plan.repo)
+                .and_then(|id| run::secret_values(&id))
+                .unwrap_or_default();
+            let logs = paths::log_dir(&plan.key);
+
+            if let Err(e) = background::finish(&send, &bodies, &ids) {
+                background::remember_post(repo, Some(&e));
+                rec.post_error = Some(e.clone());
+                record::keep(
+                    repo,
+                    &record::line(repo, &plan, &result, &rec, &logs, &secrets),
+                );
+                return Err(e);
+            }
+
+            background::remember_post(repo, None);
+            rec.posted_checks = true;
+
+            // A fork's summary is its own code's Markdown, so only a same-repo PR gets the comment
+            if same_repo {
+                rec.posted_comment = comment(sender, Some(&[number]), &plan, &entry.base, &result);
+            }
+
+            let line = record::line(repo, &plan, &result, &rec, &logs, &secrets);
+            record::keep(repo, &line);
+            record::share(&plan, repo, &line);
+
+            Ok(Some(if result.passed {
+                "posted success"
+            } else {
+                "posted failure"
+            }))
+        }
+        Action::Claimed => {
+            if since.is_zero() {
+                note(repo, "skipped", pr, "claimed_by_another_machine");
+            }
+
+            Ok(None)
+        }
+        Action::Run => {
+            let marks = refused_path(repo);
+
+            if let Some(bad) = tainted(&entry.path, sha, &refused(&marks, clock::unix_now())) {
+                println!(
+                    "{repo}#{number}: {} contains {}, a head this machine refused",
+                    &sha[..12],
+                    &bad[..bad.len().min(12)]
+                );
+                note(repo, "skipped", pr, "contains_refused_head");
+                background::mark(&send, &existing, sha, &names, Wait::Queued)?;
+                return Ok(Some("not run, it contains a head this machine refused"));
+            }
+
+            let me = me.as_deref().unwrap_or_default();
+            let trusted: Vec<String> = std::iter::once(me.to_string())
+                .chain(plan.config.daemon_authors.iter().cloned())
+                .filter(|l| !l.is_empty())
+                .collect();
+            let pusher = sender.pusher(number, &pr.branch, sha, &trusted)?;
+
+            if let Some((login, source)) = &pusher {
+                println!(
+                    "{repo}#{number}: {login} pushed {}, from {source}",
+                    &sha[..12]
+                );
+            }
+
+            let verdict = pushed(
+                &pr.author,
+                pusher.as_ref().map(|(login, _)| login.as_str()),
+                me,
+                &plan.config.daemon_authors,
+            );
+
+            if verdict == Pushed::Wait {
+                if since.is_zero() {
+                    println!(
+                        "{repo}#{number}: GitHub has not said who pushed {} yet, asking again every poll",
+                        &sha[..12]
+                    );
+                }
+
+                waits.insert((repo.to_string(), number), sha.clone());
+                background::mark(&send, &existing, sha, &names, Wait::Queued)?;
+                return Ok(None);
+            }
+
+            let refused = refusal(&verdict);
+
+            waits.remove(&(repo.to_string(), number));
+
+            // Only a known pusher who is not allowed marks the head, heads on top of it inherit the mark
+            if let Some((why, reason, mark)) = refused {
+                if mark {
+                    refuse(&marks, sha, clock::unix_now());
+                }
+
+                note(repo, "skipped", pr, reason);
+                background::mark(&send, &existing, sha, &names, Wait::Queued)?;
+                return Ok(Some(why));
+            }
+
+            // A new `shipcheck` run is the claim, the latest one on the commit wins
+            let ours = sender
+                .send(&check::waiting(check::NAME, sha, Wait::Running), None)?
+                .0;
+            let mut jobs = existing;
+            jobs.remove(check::NAME);
+            let job_names: Vec<String> = names.into_iter().filter(|n| n != check::NAME).collect();
+            background::mark(&send, &jobs, sha, &job_names, Wait::Running)?;
+
+            if sender.find_checks(sha)?.get(check::NAME).map(|c| c.id) != Some(ours) {
+                note(repo, "skipped", pr, "claimed_by_another_machine");
+                return Ok(None);
+            }
+
+            println!(
+                "{repo}#{number}: new head {}, running its checks",
+                &sha[..12]
+            );
+            note(repo, "rerun", pr, "no_result_for_tree");
+            // The branch's record, as the hook writes it, so a push and the daemon never run two heads of one PR at once
+            let name = if pr.branch.is_empty() {
+                format!("pr:{number}")
+            } else {
+                pr.branch.clone()
+            };
+            start(&plan, &name);
+            Ok(None)
+        }
+        Action::Queue => {
+            background::mark(&send, &existing, sha, &names, Wait::Queued)?;
+
+            // It never runs here, so asking again every poll would only spend API calls until its head changes
+            if !same_repo {
+                return Ok(Some("queued, the daemon never runs a fork's PR"));
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
