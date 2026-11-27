@@ -786,9 +786,9 @@ dependencies = [
 
 [[package]]
 name = "git-cow"
-version = "0.4.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "606342344862358415f7b955fc977956d093b681fdc87a7599f6ac74c2239bd5"
+checksum = "68b56d0ec488a9298117d7ac5f1542921541348dc4971465d6eb9efef85cebd8"
 
 [[package]]
 name = "globset"

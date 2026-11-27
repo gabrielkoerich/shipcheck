@@ -717,6 +717,8 @@ fn what_a_job_writes_in_its_checkout_runs_nothing_on_the_host() {
         let dir = dir.to_string_lossy();
         sh(&repo, &["worktree", "add", "-q", "--detach", &dir, "HEAD"]);
     }
+    // git-cow warms only an extra checkout it made, marked by the lock it keeps beside each one
+    fs::write(tmp.path().join(".template.lock"), "").unwrap();
 
     let link = standalone_git(&job, &sha).unwrap();
 
